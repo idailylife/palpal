@@ -1,0 +1,230 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PYTHON="${PYTHON:-python3}"
+NODE="${NODE:-node}"
+RUNTIME_DIR="${PALPAL_RUNTIME_DIR:-$ROOT/runtime}"
+ASSET_DIR="${PALPAL_ASSET_DIR:-$ROOT/data/pal}"
+GAME_BIN="${PALPAL_GAME_BIN:-$ROOT/vendor/sdlpal/unix/sdlpal}"
+HOST="${PALPAL_HOST:-127.0.0.1}"
+PORT="${PALPAL_PORT:-8765}"
+SAVE_SLOT="${PALPAL_SAVE_SLOT:-0}"
+HEADLESS="${PALPAL_HEADLESS:-1}"
+
+usage() {
+    printf '%s\n' \
+        'Usage: ./run [command]' \
+        '' \
+        'No command starts the debug server and game together.' \
+        '' \
+        'Commands:' \
+        '  assets  Fetch DOS game resources into data/pal' \
+        '  build   Build the patched SDLPAL binary' \
+        '  debug   Start the browser debug server' \
+        '  game    Start SDLPAL in agent mode in the foreground' \
+        '  dev     Start the debug server and game together' \
+        '  visual-smoke  Run headless game/server and verify browser canvas output' \
+        '  clean   Remove generated runtime files' \
+        '  help    Show this help' \
+        '' \
+        'Useful environment variables:' \
+        '  PYTHON, NODE, PALPAL_RUNTIME_DIR, PALPAL_ASSET_DIR, PALPAL_GAME_BIN' \
+        '  PALPAL_HOST, PALPAL_PORT, PALPAL_SAVE_SLOT, PALPAL_HEADLESS' \
+        '  PALPAL_HEADLESS=0 starts a visible SDL window for video debugging.'
+}
+
+need_cmake() {
+    if ! command -v cmake >/dev/null 2>&1; then
+        printf '%s\n' 'cmake was not found. Install CMake, then run ./run build again.' >&2
+        exit 127
+    fi
+}
+
+ensure_runtime() {
+    mkdir -p "$RUNTIME_DIR"
+}
+
+prepare_live_runtime() {
+    ensure_runtime
+    rm -f \
+        "$RUNTIME_DIR/action.txt" \
+        "$RUNTIME_DIR/action.txt.tmp" \
+        "$RUNTIME_DIR/frame.rgba" \
+        "$RUNTIME_DIR/frame.rgba.tmp" \
+        "$RUNTIME_DIR/screen.bmp" \
+        "$RUNTIME_DIR/screen_error.txt" \
+        "$RUNTIME_DIR/state.json" \
+        "$RUNTIME_DIR/state.json.tmp"
+}
+
+check_game_inputs() {
+    if [ ! -d "$ASSET_DIR" ]; then
+        printf 'Game assets not found: %s\nRun ./run assets first.\n' "$ASSET_DIR" >&2
+        exit 1
+    fi
+    if [ ! -x "$GAME_BIN" ]; then
+        printf 'Game binary not found or not executable: %s\nRun ./run build first.\n' "$GAME_BIN" >&2
+        exit 1
+    fi
+}
+
+configure_build() {
+    need_cmake
+    cmake -S "$ROOT" -B "$ROOT/build"
+}
+
+run_debug() {
+    ensure_runtime
+    cd "$ROOT"
+    "$PYTHON" -m palpal.debug_server \
+        --host "$HOST" \
+        --port "$PORT" \
+        --runtime-dir "$RUNTIME_DIR" \
+        --asset-dir "$ASSET_DIR" \
+        --game-binary "$GAME_BIN"
+}
+
+run_game() {
+    ensure_runtime
+    check_game_inputs
+    cd "$ASSET_DIR"
+    if [ "$HEADLESS" = "1" ]; then
+        SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}" \
+            PALPAL_AGENT=1 \
+            PALPAL_HEADLESS=1 \
+            PALPAL_RUNTIME_DIR="$RUNTIME_DIR" \
+            PALPAL_SAVE_SLOT="$SAVE_SLOT" \
+            "$GAME_BIN"
+    else
+        PALPAL_AGENT=1 \
+            PALPAL_HEADLESS=0 \
+            PALPAL_RUNTIME_DIR="$RUNTIME_DIR" \
+            PALPAL_SAVE_SLOT="$SAVE_SLOT" \
+            "$GAME_BIN"
+    fi
+}
+
+run_all() {
+    prepare_live_runtime
+    check_game_inputs
+    mkdir -p "$RUNTIME_DIR/logs"
+
+    run_game >"$RUNTIME_DIR/logs/game.log" 2>&1 &
+    game_pid=$!
+
+    run_debug >"$RUNTIME_DIR/logs/debug.log" 2>&1 &
+    debug_pid=$!
+
+    cleanup() {
+        kill "$debug_pid" "$game_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    sleep 1
+    if ! kill -0 "$debug_pid" 2>/dev/null; then
+        printf '%s\n' 'Debug server failed to start.' >&2
+        printf 'See %s\n' "$RUNTIME_DIR/logs/debug.log" >&2
+        exit 1
+    fi
+    if ! kill -0 "$game_pid" 2>/dev/null; then
+        printf '%s\n' 'Game failed to start.' >&2
+        printf 'See %s\n' "$RUNTIME_DIR/logs/game.log" >&2
+        exit 1
+    fi
+
+    printf 'Debug console: http://%s:%s\n' "$HOST" "$PORT"
+    printf 'Game log: %s\n' "$RUNTIME_DIR/logs/game.log"
+    printf 'Debug log: %s\n' "$RUNTIME_DIR/logs/debug.log"
+    printf '%s\n' 'Press Ctrl+C to stop both processes.'
+
+    while kill -0 "$debug_pid" 2>/dev/null; do
+        if ! kill -0 "$game_pid" 2>/dev/null; then
+            printf '%s\n' 'Game process exited; stopping debug server.' >&2
+            printf 'See %s\n' "$RUNTIME_DIR/logs/game.log" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+
+    wait "$debug_pid"
+}
+
+wait_for_debug() {
+    i=0
+    while [ "$i" -lt 100 ]; do
+        if "$PYTHON" - "$HOST" "$PORT" >/dev/null 2>&1 <<'PY'
+import sys
+import urllib.request
+
+host, port = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(f"http://{host}:{port}/state", timeout=0.2) as response:
+    raise SystemExit(0 if response.status == 200 else 1)
+PY
+        then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+run_visual_smoke() {
+    prepare_live_runtime
+    check_game_inputs
+    mkdir -p "$RUNTIME_DIR/logs"
+
+    PALPAL_HEADLESS=1 run_game >"$RUNTIME_DIR/logs/game.log" 2>&1 &
+    game_pid=$!
+
+    run_debug >"$RUNTIME_DIR/logs/debug.log" 2>&1 &
+    debug_pid=$!
+
+    cleanup() {
+        kill "$debug_pid" "$game_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    if ! wait_for_debug; then
+        printf '%s\n' 'Debug server failed to become ready.' >&2
+        printf 'See %s\n' "$RUNTIME_DIR/logs/debug.log" >&2
+        exit 1
+    fi
+
+    "$NODE" "$ROOT/scripts/visual_smoke.mjs" "http://$HOST:$PORT"
+}
+
+command="${1:-dev}"
+
+case "$command" in
+    assets)
+        "$PYTHON" "$ROOT/scripts/fetch_assets.py" --target "$ASSET_DIR"
+        ;;
+    build)
+        configure_build
+        cmake --build "$ROOT/build" --target sdlpal
+        ;;
+    debug)
+        run_debug
+        ;;
+    game)
+        run_game
+        ;;
+    dev)
+        run_all
+        ;;
+    visual-smoke)
+        run_visual_smoke
+        ;;
+    clean)
+        rm -rf "$RUNTIME_DIR"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

@@ -30,6 +30,16 @@ body {
   color: #9fb1c1;
 }
 
+.runtimeStatus {
+  width: min(100%, 960px);
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border: 1px solid #69542a;
+  border-radius: 6px;
+  background: #211b10;
+  color: #ffd98a;
+}
+
 .screenWrap {
   position: relative;
   width: min(100%, 960px);
@@ -39,7 +49,7 @@ body {
   overflow: hidden;
 }
 
-#screen,
+#frame,
 #overlay {
   position: absolute;
   inset: 0;
@@ -137,4 +147,3 @@ pre {
     max-height: none;
   }
 }
-

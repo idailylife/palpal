@@ -27,6 +27,7 @@ volatile PALINPUTSTATE   g_InputState;
 #if PAL_HAS_JOYSTICKS
 static SDL_Joystick     *g_pJoy = NULL;
 #endif
+static DWORD             g_dwLastAgentStateWriteTime = 0;
 
 #if !SDL_VERSION_ATLEAST(2,0,0)
 # define SDLK_KP_1     SDLK_KP1
@@ -1338,6 +1339,15 @@ PAL_ProcessEvent(
    PAL_TouchRepeatCheck();
 #endif
    PALPAL_AgentPollAction();
+   if (PALPAL_AgentEnabled())
+   {
+      DWORD dwNow = SDL_GetTicks();
+      if (dwNow - g_dwLastAgentStateWriteTime >= 250)
+      {
+         PALPAL_AgentWriteState();
+         g_dwLastAgentStateWriteTime = dwNow;
+      }
+   }
 }
 
 VOID

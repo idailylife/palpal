@@ -8,7 +8,7 @@ console for humans and LLM agents.
 ## What This Provides
 
 - Native SDLPAL agent mode that exports live game state to `runtime/state.json`.
-- Latest rendered game frame exported to `runtime/screen.bmp`.
+- Latest rendered game frame exported to `runtime/frame.rgba`.
 - File-based action injection through `runtime/action.txt`.
 - HTTP endpoints for state and actions.
 - WebSocket stream for live debug updates.
@@ -21,15 +21,18 @@ only into gitignored local directories.
 ## Requirements
 
 - macOS or Linux shell environment.
-- `make`
+- `cmake`
 - `python3`
+- `node` and Google Chrome for `./run visual-smoke`
 - `git`
+- C/C++ compiler toolchain.
+- `pkg-config`
 - SDL3 development package available to `pkg-config sdl3`
 
-On macOS with Homebrew, SDL3 can usually be installed with:
+On macOS with Homebrew, the native requirements can usually be installed with:
 
 ```sh
-brew install sdl3
+brew install cmake pkg-config sdl3
 ```
 
 ## Quick Start
@@ -37,25 +40,30 @@ brew install sdl3
 Fetch local game resources:
 
 ```sh
-make assets
+./run assets
 ```
 
-Build the patched SDLPAL binary:
+Build the patched SDLPAL binary with CMake:
 
 ```sh
-make build-game
+./run build
 ```
 
-Start the debug server:
+Start the headless debug server and game together:
 
 ```sh
-make debug
+./run
 ```
 
-In another terminal, start the game in agent mode:
+`./run dev` is kept as an explicit alias. The game runs in the background while
+the browser debug server stays attached to the terminal. Press `Ctrl+C` to stop
+both processes.
+
+For debugging, you can still run them in separate terminals:
 
 ```sh
-make run-game
+./run debug
+./run game
 ```
 
 Open:
@@ -64,9 +72,42 @@ Open:
 http://127.0.0.1:8765
 ```
 
-The SDLPAL window is still the authoritative running game. The browser console
-mirrors the latest exported frame, live state JSON, map objects, and recent
-actions.
+The native SDLPAL runtime remains the authoritative running game. The browser
+console mirrors the latest exported frame, live state JSON, map objects, and
+recent actions.
+
+By default, `./run`, `./run dev`, and `./run game` use true headless agent mode
+and do not create an SDL game window. Use `PALPAL_HEADLESS=0 ./run game` when
+you explicitly want a visible SDL window for video debugging.
+
+## CMake
+
+```sh
+cmake -S . -B build
+cmake --build build --target sdlpal
+```
+
+Useful CMake targets:
+
+```sh
+cmake --build build --target assets
+cmake --build build --target debug
+cmake --build build --target game
+cmake --build build --target dev
+cmake --build build --target clean-runtime
+```
+
+`./run build` is just the shorter form of configuring `build/` and building the
+`sdlpal` target. The generated executable is written to
+`vendor/sdlpal/unix/sdlpal`.
+
+Compiler warnings for the vendored SDLPAL tree are quiet by default. To audit
+them explicitly, reconfigure with strict warnings:
+
+```sh
+cmake -S . -B build -DPALPAL_STRICT_WARNINGS=ON
+cmake --build build --target sdlpal
+```
 
 ## Runtime Files
 
@@ -76,7 +117,7 @@ patch to SDLPAL small and easy to inspect.
 SDLPAL writes:
 
 - `runtime/state.json`: live game state snapshot.
-- `runtime/screen.bmp`: latest exported 320x200 frame.
+- `runtime/frame.rgba`: latest exported 320x200 RGBA frame.
 
 The debug server writes:
 
@@ -119,6 +160,12 @@ Live stream:
 ws://127.0.0.1:8765/stream
 ```
 
+Live raw frame stream:
+
+```text
+ws://127.0.0.1:8765/frames
+```
+
 Reserved but not implemented yet:
 
 - `POST /reset`
@@ -148,12 +195,20 @@ and semantic categories should be added as a separate annotation layer.
 ## Useful Commands
 
 ```sh
-make assets        # fetch local gitignored DOS resources
-make build-game    # build vendor/sdlpal/unix/sdlpal
-make debug         # run browser debug server on 127.0.0.1:8765
-make run-game      # run SDLPAL with PALPAL_AGENT=1
-make clean-runtime # remove runtime files
+./run assets # fetch local gitignored DOS resources
+./run build  # configure and build vendor/sdlpal/unix/sdlpal with CMake
+./run        # run browser debug server and game together
+./run debug  # run browser debug server on 127.0.0.1:8765
+./run game   # run SDLPAL with PALPAL_AGENT=1
+./run dev    # explicit alias for ./run
+./run visual-smoke  # verify the browser canvas renders live raw frames
+./run clean  # remove runtime files
 ```
+
+`./run visual-smoke` starts the headless game and debug server, opens the UI in
+headless Chrome through the Chrome DevTools Protocol, verifies that both
+WebSocket streams are live, and checks that the frame canvas has non-black
+pixels. It stops the game and server before exiting.
 
 ## Licensing Notes
 
@@ -163,4 +218,3 @@ runtime should be treated as GPL-3.0 compatible work.
 The DOS game resources are not licensed by this repository. Keep resources in
 gitignored local paths such as `data/pal/`, and do not commit or redistribute
 them from this project.
-

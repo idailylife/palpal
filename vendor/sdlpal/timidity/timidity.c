@@ -399,9 +399,11 @@ static int read_config_file(const char *name)
       }
     }
   }
+  (void)line;
   SDL_RWclose(rw);
   return 0;
 fail:
+  (void)line;
   SDL_RWclose(rw);
   return -2;
 }

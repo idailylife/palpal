@@ -20,6 +20,7 @@
 //
 #include <float.h>
 #include "main.h"
+#include "agent.h"
 
 // Screen buffer
 SDL_Surface              *gpScreen           = NULL;
@@ -179,6 +180,23 @@ VIDEO_Startup(
    gRenderBackend.Setup = NullFunc;
    gRenderBackend.CreateTexture = VIDEO_CreateTexture;
    gRenderBackend.RenderCopy = VIDEO_RenderCopy;
+
+   if (PALPAL_AgentHeadless())
+   {
+      gpScreen = SDL_CreateRGBSurface(SDL_SWSURFACE, 320, 200, 8, 0, 0, 0, 0);
+      gpScreenBak = SDL_CreateRGBSurface(SDL_SWSURFACE, 320, 200, 8, 0, 0, 0, 0);
+      gpScreenReal = SDL_CreateRGBSurface(SDL_SWSURFACE, 320, 200, 32,
+                                          0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+      gpPalette = SDL_AllocPalette(256);
+
+      if (gpScreen == NULL || gpScreenBak == NULL || gpScreenReal == NULL || gpPalette == NULL)
+      {
+         VIDEO_Shutdown();
+         return -2;
+      }
+
+      return 0;
+   }
 
 #if PAL_HAS_GLSL
    if( gConfig.fEnableGLSL) {
@@ -483,6 +501,11 @@ VIDEO_RenderCopy(
 	void *texture_pixels;
 	int texture_pitch;
 
+	if (PALPAL_AgentHeadless() || gpRenderer == NULL || gpTexture == NULL)
+	{
+		return;
+	}
+
 	SDL_LockTexture(gpTexture, NULL, &texture_pixels, &texture_pitch);
 	memset(texture_pixels, 0, gTextureRect.y * texture_pitch);
 	uint8_t *pixels = (uint8_t *)texture_pixels + gTextureRect.y * texture_pitch;
@@ -632,6 +655,7 @@ VIDEO_UpdateScreen(
 
 #if SDL_VERSION_ATLEAST(2,0,0)
    gRenderBackend.RenderCopy();
+   PALPAL_AgentWriteFrame();
 #else
    SDL_UpdateRect(gpScreenReal, dstrect.x, dstrect.y, dstrect.w, dstrect.h);
 #endif
@@ -725,6 +749,11 @@ VIDEO_Resize(
 {
 #if SDL_VERSION_ATLEAST(2,0,0)
    SDL_Rect rect;
+
+   if (PALPAL_AgentHeadless())
+   {
+      return;
+   }
 
    if (gpTexture)
    {
@@ -851,6 +880,11 @@ VIDEO_ToggleFullscreen(
 --*/
 {
 #if SDL_VERSION_ATLEAST(2,0,0)
+	if (PALPAL_AgentHeadless() || gpWindow == NULL)
+	{
+		return;
+	}
+
 	if (gConfig.fFullScreen)
 	{
 		SDL_SetWindowFullscreen(gpWindow, 0);
@@ -1113,6 +1147,7 @@ VIDEO_SwitchScreen(
       SDL_SoftStretch(gpScreenBak, NULL, gpScreenReal, &dstrect);
 #if SDL_VERSION_ATLEAST(2, 0, 0)
       gRenderBackend.RenderCopy();
+      PALPAL_AgentWriteFrame();
 #else
       SDL_UpdateRect(gpScreenReal, 0, 0, gpScreenReal->w, gpScreenReal->h);
 #endif
@@ -1256,6 +1291,7 @@ VIDEO_FadeScreen(
             SDL_FillRect(gpScreenReal, &dstrect, 0);
 #if SDL_VERSION_ATLEAST(2, 0, 0)
             gRenderBackend.RenderCopy();
+            PALPAL_AgentWriteFrame();
 #else
 			SDL_UpdateRect(gpScreenReal, 0, 0, gpScreenReal->w, gpScreenReal->h);
 #endif
@@ -1271,6 +1307,7 @@ VIDEO_FadeScreen(
             SDL_SoftStretch(gpScreenBak, NULL, gpScreenReal, &dstrect);
 #if SDL_VERSION_ATLEAST(2, 0, 0)
             gRenderBackend.RenderCopy();
+            PALPAL_AgentWriteFrame();
 #else
             SDL_UpdateRect(gpScreenReal, 0, 0, gpScreenReal->w, gpScreenReal->h);
 #endif
@@ -1309,6 +1346,11 @@ VIDEO_SetWindowTitle(
 --*/
 {
 #if SDL_VERSION_ATLEAST(2,0,0)
+	if (PALPAL_AgentHeadless() || gpWindow == NULL)
+	{
+		return;
+	}
+
 	SDL_SetWindowTitle(gpWindow, PAL_CONVERT_UTF8(pszTitle));
 #else
 	SDL_WM_SetCaption(pszTitle, NULL);
@@ -1458,6 +1500,7 @@ VIDEO_DrawSurfaceToScreen(
    }
    SDL_BlitScaled(pSurface, NULL, gpScreenReal, NULL);
    gRenderBackend.RenderCopy();
+   PALPAL_AgentWriteFrame();
 #else
    SDL_Surface   *pCompatSurface;
    SDL_Rect       rect;

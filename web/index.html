@@ -13,8 +13,9 @@
           <strong>PALPAL Debug</strong>
           <span id="connection">connecting</span>
         </div>
+        <div id="runtimeStatus" class="runtimeStatus" hidden></div>
         <div class="screenWrap">
-          <img id="screen" alt="latest game frame" />
+          <canvas id="frame" width="320" height="200" aria-label="latest game frame"></canvas>
           <canvas id="overlay" width="640" height="400"></canvas>
         </div>
         <div class="controls">
@@ -45,4 +46,3 @@
     <script src="/app.js"></script>
   </body>
 </html>
-

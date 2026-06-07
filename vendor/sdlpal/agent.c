@@ -14,6 +14,7 @@
 
 static int g_agent_initialized = 0;
 static int g_agent_enabled = 0;
+static int g_agent_headless = 0;
 static char g_agent_runtime_dir[PAL_MAX_PATH] = "runtime";
 static DWORD g_agent_buttons = 0;
 static PALDIRECTION g_agent_dir = kDirUnknown;
@@ -25,6 +26,7 @@ PALPAL_AgentInit(
 )
 {
    const char *enabled;
+   const char *headless;
    const char *runtime_dir;
 
    if (g_agent_initialized)
@@ -35,6 +37,9 @@ PALPAL_AgentInit(
    g_agent_initialized = 1;
    enabled = getenv("PALPAL_AGENT");
    g_agent_enabled = (enabled && strcmp(enabled, "0") != 0);
+
+   headless = getenv("PALPAL_HEADLESS");
+   g_agent_headless = (headless && strcmp(headless, "0") != 0);
 
    runtime_dir = getenv("PALPAL_RUNTIME_DIR");
    if (runtime_dir && runtime_dir[0])
@@ -64,6 +69,15 @@ PALPAL_AgentSaveSlot(
       return 0;
    }
    return atoi(slot);
+}
+
+BOOL
+PALPAL_AgentHeadless(
+   VOID
+)
+{
+   PALPAL_AgentInit();
+   return g_agent_headless ? TRUE : FALSE;
 }
 
 static VOID
@@ -182,6 +196,13 @@ PALPAL_AgentPollAction(
       g_InputState.dir = g_agent_dir;
       g_InputState.prevdir = kDirUnknown;
       g_agent_hold_frames--;
+   }
+   else if (g_agent_dir != kDirUnknown)
+   {
+      g_agent_buttons = 0;
+      g_agent_dir = kDirUnknown;
+      g_InputState.dir = kDirUnknown;
+      g_InputState.prevdir = kDirUnknown;
    }
 }
 
@@ -330,6 +351,138 @@ PALPAL_AgentWriteWalkability(
    fprintf(fp, "]");
 }
 
+static VOID
+PALPAL_WriteLE16(
+   BYTE *p,
+   WORD value
+)
+{
+   p[0] = (BYTE)(value & 0xFF);
+   p[1] = (BYTE)((value >> 8) & 0xFF);
+}
+
+static VOID
+PALPAL_WriteLE32(
+   BYTE *p,
+   DWORD value
+)
+{
+   p[0] = (BYTE)(value & 0xFF);
+   p[1] = (BYTE)((value >> 8) & 0xFF);
+   p[2] = (BYTE)((value >> 16) & 0xFF);
+   p[3] = (BYTE)((value >> 24) & 0xFF);
+}
+
+VOID
+PALPAL_AgentWriteFrame(
+   VOID
+)
+{
+   enum {
+      PALPAL_FRAME_WIDTH = 320,
+      PALPAL_FRAME_HEIGHT = 200,
+      PALPAL_FRAME_HEADER_SIZE = 24,
+      PALPAL_FRAME_PAYLOAD_SIZE = PALPAL_FRAME_WIDTH * PALPAL_FRAME_HEIGHT * 4,
+      PALPAL_FRAME_FORMAT_RGBA8888 = 1,
+      PALPAL_FRAME_INTERVAL_MS = 66
+   };
+   static DWORD s_last_frame_write_time = 0;
+   static BYTE rgba[PALPAL_FRAME_PAYLOAD_SIZE];
+   char frame_path[PAL_MAX_PATH];
+   char tmp_path[PAL_MAX_PATH];
+   BYTE header[PALPAL_FRAME_HEADER_SIZE];
+   SDL_Palette *palette;
+   DWORD now;
+   DWORD frame_num = 0;
+   FILE *fp;
+   int x, y;
+
+   if (!PALPAL_AgentEnabled() || gpScreen == NULL)
+   {
+      return;
+   }
+
+   now = SDL_GetTicks();
+   if (s_last_frame_write_time != 0 &&
+       !SDL_TICKS_PASSED(now, s_last_frame_write_time + PALPAL_FRAME_INTERVAL_MS))
+   {
+      return;
+   }
+
+#if SDL_VERSION_ATLEAST(3,0,0)
+   palette = SDL_GetSurfacePalette(gpScreen);
+#else
+   palette = gpScreen->format ? gpScreen->format->palette : NULL;
+#endif
+   if (palette == NULL || palette->colors == NULL)
+   {
+      return;
+   }
+
+   if (SDL_MUSTLOCK(gpScreen) && SDL_LockSurface(gpScreen) < 0)
+   {
+      return;
+   }
+
+   for (y = 0; y < PALPAL_FRAME_HEIGHT; y++)
+   {
+      BYTE *src = (BYTE *)gpScreen->pixels + y * gpScreen->pitch;
+      BYTE *dst = rgba + y * PALPAL_FRAME_WIDTH * 4;
+      for (x = 0; x < PALPAL_FRAME_WIDTH; x++)
+      {
+         BYTE index = src[x];
+         SDL_Color color = index < palette->ncolors ? palette->colors[index] : palette->colors[0];
+         dst[x * 4 + 0] = color.r;
+         dst[x * 4 + 1] = color.g;
+         dst[x * 4 + 2] = color.b;
+         dst[x * 4 + 3] = 0xFF;
+      }
+   }
+
+   if (SDL_MUSTLOCK(gpScreen))
+   {
+      SDL_UnlockSurface(gpScreen);
+   }
+
+   if (gpGlobals != NULL)
+   {
+      frame_num = gpGlobals->dwFrameNum;
+   }
+
+   memset(header, 0, sizeof(header));
+   header[0] = 'P';
+   header[1] = 'F';
+   header[2] = 'R';
+   header[3] = 'M';
+   PALPAL_WriteLE16(header + 4, 1);
+   PALPAL_WriteLE16(header + 6, PALPAL_FRAME_WIDTH);
+   PALPAL_WriteLE16(header + 8, PALPAL_FRAME_HEIGHT);
+   PALPAL_WriteLE16(header + 10, PALPAL_FRAME_FORMAT_RGBA8888);
+   PALPAL_WriteLE32(header + 12, 0);
+   PALPAL_WriteLE32(header + 16, frame_num);
+   PALPAL_WriteLE32(header + 20, PALPAL_FRAME_PAYLOAD_SIZE);
+
+   PALPAL_AgentPath(frame_path, sizeof(frame_path), "frame.rgba");
+   PALPAL_AgentPath(tmp_path, sizeof(tmp_path), "frame.rgba.tmp");
+   fp = fopen(tmp_path, "wb");
+   if (!fp)
+   {
+      return;
+   }
+
+   if (fwrite(header, 1, sizeof(header), fp) != sizeof(header) ||
+       fwrite(rgba, 1, sizeof(rgba), fp) != sizeof(rgba))
+   {
+      fclose(fp);
+      remove(tmp_path);
+      return;
+   }
+
+   fclose(fp);
+   rename(tmp_path, frame_path);
+   s_last_frame_write_time = now;
+}
+
 VOID
 PALPAL_AgentWriteState(
    VOID
@@ -337,7 +490,6 @@ PALPAL_AgentWriteState(
 {
    char state_path[PAL_MAX_PATH];
    char tmp_path[PAL_MAX_PATH];
-   char screen_path[PAL_MAX_PATH];
    FILE *fp;
    int scene_index;
    WORD map_id = 0;
@@ -393,44 +545,4 @@ PALPAL_AgentWriteState(
 
    fclose(fp);
    rename(tmp_path, state_path);
-
-   PALPAL_AgentPath(screen_path, sizeof(screen_path), "screen.bmp");
-   if (gpScreen)
-   {
-      char error_path[PAL_MAX_PATH];
-      PALPAL_AgentPath(error_path, sizeof(error_path), "screen_error.txt");
-      if (PAL_GetCurrentMap())
-      {
-         PAL_MakeScene();
-      }
-#if SDL_VERSION_ATLEAST(3,0,0)
-      if (!SDL_SaveBMP(gpScreen, screen_path))
-#else
-      if (SDL_SaveBMP(gpScreen, screen_path) != 0)
-#endif
-      {
-         FILE *efp = fopen(error_path, "w");
-         if (efp)
-         {
-            fprintf(efp, "%s\n", SDL_GetError());
-            fclose(efp);
-         }
-      }
-      else
-      {
-         remove(error_path);
-      }
-   }
-   else
-   {
-      char error_path[PAL_MAX_PATH];
-      FILE *efp;
-      PALPAL_AgentPath(error_path, sizeof(error_path), "screen_error.txt");
-      efp = fopen(error_path, "w");
-      if (efp)
-      {
-         fprintf(efp, "gpScreen is NULL\n");
-         fclose(efp);
-      }
-   }
 }

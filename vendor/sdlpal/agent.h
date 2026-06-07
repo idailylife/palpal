@@ -17,6 +17,11 @@ PALPAL_AgentSaveSlot(
    VOID
 );
 
+BOOL
+PALPAL_AgentHeadless(
+   VOID
+);
+
 VOID
 PALPAL_AgentPollAction(
    VOID
@@ -24,6 +29,11 @@ PALPAL_AgentPollAction(
 
 VOID
 PALPAL_AgentWriteState(
+   VOID
+);
+
+VOID
+PALPAL_AgentWriteFrame(
    VOID
 );
 

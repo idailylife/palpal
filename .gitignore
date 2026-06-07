@@ -1,5 +1,6 @@
 data/
 runtime/
+build/
 *.rpg
 vendor/sdlpal/**/*.o
 vendor/sdlpal/**/*.d

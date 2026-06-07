@@ -142,7 +142,7 @@ extern "C" void native_midi_start(NativeMidiSong *song, int looping)
 
 	song->playing = true;
 	song->looping = looping ? true : false;
-	song->Thread = std::move(std::thread([](NativeMidiSong *song)->void {
+	song->Thread = std::thread([](NativeMidiSong *song)->void {
         while(song->looping)
         {
             auto pid = fork();
@@ -163,7 +163,7 @@ extern "C" void native_midi_start(NativeMidiSong *song, int looping)
             waitpid(pid, &status, 0);
         }
         song->playing = false;
-	}, song));
+	}, song);
 }
 
 extern "C" void native_midi_stop(NativeMidiSong *song)
@@ -180,7 +180,7 @@ extern "C" void native_midi_stop(NativeMidiSong *song)
             	}
 		if (song->Thread.joinable())
 			song->Thread.join();
-		song->Thread = std::move(std::thread());
+		song->Thread = std::thread();
 	}
 }
 

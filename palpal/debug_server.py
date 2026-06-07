@@ -38,6 +38,7 @@ VALID_BUTTONS = {
     "home",
     "end",
 }
+STALE_AFTER_SECONDS = 2.0
 
 
 def read_json(path: Path) -> dict:
@@ -49,8 +50,8 @@ def read_json(path: Path) -> dict:
         return {"status": "state_parse_error", "error": str(exc)}
 
 
-def websocket_frame(payload: bytes) -> bytes:
-    header = bytearray([0x81])
+def websocket_frame(payload: bytes, opcode: int = 0x1) -> bytes:
+    header = bytearray([0x80 | (opcode & 0x0F)])
     size = len(payload)
     if size < 126:
         header.append(size)
@@ -80,16 +81,39 @@ class DebugState:
         return self.runtime_dir / "screen.bmp"
 
     @property
+    def frame_path(self) -> Path:
+        return self.runtime_dir / "frame.rgba"
+
+    @property
     def action_path(self) -> Path:
         return self.runtime_dir / "action.txt"
 
+    def file_info(self, path: Path) -> dict:
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            return {"available": False}
+        age = max(0.0, time.time() - mtime)
+        return {
+            "available": True,
+            "mtime": mtime,
+            "age_seconds": age,
+            "stale": age > STALE_AFTER_SECONDS,
+        }
+
     def snapshot(self) -> dict:
         state = read_json(self.state_path)
+        state_info = self.file_info(self.state_path)
+        frame_info = self.file_info(self.frame_path)
         state["_debug"] = {
             "runtime_dir": str(self.runtime_dir),
             "asset_dir": str(self.asset_dir),
             "game_binary": str(self.game_binary),
-            "screen_available": self.screen_path.exists(),
+            "state_file": state_info,
+            "frame_file": frame_info,
+            "frame_available": frame_info["available"],
+            "runtime_stale": state_info.get("stale", True) or frame_info.get("stale", True),
+            "stale_after_seconds": STALE_AFTER_SECONDS,
             "recent_actions": self.action_log[-20:],
         }
         return state
@@ -123,7 +147,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_file(self.server.state.screen_path, "image/bmp", no_cache=True)
             return
         if parsed.path == "/stream":
-            self.handle_websocket()
+            self.handle_state_websocket()
+            return
+        if parsed.path == "/frames":
+            self.handle_frame_websocket()
             return
 
         rel = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
@@ -186,11 +213,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def handle_websocket(self) -> None:
+    def handle_websocket_upgrade(self) -> bool:
         key = self.headers.get("Sec-WebSocket-Key")
         if not key:
             self.send_error(HTTPStatus.BAD_REQUEST, "missing Sec-WebSocket-Key")
-            return
+            return False
         accept = base64.b64encode(
             hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
         ).decode("ascii")
@@ -199,18 +226,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
+        return True
 
+    def handle_state_websocket(self) -> None:
+        if not self.handle_websocket_upgrade():
+            return
         last = None
         self.connection.settimeout(1.0)
         while True:
             payload = json.dumps(self.server.state.snapshot(), ensure_ascii=False).encode("utf-8")
             if payload != last:
                 try:
-                    self.connection.sendall(websocket_frame(payload))
+                    self.connection.sendall(websocket_frame(payload, opcode=0x1))
                 except (BrokenPipeError, ConnectionResetError, socket.timeout):
                     return
                 last = payload
             time.sleep(0.25)
+
+    def handle_frame_websocket(self) -> None:
+        if not self.handle_websocket_upgrade():
+            return
+        last_signature = None
+        self.connection.settimeout(1.0)
+        while True:
+            try:
+                stat = self.server.state.frame_path.stat()
+            except FileNotFoundError:
+                time.sleep(0.05)
+                continue
+
+            signature = (stat.st_mtime_ns, stat.st_size)
+            if signature != last_signature:
+                try:
+                    payload = self.server.state.frame_path.read_bytes()
+                    self.connection.sendall(websocket_frame(payload, opcode=0x2))
+                except (FileNotFoundError, BrokenPipeError, ConnectionResetError, socket.timeout):
+                    return
+                last_signature = signature
+            time.sleep(0.02)
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"{self.address_string()} - {fmt % args}")
@@ -248,4 +301,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

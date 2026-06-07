@@ -23,6 +23,8 @@ automation layer.
 - `palpal/debug_server.py`: HTTP/WebSocket debug server.
 - `web/`: browser debug UI.
 - `scripts/fetch_assets.py`: local-only asset fetch helper.
+- `run`: project command wrapper for assets/build/debug/game/dev.
+- `CMakeLists.txt`: native CMake build for the patched SDLPAL target and local helper targets.
 - `runtime/`: generated state/action/screenshot files; gitignored.
 - `data/pal/`: local game resources; gitignored.
 
@@ -44,25 +46,40 @@ automation layer.
 Fetch local resources:
 
 ```sh
-make assets
+./run assets
 ```
 
 Build SDLPAL:
 
 ```sh
-make build-game
+./run build
 ```
 
-Run the debug server:
+Run the debug server and game together:
 
 ```sh
-make debug
+./run
 ```
 
-Run the game in agent mode:
+`./run dev` is an explicit alias for the same workflow. The game runs in the
+background and the debug server stays attached to the terminal.
+
+Run only the debug server, for troubleshooting:
 
 ```sh
-make run-game
+./run debug
+```
+
+Run only the game in agent mode, for troubleshooting:
+
+```sh
+./run game
+```
+
+Run both together explicitly:
+
+```sh
+./run dev
 ```
 
 Open:
@@ -128,7 +145,7 @@ Next useful extensions:
 Run after native changes:
 
 ```sh
-make build-game
+./run build
 ```
 
 Run after Python/server changes:
@@ -140,7 +157,7 @@ PYTHONPYCACHEPREFIX=.pycache python3 -m py_compile palpal/debug_server.py script
 Smoke test the server:
 
 ```sh
-make debug
+./run debug
 curl http://127.0.0.1:8765/state
 curl -X POST http://127.0.0.1:8765/action \
   -H 'Content-Type: application/json' \
@@ -150,7 +167,7 @@ curl -X POST http://127.0.0.1:8765/action \
 Smoke test native export:
 
 ```sh
-make run-game
+./run game
 ls -l runtime/state.json runtime/screen.bmp
 ```
 
@@ -168,4 +185,3 @@ Stop any test game/debug processes before finishing work.
   fields. Infer carefully and expose confidence/annotations separately.
 - Build artifacts under `vendor/sdlpal` are noisy. Do not treat generated `.o`,
   `.d`, or `sdlpal` binary files as source changes.
-

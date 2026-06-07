@@ -503,9 +503,16 @@ main(
    //
    // Initialize SDL
    //
-   if (SDL_Init(PAL_SDL_INIT_FLAGS) == SDL_FAIL)
    {
-	   TerminateOnError("Could not initialize SDL: %s.\n", SDL_GetError());
+      Uint32 init_flags = PAL_SDL_INIT_FLAGS;
+      if (PALPAL_AgentHeadless())
+      {
+         init_flags &= ~SDL_INIT_VIDEO;
+      }
+      if (SDL_Init(init_flags) == SDL_FAIL)
+      {
+         TerminateOnError("Could not initialize SDL: %s.\n", SDL_GetError());
+      }
    }
 
    PAL_LoadConfig(TRUE);
