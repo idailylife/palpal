@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+rev="$(git -C "$(dirname "$0")/.." rev-parse --short HEAD 2>/dev/null || printf unknown)"
+cat >"$(dirname "$0")/../generated.h" <<EOF
+#ifndef PAL_GENERATED_H
+#define PAL_GENERATED_H
+#define PAL_GIT_REVISION "$rev"
+#endif
+EOF
+

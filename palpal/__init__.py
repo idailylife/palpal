@@ -1,0 +1,2 @@
+"""PALPAL local automation tools."""
+

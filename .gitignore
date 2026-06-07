@@ -1,0 +1,9 @@
+data/
+runtime/
+*.rpg
+vendor/sdlpal/**/*.o
+vendor/sdlpal/**/*.d
+vendor/sdlpal/unix/sdlpal
+vendor/sdlpal/unix/sdlpal-tests
+__pycache__/
+.pycache/

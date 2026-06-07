@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PALPAL Debug</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="screenPane">
+        <div class="toolbar">
+          <strong>PALPAL Debug</strong>
+          <span id="connection">connecting</span>
+        </div>
+        <div class="screenWrap">
+          <img id="screen" alt="latest game frame" />
+          <canvas id="overlay" width="640" height="400"></canvas>
+        </div>
+        <div class="controls">
+          <button data-button="up">Up</button>
+          <button data-button="left">Left</button>
+          <button data-button="search">Search</button>
+          <button data-button="right">Right</button>
+          <button data-button="down">Down</button>
+          <button data-button="menu">Menu</button>
+          <button data-button="status">Status</button>
+        </div>
+      </section>
+      <aside class="statePane">
+        <section>
+          <h2>State</h2>
+          <div id="summary" class="summary"></div>
+        </section>
+        <section>
+          <h2>Objects</h2>
+          <div id="objects" class="objects"></div>
+        </section>
+        <section>
+          <h2>JSON</h2>
+          <pre id="json"></pre>
+        </section>
+      </aside>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
+
