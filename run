@@ -77,7 +77,7 @@ configure_build() {
 run_debug() {
     ensure_runtime
     cd "$ROOT"
-    "$PYTHON" -m palpal.debug_server \
+    exec "$PYTHON" -m palpal.debug_server \
         --host "$HOST" \
         --port "$PORT" \
         --runtime-dir "$RUNTIME_DIR" \
@@ -90,14 +90,16 @@ run_game() {
     check_game_inputs
     cd "$ASSET_DIR"
     if [ "$HEADLESS" = "1" ]; then
-        SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}" \
+        exec env \
+            SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}" \
             PALPAL_AGENT=1 \
             PALPAL_HEADLESS=1 \
             PALPAL_RUNTIME_DIR="$RUNTIME_DIR" \
             PALPAL_SAVE_SLOT="$SAVE_SLOT" \
             "$GAME_BIN"
     else
-        PALPAL_AGENT=1 \
+        exec env \
+            PALPAL_AGENT=1 \
             PALPAL_HEADLESS=0 \
             PALPAL_RUNTIME_DIR="$RUNTIME_DIR" \
             PALPAL_SAVE_SLOT="$SAVE_SLOT" \
@@ -117,7 +119,18 @@ run_all() {
     debug_pid=$!
 
     cleanup() {
+        trap - EXIT INT TERM
         kill "$debug_pid" "$game_pid" 2>/dev/null || true
+        i=0
+        while [ "$i" -lt 20 ]; do
+            if ! kill -0 "$debug_pid" 2>/dev/null && ! kill -0 "$game_pid" 2>/dev/null; then
+                return
+            fi
+            i=$((i + 1))
+            sleep 0.1
+        done
+        kill -KILL "$debug_pid" "$game_pid" 2>/dev/null || true
+        wait "$debug_pid" "$game_pid" 2>/dev/null || true
     }
     trap cleanup EXIT INT TERM
 
@@ -182,7 +195,18 @@ run_visual_smoke() {
     debug_pid=$!
 
     cleanup() {
+        trap - EXIT INT TERM
         kill "$debug_pid" "$game_pid" 2>/dev/null || true
+        i=0
+        while [ "$i" -lt 20 ]; do
+            if ! kill -0 "$debug_pid" 2>/dev/null && ! kill -0 "$game_pid" 2>/dev/null; then
+                return
+            fi
+            i=$((i + 1))
+            sleep 0.1
+        done
+        kill -KILL "$debug_pid" "$game_pid" 2>/dev/null || true
+        wait "$debug_pid" "$game_pid" 2>/dev/null || true
     }
     trap cleanup EXIT INT TERM
 

@@ -84,7 +84,6 @@ PAL_GameMain(
       if (PALPAL_AgentEnabled())
       {
          PAL_ProcessEvent();
-         PALPAL_AgentPollAction();
          SDL_Delay(1);
       }
       else

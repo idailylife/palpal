@@ -13,9 +13,11 @@ body {
   display: grid;
   grid-template-columns: minmax(520px, 1fr) 420px;
   min-height: 100vh;
+  min-width: 0;
 }
 
 .screenPane {
+  min-width: 0;
   padding: 16px;
 }
 
@@ -23,11 +25,13 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
   margin-bottom: 12px;
 }
 
 #connection {
   color: #9fb1c1;
+  text-align: right;
 }
 
 .runtimeStatus {
@@ -59,10 +63,57 @@ body {
 }
 
 .controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: auto minmax(180px, 260px) minmax(220px, 1fr);
+  align-items: start;
+  gap: 12px;
   margin-top: 12px;
+  width: min(100%, 960px);
+}
+
+.controlGroup {
+  min-width: 0;
+}
+
+.controlGroup h2 {
+  margin-bottom: 6px;
+}
+
+.dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 64px);
+  grid-template-rows: repeat(3, 44px);
+  gap: 6px;
+}
+
+.actionButtons,
+.advancedButtons {
+  display: grid;
+  gap: 8px;
+}
+
+.actionButtons {
+  grid-template-columns: 1fr;
+}
+
+.advancedGroup {
+  border: 1px solid #2b333b;
+  border-radius: 6px;
+  background: #0f1317;
+  padding: 8px;
+}
+
+.advancedGroup summary {
+  color: #9fb1c1;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.advancedButtons {
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  margin-top: 10px;
 }
 
 button {
@@ -70,17 +121,41 @@ button {
   color: #eef5fb;
   border: 1px solid #46586b;
   border-radius: 6px;
+  min-height: 44px;
+  min-width: 0;
   padding: 8px 12px;
   cursor: pointer;
+  font: inherit;
+  font-weight: 650;
 }
 
 button:hover {
   background: #304457;
 }
 
+button:focus-visible {
+  outline: 2px solid #66e3ff;
+  outline-offset: 2px;
+}
+
+button.is-active {
+  background: #3a5c73;
+  border-color: #66e3ff;
+}
+
+.primaryAction {
+  background: #2f4a38;
+  border-color: #5f896c;
+}
+
+.primaryAction:hover {
+  background: #3b6047;
+}
+
 .statePane {
   border-left: 1px solid #303840;
   background: #171b20;
+  min-width: 0;
   padding: 16px;
   overflow: auto;
   max-height: 100vh;
@@ -141,9 +216,45 @@ pre {
     grid-template-columns: 1fr;
   }
 
+  .controls {
+    grid-template-columns: auto minmax(180px, 1fr);
+  }
+
+  .advancedGroup {
+    grid-column: 1 / -1;
+  }
+
   .statePane {
     border-left: 0;
     border-top: 1px solid #303840;
     max-height: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .screenPane,
+  .statePane {
+    padding: 12px;
+  }
+
+  .toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  #connection {
+    text-align: left;
+  }
+
+  .controls {
+    grid-template-columns: 1fr;
+  }
+
+  .dpad {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    max-width: 360px;
+    margin: 0 auto;
+    width: 100%;
   }
 }

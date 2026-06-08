@@ -17,6 +17,7 @@ static int g_agent_enabled = 0;
 static int g_agent_headless = 0;
 static char g_agent_runtime_dir[PAL_MAX_PATH] = "runtime";
 static DWORD g_agent_buttons = 0;
+static DWORD g_agent_injected_buttons = 0;
 static PALDIRECTION g_agent_dir = kDirUnknown;
 static int g_agent_hold_frames = 0;
 
@@ -185,6 +186,12 @@ PALPAL_AgentPollAction(
       return;
    }
 
+   if (g_agent_injected_buttons != 0)
+   {
+      g_InputState.dwKeyPress &= ~g_agent_injected_buttons;
+      g_agent_injected_buttons = 0;
+   }
+
    if (g_agent_hold_frames <= 0)
    {
       PALPAL_AgentLoadActionFile();
@@ -193,6 +200,7 @@ PALPAL_AgentPollAction(
    if (g_agent_hold_frames > 0)
    {
       g_InputState.dwKeyPress |= g_agent_buttons;
+      g_agent_injected_buttons = g_agent_buttons;
       g_InputState.dir = g_agent_dir;
       g_InputState.prevdir = kDirUnknown;
       g_agent_hold_frames--;

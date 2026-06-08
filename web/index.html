@@ -18,14 +18,45 @@
           <canvas id="frame" width="320" height="200" aria-label="latest game frame"></canvas>
           <canvas id="overlay" width="640" height="400"></canvas>
         </div>
-        <div class="controls">
-          <button data-button="up">Up</button>
-          <button data-button="left">Left</button>
-          <button data-button="search">Search</button>
-          <button data-button="right">Right</button>
-          <button data-button="down">Down</button>
-          <button data-button="menu">Menu</button>
-          <button data-button="status">Status</button>
+        <div class="controls" aria-label="game controls">
+          <section class="controlGroup moveGroup" aria-label="movement">
+            <h2>Move</h2>
+            <div class="dpad">
+              <span></span>
+              <button data-button="up" aria-label="Up">Up</button>
+              <span></span>
+              <button data-button="left" aria-label="Left">Left</button>
+              <span></span>
+              <button data-button="right" aria-label="Right">Right</button>
+              <span></span>
+              <button data-button="down" aria-label="Down">Down</button>
+              <span></span>
+            </div>
+          </section>
+          <section class="controlGroup actionGroup" aria-label="primary actions">
+            <h2>Actions</h2>
+            <div class="actionButtons">
+              <button class="primaryAction" data-button="search">Search / Confirm</button>
+              <button data-button="menu">Menu / Cancel</button>
+              <button data-button="status">Status</button>
+            </div>
+          </section>
+          <details class="controlGroup advancedGroup">
+            <summary>Advanced / Battle</summary>
+            <div class="advancedButtons">
+              <button data-button="page_up">Page Up</button>
+              <button data-button="page_down">Page Down</button>
+              <button data-button="repeat">Repeat</button>
+              <button data-button="auto">Auto</button>
+              <button data-button="defend">Defend</button>
+              <button data-button="use_item">Use Item</button>
+              <button data-button="throw_item">Throw Item</button>
+              <button data-button="flee">Flee</button>
+              <button data-button="force">Force</button>
+              <button data-button="home">Home</button>
+              <button data-button="end">End</button>
+            </div>
+          </details>
         </div>
       </section>
       <aside class="statePane">

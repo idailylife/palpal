@@ -11,6 +11,9 @@ const ctx = overlay.getContext("2d");
 let latestState = null;
 let stateConnected = false;
 let frameConnected = false;
+const repeatableButtons = new Set(["up", "down", "left", "right"]);
+const actionCooldownMs = 180;
+const lastActionAt = new Map();
 
 function setConnection() {
   const state = stateConnected ? "state live" : "state reconnecting";
@@ -159,6 +162,24 @@ async function sendAction(buttons, frames = 1) {
   });
 }
 
+function flashButton(buttonName) {
+  const button = document.querySelector(`[data-button="${buttonName}"]`);
+  if (!button) return;
+  button.classList.add("is-active");
+  setTimeout(() => button.classList.remove("is-active"), 120);
+}
+
+function sendButton(buttonName) {
+  const now = performance.now();
+  if (!repeatableButtons.has(buttonName)) {
+    const last = lastActionAt.get(buttonName) || 0;
+    if (now - last < actionCooldownMs) return;
+  }
+  lastActionAt.set(buttonName, now);
+  flashButton(buttonName);
+  sendAction([buttonName], 1);
+}
+
 function connectStream() {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${location.host}/stream`);
@@ -205,10 +226,21 @@ function connectFrames() {
 }
 
 document.querySelectorAll("[data-button]").forEach((button) => {
-  button.addEventListener("click", () => sendAction([button.dataset.button], 1));
+  button.addEventListener("click", () => {
+    button.blur();
+    sendButton(button.dataset.button);
+  });
 });
 
 window.addEventListener("keydown", (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  if (
+    (event.key === "Enter" || event.key === " ") &&
+    target?.closest("button, summary")
+  ) {
+    return;
+  }
+
   const map = {
     ArrowUp: "up",
     ArrowDown: "down",
@@ -217,11 +249,16 @@ window.addEventListener("keydown", (event) => {
     Enter: "search",
     " ": "search",
     Escape: "menu",
+    PageUp: "page_up",
+    PageDown: "page_down",
+    Home: "home",
+    End: "end",
   };
   const button = map[event.key];
   if (button) {
+    if (event.repeat && !repeatableButtons.has(button)) return;
     event.preventDefault();
-    sendAction([button], 1);
+    sendButton(button);
   }
 });
 
