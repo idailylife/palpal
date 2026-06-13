@@ -28,6 +28,7 @@ let navigationRenderKey = null;
 let latestFullNavigation = null;
 let latestFullNavigationStableKey = null;
 let navigationRouteRequestId = 0;
+let navigationDiagnosticKey = null;
 let explorationRenderKey = null;
 let summaryRenderKey = null;
 let dialogRenderKey = null;
@@ -49,6 +50,34 @@ const lastActionAt = new Map();
 
 function navigationTargets(state) {
   return new Map((state._navigation?.targets || []).map((target) => [target.id, target]));
+}
+
+function navigationDiagnosticContext(state) {
+  const pos = state?.party_position || {};
+  return {
+    frame: state?.frame ?? null,
+    scene_id: state?.scene_id ?? null,
+    map_id: state?.map_id ?? null,
+    room_key: state?.room?.key ?? null,
+    region_key: state?.region_key ?? null,
+    party_position: { x: pos.x ?? null, y: pos.y ?? null },
+    dialog_active: Boolean(state?.dialog?.active),
+    dialog_text: state?.dialog?.latest_event?.text ?? null,
+    active_navigation: activeNavigation ? { ...activeNavigation } : null,
+    runtime_stale: Boolean(state?._debug?.runtime_stale),
+  };
+}
+
+function sendNavigationDiagnostic(type, details = {}) {
+  fetch("/diagnostics/navigation", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      type,
+      time: new Date().toISOString(),
+      details,
+    }),
+  }).catch((error) => console.warn("navigation diagnostic failed", error));
 }
 
 navigationEl.addEventListener("click", (event) => {
@@ -127,6 +156,7 @@ function statusText(status) {
     blocked_by_interactable: "needs action",
     blocked_by_transition: "transition",
     needs_direction: "needs facing",
+    target_inactive: "gone",
     unreachable_static: "unreachable",
     no_nav_grid: "no grid",
     unknown: "checking",
@@ -140,6 +170,7 @@ function statusClass(status) {
   if (status === "blocked_by_interactable") return "tagTransition";
   if (status === "blocked_by_transition") return "tagTransition";
   if (status === "needs_direction") return "tagTransition";
+  if (status === "target_inactive") return "tagUnreachable";
   if (status === "unreachable_static") return "tagUnreachable";
   return "";
 }
@@ -443,6 +474,22 @@ function renderObjects(state) {
 function renderNavigation(state) {
   const targets = state._navigation?.targets || [];
   if (!targets.length) {
+    const diagnosticKey = JSON.stringify({
+      total: 0,
+      dialog: Boolean(state.dialog?.active),
+      activeNavigation,
+      runtimeStale: Boolean(state._debug?.runtime_stale),
+    });
+    if (navigationDiagnosticKey !== diagnosticKey) {
+      navigationDiagnosticKey = diagnosticKey;
+      sendNavigationDiagnostic("navigation_buttons", {
+        ...navigationDiagnosticContext(state),
+        total: 0,
+        enabled: 0,
+        disabled: 0,
+        disabled_reasons: ["no_targets"],
+      });
+    }
     const emptyKey = "empty";
     if (navigationRenderKey !== emptyKey) {
       navigationEl.innerHTML = '<div class="navEmpty">No navigation grid yet.</div>';
@@ -467,6 +514,44 @@ function renderNavigation(state) {
   });
   if (navigationRenderKey === renderKey) return;
 
+  let enabledCount = 0;
+  const disabledReasons = new Set();
+  for (const target of targets) {
+    const canGo = ![
+      "unreachable_static",
+      "blocked_by_transition",
+      "needs_direction",
+      "no_nav_grid",
+      "target_inactive",
+    ].includes(target.status);
+    const goEnabled = canGo && !activeNavigation && !state.dialog?.active;
+    if (goEnabled) {
+      enabledCount += 1;
+    } else {
+      if (!canGo) disabledReasons.add(`status:${target.status || "unknown"}`);
+      if (activeNavigation) disabledReasons.add("active_navigation");
+      if (state.dialog?.active) disabledReasons.add("dialog_active");
+    }
+  }
+  const diagnosticKey = JSON.stringify({
+    total: targets.length,
+    enabled: enabledCount,
+    activeNavigation,
+    dialog: Boolean(state.dialog?.active),
+    statuses: targets.map((target) => `${target.id}:${target.status}`).join("|"),
+  });
+  if (navigationDiagnosticKey !== diagnosticKey) {
+    navigationDiagnosticKey = diagnosticKey;
+    sendNavigationDiagnostic("navigation_buttons", {
+      ...navigationDiagnosticContext(state),
+      total: targets.length,
+      enabled: enabledCount,
+      disabled: targets.length - enabledCount,
+      disabled_reasons: Array.from(disabledReasons).sort(),
+      target_statuses: targets.map((target) => ({ id: target.id, status: target.status, kind: target.kind })),
+    });
+  }
+
   navigationEl.innerHTML = targets
     .map((target) => {
       const isActive = activeNavigation?.targetId === target.id;
@@ -477,7 +562,13 @@ function renderNavigation(state) {
       ]
         .filter(Boolean)
         .join(" · ");
-      const canGo = !["unreachable_static", "blocked_by_transition", "needs_direction", "no_nav_grid"].includes(target.status);
+      const canGo = ![
+        "unreachable_static",
+        "blocked_by_transition",
+        "needs_direction",
+        "no_nav_grid",
+        "target_inactive",
+      ].includes(target.status);
       const goEnabled = canGo && !activeNavigation && !state.dialog?.active;
       const goLabel = isActive ? navigationRunText(activeNavigation.status) : target.status === "transition" ? "Enter" : "Go";
       return `<div class="navTarget ${selectedRoute?.target_id === target.id ? "is-selected" : ""}" data-nav-id="${target.id}" role="button" tabindex="0">
@@ -610,6 +701,7 @@ function markerStyle(obj) {
     blocked_by_interactable: "#ffd666",
     blocked_by_transition: "#ff8a66",
     needs_direction: "#ffd666",
+    target_inactive: "#9aa3ad",
     unreachable_static: "#9aa3ad",
     unknown: "#cbd6df",
   };
@@ -947,7 +1039,20 @@ async function navigationStep(targetId) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id: targetId }),
   });
-  return response.json();
+  const result = await response.json();
+  sendNavigationDiagnostic("navigation_step_result", {
+    ...navigationDiagnosticContext(latestState),
+    target_id: targetId,
+    http_status: response.status,
+    ok: Boolean(result.ok),
+    status: result.status ?? null,
+    move: result.move ?? null,
+    segment_steps: result.segment_steps ?? null,
+    remaining_steps: result.remaining_steps ?? null,
+    required_direction: result.required_direction ?? null,
+    blocker_id: result.blocker?.id ?? null,
+  });
+  return result;
 }
 
 function updateNavigationTarget(targetId, patch) {
@@ -965,22 +1070,51 @@ async function waitForInteractionResult(stepResult, timeoutMs = 2500) {
   const blocker = stepResult.blocker || {};
   const blockerId = blocker.id;
   const deadline = performance.now() + timeoutMs;
+  sendNavigationDiagnostic("interaction_wait_start", {
+    ...navigationDiagnosticContext(latestState),
+    target_id: stepResult.target_id ?? null,
+    blocker_id: blockerId ?? null,
+    timeout_ms: timeoutMs,
+  });
   while (performance.now() < deadline) {
     await sleep(80);
     const response = await fetch("/state");
     const state = await response.json();
     render(state);
     if (state._debug?.runtime_stale || state.in_battle || state.dialog?.active) {
+      sendNavigationDiagnostic("interaction_wait_stop", {
+        ...navigationDiagnosticContext(state),
+        target_id: stepResult.target_id ?? null,
+        blocker_id: blockerId ?? null,
+        reason: state._debug?.runtime_stale ? "runtime_stale" : state.in_battle ? "in_battle" : "dialog_active",
+      });
       return false;
     }
     if (!blockerId) {
+      sendNavigationDiagnostic("interaction_wait_stop", {
+        ...navigationDiagnosticContext(state),
+        target_id: stepResult.target_id ?? null,
+        reason: "no_blocker",
+      });
       return true;
     }
     const current = (state.objects || []).find((obj) => obj.id === blockerId);
     if (!current || current.blocking === false || current.state !== blocker.state) {
+      sendNavigationDiagnostic("interaction_wait_stop", {
+        ...navigationDiagnosticContext(state),
+        target_id: stepResult.target_id ?? null,
+        blocker_id: blockerId,
+        reason: !current ? "blocker_missing" : current.blocking === false ? "blocker_unblocked" : "blocker_state_changed",
+      });
       return true;
     }
   }
+  sendNavigationDiagnostic("interaction_wait_stop", {
+    ...navigationDiagnosticContext(latestState),
+    target_id: stepResult.target_id ?? null,
+    blocker_id: blockerId ?? null,
+    reason: "timeout",
+  });
   return false;
 }
 
@@ -1005,12 +1139,29 @@ async function playNavigationSegment(stepResult, startKey) {
 }
 
 async function navigateToTarget(targetId) {
-  if (activeNavigation) return;
+  if (activeNavigation) {
+    sendNavigationDiagnostic("navigation_click_ignored", {
+      ...navigationDiagnosticContext(latestState),
+      target_id: targetId,
+      reason: "active_navigation",
+    });
+    return;
+  }
   activeNavigation = { targetId, status: "starting" };
+  sendNavigationDiagnostic("navigation_start", {
+    ...navigationDiagnosticContext(latestState),
+    target_id: targetId,
+  });
   if (latestState) renderNavigation(latestState);
 
-  const unlockNavigation = () => {
+  const unlockNavigation = (reason = "complete") => {
     if (!activeNavigation) return;
+    sendNavigationDiagnostic("navigation_unlock", {
+      ...navigationDiagnosticContext(latestState),
+      target_id: activeNavigation.targetId,
+      status: activeNavigation.status,
+      reason,
+    });
     activeNavigation = null;
     if (latestState) renderNavigation(latestState);
   };
@@ -1027,7 +1178,7 @@ async function navigateToTarget(targetId) {
       }
 
       if (result.status === "arrived") {
-        unlockNavigation();
+        unlockNavigation("arrived");
         await refreshState();
         return;
       }
@@ -1051,20 +1202,20 @@ async function navigateToTarget(targetId) {
       }
 
       if (!result.ok || result.status !== "stepping") {
-        unlockNavigation();
+        unlockNavigation(result.status || "not_stepping");
         await refreshState();
         return;
       }
 
       const progressed = await playNavigationSegment(result, startKey);
       if (!progressed) {
-        unlockNavigation();
+        unlockNavigation("progress_failed");
         await refreshState();
         return;
       }
     }
   } finally {
-    unlockNavigation();
+    unlockNavigation("finally");
   }
 }
 

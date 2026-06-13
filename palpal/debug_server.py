@@ -267,6 +267,10 @@ class DebugState:
         return self.runtime_dir / "action_result.json"
 
     @property
+    def navigation_log_path(self) -> Path:
+        return self.runtime_dir / "logs" / "navigation.log"
+
+    @property
     def exploration_path(self) -> Path:
         return self.runtime_dir / "exploration.json"
 
@@ -318,6 +322,35 @@ class DebugState:
         self.event_log.append(event)
         self.event_log = self.event_log[-200:]
         self.write_events()
+
+    def append_navigation_diagnostic(self, event_type: str, payload: dict | None = None, state: dict | None = None) -> None:
+        payload = payload or {}
+        entry = {
+            "time": time.time(),
+            "type": event_type,
+            **payload,
+        }
+        if state is not None:
+            pos = state.get("party_position") or {}
+            dialog = state.get("dialog") or {}
+            entry.update(
+                {
+                    "frame": state.get("frame"),
+                    "scene_id": state.get("scene_id"),
+                    "map_id": state.get("map_id"),
+                    "room_key": (state.get("room") or {}).get("key"),
+                    "region_key": state.get("region_key"),
+                    "party_position": {"x": pos.get("x"), "y": pos.get("y")},
+                    "dialog_active": bool(dialog.get("active")),
+                    "dialog_latest_text": (dialog.get("latest_event") or {}).get("text"),
+                    "in_battle": bool(state.get("in_battle")),
+                    "in_main_game": state.get("in_main_game"),
+                    "action_pending": self.action_path.exists(),
+                }
+            )
+        self.navigation_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.navigation_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
     def dialog_source_key(self, event: dict) -> str:
         return ":".join(
@@ -908,6 +941,8 @@ class DebugState:
             return {"ok": False, "status": "no_nav_grid", "target_id": target_id}
         if target is None:
             return {"ok": False, "status": "unknown_target", "target_id": target_id}
+        if not target.get("interactable"):
+            return {"ok": False, "status": "target_inactive", "target_id": target_id}
         start = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         if start is None or not nav_bit(grid, start):
             return {"ok": False, "status": "bad_start", "target_id": target_id}
@@ -1358,6 +1393,7 @@ class DebugState:
 
         entry = {"time": time.time(), "buttons": buttons, "frames": frames}
         self.action_log.append(entry)
+        self.append_navigation_diagnostic("action_written", {"action": entry})
         return entry
 
     def write_use_item_action(self, item_id: int, role_id: int | None = None, target: str | None = None) -> dict:
@@ -1387,6 +1423,7 @@ class DebugState:
             "target": "all" if target_value == "all" else "role",
         }
         self.action_log.append(entry)
+        self.append_navigation_diagnostic("action_written", {"action": entry})
         return entry
 
 
@@ -1483,8 +1520,42 @@ class Handler(BaseHTTPRequestHandler):
                 target = int(payload.get("id") or 0)
                 state = read_json(self.server.state.state_path)
                 result = self.server.state.navigation_step(state, target)
+                self.server.state.append_navigation_diagnostic(
+                    "navigation_step",
+                    {
+                        "target_id": target,
+                        "ok": bool(result.get("ok")),
+                        "status": result.get("status"),
+                        "move": result.get("move"),
+                        "segment_steps": result.get("segment_steps"),
+                        "remaining_steps": result.get("remaining_steps"),
+                        "required_direction": result.get("required_direction"),
+                        "blocker_id": (result.get("blocker") or {}).get("id"),
+                    },
+                    state,
+                )
                 status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
                 self.send_json(result, status)
+            except Exception as exc:
+                self.server.state.append_navigation_diagnostic("navigation_step_error", {"error": str(exc)})
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/diagnostics/navigation":
+            try:
+                payload = self.read_body_json()
+                state = read_json(self.server.state.state_path)
+                event_type = str(payload.get("type") or "client_event")
+                details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+                self.server.state.append_navigation_diagnostic(
+                    f"client_{event_type}",
+                    {
+                        "details": details,
+                        "client_time": payload.get("time"),
+                    },
+                    state,
+                )
+                self.send_json({"ok": True})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return

@@ -365,6 +365,29 @@ class ExplorationTests(unittest.TestCase):
             self.assertEqual(result["action"]["buttons"], ["search"])
             self.assertTrue(debug.action_path.exists())
 
+    def test_navigation_step_stops_when_target_becomes_inactive(self):
+        target = {
+            "id": 63,
+            "x": 32,
+            "y": 0,
+            "state": 0,
+            "trigger_mode": 1,
+            "trigger_script": 100,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": False,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(start=(2, 0), objects=[target])
+            self.write_state(debug, state)
+
+            result = debug.navigation_step(state, target_id=63)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "target_inactive")
+            self.assertFalse(debug.action_path.exists())
+
     def test_navigation_step_reports_search_target_needs_direction(self):
         target = {
             "id": 10,
