@@ -8,6 +8,12 @@
   </head>
   <body>
     <main class="layout">
+      <aside class="navigationPane">
+        <section>
+          <h2>Navigation</h2>
+          <div id="navigation" class="navigation"></div>
+        </section>
+      </aside>
       <section class="screenPane">
         <div class="toolbar">
           <strong>PALPAL Debug</strong>
@@ -65,11 +71,42 @@
           <div id="summary" class="summary"></div>
         </section>
         <section>
+          <h2>Dialog</h2>
+          <div id="dialogStatus" class="dialogStatus"></div>
+        </section>
+        <section>
+          <h2>Dialog History</h2>
+          <div id="dialogs" class="dialogs"></div>
+        </section>
+        <section>
+          <h2>Events</h2>
+          <div id="events" class="events"></div>
+        </section>
+        <section>
+          <h2>Inventory</h2>
+          <div id="inventory" class="inventory"></div>
+        </section>
+        <section>
+          <h2>Equipment</h2>
+          <div id="equipment" class="equipment"></div>
+        </section>
+        <section>
+          <h2>Exploration</h2>
+          <div id="exploration" class="exploration"></div>
+        </section>
+        <section>
           <h2>Objects</h2>
           <div id="objects" class="objects"></div>
         </section>
         <section>
-          <h2>JSON</h2>
+          <div class="sectionHeader">
+            <h2>JSON</h2>
+            <div class="jsonControls">
+              <label><input id="jsonLive" type="checkbox" checked /> live</label>
+              <button id="jsonRefresh" type="button">Refresh</button>
+              <span id="jsonStatus"></span>
+            </div>
+          </div>
           <pre id="json"></pre>
         </section>
       </aside>

@@ -28,6 +28,11 @@ PALPAL_AgentPollAction(
 );
 
 VOID
+PALPAL_AgentAfterFrame(
+   VOID
+);
+
+VOID
 PALPAL_AgentWriteState(
    VOID
 );
@@ -35,6 +40,18 @@ PALPAL_AgentWriteState(
 VOID
 PALPAL_AgentWriteFrame(
    VOID
+);
+
+VOID
+PALPAL_AgentObserveDialogStart(
+   WORD       wEventObjectID
+);
+
+VOID
+PALPAL_AgentObserveDialogText(
+   INT        iMessageID,
+   WORD       wEventObjectID,
+   LPCWSTR    lpszText
 );
 
 PAL_C_LINKAGE_END

@@ -23,6 +23,7 @@
 //
 
 #include "main.h"
+#include "agent.h"
 
 BOOL            g_fScriptSuccess = TRUE;
 static int      g_iCurEquipPart = -1;
@@ -3391,6 +3392,7 @@ PAL_RunTriggerScript(
          // Show dialog in the middle part of the screen
          //
          PAL_ClearDialog(TRUE);
+         PALPAL_AgentObserveDialogStart(wEventObjectID);
          PAL_StartDialog(kDialogCenter, (BYTE)pScript->rgwOperand[0], 0,
             pScript->rgwOperand[2] ? TRUE : FALSE);
          wScriptEntry++;
@@ -3401,6 +3403,7 @@ PAL_RunTriggerScript(
          // Show dialog in the upper part of the screen
          //
          PAL_ClearDialog(TRUE);
+         PALPAL_AgentObserveDialogStart(wEventObjectID);
          PAL_StartDialog(kDialogUpper, (BYTE)pScript->rgwOperand[1],
             pScript->rgwOperand[0], pScript->rgwOperand[2] ? TRUE : FALSE);
          wScriptEntry++;
@@ -3411,6 +3414,7 @@ PAL_RunTriggerScript(
          // Show dialog in the lower part of the screen
          //
          PAL_ClearDialog(TRUE);
+         PALPAL_AgentObserveDialogStart(wEventObjectID);
          PAL_StartDialog(kDialogLower, (BYTE)pScript->rgwOperand[1],
             pScript->rgwOperand[0], pScript->rgwOperand[2] ? TRUE : FALSE);
          wScriptEntry++;
@@ -3421,6 +3425,7 @@ PAL_RunTriggerScript(
          // Show text in a window at the center of the screen
          //
          PAL_ClearDialog(TRUE);
+         PALPAL_AgentObserveDialogStart(wEventObjectID);
          PAL_StartDialog(kDialogCenterWindow, (BYTE)pScript->rgwOperand[0], 0, FALSE);
          wScriptEntry++;
          break;
@@ -3455,12 +3460,18 @@ PAL_RunTriggerScript(
                   VIDEO_UpdateScreen(NULL);
                }
 			   else
-                  PAL_ShowDialogText(PAL_GetMsg(iMsg));
+               {
+                  LPCWSTR text = PAL_GetMsg(iMsg);
+                  PALPAL_AgentObserveDialogText(iMsg, wEventObjectID, text);
+                  PAL_ShowDialogText(text);
+               }
             }
          }
 		 else
          {
-            PAL_ShowDialogText(PAL_GetMsg(pScript->rgwOperand[0]));
+            LPCWSTR text = PAL_GetMsg(pScript->rgwOperand[0]);
+            PALPAL_AgentObserveDialogText(pScript->rgwOperand[0], wEventObjectID, text);
+            PAL_ShowDialogText(text);
             wScriptEntry++;
          }
          break;

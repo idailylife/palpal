@@ -29,6 +29,8 @@ static SDL_Joystick     *g_pJoy = NULL;
 #endif
 static DWORD             g_dwLastAgentStateWriteTime = 0;
 
+#define PALPAL_AGENT_STATE_WRITE_INTERVAL_MS 100
+
 #if !SDL_VERSION_ATLEAST(2,0,0)
 # define SDLK_KP_1     SDLK_KP1
 # define SDLK_KP_2     SDLK_KP2
@@ -1342,7 +1344,7 @@ PAL_ProcessEvent(
    if (PALPAL_AgentEnabled())
    {
       DWORD dwNow = SDL_GetTicks();
-      if (dwNow - g_dwLastAgentStateWriteTime >= 250)
+      if (dwNow - g_dwLastAgentStateWriteTime >= PALPAL_AGENT_STATE_WRITE_INTERVAL_MS)
       {
          PALPAL_AgentWriteState();
          g_dwLastAgentStateWriteTime = dwNow;

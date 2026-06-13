@@ -11,7 +11,7 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(520px, 1fr) 420px;
+  grid-template-columns: 320px minmax(520px, 1fr) 420px;
   min-height: 100vh;
   min-width: 0;
 }
@@ -152,6 +152,7 @@ button.is-active {
   background: #3b6047;
 }
 
+.navigationPane,
 .statePane {
   border-left: 1px solid #303840;
   background: #171b20;
@@ -161,6 +162,11 @@ button.is-active {
   max-height: 100vh;
 }
 
+.navigationPane {
+  border-left: 0;
+  border-right: 1px solid #303840;
+}
+
 h2 {
   font-size: 13px;
   margin: 0 0 8px;
@@ -168,11 +174,53 @@ h2 {
   text-transform: uppercase;
 }
 
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.sectionHeader h2 {
+  margin: 0;
+}
+
+.jsonControls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #9fb1c1;
+  font-size: 12px;
+}
+
+.jsonControls label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.jsonControls button {
+  min-height: 28px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+#jsonStatus {
+  min-width: 44px;
+  text-align: right;
+}
+
 section + section {
   margin-top: 18px;
 }
 
 .summary,
+.dialogStatus,
+.dialogs,
+.events,
+.inventory,
+.equipment,
 .objects,
 pre {
   background: #0f1317;
@@ -187,9 +235,237 @@ pre {
   gap: 6px 12px;
 }
 
+.dialogStatus {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  color: #cbd6df;
+}
+
+.dialogStatus.is-active {
+  border-color: #8c732d;
+  background: #1f1a10;
+  color: #fff4c2;
+}
+
 .objects {
   max-height: 260px;
   overflow: auto;
+}
+
+.events {
+  display: grid;
+  gap: 6px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.dialogs {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.inventory,
+.equipment {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.event {
+  display: grid;
+  grid-template-columns: 118px 1fr;
+  gap: 8px;
+  border-bottom: 1px solid #232a31;
+  padding-bottom: 6px;
+}
+
+.dialogEvent {
+  display: grid;
+  grid-template-columns: 86px 1fr;
+  gap: 8px;
+  border-bottom: 1px solid #232a31;
+  padding-bottom: 6px;
+}
+
+.inventoryItem {
+  display: grid;
+  grid-template-columns: 92px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid #232a31;
+  padding-bottom: 6px;
+}
+
+.equipmentRole {
+  display: grid;
+  gap: 6px;
+  border-bottom: 1px solid #232a31;
+  padding-bottom: 8px;
+}
+
+.equipmentRole div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 8px;
+}
+
+.equipmentRole span {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 6px;
+  min-width: 0;
+}
+
+.equipmentRole em {
+  color: #9fb1c1;
+  font-style: normal;
+}
+
+.event:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.dialogEvent:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.inventoryItem:last-child,
+.equipmentRole:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.event small {
+  display: block;
+  margin-top: 2px;
+  color: #9fb1c1;
+}
+
+.dialogEvent small {
+  display: block;
+  margin-top: 2px;
+  color: #9fb1c1;
+}
+
+.navigation {
+  display: grid;
+  gap: 6px;
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+}
+
+.navTarget {
+  display: grid;
+  grid-template-columns: 1fr 82px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #46586b;
+  border-radius: 6px;
+  background: #182029;
+  padding: 6px;
+  cursor: pointer;
+}
+
+.navTarget.is-selected {
+  border-color: #66e3ff;
+}
+
+.navTarget:hover {
+  background: #1e2934;
+}
+
+.navTargetSelect {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  border: 0;
+  background: transparent;
+  padding: 8px;
+  text-align: left;
+  pointer-events: none;
+}
+
+.navTargetSelect:hover {
+  background: transparent;
+}
+
+.navTarget small {
+  display: block;
+  margin-top: 2px;
+  color: #9fb1c1;
+  font-weight: 500;
+}
+
+.navGo {
+  min-height: 48px;
+  padding: 6px 8px;
+  background: #2f4a38;
+  border-color: #5f896c;
+}
+
+.navGo:hover {
+  background: #3b6047;
+}
+
+.navEmpty {
+  color: #9fb1c1;
+}
+
+.exploration {
+  display: grid;
+  gap: 8px;
+}
+
+.explorationStats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.explorationStats div {
+  border: 1px solid #2b333b;
+  border-radius: 6px;
+  background: #0f1317;
+  padding: 7px 8px;
+}
+
+.explorationStats span {
+  display: block;
+  color: #9fb1c1;
+  font-size: 12px;
+}
+
+.explorationStats strong {
+  display: block;
+  margin-top: 2px;
+}
+
+.explorationStatus {
+  min-height: 24px;
+}
+
+.explorationButtons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.miniButton {
+  min-height: 32px;
+  padding: 4px 8px;
 }
 
 .object {
@@ -200,8 +476,64 @@ pre {
   border-bottom: 1px solid #232a31;
 }
 
+.object.isInteractable {
+  color: #fff4c2;
+}
+
 .object:last-child {
   border-bottom: 0;
+}
+
+.tag {
+  display: inline-block;
+  margin: 3px 4px 0 0;
+  padding: 1px 5px;
+  border: 1px solid #46586b;
+  border-radius: 4px;
+  color: #cbd6df;
+  font-size: 12px;
+}
+
+.tagInteractable {
+  border-color: #8c732d;
+  background: #2a2110;
+  color: #ffd666;
+}
+
+.tagSearch {
+  border-color: #4b7897;
+  background: #111e27;
+  color: #9fd7ff;
+}
+
+.tagTouch {
+  border-color: #287c55;
+  background: #10251b;
+  color: #7ee3ae;
+}
+
+.tagReachable {
+  border-color: #287c55;
+  background: #10251b;
+  color: #7ee3ae;
+}
+
+.tagTransition {
+  border-color: #8f563c;
+  background: #28170f;
+  color: #ffad8f;
+}
+
+.tagDialog {
+  border-color: #8c732d;
+  background: #2a2110;
+  color: #ffd666;
+}
+
+.tagUnreachable {
+  border-color: #59626c;
+  background: #181d22;
+  color: #aeb8c2;
 }
 
 pre {
@@ -211,9 +543,33 @@ pre {
   overflow: auto;
 }
 
+@media (max-width: 1180px) {
+  .layout {
+    grid-template-columns: 300px minmax(520px, 1fr);
+  }
+
+  .statePane {
+    grid-column: 1 / -1;
+    border-left: 0;
+    border-top: 1px solid #303840;
+    max-height: none;
+  }
+}
+
 @media (max-width: 920px) {
   .layout {
     grid-template-columns: 1fr;
+  }
+
+  .navigationPane {
+    order: 2;
+    border-right: 0;
+    border-top: 1px solid #303840;
+    max-height: none;
+  }
+
+  .screenPane {
+    order: 1;
   }
 
   .controls {
@@ -225,14 +581,20 @@ pre {
   }
 
   .statePane {
+    order: 3;
     border-left: 0;
     border-top: 1px solid #303840;
+    max-height: none;
+  }
+
+  .navigation {
     max-height: none;
   }
 }
 
 @media (max-width: 560px) {
   .screenPane,
+  .navigationPane,
   .statePane {
     padding: 12px;
   }

@@ -81,15 +81,7 @@ PAL_GameMain(
       //
       // Wait for the time of one frame. Accept input here.
       //
-      if (PALPAL_AgentEnabled())
-      {
-         PAL_ProcessEvent();
-         SDL_Delay(1);
-      }
-      else
-      {
-         PAL_DelayUntil(dwTime);
-      }
+      PAL_DelayUntil(dwTime);
 
       //
       // Set the time of the next frame.
@@ -100,6 +92,7 @@ PAL_GameMain(
       // Run the main frame routine.
       //
       PAL_StartFrame();
+      PALPAL_AgentAfterFrame();
       PALPAL_AgentWriteState();
    }
 }
