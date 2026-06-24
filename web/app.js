@@ -1,7 +1,9 @@
 const stateEl = document.getElementById("json");
+const jsonDetailsEl = document.getElementById("jsonDetails");
 const jsonLiveEl = document.getElementById("jsonLive");
 const jsonRefreshEl = document.getElementById("jsonRefresh");
 const jsonStatusEl = document.getElementById("jsonStatus");
+const agentEl = document.getElementById("agent");
 const summaryEl = document.getElementById("summary");
 const objectsEl = document.getElementById("objects");
 const navigationEl = document.getElementById("navigation");
@@ -12,6 +14,11 @@ const eventsEl = document.getElementById("events");
 const inventoryEl = document.getElementById("inventory");
 const equipmentEl = document.getElementById("equipment");
 const frameCanvas = document.getElementById("frame");
+const fastDialogButton = document.getElementById("fastDialog");
+const exploreActionButton = document.getElementById("exploreAction");
+const sweepActionButton = document.getElementById("sweepAction");
+const clearTraceButton = document.getElementById("clearTraceAction");
+const exploreStepsInput = document.getElementById("exploreSteps");
 const connectionEl = document.getElementById("connection");
 const runtimeStatusEl = document.getElementById("runtimeStatus");
 const overlay = document.getElementById("overlay");
@@ -21,12 +28,15 @@ const ctx = overlay.getContext("2d");
 let latestState = null;
 let selectedRoute = null;
 let lastExploreResult = null;
+let exploreRequestInFlight = false;
+let sweepRequestInFlight = false;
 let activeNavigation = null;
-let navigationRefreshCompletedKey = null;
 let navigationRefreshInFlightKey = null;
 let navigationRenderKey = null;
-let latestFullNavigation = null;
-let latestFullNavigationStableKey = null;
+let navigationLatestEnvironmentKey = null;
+let navigationEnvironmentChangedAt = 0;
+let navigationStableEnvironmentKey = null;
+let navigationRefreshTimer = null;
 let navigationRouteRequestId = 0;
 let navigationDiagnosticKey = null;
 let explorationRenderKey = null;
@@ -34,6 +44,10 @@ let summaryRenderKey = null;
 let dialogRenderKey = null;
 let dialogsRenderKey = null;
 let eventsRenderKey = null;
+let agentRenderKey = null;
+let agentRequestInFlight = false;
+let agentLastDecision = null;
+let agentError = null;
 let inventoryRenderKey = null;
 let equipmentRenderKey = null;
 let objectsRenderKey = null;
@@ -43,10 +57,17 @@ let jsonPendingTimer = null;
 const navigationCache = new Map();
 let stateConnected = false;
 let frameConnected = false;
+let dialogAdvanceActive = false;
+let dialogAdvanceSending = false;
+let dialogAdvanceCount = 0;
 const repeatableButtons = new Set(["up", "down", "left", "right"]);
 const actionCooldownMs = 180;
+const dialogAdvanceDelayMs = 500;
+const dialogAdvanceMaxPresses = 100;
 const jsonUpdateIntervalMs = 1000;
+const navigationSettleMs = 250;
 const lastActionAt = new Map();
+const directionButtons = { 2: "up", 3: "right", 0: "down", 1: "left" };
 
 function navigationTargets(state) {
   return new Map((state._navigation?.targets || []).map((target) => [target.id, target]));
@@ -66,6 +87,108 @@ function navigationDiagnosticContext(state) {
     active_navigation: activeNavigation ? { ...activeNavigation } : null,
     runtime_stale: Boolean(state?._debug?.runtime_stale),
   };
+}
+
+function navigationEnvironmentContext(state) {
+  const pos = state?.party_position || {};
+  const dialog = state?.dialog || {};
+  const latest = dialog.latest_event || {};
+  const objects = (state?.objects || [])
+    .filter((obj) => obj.interactable)
+    .map((obj) => ({
+      id: Number(obj.id || 0),
+      x: obj.x ?? null,
+      y: obj.y ?? null,
+      state: obj.state ?? null,
+      trigger_mode: obj.trigger_mode ?? null,
+      trigger_script: obj.trigger_script ?? null,
+      sprite_id: obj.sprite_id ?? null,
+      blocking: Boolean(obj.blocking),
+      interactable: Boolean(obj.interactable),
+      vanish_time: obj.vanish_time ?? null,
+    }))
+    .sort((a, b) => a.id - b.id);
+  return {
+    room: {
+      scene_id: state?.scene_id ?? null,
+      map_id: state?.map_id ?? null,
+      key: state?.room?.key ?? null,
+    },
+    party_position: {
+      x: pos.x ?? null,
+      y: pos.y ?? null,
+    },
+    dialog: {
+      active: Boolean(dialog.active),
+      latest_event: {
+        sequence: latest.sequence ?? null,
+        message_id: latest.message_id ?? null,
+        event_object_id: latest.event_object_id ?? null,
+        text: latest.text ?? null,
+      },
+    },
+    objects,
+  };
+}
+
+function stableJsonStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJsonStringify(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function navigationEnvironmentKey(state) {
+  return stableJsonStringify(navigationEnvironmentContext(state));
+}
+
+function updateNavigationEnvironmentKey(state) {
+  const key = navigationEnvironmentKey(state);
+  if (navigationLatestEnvironmentKey !== key) {
+    navigationLatestEnvironmentKey = key;
+    navigationEnvironmentChangedAt = performance.now();
+    navigationStableEnvironmentKey = null;
+  }
+  return key;
+}
+
+function navigationCanRefresh(state) {
+  return Boolean(
+    state?._navigation &&
+    state._navigation.status !== "no_nav_grid" &&
+    !state?._debug?.runtime_stale
+  );
+}
+
+function navigationFullReady(state) {
+  return Boolean(
+    state?._navigation?.environment_key &&
+    state._navigation.environment_key === navigationEnvironmentKey(state) &&
+    state._navigation.status === "ok"
+  );
+}
+
+function navigationTargetActionable(state, targetId) {
+  if (!navigationFullReady(state) || state?.dialog?.active || state?.in_battle || state?._debug?.runtime_stale) {
+    return false;
+  }
+  const target = navigationTargets(state).get(targetId);
+  return Boolean(target && ![
+    "pending",
+    "unknown",
+    "in_dialog",
+    "unreachable_static",
+    "blocked_by_transition",
+    "needs_direction",
+    "no_nav_grid",
+    "target_inactive",
+  ].includes(target.status));
 }
 
 function sendNavigationDiagnostic(type, details = {}) {
@@ -105,11 +228,13 @@ navigationEl.addEventListener("keydown", (event) => {
   }
 });
 
-explorationEl.addEventListener("click", (event) => {
+document.addEventListener("click", (event) => {
   const actionEl = event.target.closest("[data-explore-action]");
-  if (!actionEl || !explorationEl.contains(actionEl)) return;
+  if (!actionEl) return;
   if (actionEl.dataset.exploreAction === "step") {
     exploreStep();
+  } else if (actionEl.dataset.exploreAction === "sweep") {
+    toggleExplorationSweep();
   } else if (actionEl.dataset.exploreAction === "reset") {
     resetExploration();
   }
@@ -119,6 +244,23 @@ inventoryEl.addEventListener("click", (event) => {
   const actionEl = event.target.closest("[data-use-item]");
   if (!actionEl || !inventoryEl.contains(actionEl)) return;
   useInventoryItem(Number(actionEl.dataset.useItem), actionEl.dataset.useTarget);
+});
+
+agentEl.addEventListener("click", (event) => {
+  const actionEl = event.target.closest("[data-agent-action]");
+  if (!actionEl || !agentEl.contains(actionEl)) return;
+  if (actionEl.dataset.agentAction === "decide") {
+    askAgent();
+  }
+});
+
+fastDialogButton?.addEventListener("click", () => {
+  fastDialogButton.blur();
+  if (dialogAdvanceActive) {
+    stopDialogAdvance();
+  } else {
+    startDialogAdvance();
+  }
 });
 
 jsonLiveEl?.addEventListener("change", () => {
@@ -131,6 +273,14 @@ jsonLiveEl?.addEventListener("change", () => {
 
 jsonRefreshEl?.addEventListener("click", () => {
   if (latestState) renderJson(latestState, { force: true });
+});
+
+jsonDetailsEl?.addEventListener("toggle", () => {
+  if (jsonDetailsEl.open && latestState && !jsonRenderText) {
+    renderJson(latestState, { force: true });
+  } else {
+    updateJsonStatus();
+  }
 });
 
 function setPanelHtml(element, html, key, currentKey, onChange) {
@@ -159,7 +309,9 @@ function statusText(status) {
     target_inactive: "gone",
     unreachable_static: "unreachable",
     no_nav_grid: "no grid",
+    pending: "checking",
     unknown: "checking",
+    in_dialog: "dialog",
   };
   return labels[status] || status || "unknown";
 }
@@ -172,6 +324,7 @@ function statusClass(status) {
   if (status === "needs_direction") return "tagTransition";
   if (status === "target_inactive") return "tagUnreachable";
   if (status === "unreachable_static") return "tagUnreachable";
+  if (status === "in_dialog") return "tagTransition";
   return "";
 }
 
@@ -199,11 +352,25 @@ function explorationStatusText(status) {
     complete: "complete",
     action_pending: "pending",
     no_nav_grid: "no grid",
+    no_visible_frontier: "no visible frontier",
+    route_blocked: "route blocked",
     state_stale: "stale",
     in_battle: "battle",
     in_dialog: "dialog",
+    interrupted_by_dialog: "dialog interrupted",
+    interrupted_by_battle: "battle interrupted",
+    interrupted_by_room_change: "room changed",
+    interrupted_not_in_main_game: "runtime interrupted",
     unsafe_start: "unsafe",
     position_deviated: "deviated",
+    stopped: "stopped",
+    started: "started",
+    stop_requested: "stopping",
+    not_running: "stopped",
+    running: "running",
+    stopping: "stopping",
+    room_changed: "room changed",
+    not_in_main_game: "runtime interrupted",
   };
   return labels[status] || status || "unknown";
 }
@@ -290,6 +457,79 @@ function renderDialogStatus(state) {
     });
 }
 
+function canAdvanceDialog(state) {
+  return Boolean(state?.dialog?.active) && !state?.in_battle && !state?._debug?.runtime_stale;
+}
+
+function renderFastDialogButton(state) {
+  if (!fastDialogButton) return;
+
+  const available = canAdvanceDialog(state);
+  if (dialogAdvanceActive && !available) {
+    dialogAdvanceActive = false;
+  }
+
+  fastDialogButton.disabled = !dialogAdvanceActive && !available;
+  fastDialogButton.classList.toggle("is-running", dialogAdvanceActive);
+  fastDialogButton.textContent = dialogAdvanceActive
+    ? `Advancing ${dialogAdvanceCount}/${dialogAdvanceMaxPresses}`
+    : "Fast Dialog";
+}
+
+function startDialogAdvance() {
+  if (!canAdvanceDialog(latestState)) return;
+  dialogAdvanceActive = true;
+  dialogAdvanceCount = 0;
+  renderFastDialogButton(latestState);
+  maybeContinueDialogAdvance(latestState);
+}
+
+function stopDialogAdvance() {
+  dialogAdvanceActive = false;
+  renderFastDialogButton(latestState);
+}
+
+function scheduleDialogAdvanceRefresh() {
+  setTimeout(() => {
+    if (!dialogAdvanceActive) return;
+    refreshState().catch((error) => {
+      console.warn("dialog advance refresh failed", error);
+      stopDialogAdvance();
+    });
+  }, dialogAdvanceDelayMs);
+}
+
+function maybeContinueDialogAdvance(state) {
+  if (!dialogAdvanceActive || dialogAdvanceSending) return;
+  if (!canAdvanceDialog(state) || dialogAdvanceCount >= dialogAdvanceMaxPresses) {
+    stopDialogAdvance();
+    return;
+  }
+  if (state?._debug?.action_pending) return;
+  void advanceDialogOnce();
+}
+
+async function advanceDialogOnce() {
+  if (!dialogAdvanceActive || dialogAdvanceSending) return;
+  dialogAdvanceSending = true;
+  renderFastDialogButton(latestState);
+
+  try {
+    flashButton("search");
+    await sendAction(["search"], 1);
+    dialogAdvanceCount += 1;
+  } catch (error) {
+    console.warn("dialog advance failed", error);
+    stopDialogAdvance();
+  } finally {
+    dialogAdvanceSending = false;
+    renderFastDialogButton(latestState);
+    if (dialogAdvanceActive) {
+      scheduleDialogAdvanceRefresh();
+    }
+  }
+}
+
 function renderDialogs(state) {
   const dialogs = (state._debug?.recent_dialogs || []).slice(-8).reverse();
   if (!dialogs.length) {
@@ -364,6 +604,115 @@ function renderEvents(state) {
       <span>${eventText(event)}<small>frame ${event.frame ?? "-"}</small></span>
     </div>`)
     .join(""), renderKey, eventsRenderKey);
+}
+
+function actionText(action) {
+  if (!action) return "-";
+  const args = action.args ? JSON.stringify(action.args) : "{}";
+  return `${action.tool || "unknown"} ${args}`;
+}
+
+function agentRuntimeKey(state) {
+  const room = state?.room || {};
+  return [
+    state?.scene_id ?? "",
+    state?.map_id ?? "",
+    room.key ?? state?.region_key ?? "",
+  ].join("/");
+}
+
+function evidenceItems(evidence) {
+  if (!evidence || typeof evidence !== "object") return "";
+  return Object.entries(evidence)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .slice(0, 10)
+    .map(([key, value]) => {
+      const text = typeof value === "object" ? JSON.stringify(value) : String(value);
+      return `<li><strong>${escapeHtml(key)}</strong>: ${escapeHtml(text)}</li>`;
+    })
+    .join("");
+}
+
+function renderAgentDecision(decision) {
+  if (!decision) return '<div class="navEmpty">No agent decisions yet.</div>';
+  const alternatives = decision.alternatives || [];
+  const toolsUsed = Array.isArray(decision.tool_trace) ? decision.tool_trace.length : 0;
+  return `<div class="agentDecision">
+    <div class="agentSummary">
+      <span class="tag tagDialog">${escapeHtml(decision.recommended_intent || "unknown")}</span>
+      <strong>${escapeHtml(decision.summary || "No summary.")}</strong>
+    </div>
+    ${toolsUsed ? `<div class="agentTools">Tools used: ${toolsUsed}</div>` : ""}
+    <div class="agentAction">
+      <span>Recommended action</span>
+      <code>${escapeHtml(actionText(decision.recommended_action))}</code>
+    </div>
+    <div class="agentRisk">
+      <span>Risk</span>
+      <p>${escapeHtml(decision.risk || "-")}</p>
+    </div>
+    <details>
+      <summary>Evidence</summary>
+      <ul>${evidenceItems(decision.evidence)}</ul>
+    </details>
+    ${alternatives.length ? `<details>
+      <summary>Alternatives</summary>
+      <div class="agentAlternatives">${alternatives.map((alternative) => `
+        <div>
+          <strong>${escapeHtml(alternative.intent || "alternative")}</strong>
+          <code>${escapeHtml(actionText(alternative.action))}</code>
+          <span>${escapeHtml(alternative.reason || "")}</span>
+        </div>
+      `).join("")}</div>
+    </details>` : ""}
+  </div>`;
+}
+
+function renderAgentError(error) {
+  return `<div class="agentDecision">
+    <div class="agentSummary">
+      <span class="tag tagDialog">error</span>
+      <strong>${escapeHtml(error || "Agent request failed.")}</strong>
+    </div>
+  </div>`;
+}
+
+function renderAgent(state) {
+  const log = state._debug?.recent_agent_decisions || [];
+  const decisionLog = log.filter((entry) => entry?.decision);
+  const latestLogged = decisionLog.length ? decisionLog[decisionLog.length - 1] : null;
+  const decision = agentError ? null : (agentLastDecision || latestLogged?.decision || null);
+  const history = decisionLog.slice(-8).reverse();
+  const status = agentRequestInFlight ? "loading" : agentError ? "error" : decision ? "ready" : "idle";
+  const renderKey = JSON.stringify({
+    status,
+    error: agentError,
+    decision,
+    stateContext: agentRuntimeKey(state),
+    history: history.map((entry) => [
+      entry.turn,
+      entry.time,
+      entry.decision?.recommended_intent,
+      entry.decision?.summary,
+      entry.decision?.tool_trace?.length,
+    ]),
+  });
+  agentRenderKey = setPanelHtml(agentEl, `
+    <div class="agentControls">
+      <button data-agent-action="decide" ${agentRequestInFlight ? "disabled" : ""}>${agentRequestInFlight ? "Asking..." : "Ask Agent"}</button>
+      <span>${agentError ? escapeHtml(agentError) : "No actions are executed."}</span>
+    </div>
+    ${agentError ? renderAgentError(agentError) : renderAgentDecision(decision)}
+    <div class="agentHistory">
+      <h3>Decision History</h3>
+      ${history.length ? history.map((entry) => `
+        <div class="agentHistoryItem">
+          <strong>#${entry.turn ?? "-"} ${escapeHtml(entry.decision?.recommended_intent || "unknown")}</strong>
+          <span>${escapeHtml(entry.decision?.summary || "")}</span>
+        </div>
+      `).join("") : '<div class="navEmpty">No agent decisions yet.</div>'}
+    </div>
+  `, renderKey, agentRenderKey);
 }
 
 function itemFlagLabels(item) {
@@ -473,6 +822,7 @@ function renderObjects(state) {
 
 function renderNavigation(state) {
   const targets = state._navigation?.targets || [];
+  const fullReady = navigationFullReady(state);
   if (!targets.length) {
     const diagnosticKey = JSON.stringify({
       total: 0,
@@ -503,6 +853,8 @@ function renderNavigation(state) {
     activeTarget: activeNavigation?.targetId ?? null,
     activeStatus: activeNavigation?.status ?? null,
     dialog: Boolean(state.dialog?.active),
+    navigationStatus: state._navigation?.status ?? null,
+    fullReady,
     targets: targets.map((target) => [
       target.id,
       target.kind,
@@ -517,20 +869,27 @@ function renderNavigation(state) {
   let enabledCount = 0;
   const disabledReasons = new Set();
   for (const target of targets) {
+    const displayStatus = state.dialog?.active ? "in_dialog" : fullReady ? target.status : "pending";
     const canGo = ![
       "unreachable_static",
       "blocked_by_transition",
       "needs_direction",
       "no_nav_grid",
       "target_inactive",
-    ].includes(target.status);
-    const goEnabled = canGo && !activeNavigation && !state.dialog?.active;
+      "pending",
+      "unknown",
+      "in_dialog",
+    ].includes(displayStatus);
+    const goEnabled = navigationTargetActionable(state, target.id) && !activeNavigation;
     if (goEnabled) {
       enabledCount += 1;
     } else {
-      if (!canGo) disabledReasons.add(`status:${target.status || "unknown"}`);
+      if (!fullReady) disabledReasons.add("navigation_pending");
+      if (!canGo) disabledReasons.add(`status:${displayStatus || "unknown"}`);
       if (activeNavigation) disabledReasons.add("active_navigation");
       if (state.dialog?.active) disabledReasons.add("dialog_active");
+      if (state.in_battle) disabledReasons.add("in_battle");
+      if (state._debug?.runtime_stale) disabledReasons.add("runtime_stale");
     }
   }
   const diagnosticKey = JSON.stringify({
@@ -538,7 +897,8 @@ function renderNavigation(state) {
     enabled: enabledCount,
     activeNavigation,
     dialog: Boolean(state.dialog?.active),
-    statuses: targets.map((target) => `${target.id}:${target.status}`).join("|"),
+    fullReady,
+    statuses: targets.map((target) => `${target.id}:${state.dialog?.active ? "in_dialog" : fullReady ? target.status : "pending"}`).join("|"),
   });
   if (navigationDiagnosticKey !== diagnosticKey) {
     navigationDiagnosticKey = diagnosticKey;
@@ -548,34 +908,33 @@ function renderNavigation(state) {
       enabled: enabledCount,
       disabled: targets.length - enabledCount,
       disabled_reasons: Array.from(disabledReasons).sort(),
-      target_statuses: targets.map((target) => ({ id: target.id, status: target.status, kind: target.kind })),
+      target_statuses: targets.map((target) => ({
+        id: target.id,
+        status: state.dialog?.active ? "in_dialog" : fullReady ? target.status : "pending",
+        kind: target.kind,
+      })),
     });
   }
 
   navigationEl.innerHTML = targets
     .map((target) => {
       const isActive = activeNavigation?.targetId === target.id;
+      const displayStatus = state.dialog?.active ? "in_dialog" : fullReady ? target.status : "pending";
+      const displayFullDetails = fullReady && !state.dialog?.active;
       const detail = [
-        target.kind,
-        Number.isFinite(target.steps) ? `${target.steps} steps` : "",
-        target.required_direction ? `face ${target.required_direction}` : "",
+        displayFullDetails ? target.kind : "",
+        displayFullDetails && Number.isFinite(target.steps) ? `${target.steps} steps` : "",
+        displayFullDetails && target.required_direction ? `face ${target.required_direction}` : "",
       ]
         .filter(Boolean)
         .join(" · ");
-      const canGo = ![
-        "unreachable_static",
-        "blocked_by_transition",
-        "needs_direction",
-        "no_nav_grid",
-        "target_inactive",
-      ].includes(target.status);
-      const goEnabled = canGo && !activeNavigation && !state.dialog?.active;
-      const goLabel = isActive ? navigationRunText(activeNavigation.status) : target.status === "transition" ? "Enter" : "Go";
+      const goEnabled = navigationTargetActionable(state, target.id) && !activeNavigation;
+      const goLabel = isActive ? navigationRunText(activeNavigation.status) : displayStatus === "transition" ? "Enter" : "Go";
       return `<div class="navTarget ${selectedRoute?.target_id === target.id ? "is-selected" : ""}" data-nav-id="${target.id}" role="button" tabindex="0">
         <div class="navTargetSelect">
           <strong>#${target.id}</strong>
           <span>
-            <span class="tag ${statusClass(target.status)}">${statusText(target.status)}</span>
+            <span class="tag ${statusClass(displayStatus)}">${statusText(displayStatus)}</span>
             ${detail ? `<small>${detail}</small>` : ""}
           </span>
         </div>
@@ -586,54 +945,70 @@ function renderNavigation(state) {
   navigationRenderKey = renderKey;
 }
 
-function navigationRefreshSignature(state) {
-  const pos = state.party_position || {};
-  return [
-    navigationStableSignature(state),
-    pos.x ?? "",
-    pos.y ?? "",
-  ].join("/");
+function scheduleNavigationRefresh(state) {
+  if (navigationRefreshTimer) {
+    clearTimeout(navigationRefreshTimer);
+    navigationRefreshTimer = null;
+  }
+  if (!navigationCanRefresh(state)) return;
+
+  const key = navigationEnvironmentKey(state);
+  const now = performance.now();
+  const stableFor = now - navigationEnvironmentChangedAt;
+  const waitMs = Math.max(0, navigationSettleMs - stableFor);
+  if (waitMs > 0) {
+    navigationRefreshTimer = setTimeout(() => {
+      navigationRefreshTimer = null;
+      if (latestState) scheduleNavigationRefresh(latestState);
+    }, waitMs);
+    return;
+  }
+
+  navigationStableEnvironmentKey = key;
+  const cachedNavigation = navigationCache.get(key);
+  if (cachedNavigation) {
+    if (latestState && latestState._navigation?.environment_key !== key) {
+      latestState._navigation = cachedNavigation;
+      renderNavigation(latestState);
+      renderObjects(latestState);
+      drawOverlay(latestState);
+    }
+    return;
+  }
+
+  if (navigationRefreshInFlightKey) return;
+  refreshNavigationForKey(key);
 }
 
-function navigationStableSignature(state) {
-  const objects = (state.objects || [])
-    .filter((obj) => obj.interactable)
-    .map((obj) => `${obj.id}:${obj.x}:${obj.y}:${obj.state}:${obj.trigger_mode}:${obj.trigger_script}:${obj.sprite_id}:${obj.blocking ? 1 : 0}`)
-    .join("|");
-  return [
-    state.scene_id ?? "",
-    state.map_id ?? "",
-    state.room?.key ?? "",
-    state.dialog?.active ? "dialog" : "free",
-    objects,
-  ].join("/");
-}
-
-async function refreshNavigation(state) {
-  if (!state._navigation || state._navigation.status === "no_nav_grid") return;
-  const key = navigationRefreshSignature(state);
-  if (navigationRefreshInFlightKey === key || (navigationRefreshCompletedKey === key && navigationCache.has(key))) return;
-  navigationRefreshInFlightKey = key;
+async function refreshNavigationForKey(requestKey) {
+  if (navigationRefreshInFlightKey) return;
+  navigationRefreshInFlightKey = requestKey;
   try {
     const response = await fetch("/navigation");
     if (!response.ok) {
       throw new Error(`navigation failed: ${response.status}`);
     }
     const navigation = await response.json();
-    navigationCache.set(key, navigation);
-    latestFullNavigation = navigation;
-    latestFullNavigationStableKey = navigationStableSignature(state);
-    navigationRefreshCompletedKey = key;
-    if (latestState && navigationRefreshSignature(latestState) === key) {
+    const returnedKey = navigation.environment_key || requestKey;
+    navigationCache.set(returnedKey, navigation);
+    if (
+      latestState &&
+      returnedKey === navigationStableEnvironmentKey &&
+      navigationEnvironmentKey(latestState) === returnedKey
+    ) {
       latestState._navigation = navigation;
       renderNavigation(latestState);
+      renderObjects(latestState);
       drawOverlay(latestState);
     }
   } catch (error) {
     console.warn(error);
   } finally {
-    if (navigationRefreshInFlightKey === key) {
+    if (navigationRefreshInFlightKey === requestKey) {
       navigationRefreshInFlightKey = null;
+    }
+    if (latestState && navigationEnvironmentKey(latestState) !== requestKey) {
+      scheduleNavigationRefresh(latestState);
     }
   }
 }
@@ -642,6 +1017,7 @@ function navigationRunText(status) {
   const labels = {
     starting: "Go...",
     stepping: "Moving",
+    facing: "Facing",
     interacting: "Action",
     arrived: "Arrived",
     action_pending: "Pending",
@@ -649,38 +1025,103 @@ function navigationRunText(status) {
   return labels[status] || "Stop";
 }
 
+function exploreStepCount() {
+  const raw = Number.parseInt(exploreStepsInput?.value || "4", 10);
+  if (!Number.isFinite(raw)) return 4;
+  return Math.max(1, raw);
+}
+
+function currentSweep(state) {
+  return state?._exploration?.sweep || state?._debug?.exploration_sweep || null;
+}
+
+function sweepIsRunning(state) {
+  return Boolean(currentSweep(state)?.running);
+}
+
+function explorationCoverage(exploration) {
+  const explored = Number(exploration?.explored ?? exploration?.visited ?? 0);
+  const explorable = Number(exploration?.explorable ?? 0);
+  if (!Number.isFinite(explored) || !Number.isFinite(explorable) || explorable <= 0) {
+    return { explored: Math.max(0, explored || 0), explorable: Math.max(0, explorable || 0), percent: 0 };
+  }
+  const percent = Math.max(0, Math.min(100, Math.round((explored / explorable) * 100)));
+  return { explored, explorable, percent };
+}
+
+function syncExploreAction(state) {
+  const exploration = state?._exploration;
+  const sweep = currentSweep(state);
+  const sweepRunning = Boolean(sweep?.running);
+  const disabled = exploreRequestInFlight || sweepRequestInFlight || sweepRunning || !exploration || exploration.status !== "ok" || exploration.complete || Boolean(state?.dialog?.active);
+  if (exploreActionButton) {
+    exploreActionButton.disabled = disabled;
+  }
+  if (sweepActionButton) {
+    sweepActionButton.disabled = sweepRequestInFlight || (!sweepRunning && (!exploration || exploration.status !== "ok" || Boolean(state?.dialog?.active)));
+    sweepActionButton.textContent = sweepRunning ? "Stop Sweep" : "Sweep";
+  }
+  if (clearTraceButton) {
+    clearTraceButton.disabled = sweepRequestInFlight || sweepRunning || !exploration;
+  }
+}
+
 function renderExploration(state) {
   const exploration = state._exploration;
   if (!exploration) {
+    syncExploreAction(state);
     explorationRenderKey = setPanelHtml(explorationEl, '<div class="navEmpty">No exploration state yet.</div>', "empty", explorationRenderKey);
     return;
   }
 
   const resultStatus = lastExploreResult?.status;
   const complete = exploration.complete ? '<span class="tag tagReachable">complete</span>' : "";
+  const sweep = currentSweep(state) || {};
+  const sweepRunning = Boolean(sweep.running);
+  const sweepStatus = sweepRunning ? "running" : sweep.stop_requested ? "stopping" : sweep.finished_reason || "stopped";
   const status = resultStatus || exploration.status;
+  const coverage = explorationCoverage(exploration);
   const renderKey = JSON.stringify({
     resultStatus,
     status: exploration.status,
     visited: exploration.visited,
+    explored: exploration.explored,
+    explorable: exploration.explorable,
     frontier: exploration.frontier,
     blocked: exploration.blocked_edges,
     complete: exploration.complete,
     dialog: Boolean(state.dialog?.active),
+    coveragePercent: coverage.percent,
+    sweepRunning,
+    sweepStatus,
+    sweepSegments: sweep.segments_sent,
+    sweepSteps: sweep.steps_sent,
+    sweepUpdatedAt: sweep.updated_at,
   });
+  syncExploreAction(state);
   explorationRenderKey = setPanelHtml(explorationEl, `
     <div class="explorationStats">
-      <div><span>visited</span><strong>${exploration.visited ?? 0}</strong></div>
-      <div><span>frontier</span><strong>${exploration.frontier ?? 0}</strong></div>
-      <div><span>blocked</span><strong>${exploration.blocked_edges ?? 0}</strong></div>
+      <div><span>explored</span><strong>${exploration.explored ?? exploration.visited ?? 0}</strong></div>
+      <div><span>edge</span><strong>${exploration.frontier ?? 0}</strong></div>
+      <div><span>explorable</span><strong>${exploration.explorable ?? 0}</strong></div>
+    </div>
+    <div class="explorationProgress">
+      <div class="explorationProgressMeta">
+        <span>room coverage</span>
+        <strong>${coverage.percent}%</strong>
+      </div>
+      <div class="explorationProgressTrack" aria-label="room exploration coverage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${coverage.percent}" role="progressbar">
+        <span style="width: ${coverage.percent}%"></span>
+      </div>
+      <small>${coverage.explored} / ${coverage.explorable} safe nodes explored</small>
     </div>
     <div class="explorationStatus">
       <span class="tag">${explorationStatusText(status)}</span>
       ${complete}
     </div>
-    <div class="explorationButtons">
-      <button data-explore-action="step" ${exploration.status !== "ok" || exploration.complete || state.dialog?.active ? "disabled" : ""}>Explore Step</button>
-      <button data-explore-action="reset">Reset Map</button>
+    <div class="explorationSweep">
+      <span class="tag ${sweepRunning ? "tagReachable" : ""}">${explorationStatusText(sweepStatus)}</span>
+      <span>${Number(sweep.segments_sent || 0)} segments / ${Number(sweep.steps_sent || 0)} steps</span>
     </div>
   `, renderKey, explorationRenderKey);
 }
@@ -789,11 +1230,19 @@ function drawExploration(state) {
   const scaleY = overlay.height / 200;
 
   ctx.save();
-  for (const node of exploration.nodes?.visited || []) {
+  for (const node of exploration.nodes?.explorable || []) {
     const x = (node.x - viewport.x) * scaleX;
     const y = (node.y - viewport.y) * scaleY;
     if (x < -10 || y < -10 || x > overlay.width + 10 || y > overlay.height + 10) continue;
-    ctx.fillStyle = "rgba(126, 227, 174, 0.24)";
+    ctx.fillStyle = "rgba(102, 227, 255, 0.08)";
+    ctx.fillRect(x - 4, y - 4, 8, 8);
+  }
+
+  for (const node of exploration.nodes?.explored || exploration.nodes?.visited || []) {
+    const x = (node.x - viewport.x) * scaleX;
+    const y = (node.y - viewport.y) * scaleY;
+    if (x < -10 || y < -10 || x > overlay.width + 10 || y > overlay.height + 10) continue;
+    ctx.fillStyle = "rgba(126, 227, 174, 0.34)";
     ctx.fillRect(x - 5, y - 5, 10, 10);
   }
 
@@ -801,7 +1250,7 @@ function drawExploration(state) {
     const x = (node.x - viewport.x) * scaleX;
     const y = (node.y - viewport.y) * scaleY;
     if (x < -10 || y < -10 || x > overlay.width + 10 || y > overlay.height + 10) continue;
-    ctx.strokeStyle = "rgba(255, 214, 102, 0.95)";
+    ctx.strokeStyle = "rgba(255, 214, 102, 0.62)";
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(x, y, 5, 0, Math.PI * 2);
@@ -865,6 +1314,10 @@ function drawOverlay(state) {
 
 function updateJsonStatus() {
   if (!jsonStatusEl) return;
+  if (jsonDetailsEl && !jsonDetailsEl.open) {
+    jsonStatusEl.textContent = "hidden";
+    return;
+  }
   if (!jsonLiveEl?.checked) {
     jsonStatusEl.textContent = "paused";
     return;
@@ -878,6 +1331,7 @@ function updateJsonStatus() {
 
 function scheduleJsonRender() {
   if (jsonPendingTimer) return;
+  if (jsonDetailsEl && !jsonDetailsEl.open) return;
   const elapsed = performance.now() - jsonLastRenderedAt;
   const delay = Math.max(0, jsonUpdateIntervalMs - elapsed);
   jsonPendingTimer = setTimeout(() => {
@@ -888,6 +1342,10 @@ function scheduleJsonRender() {
 
 function renderJson(state, options = {}) {
   const force = Boolean(options.force);
+  if (!force && jsonDetailsEl && !jsonDetailsEl.open) {
+    updateJsonStatus();
+    return;
+  }
   if (!force && jsonLiveEl && !jsonLiveEl.checked) {
     updateJsonStatus();
     return;
@@ -910,24 +1368,18 @@ function renderJson(state, options = {}) {
 }
 
 function render(state) {
-  const navKey = navigationRefreshSignature(state);
+  const navKey = updateNavigationEnvironmentKey(state);
   const cachedNavigation = navigationCache.get(navKey);
   if (cachedNavigation) {
     state._navigation = cachedNavigation;
-    latestFullNavigation = cachedNavigation;
-    latestFullNavigationStableKey = navigationStableSignature(state);
-  } else if (
-    state._navigation?.status === "pending" &&
-    latestFullNavigation &&
-    latestFullNavigationStableKey === navigationStableSignature(state)
-  ) {
-    state._navigation = latestFullNavigation;
   }
   latestState = state;
   renderJson(state);
   renderRuntimeStatus(state);
   renderSummary(state);
+  renderAgent(state);
   renderDialogStatus(state);
+  renderFastDialogButton(state);
   renderDialogs(state);
   renderEvents(state);
   renderInventory(state);
@@ -936,7 +1388,8 @@ function render(state) {
   renderExploration(state);
   renderObjects(state);
   drawOverlay(state);
-  refreshNavigation(state);
+  scheduleNavigationRefresh(state);
+  maybeContinueDialogAdvance(state);
 }
 
 async function useInventoryItem(itemId, target) {
@@ -954,6 +1407,14 @@ async function useInventoryItem(itemId, target) {
 }
 
 async function selectNavigationTarget(targetId) {
+  if (!navigationTargetActionable(latestState, targetId)) {
+    sendNavigationDiagnostic("navigation_route_ignored", {
+      ...navigationDiagnosticContext(latestState),
+      target_id: targetId,
+      reason: "navigation_not_ready",
+    });
+    return;
+  }
   const requestId = ++navigationRouteRequestId;
   selectedRoute = { target_id: targetId, status: "loading" };
   if (latestState) {
@@ -980,7 +1441,35 @@ async function selectNavigationTarget(targetId) {
 
 async function refreshState() {
   const response = await fetch("/state");
-  render(await response.json());
+  const state = await response.json();
+  render(state);
+}
+
+async function askAgent() {
+  if (agentRequestInFlight) return;
+  agentRequestInFlight = true;
+  agentError = null;
+  if (latestState) renderAgent(latestState);
+
+  try {
+    const response = await fetch("/agent/decide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || `agent failed: ${response.status}`);
+    }
+    agentLastDecision = result.decision;
+    await refreshState();
+  } catch (error) {
+    agentLastDecision = null;
+    agentError = error instanceof Error ? error.message : String(error);
+  } finally {
+    agentRequestInFlight = false;
+    if (latestState) renderAgent(latestState);
+  }
 }
 
 function partyPositionKey(state) {
@@ -1055,6 +1544,10 @@ async function navigationStep(targetId) {
   return result;
 }
 
+function partyDirectionButton(state) {
+  return directionButtons[Number(state?.party_direction)];
+}
+
 function updateNavigationTarget(targetId, patch) {
   if (!latestState?._navigation?.targets) return;
   latestState._navigation = {
@@ -1063,7 +1556,7 @@ function updateNavigationTarget(targetId, patch) {
       target.id === targetId ? { ...target, ...patch } : target
     ),
   };
-  navigationCache.set(navigationRefreshSignature(latestState), latestState._navigation);
+  navigationCache.set(navigationEnvironmentKey(latestState), latestState._navigation);
 }
 
 async function waitForInteractionResult(stepResult, timeoutMs = 2500) {
@@ -1118,24 +1611,26 @@ async function waitForInteractionResult(stepResult, timeoutMs = 2500) {
   return false;
 }
 
-async function playNavigationSegment(stepResult, startKey) {
-  const firstProgressed = await waitForPositionChange(startKey);
-  if (!firstProgressed) {
-    return false;
-  }
-
-  const moves = stepResult.segment_moves || [stepResult.move].filter(Boolean);
-  for (let index = 1; index < moves.length; index += 1) {
-    await sleep(110);
-    const startKey = partyPositionKey(latestState);
-    await sendAction([moves[index]], 1);
-    const progressed = await waitForPositionChange(startKey);
-    if (!progressed) {
+async function waitForFacing(requiredDirection) {
+  if (!requiredDirection) return true;
+  const deadline = performance.now() + 1200;
+  while (performance.now() < deadline) {
+    await sleep(35);
+    const response = await fetch("/state");
+    const state = await response.json();
+    render(state);
+    if (partyDirectionButton(state) === requiredDirection) {
+      return true;
+    }
+    if (state._debug?.runtime_stale || state.in_battle) {
       return false;
     }
   }
-  const expectedKey = routeNodePositionKey(stepResult.expected_node || stepResult.route?.nodes?.[1]);
-  return expectedKey ? partyPositionKey(latestState) === expectedKey : true;
+  return false;
+}
+
+async function playNavigationSegment(stepResult, startKey) {
+  return waitForNavigationProgress(stepResult, startKey);
 }
 
 async function navigateToTarget(targetId) {
@@ -1144,6 +1639,14 @@ async function navigateToTarget(targetId) {
       ...navigationDiagnosticContext(latestState),
       target_id: targetId,
       reason: "active_navigation",
+    });
+    return;
+  }
+  if (!navigationTargetActionable(latestState, targetId)) {
+    sendNavigationDiagnostic("navigation_click_ignored", {
+      ...navigationDiagnosticContext(latestState),
+      target_id: targetId,
+      reason: "navigation_not_ready",
     });
     return;
   }
@@ -1196,8 +1699,22 @@ async function navigateToTarget(targetId) {
       }
 
       if (result.ok && result.status === "interacting") {
-        await waitForInteractionResult(result);
+        const interactionProgressed = await waitForInteractionResult(result);
         await refreshState();
+        if (!result.blocker?.id) {
+          unlockNavigation(interactionProgressed ? "interacted" : "interaction_done");
+          return;
+        }
+        continue;
+      }
+
+      if (result.ok && result.status === "facing") {
+        const faced = await waitForFacing(result.required_direction);
+        if (!faced) {
+          unlockNavigation("facing_failed");
+          await refreshState();
+          return;
+        }
         continue;
       }
 
@@ -1220,21 +1737,67 @@ async function navigateToTarget(targetId) {
 }
 
 async function exploreStep() {
+  if (exploreRequestInFlight || sweepIsRunning(latestState)) return;
+  const maxSteps = exploreStepCount();
+  if (exploreStepsInput) exploreStepsInput.value = String(maxSteps);
+  exploreRequestInFlight = true;
   lastExploreResult = { status: "stepping" };
+  syncExploreAction(latestState);
   if (latestState) renderExploration(latestState);
-  const response = await fetch("/exploration/step", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ max_steps: 1 }),
-  });
-  lastExploreResult = await response.json();
-  if (latestState && lastExploreResult.exploration) {
-    latestState._exploration = lastExploreResult.exploration;
-    render(latestState);
+  try {
+    const response = await fetch("/exploration/step", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ max_steps: maxSteps }),
+    });
+    lastExploreResult = await response.json();
+    if (latestState) {
+      if (lastExploreResult.exploration) {
+        latestState._exploration = lastExploreResult.exploration;
+      }
+      render(latestState);
+    }
+  } finally {
+    exploreRequestInFlight = false;
+    syncExploreAction(latestState);
+  }
+}
+
+async function toggleExplorationSweep() {
+  if (sweepRequestInFlight) return;
+  const running = sweepIsRunning(latestState);
+  sweepRequestInFlight = true;
+  lastExploreResult = { status: running ? "stopping" : "running" };
+  syncExploreAction(latestState);
+  if (latestState) renderExploration(latestState);
+  try {
+    const response = await fetch(running ? "/exploration/sweep/stop" : "/exploration/sweep/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const result = await response.json();
+    lastExploreResult = { status: result.status || (running ? "stopping" : "running") };
+    if (latestState && result.sweep) {
+      latestState._exploration = {
+        ...(latestState._exploration || {}),
+        sweep: result.sweep,
+      };
+      latestState._debug = {
+        ...(latestState._debug || {}),
+        exploration_sweep: result.sweep,
+      };
+      render(latestState);
+    }
+    await refreshState();
+  } finally {
+    sweepRequestInFlight = false;
+    syncExploreAction(latestState);
   }
 }
 
 async function resetExploration() {
+  if (sweepIsRunning(latestState)) return;
   await fetch("/exploration/reset", { method: "POST" });
   lastExploreResult = null;
   await refreshState();
@@ -1274,11 +1837,16 @@ function renderFrame(buffer) {
 }
 
 async function sendAction(buttons, frames = 1) {
-  await fetch("/action", {
+  const response = await fetch("/action", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ buttons, frames }),
   });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) {
+    throw new Error(result.error || `action failed: ${response.status}`);
+  }
+  return result;
 }
 
 function flashButton(buttonName) {
@@ -1296,7 +1864,7 @@ function sendButton(buttonName) {
   }
   lastActionAt.set(buttonName, now);
   flashButton(buttonName);
-  sendAction([buttonName], 1);
+  sendAction([buttonName], 1).catch((error) => console.warn("action failed", error));
 }
 
 function connectStream() {

@@ -164,6 +164,17 @@ curl -X POST http://127.0.0.1:8765/action \
   -d '{"buttons":["search"],"frames":1}'
 ```
 
+When checking the debug server from an agent sandbox, `curl` may fail with HTTP
+code `000` or exit code `7` even while the browser UI is working. Confirm the
+server is listening first:
+
+```sh
+lsof -nP -iTCP:8765 -sTCP:LISTEN
+```
+
+If the listener exists, retry the read-only localhost request with the agent's
+permission escalation mechanism before concluding the debug server is down.
+
 Smoke test native export:
 
 ```sh

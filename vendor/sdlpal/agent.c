@@ -17,14 +17,29 @@ static int g_agent_initialized = 0;
 static int g_agent_enabled = 0;
 static int g_agent_headless = 0;
 static char g_agent_runtime_dir[PAL_MAX_PATH] = "runtime";
-static DWORD g_agent_buttons = 0;
-static PALDIRECTION g_agent_dir = kDirUnknown;
 static PALDIRECTION g_agent_injected_dir = kDirUnknown;
 static BOOL g_agent_action_pending = FALSE;
 static BOOL g_agent_dir_active = FALSE;
 static DWORD g_agent_last_dialog_ticks = 0;
 static DWORD g_agent_dialog_sequence = 0;
 static WCHAR g_agent_dialog_speaker[64];
+
+#define PALPAL_AGENT_MAX_ACTION_STEPS 64
+
+typedef struct tagPALPALACTIONSTEP
+{
+   DWORD buttons;
+   PALDIRECTION dir;
+} PALPALACTIONSTEP;
+
+static PALPALACTIONSTEP g_agent_action_queue[PALPAL_AGENT_MAX_ACTION_STEPS];
+static int g_agent_action_count = 0;
+static int g_agent_action_index = 0;
+static DWORD g_agent_last_action_ticks = 0;
+static BOOL g_agent_waiting_for_move = FALSE;
+static int g_agent_wait_x = 0;
+static int g_agent_wait_y = 0;
+static DWORD g_agent_wait_ticks = 0;
 
 static const char * const g_agent_equipment_slot_keys[MAX_PLAYER_EQUIPMENTS] = {
    "head",
@@ -532,17 +547,54 @@ PALPAL_AgentButtonForName(
 }
 
 static VOID
-PALPAL_AgentAddButton(
+PALPAL_AgentQueueButton(
    const char *name
 )
 {
    DWORD button = PALPAL_AgentButtonForName(name);
-   g_agent_buttons |= button;
+   PALDIRECTION dir = kDirUnknown;
 
-   if (button & kKeyUp) g_agent_dir = kDirNorth;
-   else if (button & kKeyDown) g_agent_dir = kDirSouth;
-   else if (button & kKeyLeft) g_agent_dir = kDirWest;
-   else if (button & kKeyRight) g_agent_dir = kDirEast;
+   if (button == kKeyNone || g_agent_action_count >= PALPAL_AGENT_MAX_ACTION_STEPS)
+   {
+      return;
+   }
+
+   if (button & kKeyUp) dir = kDirNorth;
+   else if (button & kKeyDown) dir = kDirSouth;
+   else if (button & kKeyLeft) dir = kDirWest;
+   else if (button & kKeyRight) dir = kDirEast;
+
+   g_agent_action_queue[g_agent_action_count].buttons = button;
+   g_agent_action_queue[g_agent_action_count].dir = dir;
+   g_agent_action_count++;
+}
+
+static BOOL
+PALPAL_AgentPartyPosition(
+   int *x,
+   int *y
+)
+{
+   if (gpGlobals == NULL || !gpGlobals->fInMainGame)
+   {
+      return FALSE;
+   }
+
+   *x = PAL_X(gpGlobals->viewport) + PAL_X(gpGlobals->partyoffset);
+   *y = PAL_Y(gpGlobals->viewport) + PAL_Y(gpGlobals->partyoffset);
+   return TRUE;
+}
+
+static VOID
+PALPAL_AgentClearActionQueue(
+   VOID
+)
+{
+   g_agent_action_pending = FALSE;
+   g_agent_action_count = 0;
+   g_agent_action_index = 0;
+   g_agent_waiting_for_move = FALSE;
+   g_agent_last_action_ticks = 0;
 }
 
 static VOID
@@ -565,9 +617,11 @@ PALPAL_AgentLoadActionFile(
       return;
    }
 
-   g_agent_buttons = 0;
-   g_agent_dir = kDirUnknown;
-   g_agent_action_pending = TRUE;
+   g_agent_action_count = 0;
+   g_agent_action_index = 0;
+   g_agent_last_action_ticks = 0;
+   g_agent_waiting_for_move = FALSE;
+   g_agent_action_pending = FALSE;
 
    while (fgets(line, sizeof(line), fp))
    {
@@ -583,7 +637,7 @@ PALPAL_AgentLoadActionFile(
       }
       else if (strcmp(key, "button") == 0)
       {
-         PALPAL_AgentAddButton(value);
+         PALPAL_AgentQueueButton(value);
       }
       else if (strcmp(key, "use_item") == 0)
       {
@@ -611,6 +665,7 @@ PALPAL_AgentLoadActionFile(
 
    fclose(fp);
    remove(path);
+   g_agent_action_pending = (g_agent_action_count > 0);
    if (pending_use_item)
    {
       PALPAL_AgentUseItem(pending_item_id, pending_role_id, pending_target_all);
@@ -634,17 +689,65 @@ PALPAL_AgentPollAction(
 
    if (g_agent_action_pending)
    {
-      g_InputState.dwKeyPress |= g_agent_buttons;
-      if (g_agent_dir != kDirUnknown)
+      DWORD now = SDL_GetTicks();
+      int x = 0;
+      int y = 0;
+
+      if (g_agent_waiting_for_move)
       {
-         g_InputState.dir = g_agent_dir;
+         if (PALPAL_AgentPartyPosition(&x, &y) && (x != g_agent_wait_x || y != g_agent_wait_y))
+         {
+            g_agent_waiting_for_move = FALSE;
+         }
+         else if (now - g_agent_wait_ticks >= 300)
+         {
+            PALPAL_AgentClearActionQueue();
+            return;
+         }
+         else
+         {
+            return;
+         }
+      }
+      if (g_agent_action_index >= g_agent_action_count)
+      {
+         PALPAL_AgentClearActionQueue();
+         return;
+      }
+
+      PALPALACTIONSTEP *step = &g_agent_action_queue[g_agent_action_index];
+
+      if (g_agent_last_action_ticks != 0 && now - g_agent_last_action_ticks < 30)
+      {
+         return;
+      }
+
+      g_InputState.dwKeyPress |= step->buttons;
+      if (step->dir != kDirUnknown)
+      {
+         g_InputState.dir = step->dir;
          g_InputState.prevdir = kDirUnknown;
-         g_agent_injected_dir = g_agent_dir;
+         g_agent_injected_dir = step->dir;
          g_agent_dir_active = TRUE;
       }
-      g_agent_action_pending = FALSE;
-      g_agent_buttons = 0;
-      g_agent_dir = kDirUnknown;
+      if (step->dir != kDirUnknown && PALPAL_AgentPartyPosition(&x, &y))
+      {
+         g_agent_waiting_for_move = TRUE;
+         g_agent_wait_x = x;
+         g_agent_wait_y = y;
+         g_agent_wait_ticks = now;
+      }
+      g_agent_last_action_ticks = now;
+      g_agent_action_index++;
+      if (g_agent_action_index >= g_agent_action_count)
+      {
+         g_agent_action_pending = g_agent_waiting_for_move;
+         if (!g_agent_action_pending)
+         {
+            g_agent_action_count = 0;
+            g_agent_action_index = 0;
+         }
+      }
    }
 }
 

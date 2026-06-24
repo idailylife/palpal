@@ -50,8 +50,17 @@ prepare_live_runtime() {
     rm -f \
         "$RUNTIME_DIR/action.txt" \
         "$RUNTIME_DIR/action.txt.tmp" \
+        "$RUNTIME_DIR/action_result.json" \
+        "$RUNTIME_DIR/agent_log.jsonl" \
+        "$RUNTIME_DIR/dialog_history.json" \
+        "$RUNTIME_DIR/dialog_history.json.tmp" \
+        "$RUNTIME_DIR/events.json" \
+        "$RUNTIME_DIR/events.json.tmp" \
+        "$RUNTIME_DIR/exploration.json" \
+        "$RUNTIME_DIR/exploration.json.tmp" \
         "$RUNTIME_DIR/frame.rgba" \
         "$RUNTIME_DIR/frame.rgba.tmp" \
+        "$RUNTIME_DIR/logs/navigation.log" \
         "$RUNTIME_DIR/screen.bmp" \
         "$RUNTIME_DIR/screen_error.txt" \
         "$RUNTIME_DIR/state.json" \

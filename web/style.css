@@ -93,7 +93,42 @@ body {
 }
 
 .actionButtons {
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.exploreStepControl {
+  align-items: center;
+  background: #161d24;
+  border: 1px solid #33404d;
+  border-radius: 6px;
+  color: #9fb1c1;
+  display: flex;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 8px;
+}
+
+.exploreStepControl span {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.exploreStepControl input {
+  background: #0b0e11;
+  border: 1px solid #46586b;
+  border-radius: 5px;
+  color: #eef5fb;
+  font: inherit;
+  font-weight: 700;
+  min-width: 0;
+  padding: 6px 8px;
+  width: 64px;
+}
+
+.exploreStepControl input:focus-visible {
+  outline: 2px solid #66e3ff;
+  outline-offset: 2px;
 }
 
 .advancedGroup {
@@ -148,6 +183,11 @@ button.is-active {
   border-color: #5f896c;
 }
 
+.dialogAdvanceButton.is-running {
+  background: #3a4f6b;
+  border-color: #6a8fc0;
+}
+
 .primaryAction:hover {
   background: #3b6047;
 }
@@ -165,6 +205,13 @@ button.is-active {
 .navigationPane {
   border-left: 0;
   border-right: 1px solid #303840;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.statePane {
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 h2 {
@@ -192,6 +239,7 @@ h2 {
   gap: 8px;
   color: #9fb1c1;
   font-size: 12px;
+  margin-bottom: 8px;
 }
 
 .jsonControls label {
@@ -207,8 +255,39 @@ h2 {
 }
 
 #jsonStatus {
+  color: #9fb1c1;
+  font-size: 12px;
   min-width: 44px;
   text-align: right;
+}
+
+.jsonSection details {
+  border: 1px solid #2b333b;
+  border-radius: 6px;
+  background: #0f1317;
+  padding: 8px 10px 10px;
+}
+
+.jsonSection summary {
+  align-items: center;
+  color: #9fb1c1;
+  cursor: pointer;
+  display: flex;
+  font-size: 13px;
+  font-weight: 700;
+  justify-content: space-between;
+  list-style-position: inside;
+  margin: -8px -10px 0;
+  padding: 8px 10px;
+  text-transform: uppercase;
+}
+
+.jsonSection details[open] summary {
+  margin-bottom: 8px;
+}
+
+.jsonTitle {
+  color: #9fb1c1;
 }
 
 section + section {
@@ -216,6 +295,7 @@ section + section {
 }
 
 .summary,
+.agent,
 .dialogStatus,
 .dialogs,
 .events,
@@ -226,13 +306,160 @@ pre {
   background: #0f1317;
   border: 1px solid #2b333b;
   border-radius: 6px;
+  min-width: 0;
   padding: 10px;
+}
+
+.summary *,
+.agent *,
+.dialogStatus *,
+.dialogs *,
+.events *,
+.inventory *,
+.equipment *,
+.objects * {
+  min-width: 0;
 }
 
 .summary {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px 12px;
+}
+
+.agent {
+  display: grid;
+  gap: 10px;
+}
+
+.agentMode {
+  color: #ffd666;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.agentControls {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.agentControls button {
+  min-height: 36px;
+  padding: 6px 10px;
+  background: #2f4a38;
+  border-color: #5f896c;
+}
+
+.agentControls span {
+  color: #9fb1c1;
+  font-size: 12px;
+}
+
+.agentDecision,
+.agentHistory {
+  display: grid;
+  gap: 8px;
+}
+
+.agentSummary {
+  display: grid;
+  gap: 6px;
+}
+
+.agentTools {
+  color: #9fb1c1;
+  font-size: 12px;
+}
+
+.agentAction,
+.agentRisk {
+  display: grid;
+  gap: 4px;
+}
+
+.agentAction span,
+.agentRisk span {
+  color: #9fb1c1;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.agentAction code,
+.agentAlternatives code {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.agentRisk p {
+  margin: 0;
+}
+
+.agent details {
+  border-top: 1px solid #232a31;
+  padding-top: 6px;
+}
+
+.agent summary {
+  color: #9fb1c1;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.agent ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.agent li {
+  margin: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.agentAlternatives {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.agentAlternatives div {
+  display: grid;
+  gap: 3px;
+  border-bottom: 1px solid #232a31;
+  padding-bottom: 6px;
+}
+
+.agentAlternatives div:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.agentHistory h3 {
+  margin: 4px 0 0;
+  color: #9fb1c1;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.agentHistoryItem {
+  display: grid;
+  gap: 2px;
+  border-bottom: 1px solid #232a31;
+  padding-bottom: 6px;
+}
+
+.agentHistoryItem:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.agentHistoryItem span {
+  color: #cbd6df;
+  font-size: 13px;
 }
 
 .dialogStatus {
@@ -250,21 +477,24 @@ pre {
 
 .objects {
   max-height: 260px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .events {
   display: grid;
   gap: 6px;
   max-height: 180px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .dialogs {
   display: grid;
   gap: 6px;
   max-height: 220px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .inventory,
@@ -272,13 +502,15 @@ pre {
   display: grid;
   gap: 6px;
   max-height: 220px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .event {
   display: grid;
   grid-template-columns: 118px 1fr;
   gap: 8px;
+  min-width: 0;
   border-bottom: 1px solid #232a31;
   padding-bottom: 6px;
 }
@@ -287,6 +519,7 @@ pre {
   display: grid;
   grid-template-columns: 86px 1fr;
   gap: 8px;
+  min-width: 0;
   border-bottom: 1px solid #232a31;
   padding-bottom: 6px;
 }
@@ -296,6 +529,7 @@ pre {
   grid-template-columns: 92px 1fr auto;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   border-bottom: 1px solid #232a31;
   padding-bottom: 6px;
 }
@@ -356,8 +590,8 @@ pre {
 .navigation {
   display: grid;
   gap: 6px;
-  max-height: calc(100vh - 64px);
-  overflow: auto;
+  min-width: 0;
+  overflow: visible;
 }
 
 .navTarget {
@@ -420,8 +654,12 @@ pre {
 }
 
 .exploration {
+  background: #0f1317;
+  border: 1px solid #2b333b;
+  border-radius: 6px;
   display: grid;
   gap: 8px;
+  padding: 10px;
 }
 
 .explorationStats {
@@ -452,10 +690,45 @@ pre {
   min-height: 24px;
 }
 
-.explorationButtons {
+.explorationProgress {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+}
+
+.explorationProgressMeta {
+  align-items: baseline;
+  display: flex;
+  justify-content: space-between;
   gap: 8px;
+}
+
+.explorationProgressMeta span,
+.explorationProgress small {
+  color: #9fb1c1;
+  font-size: 12px;
+}
+
+.explorationProgressTrack {
+  background: #0b0e11;
+  border: 1px solid #2b333b;
+  border-radius: 999px;
+  height: 9px;
+  overflow: hidden;
+}
+
+.explorationProgressTrack span {
+  background: #7ee3ae;
+  display: block;
+  height: 100%;
+}
+
+.explorationSweep {
+  align-items: center;
+  color: #9fb1c1;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 6px;
 }
 
 button:disabled {
@@ -540,7 +813,8 @@ pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   max-height: 420px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 @media (max-width: 1180px) {

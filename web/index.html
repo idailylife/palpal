@@ -10,6 +10,10 @@
     <main class="layout">
       <aside class="navigationPane">
         <section>
+          <h2>Exploration</h2>
+          <div id="exploration" class="exploration"></div>
+        </section>
+        <section>
           <h2>Navigation</h2>
           <div id="navigation" class="navigation"></div>
         </section>
@@ -43,8 +47,15 @@
             <h2>Actions</h2>
             <div class="actionButtons">
               <button class="primaryAction" data-button="search">Search / Confirm</button>
+              <button id="fastDialog" class="dialogAdvanceButton" type="button" disabled>Fast Dialog</button>
               <button data-button="menu">Menu / Cancel</button>
               <button data-button="status">Status</button>
+              <button id="exploreAction" data-explore-action="step" type="button">Explore</button>
+              <button id="sweepAction" data-explore-action="sweep" type="button">Sweep</button>
+              <label class="exploreStepControl" for="exploreSteps">
+                <span>Steps</span>
+                <input id="exploreSteps" type="number" min="1" step="1" value="4" inputmode="numeric" />
+              </label>
             </div>
           </section>
           <details class="controlGroup advancedGroup">
@@ -59,6 +70,7 @@
               <button data-button="throw_item">Throw Item</button>
               <button data-button="flee">Flee</button>
               <button data-button="force">Force</button>
+              <button id="clearTraceAction" data-explore-action="reset" type="button">Clear Trace</button>
               <button data-button="home">Home</button>
               <button data-button="end">End</button>
             </div>
@@ -69,6 +81,13 @@
         <section>
           <h2>State</h2>
           <div id="summary" class="summary"></div>
+        </section>
+        <section>
+          <div class="sectionHeader">
+            <h2>Agent</h2>
+            <span class="agentMode">dry run only</span>
+          </div>
+          <div id="agent" class="agent"></div>
         </section>
         <section>
           <h2>Dialog</h2>
@@ -91,23 +110,21 @@
           <div id="equipment" class="equipment"></div>
         </section>
         <section>
-          <h2>Exploration</h2>
-          <div id="exploration" class="exploration"></div>
-        </section>
-        <section>
           <h2>Objects</h2>
           <div id="objects" class="objects"></div>
         </section>
-        <section>
-          <div class="sectionHeader">
-            <h2>JSON</h2>
-            <div class="jsonControls">
-              <label><input id="jsonLive" type="checkbox" checked /> live</label>
-              <button id="jsonRefresh" type="button">Refresh</button>
+        <section class="jsonSection">
+          <details id="jsonDetails">
+            <summary>
+              <span class="jsonTitle">JSON</span>
               <span id="jsonStatus"></span>
+            </summary>
+            <div class="jsonControls">
+              <label><input id="jsonLive" type="checkbox" /> live</label>
+              <button id="jsonRefresh" type="button">Refresh</button>
             </div>
-          </div>
-          <pre id="json"></pre>
+            <pre id="json"></pre>
+          </details>
         </section>
       </aside>
     </main>
