@@ -27,6 +27,7 @@
         <div class="screenWrap">
           <canvas id="frame" width="320" height="200" aria-label="latest game frame"></canvas>
           <canvas id="overlay" width="640" height="400"></canvas>
+          <div id="summary" class="summary stateOverlay" aria-label="game state summary"></div>
         </div>
         <div class="controls" aria-label="game controls">
           <section class="controlGroup moveGroup" aria-label="movement">
@@ -50,12 +51,6 @@
               <button id="fastDialog" class="dialogAdvanceButton" type="button" disabled>Fast Dialog</button>
               <button data-button="menu">Menu / Cancel</button>
               <button data-button="status">Status</button>
-              <button id="exploreAction" data-explore-action="step" type="button">Explore</button>
-              <button id="sweepAction" data-explore-action="sweep" type="button">Sweep</button>
-              <label class="exploreStepControl" for="exploreSteps">
-                <span>Steps</span>
-                <input id="exploreSteps" type="number" min="1" step="1" value="4" inputmode="numeric" />
-              </label>
             </div>
           </section>
           <details class="controlGroup advancedGroup">
@@ -70,7 +65,6 @@
               <button data-button="throw_item">Throw Item</button>
               <button data-button="flee">Flee</button>
               <button data-button="force">Force</button>
-              <button id="clearTraceAction" data-explore-action="reset" type="button">Clear Trace</button>
               <button data-button="home">Home</button>
               <button data-button="end">End</button>
             </div>
@@ -79,8 +73,7 @@
       </section>
       <aside class="statePane">
         <section>
-          <h2>State</h2>
-          <div id="summary" class="summary"></div>
+          <div id="checkpoints" class="checkpoints"></div>
         </section>
         <section>
           <div class="sectionHeader">
@@ -88,10 +81,6 @@
             <span class="agentMode">dry run only</span>
           </div>
           <div id="agent" class="agent"></div>
-        </section>
-        <section>
-          <h2>Dialog</h2>
-          <div id="dialogStatus" class="dialogStatus"></div>
         </section>
         <section>
           <h2>Dialog History</h2>
@@ -110,8 +99,10 @@
           <div id="equipment" class="equipment"></div>
         </section>
         <section>
-          <h2>Objects</h2>
-          <div id="objects" class="objects"></div>
+          <details class="objectsDetails">
+            <summary>Objects</summary>
+            <div id="objects" class="objects"></div>
+          </details>
         </section>
         <section class="jsonSection">
           <details id="jsonDetails">

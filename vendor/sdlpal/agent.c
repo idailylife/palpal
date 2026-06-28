@@ -16,6 +16,9 @@
 static int g_agent_initialized = 0;
 static int g_agent_enabled = 0;
 static int g_agent_headless = 0;
+static BOOL g_agent_startup_waiting = FALSE;
+static BOOL g_agent_startup_ready = FALSE;
+static int g_agent_startup_slot = 0;
 static char g_agent_runtime_dir[PAL_MAX_PATH] = "runtime";
 static PALDIRECTION g_agent_injected_dir = kDirUnknown;
 static BOOL g_agent_action_pending = FALSE;
@@ -25,6 +28,7 @@ static DWORD g_agent_dialog_sequence = 0;
 static WCHAR g_agent_dialog_speaker[64];
 
 #define PALPAL_AGENT_MAX_ACTION_STEPS 64
+#define PALPAL_AGENT_DIALOG_EVENT_CAPACITY 32
 
 typedef struct tagPALPALACTIONSTEP
 {
@@ -40,6 +44,13 @@ static BOOL g_agent_waiting_for_move = FALSE;
 static int g_agent_wait_x = 0;
 static int g_agent_wait_y = 0;
 static DWORD g_agent_wait_ticks = 0;
+
+typedef enum tagPALPALAGENTSLOTCOMMAND
+{
+   kPalpalAgentSlotCommandNone = 0,
+   kPalpalAgentSlotCommandSave,
+   kPalpalAgentSlotCommandLoad
+} PALPALAGENTSLOTCOMMAND;
 
 static const char * const g_agent_equipment_slot_keys[MAX_PLAYER_EQUIPMENTS] = {
    "head",
@@ -65,6 +76,9 @@ typedef struct tagPALPALDIALOGEVENT
 } PALPALDIALOGEVENT;
 
 static PALPALDIALOGEVENT g_agent_latest_dialog_event;
+static PALPALDIALOGEVENT g_agent_dialog_events[PALPAL_AGENT_DIALOG_EVENT_CAPACITY];
+static int g_agent_dialog_event_next = 0;
+static int g_agent_dialog_event_count = 0;
 
 #define PALPAL_DIALOG_ACTIVE_GRACE_MS 1000
 
@@ -117,6 +131,57 @@ PALPAL_AgentSaveSlot(
       return 0;
    }
    return atoi(slot);
+}
+
+BOOL
+PALPAL_AgentStartupWaitMode(
+   VOID
+)
+{
+   const char *mode;
+
+   if (!PALPAL_AgentEnabled())
+   {
+      return FALSE;
+   }
+
+   mode = getenv("PALPAL_START_MODE");
+   if (mode == NULL || mode[0] == '\0')
+   {
+      return TRUE;
+   }
+   return strcmp(mode, "wait") == 0 ? TRUE : FALSE;
+}
+
+VOID
+PALPAL_AgentBeginStartupWait(
+   VOID
+)
+{
+   if (!PALPAL_AgentEnabled())
+   {
+      return;
+   }
+
+   g_agent_startup_slot = PALPAL_AgentSaveSlot();
+   g_agent_startup_ready = FALSE;
+   g_agent_startup_waiting = TRUE;
+}
+
+BOOL
+PALPAL_AgentStartupReady(
+   VOID
+)
+{
+   return g_agent_startup_ready ? TRUE : FALSE;
+}
+
+INT
+PALPAL_AgentStartupSlot(
+   VOID
+)
+{
+   return g_agent_startup_slot;
 }
 
 BOOL
@@ -423,6 +488,233 @@ PALPAL_AgentWriteActionResult(
    rename(tmp_path, result_path);
 }
 
+static VOID
+PALPAL_AgentWriteSlotResult(
+   BOOL ok,
+   const char *status,
+   const char *action,
+   int slot,
+   const char *error
+)
+{
+   char result_path[PAL_MAX_PATH];
+   char tmp_path[PAL_MAX_PATH];
+   FILE *fp;
+
+   PALPAL_AgentPath(result_path, sizeof(result_path), "action_result.json");
+   PALPAL_AgentPath(tmp_path, sizeof(tmp_path), "action_result.json.tmp");
+   fp = fopen(tmp_path, "w");
+   if (!fp)
+   {
+      return;
+   }
+
+   fprintf(fp,
+      "{\"time_ms\":%u,"
+      "\"ok\":%s,"
+      "\"status\":\"%s\","
+      "\"action\":\"%s\","
+      "\"slot\":%d,"
+      "\"error\":",
+      (unsigned int)SDL_GetTicks(),
+      ok ? "true" : "false",
+      status ? status : "unknown",
+      action ? action : "unknown",
+      slot);
+   if (error && error[0])
+   {
+      fprintf(fp, "\"%s\"", error);
+   }
+   else
+   {
+      fputs("null", fp);
+   }
+   fputs("}\n", fp);
+   fclose(fp);
+   rename(tmp_path, result_path);
+}
+
+static BOOL
+PALPAL_AgentSlotCommandAllowed(
+   const char *action,
+   int slot
+)
+{
+   if (slot < 0)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "invalid_slot", action, slot, "invalid_slot");
+      return FALSE;
+   }
+   if (gpGlobals == NULL || !gpGlobals->fInMainGame)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "not_in_main_game", action, slot, "not_in_main_game");
+      return FALSE;
+   }
+   if (gpGlobals->fInBattle)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "in_battle", action, slot, "in_battle");
+      return FALSE;
+   }
+   if (gpGlobals->fEnteringScene)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "entering_scene", action, slot, "entering_scene");
+      return FALSE;
+   }
+   if (PAL_IsInDialog())
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "in_dialog", action, slot, "in_dialog");
+      return FALSE;
+   }
+   if (g_agent_action_pending || g_agent_action_count > 0 || g_agent_waiting_for_move)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "action_pending", action, slot, "action_pending");
+      return FALSE;
+   }
+   return TRUE;
+}
+
+static VOID
+PALPAL_AgentDoStartupSlotAction(
+   const char *action,
+   int slot
+)
+{
+   const char *status;
+
+   if (slot < 0)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "invalid_slot", action, slot, "invalid_slot");
+      return;
+   }
+
+   g_agent_startup_slot = slot;
+   g_agent_startup_ready = TRUE;
+   g_agent_startup_waiting = FALSE;
+   status = (strcmp(action, "start_slot") == 0) ? "start_scheduled" : "load_scheduled";
+   PALPAL_AgentWriteSlotResult(TRUE, status, action, slot, NULL);
+}
+
+static WORD
+PALPAL_AgentSavedTimes(
+   int slot
+)
+{
+   char filename[32];
+   FILE *fp;
+   WORD saved_times = 0;
+
+   snprintf(filename, sizeof(filename), "%d.rpg", slot);
+   fp = UTIL_OpenFileAtPath(gConfig.pszSavePath, filename);
+   if (!fp)
+   {
+      return 0;
+   }
+   if (fread(&saved_times, sizeof(WORD), 1, fp) == 1)
+   {
+      saved_times = SDL_SwapLE16(saved_times);
+   }
+   else
+   {
+      saved_times = 0;
+   }
+   fclose(fp);
+   return saved_times;
+}
+
+static WORD
+PALPAL_AgentNextSavedTimes(
+   VOID
+)
+{
+   WORD saved_times = 0;
+   int i;
+
+   for (i = 1; i <= 99; i++)
+   {
+      WORD current = PALPAL_AgentSavedTimes(i);
+      if (current > saved_times)
+      {
+         saved_times = current;
+      }
+   }
+   return saved_times + 1;
+}
+
+static VOID
+PALPAL_AgentLoadStartupActionFile(
+   VOID
+)
+{
+   char path[PAL_MAX_PATH];
+   FILE *fp;
+   char line[128];
+   int pending_slot = -1;
+   char pending_action[32];
+
+   PALPAL_AgentPath(path, sizeof(path), "action.txt");
+   fp = fopen(path, "r");
+   if (!fp)
+   {
+      return;
+   }
+
+   pending_action[0] = '\0';
+   while (fgets(line, sizeof(line), fp))
+   {
+      char key[32], value[64];
+      if (sscanf(line, "%31s %63s", key, value) != 2)
+      {
+         continue;
+      }
+      if (strcmp(key, "start_slot") == 0 || strcmp(key, "load_slot") == 0)
+      {
+         strncpy(pending_action, key, sizeof(pending_action) - 1);
+         pending_action[sizeof(pending_action) - 1] = '\0';
+         pending_slot = atoi(value);
+         break;
+      }
+      if (strcmp(key, "save_slot") == 0)
+      {
+         PALPAL_AgentWriteSlotResult(FALSE, "not_in_main_game", key, atoi(value), "not_in_main_game");
+      }
+   }
+
+   fclose(fp);
+   remove(path);
+   if (pending_action[0])
+   {
+      PALPAL_AgentDoStartupSlotAction(pending_action, pending_slot);
+   }
+}
+
+static VOID
+PALPAL_AgentDoSaveSlot(
+   int slot
+)
+{
+   if (!PALPAL_AgentSlotCommandAllowed("save_slot", slot))
+   {
+      return;
+   }
+
+   PAL_SaveGame(slot, PALPAL_AgentNextSavedTimes());
+   PALPAL_AgentWriteSlotResult(TRUE, "saved", "save_slot", slot, NULL);
+}
+
+static VOID
+PALPAL_AgentDoLoadSlot(
+   int slot
+)
+{
+   if (!PALPAL_AgentSlotCommandAllowed("load_slot", slot))
+   {
+      return;
+   }
+
+   PAL_ReloadInNextTick(slot);
+   PALPAL_AgentWriteSlotResult(TRUE, "load_scheduled", "load_slot", slot, NULL);
+}
+
 static BOOL
 PALPAL_AgentPartyHasRole(
    WORD role_id
@@ -609,6 +901,8 @@ PALPAL_AgentLoadActionFile(
    BOOL pending_target_all = FALSE;
    WORD pending_item_id = 0;
    WORD pending_role_id = 0;
+   PALPALAGENTSLOTCOMMAND pending_slot_command = kPalpalAgentSlotCommandNone;
+   int pending_slot = 0;
 
    PALPAL_AgentPath(path, sizeof(path), "action.txt");
    fp = fopen(path, "r");
@@ -661,11 +955,29 @@ PALPAL_AgentLoadActionFile(
          pending_role_id = role_id;
          pending_target_all = target_all;
       }
+      else if (strcmp(key, "save_slot") == 0)
+      {
+         pending_slot_command = kPalpalAgentSlotCommandSave;
+         pending_slot = atoi(value);
+      }
+      else if (strcmp(key, "load_slot") == 0)
+      {
+         pending_slot_command = kPalpalAgentSlotCommandLoad;
+         pending_slot = atoi(value);
+      }
    }
 
    fclose(fp);
    remove(path);
    g_agent_action_pending = (g_agent_action_count > 0);
+   if (pending_slot_command == kPalpalAgentSlotCommandSave)
+   {
+      PALPAL_AgentDoSaveSlot(pending_slot);
+   }
+   else if (pending_slot_command == kPalpalAgentSlotCommandLoad)
+   {
+      PALPAL_AgentDoLoadSlot(pending_slot);
+   }
    if (pending_use_item)
    {
       PALPAL_AgentUseItem(pending_item_id, pending_role_id, pending_target_all);
@@ -678,6 +990,20 @@ PALPAL_AgentPollAction(
 )
 {
    if (!PALPAL_AgentEnabled())
+   {
+      return;
+   }
+
+   if (g_agent_startup_waiting)
+   {
+      if (!g_agent_startup_ready)
+      {
+         PALPAL_AgentLoadStartupActionFile();
+      }
+      return;
+   }
+
+   if (gpGlobals == NULL || !gpGlobals->fInMainGame)
    {
       return;
    }
@@ -1260,6 +1586,7 @@ PALPAL_AgentObserveDialogText(
 )
 {
    PALPALDIALOGEVENT *event;
+   PALPALDIALOGEVENT *slot;
 
    if (!PALPAL_AgentEnabled() || gpGlobals == NULL || lpszText == NULL || lpszText[0] == 0)
    {
@@ -1269,6 +1596,7 @@ PALPAL_AgentObserveDialogText(
    if (g_TextLib.nCurrentDialogLine == 0 && PALPAL_AgentIsSpeakerLine(lpszText))
    {
       PALPAL_AgentCopySpeakerName(g_agent_dialog_speaker, sizeof(g_agent_dialog_speaker) / sizeof(g_agent_dialog_speaker[0]), lpszText);
+      return;
    }
 
    event = &g_agent_latest_dialog_event;
@@ -1283,6 +1611,14 @@ PALPAL_AgentObserveDialogText(
    event->position = g_TextLib.bDialogPosition;
    PALPAL_AgentCopyWideString(event->speaker, sizeof(event->speaker) / sizeof(event->speaker[0]), g_agent_dialog_speaker);
    PALPAL_AgentCopyWideString(event->text, sizeof(event->text) / sizeof(event->text[0]), lpszText);
+
+   slot = &g_agent_dialog_events[g_agent_dialog_event_next];
+   *slot = *event;
+   g_agent_dialog_event_next = (g_agent_dialog_event_next + 1) % PALPAL_AGENT_DIALOG_EVENT_CAPACITY;
+   if (g_agent_dialog_event_count < PALPAL_AGENT_DIALOG_EVENT_CAPACITY)
+   {
+      g_agent_dialog_event_count++;
+   }
 }
 
 static VOID
@@ -1387,7 +1723,26 @@ PALPAL_AgentWriteDialog(
    {
       fputs("null", fp);
    }
-   fputc('}', fp);
+   fputs(",\"events\":[", fp);
+   if (g_agent_dialog_event_count > 0)
+   {
+      int i;
+      int start = g_agent_dialog_event_count == PALPAL_AGENT_DIALOG_EVENT_CAPACITY ? g_agent_dialog_event_next : 0;
+      for (i = 0; i < g_agent_dialog_event_count; i++)
+      {
+         const PALPALDIALOGEVENT *event = &g_agent_dialog_events[(start + i) % PALPAL_AGENT_DIALOG_EVENT_CAPACITY];
+         if (!event->valid)
+         {
+            continue;
+         }
+         if (i > 0)
+         {
+            fputc(',', fp);
+         }
+         PALPAL_AgentWriteDialogEvent(fp, event);
+      }
+   }
+   fputs("]}", fp);
 }
 
 static VOID
@@ -1602,6 +1957,42 @@ PALPAL_AgentWriteFrame(
    s_last_frame_write_time = now;
 }
 
+static VOID
+PALPAL_AgentWriteStartupState(
+   VOID
+)
+{
+   char state_path[PAL_MAX_PATH];
+   char tmp_path[PAL_MAX_PATH];
+   FILE *fp;
+
+   if (!PALPAL_AgentEnabled())
+   {
+      return;
+   }
+
+   PALPAL_AgentPath(state_path, sizeof(state_path), "state.json");
+   PALPAL_AgentPath(tmp_path, sizeof(tmp_path), "state.json.tmp");
+   fp = fopen(tmp_path, "w");
+   if (!fp)
+   {
+      return;
+   }
+
+   fprintf(fp, "{");
+   fprintf(fp, "\"status\":\"startup_waiting\",");
+   fprintf(fp, "\"frame\":0,");
+   fprintf(fp, "\"in_main_game\":false,");
+   fprintf(fp, "\"in_battle\":false,");
+   fprintf(fp, "\"entering_scene\":false,");
+   fprintf(fp, "\"startup_mode\":\"wait\",");
+   fprintf(fp, "\"selected_save_slot\":%d", g_agent_startup_slot);
+   fprintf(fp, "}\n");
+
+   fclose(fp);
+   rename(tmp_path, state_path);
+}
+
 VOID
 PALPAL_AgentWriteState(
    VOID
@@ -1615,8 +2006,16 @@ PALPAL_AgentWriteState(
    int player_x;
    int player_y;
 
-   if (!PALPAL_AgentEnabled() || !gpGlobals->fInMainGame)
+   if (!PALPAL_AgentEnabled())
    {
+      return;
+   }
+   if (!gpGlobals->fInMainGame)
+   {
+      if (g_agent_startup_waiting)
+      {
+         PALPAL_AgentWriteStartupState();
+      }
       return;
    }
 

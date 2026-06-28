@@ -53,6 +53,22 @@ body {
   overflow: hidden;
 }
 
+.summary.stateOverlay {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  z-index: 3;
+  width: min(190px, calc(100% - 16px));
+  pointer-events: none;
+  color: #d9e5ef;
+  font: 9px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 0;
+  text-shadow:
+    0 1px 1px #000,
+    1px 0 1px #000,
+    0 0 3px #000;
+}
+
 #frame,
 #overlay {
   position: absolute;
@@ -94,41 +110,6 @@ body {
 
 .actionButtons {
   grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.exploreStepControl {
-  align-items: center;
-  background: #161d24;
-  border: 1px solid #33404d;
-  border-radius: 6px;
-  color: #9fb1c1;
-  display: flex;
-  gap: 8px;
-  min-height: 44px;
-  padding: 6px 8px;
-}
-
-.exploreStepControl span {
-  font-size: 12px;
-  font-weight: 700;
-  text-transform: uppercase;
-}
-
-.exploreStepControl input {
-  background: #0b0e11;
-  border: 1px solid #46586b;
-  border-radius: 5px;
-  color: #eef5fb;
-  font: inherit;
-  font-weight: 700;
-  min-width: 0;
-  padding: 6px 8px;
-  width: 64px;
-}
-
-.exploreStepControl input:focus-visible {
-  outline: 2px solid #66e3ff;
-  outline-offset: 2px;
 }
 
 .advancedGroup {
@@ -295,6 +276,7 @@ section + section {
 }
 
 .summary,
+.checkpoints,
 .agent,
 .dialogStatus,
 .dialogs,
@@ -311,6 +293,7 @@ pre {
 }
 
 .summary *,
+.checkpoints *,
 .agent *,
 .dialogStatus *,
 .dialogs *,
@@ -323,8 +306,171 @@ pre {
 
 .summary {
   display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 10px;
+}
+
+.stateOverlay div {
+  color: #8fa4b5;
+  text-transform: uppercase;
+}
+
+.stateOverlay strong {
+  color: #eef5fb;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.summary.stateOverlay {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+}
+
+.checkpoints {
+  background: transparent;
+  border: 0;
+  display: block;
+  padding: 0;
+  position: relative;
+}
+
+.checkpointMenu {
+  position: relative;
+}
+
+.checkpointMenu > summary {
+  align-items: center;
+  background: #243241;
+  border: 1px solid #46586b;
+  border-radius: 6px;
+  color: #eef5fb;
+  cursor: pointer;
+  display: flex;
+  font-weight: 650;
+  justify-content: center;
+  list-style: none;
+  min-height: 44px;
+  padding: 8px 12px;
+  user-select: none;
+}
+
+.checkpointMenu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.checkpointMenu > summary:hover {
+  background: #304457;
+}
+
+.checkpointMenu > summary:focus-visible {
+  outline: 2px solid #66e3ff;
+  outline-offset: 2px;
+}
+
+.checkpointMenuPanel {
+  background: #0f1317;
+  border: 1px solid #2b333b;
+  border-radius: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  display: grid;
+  gap: 8px;
+  max-height: calc(100vh - 96px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 10px;
+  position: fixed;
+  right: 16px;
+  top: 72px;
+  width: min(560px, calc(100vw - 32px));
+  z-index: 100;
+}
+
+.checkpointControls {
+  display: grid;
+  grid-template-columns: 1fr 132px;
+  gap: 8px;
+}
+
+.checkpointControls input {
+  background: #0b0e11;
+  border: 1px solid #46586b;
+  border-radius: 6px;
+  color: #eef5fb;
+  font: inherit;
+  min-height: 36px;
+  min-width: 0;
+  padding: 6px 8px;
+}
+
+.checkpointControls button {
+  min-height: 36px;
+  padding: 6px 8px;
+}
+
+.startupButton {
+  min-height: 36px;
+  width: 100%;
+}
+
+.checkpointStatus {
+  color: #9fb1c1;
+  font-size: 12px;
+}
+
+.checkpointStatus.is-error {
+  color: #ffad8f;
+}
+
+.checkpointMenuMeta {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr auto;
+}
+
+.checkpointList {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.checkpointItem {
+  border-bottom: 1px solid #232a31;
+  display: grid;
+  gap: 8px;
+  padding-bottom: 8px;
+}
+
+.checkpointItem:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.checkpointMeta {
+  display: grid;
+  gap: 3px;
+}
+
+.checkpointMeta span {
+  color: #cbd6df;
+  overflow-wrap: anywhere;
+}
+
+.checkpointMeta small {
+  color: #9fb1c1;
+  display: block;
+  margin-top: 1px;
+}
+
+.checkpointActions {
+  display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px 12px;
+  gap: 8px;
 }
 
 .agent {
@@ -356,6 +502,17 @@ pre {
 .agentControls span {
   color: #9fb1c1;
   font-size: 12px;
+}
+
+.agentStatusText {
+  overflow-wrap: anywhere;
+}
+
+.agentProgress {
+  color: #8aa0b2;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .agentDecision,
@@ -438,11 +595,16 @@ pre {
   padding-bottom: 0;
 }
 
-.agentHistory h3 {
-  margin: 4px 0 0;
-  color: #9fb1c1;
+.agentHistory summary {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.agentHistory summary span {
+  color: #8aa0b2;
   font-size: 12px;
-  text-transform: uppercase;
 }
 
 .agentHistoryItem {
@@ -475,10 +637,58 @@ pre {
   color: #fff4c2;
 }
 
+.dialogCurrent {
+  align-items: start;
+  border-bottom: 1px solid #232a31;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 76px 1fr;
+  padding-bottom: 6px;
+}
+
+.dialogCurrent.is-active {
+  color: #fff4c2;
+}
+
+.dialogCurrent small {
+  color: #9fb1c1;
+  display: block;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
 .objects {
   max-height: 260px;
   overflow-x: hidden;
   overflow-y: auto;
+}
+
+.objectsDetails .objects {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.objectsDetails {
+  background: #0f1317;
+  border: 1px solid #2b333b;
+  border-radius: 6px;
+  padding: 8px 10px 10px;
+}
+
+.objectsDetails > summary {
+  color: #9fb1c1;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  list-style-position: inside;
+  margin: -8px -10px;
+  padding: 8px 10px;
+  text-transform: uppercase;
+}
+
+.objectsDetails[open] > summary {
+  margin-bottom: 8px;
 }
 
 .events {
@@ -589,20 +799,20 @@ pre {
 
 .navigation {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
   overflow: visible;
 }
 
 .navTarget {
   display: grid;
-  grid-template-columns: 1fr 82px;
+  grid-template-columns: 1fr 54px;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   border: 1px solid #46586b;
-  border-radius: 6px;
+  border-radius: 5px;
   background: #182029;
-  padding: 6px;
+  padding: 3px;
   cursor: pointer;
 }
 
@@ -616,31 +826,44 @@ pre {
 
 .navTargetSelect {
   display: grid;
-  grid-template-columns: 48px 1fr;
+  grid-template-columns: 36px 1fr;
   align-items: center;
-  gap: 8px;
-  min-height: 48px;
+  gap: 5px;
+  min-height: 32px;
   border: 0;
   background: transparent;
-  padding: 8px;
+  padding: 4px 5px;
   text-align: left;
   pointer-events: none;
+}
+
+.navTargetSelect strong {
+  font-size: 12px;
 }
 
 .navTargetSelect:hover {
   background: transparent;
 }
 
+.navTarget .tag {
+  font-size: 10px;
+  margin: 0 3px 0 0;
+  padding: 0 4px;
+}
+
 .navTarget small {
   display: block;
-  margin-top: 2px;
+  margin-top: 1px;
   color: #9fb1c1;
+  font-size: 11px;
   font-weight: 500;
+  line-height: 1.2;
 }
 
 .navGo {
-  min-height: 48px;
-  padding: 6px 8px;
+  min-height: 32px;
+  padding: 4px 6px;
+  font-size: 12px;
   background: #2f4a38;
   border-color: #5f896c;
 }
@@ -654,45 +877,43 @@ pre {
 }
 
 .exploration {
-  background: #0f1317;
-  border: 1px solid #2b333b;
-  border-radius: 6px;
   display: grid;
-  gap: 8px;
-  padding: 10px;
+  gap: 5px;
+  padding: 0;
 }
 
 .explorationStats {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
+  gap: 8px;
 }
 
 .explorationStats div {
-  border: 1px solid #2b333b;
-  border-radius: 6px;
-  background: #0f1317;
-  padding: 7px 8px;
+  padding: 0;
 }
 
 .explorationStats span {
   display: block;
   color: #9fb1c1;
-  font-size: 12px;
+  font-size: 10px;
+  line-height: 1.15;
+  text-transform: uppercase;
 }
 
 .explorationStats strong {
   display: block;
-  margin-top: 2px;
+  font-size: 13px;
+  line-height: 1.2;
+  margin-top: 1px;
 }
 
 .explorationStatus {
-  min-height: 24px;
+  min-height: 18px;
 }
 
 .explorationProgress {
   display: grid;
-  gap: 5px;
+  gap: 3px;
 }
 
 .explorationProgressMeta {
@@ -705,14 +926,13 @@ pre {
 .explorationProgressMeta span,
 .explorationProgress small {
   color: #9fb1c1;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .explorationProgressTrack {
   background: #0b0e11;
-  border: 1px solid #2b333b;
   border-radius: 999px;
-  height: 9px;
+  height: 5px;
   overflow: hidden;
 }
 
@@ -722,13 +942,10 @@ pre {
   height: 100%;
 }
 
-.explorationSweep {
-  align-items: center;
-  color: #9fb1c1;
-  display: flex;
-  flex-wrap: wrap;
-  font-size: 12px;
-  gap: 6px;
+.exploration .tag {
+  font-size: 10px;
+  margin-top: 0;
+  padding: 0 4px;
 }
 
 button:disabled {

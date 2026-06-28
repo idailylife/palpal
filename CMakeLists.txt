@@ -15,6 +15,8 @@ set(PALPAL_GAME_BIN "${SDLPAL_DIR}/unix/sdlpal" CACHE FILEPATH "Patched SDLPAL e
 set(PALPAL_HOST "127.0.0.1" CACHE STRING "Debug server host")
 set(PALPAL_PORT "8765" CACHE STRING "Debug server port")
 set(PALPAL_SAVE_SLOT "0" CACHE STRING "Save slot loaded by SDLPAL agent mode")
+set(PALPAL_CHECKPOINT_SLOT "99" CACHE STRING "Private save slot used by PALPAL checkpoints")
+set(PALPAL_START_MODE "wait" CACHE STRING "Agent startup mode: wait for Web UI or load PALPAL_SAVE_SLOT")
 option(PALPAL_STRICT_WARNINGS "Enable compiler warnings for vendored SDLPAL sources" OFF)
 option(PALPAL_QUIET_VENDOR_WARNINGS "Suppress compiler warnings from vendored SDLPAL sources during normal builds" ON)
 
@@ -26,6 +28,8 @@ set(PALPAL_ENV
     "PALPAL_HOST=${PALPAL_HOST}"
     "PALPAL_PORT=${PALPAL_PORT}"
     "PALPAL_SAVE_SLOT=${PALPAL_SAVE_SLOT}"
+    "PALPAL_CHECKPOINT_SLOT=${PALPAL_CHECKPOINT_SLOT}"
+    "PALPAL_START_MODE=${PALPAL_START_MODE}"
 )
 
 set(SDLPAL_SOURCE_DIRS

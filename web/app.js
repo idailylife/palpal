@@ -5,20 +5,16 @@ const jsonRefreshEl = document.getElementById("jsonRefresh");
 const jsonStatusEl = document.getElementById("jsonStatus");
 const agentEl = document.getElementById("agent");
 const summaryEl = document.getElementById("summary");
+const checkpointsEl = document.getElementById("checkpoints");
 const objectsEl = document.getElementById("objects");
 const navigationEl = document.getElementById("navigation");
 const explorationEl = document.getElementById("exploration");
-const dialogStatusEl = document.getElementById("dialogStatus");
 const dialogsEl = document.getElementById("dialogs");
 const eventsEl = document.getElementById("events");
 const inventoryEl = document.getElementById("inventory");
 const equipmentEl = document.getElementById("equipment");
 const frameCanvas = document.getElementById("frame");
 const fastDialogButton = document.getElementById("fastDialog");
-const exploreActionButton = document.getElementById("exploreAction");
-const sweepActionButton = document.getElementById("sweepAction");
-const clearTraceButton = document.getElementById("clearTraceAction");
-const exploreStepsInput = document.getElementById("exploreSteps");
 const connectionEl = document.getElementById("connection");
 const runtimeStatusEl = document.getElementById("runtimeStatus");
 const overlay = document.getElementById("overlay");
@@ -27,9 +23,6 @@ const ctx = overlay.getContext("2d");
 
 let latestState = null;
 let selectedRoute = null;
-let lastExploreResult = null;
-let exploreRequestInFlight = false;
-let sweepRequestInFlight = false;
 let activeNavigation = null;
 let navigationRefreshInFlightKey = null;
 let navigationRenderKey = null;
@@ -41,13 +34,18 @@ let navigationRouteRequestId = 0;
 let navigationDiagnosticKey = null;
 let explorationRenderKey = null;
 let summaryRenderKey = null;
-let dialogRenderKey = null;
 let dialogsRenderKey = null;
 let eventsRenderKey = null;
 let agentRenderKey = null;
 let agentRequestInFlight = false;
 let agentLastDecision = null;
 let agentError = null;
+let checkpoints = [];
+let checkpointsLoaded = false;
+let checkpointBusy = null;
+let checkpointStatus = "";
+let checkpointError = null;
+let checkpointRenderKey = null;
 let inventoryRenderKey = null;
 let equipmentRenderKey = null;
 let objectsRenderKey = null;
@@ -60,6 +58,7 @@ let frameConnected = false;
 let dialogAdvanceActive = false;
 let dialogAdvanceSending = false;
 let dialogAdvanceCount = 0;
+let dialogAdvanceStartMarker = null;
 const repeatableButtons = new Set(["up", "down", "left", "right"]);
 const actionCooldownMs = 180;
 const dialogAdvanceDelayMs = 500;
@@ -228,18 +227,6 @@ navigationEl.addEventListener("keydown", (event) => {
   }
 });
 
-document.addEventListener("click", (event) => {
-  const actionEl = event.target.closest("[data-explore-action]");
-  if (!actionEl) return;
-  if (actionEl.dataset.exploreAction === "step") {
-    exploreStep();
-  } else if (actionEl.dataset.exploreAction === "sweep") {
-    toggleExplorationSweep();
-  } else if (actionEl.dataset.exploreAction === "reset") {
-    resetExploration();
-  }
-});
-
 inventoryEl.addEventListener("click", (event) => {
   const actionEl = event.target.closest("[data-use-item]");
   if (!actionEl || !inventoryEl.contains(actionEl)) return;
@@ -251,6 +238,24 @@ agentEl.addEventListener("click", (event) => {
   if (!actionEl || !agentEl.contains(actionEl)) return;
   if (actionEl.dataset.agentAction === "decide") {
     askAgent();
+  }
+});
+
+checkpointsEl?.addEventListener("click", (event) => {
+  const actionEl = event.target.closest("[data-checkpoint-action]");
+  if (!actionEl || !checkpointsEl.contains(actionEl)) return;
+  const action = actionEl.dataset.checkpointAction;
+  const id = actionEl.dataset.checkpointId;
+  if (action === "save") {
+    saveCheckpoint();
+  } else if (action === "load" && id) {
+    loadCheckpoint(id);
+  } else if (action === "delete" && id) {
+    deleteCheckpoint(id);
+  } else if (action === "refresh") {
+    refreshCheckpoints();
+  } else if (action === "start-new") {
+    startNewGame();
   }
 });
 
@@ -432,33 +437,244 @@ function renderSummary(state) {
     .join(""), renderKey, summaryRenderKey);
 }
 
-function renderDialogStatus(state) {
+function checkpointFileSummary(checkpoint) {
+  const files = checkpoint.files || {};
+  const companionKeys = Object.keys(files).filter((key) => key.startsWith("companion/"));
+  const companionAvailable = companionKeys.filter((key) => files[key]?.available).length;
+  return {
+    gameAvailable: Boolean(files["game.rpg"]?.available),
+    companionAvailable,
+    companionTotal: companionKeys.length,
+  };
+}
+
+function formatCheckpointTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function renderCheckpoints(state) {
+  if (!checkpointsEl) return;
+  const existingMenu = checkpointsEl.querySelector(".checkpointMenu");
+  const menuOpen = Boolean(existingMenu?.open);
+  const existingInput = document.getElementById("checkpointLabel");
+  const existingLabel = existingInput?.value || "";
+  const labelHadFocus = document.activeElement === existingInput;
+  const labelSelectionStart = existingInput?.selectionStart ?? existingLabel.length;
+  const labelSelectionEnd = existingInput?.selectionEnd ?? labelSelectionStart;
+  const stateBusy = Boolean(checkpointBusy);
+  const startupWaiting = state?.status === "startup_waiting";
+  const stableMainGame = state?.in_main_game !== false && !state?._debug?.runtime_stale && !state?.dialog?.active && !state?.in_battle && !state?.entering_scene && !state?._debug?.action_pending;
+  const canSave = !stateBusy && stableMainGame;
+  const canLoad = !stateBusy && !state?._debug?.action_pending && (startupWaiting || stableMainGame);
+  const canStartNew = startupWaiting && !stateBusy && !state?._debug?.action_pending;
+  const renderKey = JSON.stringify({
+    loaded: checkpointsLoaded,
+    busy: checkpointBusy,
+    status: checkpointStatus,
+    error: checkpointError,
+    canSave,
+    canLoad,
+    canStartNew,
+    startupWaiting,
+    checkpoints: checkpoints.map((checkpoint) => [
+      checkpoint.id,
+      checkpoint.label,
+      checkpoint.created_at,
+      checkpoint.state?.scene_id,
+      checkpoint.state?.map_id,
+      checkpoint.state?.room_key,
+      checkpoint.state?.frame,
+      checkpoint.state?.dialog_active,
+      checkpoint.state?.entering_scene,
+      checkpointFileSummary(checkpoint),
+    ]),
+    menuOpen,
+  });
+  if (checkpointRenderKey === renderKey) return;
+
+  const defaultStatus = startupWaiting
+    ? "Game is waiting for a checkpoint or new game."
+    : (checkpointsLoaded ? `${checkpoints.length} saved` : "Loading...");
+  const statusText = checkpointError || checkpointStatus || defaultStatus;
+  const buttonText = checkpointBusy
+    ? checkpointStatus || "Checkpoint busy..."
+    : checkpointsLoaded
+      ? `Checkpoints (${checkpoints.length})`
+      : "Checkpoints";
+  const listHtml = checkpointsLoaded && checkpoints.length
+    ? checkpoints.map((checkpoint) => {
+        const fileSummary = checkpointFileSummary(checkpoint);
+        const label = checkpoint.label || checkpoint.id;
+        const scene = checkpoint.state || {};
+        const meta = [
+          `scene ${scene.scene_id ?? "-"}/${scene.map_id ?? "-"}`,
+          `room ${scene.room_key ?? "-"}`,
+          `frame ${scene.frame ?? "-"}`,
+          scene.dialog_active ? "dialog" : "",
+          scene.entering_scene ? "entering" : "",
+        ].filter(Boolean).join(" / ");
+        return `<div class="checkpointItem">
+          <div class="checkpointMeta">
+            <strong>${escapeHtml(label)}</strong>
+            <span>${escapeHtml(checkpoint.id)}<small>${escapeHtml(formatCheckpointTime(checkpoint.created_at))}</small></span>
+            <span>${escapeHtml(meta)}</span>
+            <span>
+              <span class="tag ${fileSummary.gameAvailable ? "tagReachable" : "tagUnreachable"}">game ${fileSummary.gameAvailable ? "ok" : "missing"}</span>
+              <span class="tag">companion ${fileSummary.companionAvailable}/${fileSummary.companionTotal}</span>
+            </span>
+          </div>
+          <div class="checkpointActions">
+            <button class="miniButton" data-checkpoint-action="load" data-checkpoint-id="${escapeHtml(checkpoint.id)}" ${canLoad ? "" : "disabled"}>Load</button>
+            <button class="miniButton" data-checkpoint-action="delete" data-checkpoint-id="${escapeHtml(checkpoint.id)}" ${stateBusy ? "disabled" : ""}>Delete</button>
+          </div>
+        </div>`;
+      }).join("")
+    : '<div class="navEmpty">No checkpoints yet.</div>';
+
+  checkpointsEl.innerHTML = `
+    <details class="checkpointMenu" ${menuOpen ? "open" : ""}>
+      <summary>${escapeHtml(buttonText)}</summary>
+      <div class="checkpointMenuPanel">
+        <div class="checkpointControls">
+          <input id="checkpointLabel" type="text" maxlength="120" placeholder="short label" value="${escapeHtml(existingLabel)}" ${stateBusy ? "disabled" : ""} />
+          <button id="checkpointSave" data-checkpoint-action="save" ${canSave ? "" : "disabled"}>${checkpointBusy === "saving" ? "Saving..." : "Save"}</button>
+        </div>
+        ${startupWaiting ? `<button class="startupButton" data-checkpoint-action="start-new" ${canStartNew ? "" : "disabled"}>${checkpointBusy === "starting" ? "Starting..." : "Start New Game"}</button>` : ""}
+        <div class="checkpointMenuMeta">
+          <div id="checkpointStatus" class="${checkpointError ? "checkpointStatus is-error" : "checkpointStatus"}">${escapeHtml(statusText)}</div>
+          <button class="miniButton" data-checkpoint-action="refresh" ${stateBusy ? "disabled" : ""}>Refresh</button>
+        </div>
+        <div class="checkpointList">${listHtml}</div>
+      </div>
+    </details>
+  `;
+  if (labelHadFocus && !stateBusy) {
+    const nextInput = document.getElementById("checkpointLabel");
+    if (nextInput) {
+      nextInput.focus();
+      nextInput.setSelectionRange(labelSelectionStart, labelSelectionEnd);
+    }
+  }
+  checkpointRenderKey = renderKey;
+}
+
+function renderDialogCurrent(state) {
   const dialog = state.dialog || {};
   const active = Boolean(dialog.active);
-  const rows = active
+  const visibility = dialog.visible ? "visible" : dialog.held ? "held" : "hidden";
+  const meta = active
     ? [
-        ["status", '<span class="tag tagDialog">active</span>'],
-        ["visible", dialog.visible ? "yes" : dialog.held ? "held" : "no"],
-        ["position", dialog.position || "-"],
-        ["line", dialog.current_line ?? "-"],
-        ["text", `${dialog.text_position?.x ?? "-"}, ${dialog.text_position?.y ?? "-"}`],
-        ["rng", dialog.playing_rng ? "yes" : "no"],
-      ]
-    : [["status", '<span class="tag">inactive</span>']];
-
-  const renderKey = JSON.stringify({
+        dialog.position || "active",
+        `line ${dialog.current_line ?? "-"}`,
+        visibility,
+        dialog.playing_rng ? "rng" : "",
+      ].filter(Boolean).join(" / ")
+    : "inactive";
+  const text = active ? (dialog.latest_event?.text || "") : "";
+  const key = JSON.stringify({
     active,
-    rows,
+    meta,
+    text,
   });
-  dialogRenderKey = setPanelHtml(dialogStatusEl, rows
-    .map(([key, value]) => `<div>${key}</div><strong>${value ?? "-"}</strong>`)
-    .join(""), renderKey, dialogRenderKey, () => {
-      dialogStatusEl.className = `dialogStatus ${active ? "is-active" : ""}`;
-    });
+  const html = `<div class="dialogCurrent ${active ? "is-active" : ""}">
+    <strong>${active ? '<span class="tag tagDialog">active</span>' : '<span class="tag">inactive</span>'}</strong>
+    <span>${escapeHtml(meta)}${text ? `<small>${escapeHtml(text)}</small>` : ""}</span>
+  </div>`;
+  return { html, key };
 }
 
 function canAdvanceDialog(state) {
   return Boolean(state?.dialog?.active) && !state?.in_battle && !state?._debug?.runtime_stale;
+}
+
+function dialogText(dialog) {
+  return String(dialog?.text || "").trim();
+}
+
+function dialogSourceKeys(dialog) {
+  const keys = [];
+  if (dialog?.source_key) keys.push(String(dialog.source_key));
+  if (Array.isArray(dialog?.source_keys)) {
+    for (const key of dialog.source_keys) {
+      if (key) keys.push(String(key));
+    }
+  }
+  return [...new Set(keys)];
+}
+
+function dialogMarkerFromEntry(dialog) {
+  if (!dialog) return null;
+  return {
+    time: Number.isFinite(Number(dialog.time)) ? Number(dialog.time) : null,
+    sourceKeys: dialogSourceKeys(dialog),
+  };
+}
+
+function dialogEntryMatchesMarker(dialog, marker) {
+  if (!dialog || !marker?.sourceKeys?.length) return false;
+  const keys = new Set(dialogSourceKeys(dialog));
+  return marker.sourceKeys.some((key) => keys.has(key));
+}
+
+function dialogAdvanceInitialMarker(state) {
+  const dialogs = state?._debug?.recent_dialogs || [];
+  if (!dialogs.length) return null;
+
+  const latestDialog = dialogs[dialogs.length - 1];
+  const latestText = dialogText(latestDialog);
+  const activeText = String(state?.dialog?.latest_event?.text || "").trim();
+  if (state?.dialog?.active && activeText && latestText && (latestText === activeText || latestText.endsWith(activeText))) {
+    return dialogMarkerFromEntry(dialogs[dialogs.length - 2]);
+  }
+  return dialogMarkerFromEntry(latestDialog);
+}
+
+function dialogIdentity(dialog) {
+  if (!dialog || dialog.speaker_hint === "\u7cfb\u7edf") return null;
+  const sceneId = dialog.scene_id ?? "";
+  const mapId = dialog.map_id ?? "";
+  const roomKey = dialog.room_key ?? "";
+  if (dialog.event_object_id != null && dialog.event_object_id !== "") {
+    return `object:${sceneId}:${mapId}:${roomKey}:${dialog.event_object_id}`;
+  }
+  if (dialog.speaker_hint) {
+    return `speaker:${sceneId}:${mapId}:${roomKey}:${dialog.speaker_hint}`;
+  }
+  return null;
+}
+
+function dialogAdvanceRecentDialogs(state) {
+  const dialogs = state?._debug?.recent_dialogs || [];
+  const marker = dialogAdvanceStartMarker;
+  if (!marker) return dialogs.slice();
+
+  const markerIndex = dialogs.findIndex((dialog) => dialogEntryMatchesMarker(dialog, marker));
+  if (markerIndex >= 0) return dialogs.slice(markerIndex + 1);
+
+  if (marker.time != null) {
+    return dialogs.filter((dialog) => {
+      const time = Number(dialog?.time);
+      return Number.isFinite(time) && time > marker.time;
+    });
+  }
+  return dialogs.slice();
+}
+
+function dialogAdvanceReachedRepeatedNpcLine(state) {
+  const candidates = dialogAdvanceRecentDialogs(state)
+    .map((dialog) => ({
+      identity: dialogIdentity(dialog),
+      text: dialogText(dialog),
+    }))
+    .filter((dialog) => dialog.identity && dialog.text);
+  if (candidates.length < 2) return false;
+
+  const previous = candidates[candidates.length - 2];
+  const current = candidates[candidates.length - 1];
+  return previous.identity === current.identity && previous.text === current.text;
 }
 
 function renderFastDialogButton(state) {
@@ -467,6 +683,7 @@ function renderFastDialogButton(state) {
   const available = canAdvanceDialog(state);
   if (dialogAdvanceActive && !available) {
     dialogAdvanceActive = false;
+    dialogAdvanceStartMarker = null;
   }
 
   fastDialogButton.disabled = !dialogAdvanceActive && !available;
@@ -480,12 +697,14 @@ function startDialogAdvance() {
   if (!canAdvanceDialog(latestState)) return;
   dialogAdvanceActive = true;
   dialogAdvanceCount = 0;
+  dialogAdvanceStartMarker = dialogAdvanceInitialMarker(latestState);
   renderFastDialogButton(latestState);
   maybeContinueDialogAdvance(latestState);
 }
 
 function stopDialogAdvance() {
   dialogAdvanceActive = false;
+  dialogAdvanceStartMarker = null;
   renderFastDialogButton(latestState);
 }
 
@@ -502,6 +721,10 @@ function scheduleDialogAdvanceRefresh() {
 function maybeContinueDialogAdvance(state) {
   if (!dialogAdvanceActive || dialogAdvanceSending) return;
   if (!canAdvanceDialog(state) || dialogAdvanceCount >= dialogAdvanceMaxPresses) {
+    stopDialogAdvance();
+    return;
+  }
+  if (dialogAdvanceReachedRepeatedNpcLine(state)) {
     stopDialogAdvance();
     return;
   }
@@ -531,30 +754,43 @@ async function advanceDialogOnce() {
 }
 
 function renderDialogs(state) {
+  const current = renderDialogCurrent(state);
   const dialogs = (state._debug?.recent_dialogs || []).slice(-8).reverse();
   if (!dialogs.length) {
-    dialogsRenderKey = setPanelHtml(dialogsEl, '<div class="navEmpty">No dialog history yet.</div>', "empty", dialogsRenderKey);
+    dialogsRenderKey = setPanelHtml(
+      dialogsEl,
+      `${current.html}<div class="navEmpty">No dialog history yet.</div>`,
+      `${current.key}:empty`,
+      dialogsRenderKey,
+    );
     return;
   }
 
-  const renderKey = JSON.stringify(dialogs.map((dialog) => [
-    dialog.source_key,
-    dialog.frame,
-    dialog.speaker_hint,
-    dialog.text,
-    dialog.scene_id,
-    dialog.map_id,
-    dialog.event_object_id,
-    dialog.message_id,
-  ]));
-  dialogsRenderKey = setPanelHtml(dialogsEl, dialogs
+  const renderKey = JSON.stringify([
+    current.key,
+    dialogs.map((dialog) => [
+      dialog.source_key,
+      dialog.frame,
+      dialog.speaker_hint,
+      dialog.text,
+      dialog.scene_id,
+      dialog.map_id,
+      dialog.event_object_id,
+      dialog.message_id,
+      dialog.message_ids,
+    ]),
+  ]);
+  dialogsRenderKey = setPanelHtml(dialogsEl, current.html + dialogs
     .map((dialog) => {
       const speaker = dialog.speaker_hint ? escapeHtml(dialog.speaker_hint) : "unknown";
+      const messageMeta = dialog.message_ids?.length
+        ? `msgs #${dialog.message_ids.join(", #")}`
+        : (dialog.message_id != null ? `msg #${dialog.message_id}` : "");
       const meta = [
         `frame ${dialog.frame ?? "-"}`,
         `scene ${dialog.scene_id ?? "-"}/${dialog.map_id ?? "-"}`,
         dialog.event_object_id ? `obj #${dialog.event_object_id}` : "",
-        dialog.message_id != null ? `msg #${dialog.message_id}` : "",
+        messageMeta,
       ].filter(Boolean).join(" / ");
       return `<div class="dialogEvent">
         <strong>${speaker}</strong>
@@ -677,16 +913,61 @@ function renderAgentError(error) {
   </div>`;
 }
 
+function agentButtonText(status) {
+  if (status?.running) {
+    const round = Number(status.round || 0);
+    return round > 0 ? `Round ${round}...` : "Thinking...";
+  }
+  return agentRequestInFlight ? "Thinking..." : "Ask Agent";
+}
+
+function agentStatusText(status) {
+  if (agentError) return agentError;
+  if (status?.running) return status.message || "Waiting for agent.";
+  if (agentRequestInFlight) return "Waiting for agent.";
+  if (status?.phase === "completed") return status.message || "Decision ready. No actions were executed.";
+  if (status?.phase === "error") return status.error || status.message || "Agent request failed.";
+  return "No actions are executed.";
+}
+
+function renderAgentProgress(status) {
+  if (!status?.running) return "";
+  const fields = [
+    status.backend ? `backend ${status.backend}` : "",
+    status.phase ? `phase ${status.phase}` : "",
+    Number(status.round || 0) > 0 ? `round ${status.round}` : "",
+    Number(status.tool_calls || 0) > 0 ? `tools ${status.tool_calls}` : "",
+    status.current_tool ? `current ${status.current_tool}` : "",
+  ].filter(Boolean);
+  if (!fields.length) return "";
+  return `<div class="agentProgress">${escapeHtml(fields.join(" · "))}</div>`;
+}
+
 function renderAgent(state) {
   const log = state._debug?.recent_agent_decisions || [];
+  const agentStatus = state._debug?.agent_status || {};
+  const historyOpen = Boolean(agentEl.querySelector(".agentHistory")?.open);
   const decisionLog = log.filter((entry) => entry?.decision);
   const latestLogged = decisionLog.length ? decisionLog[decisionLog.length - 1] : null;
   const decision = agentError ? null : (agentLastDecision || latestLogged?.decision || null);
   const history = decisionLog.slice(-8).reverse();
-  const status = agentRequestInFlight ? "loading" : agentError ? "error" : decision ? "ready" : "idle";
+  const agentBusy = agentRequestInFlight || Boolean(agentStatus.running);
+  const status = agentBusy ? "loading" : agentError ? "error" : decision ? "ready" : "idle";
   const renderKey = JSON.stringify({
     status,
     error: agentError,
+    agentStatus: [
+      agentStatus.running,
+      agentStatus.backend,
+      agentStatus.model,
+      agentStatus.phase,
+      agentStatus.round,
+      agentStatus.tool_calls,
+      agentStatus.current_tool,
+      agentStatus.message,
+      agentStatus.error,
+      agentStatus.updated_at,
+    ],
     decision,
     stateContext: agentRuntimeKey(state),
     history: history.map((entry) => [
@@ -699,19 +980,20 @@ function renderAgent(state) {
   });
   agentRenderKey = setPanelHtml(agentEl, `
     <div class="agentControls">
-      <button data-agent-action="decide" ${agentRequestInFlight ? "disabled" : ""}>${agentRequestInFlight ? "Asking..." : "Ask Agent"}</button>
-      <span>${agentError ? escapeHtml(agentError) : "No actions are executed."}</span>
+      <button data-agent-action="decide" ${agentBusy ? "disabled" : ""}>${escapeHtml(agentButtonText(agentStatus))}</button>
+      <span class="agentStatusText">${escapeHtml(agentStatusText(agentStatus))}</span>
     </div>
+    ${renderAgentProgress(agentStatus)}
     ${agentError ? renderAgentError(agentError) : renderAgentDecision(decision)}
-    <div class="agentHistory">
-      <h3>Decision History</h3>
+    <details class="agentHistory" ${historyOpen ? "open" : ""}>
+      <summary>Decision History <span>${history.length}</span></summary>
       ${history.length ? history.map((entry) => `
         <div class="agentHistoryItem">
           <strong>#${entry.turn ?? "-"} ${escapeHtml(entry.decision?.recommended_intent || "unknown")}</strong>
           <span>${escapeHtml(entry.decision?.summary || "")}</span>
         </div>
       `).join("") : '<div class="navEmpty">No agent decisions yet.</div>'}
-    </div>
+    </details>
   `, renderKey, agentRenderKey);
 }
 
@@ -1025,20 +1307,6 @@ function navigationRunText(status) {
   return labels[status] || "Stop";
 }
 
-function exploreStepCount() {
-  const raw = Number.parseInt(exploreStepsInput?.value || "4", 10);
-  if (!Number.isFinite(raw)) return 4;
-  return Math.max(1, raw);
-}
-
-function currentSweep(state) {
-  return state?._exploration?.sweep || state?._debug?.exploration_sweep || null;
-}
-
-function sweepIsRunning(state) {
-  return Boolean(currentSweep(state)?.running);
-}
-
 function explorationCoverage(exploration) {
   const explored = Number(exploration?.explored ?? exploration?.visited ?? 0);
   const explorable = Number(exploration?.explorable ?? 0);
@@ -1049,40 +1317,17 @@ function explorationCoverage(exploration) {
   return { explored, explorable, percent };
 }
 
-function syncExploreAction(state) {
-  const exploration = state?._exploration;
-  const sweep = currentSweep(state);
-  const sweepRunning = Boolean(sweep?.running);
-  const disabled = exploreRequestInFlight || sweepRequestInFlight || sweepRunning || !exploration || exploration.status !== "ok" || exploration.complete || Boolean(state?.dialog?.active);
-  if (exploreActionButton) {
-    exploreActionButton.disabled = disabled;
-  }
-  if (sweepActionButton) {
-    sweepActionButton.disabled = sweepRequestInFlight || (!sweepRunning && (!exploration || exploration.status !== "ok" || Boolean(state?.dialog?.active)));
-    sweepActionButton.textContent = sweepRunning ? "Stop Sweep" : "Sweep";
-  }
-  if (clearTraceButton) {
-    clearTraceButton.disabled = sweepRequestInFlight || sweepRunning || !exploration;
-  }
-}
-
 function renderExploration(state) {
   const exploration = state._exploration;
   if (!exploration) {
-    syncExploreAction(state);
     explorationRenderKey = setPanelHtml(explorationEl, '<div class="navEmpty">No exploration state yet.</div>', "empty", explorationRenderKey);
     return;
   }
 
-  const resultStatus = lastExploreResult?.status;
   const complete = exploration.complete ? '<span class="tag tagReachable">complete</span>' : "";
-  const sweep = currentSweep(state) || {};
-  const sweepRunning = Boolean(sweep.running);
-  const sweepStatus = sweepRunning ? "running" : sweep.stop_requested ? "stopping" : sweep.finished_reason || "stopped";
-  const status = resultStatus || exploration.status;
+  const status = exploration.status;
   const coverage = explorationCoverage(exploration);
   const renderKey = JSON.stringify({
-    resultStatus,
     status: exploration.status,
     visited: exploration.visited,
     explored: exploration.explored,
@@ -1092,13 +1337,7 @@ function renderExploration(state) {
     complete: exploration.complete,
     dialog: Boolean(state.dialog?.active),
     coveragePercent: coverage.percent,
-    sweepRunning,
-    sweepStatus,
-    sweepSegments: sweep.segments_sent,
-    sweepSteps: sweep.steps_sent,
-    sweepUpdatedAt: sweep.updated_at,
   });
-  syncExploreAction(state);
   explorationRenderKey = setPanelHtml(explorationEl, `
     <div class="explorationStats">
       <div><span>explored</span><strong>${exploration.explored ?? exploration.visited ?? 0}</strong></div>
@@ -1118,10 +1357,6 @@ function renderExploration(state) {
     <div class="explorationStatus">
       <span class="tag">${explorationStatusText(status)}</span>
       ${complete}
-    </div>
-    <div class="explorationSweep">
-      <span class="tag ${sweepRunning ? "tagReachable" : ""}">${explorationStatusText(sweepStatus)}</span>
-      <span>${Number(sweep.segments_sent || 0)} segments / ${Number(sweep.steps_sent || 0)} steps</span>
     </div>
   `, renderKey, explorationRenderKey);
 }
@@ -1377,8 +1612,8 @@ function render(state) {
   renderJson(state);
   renderRuntimeStatus(state);
   renderSummary(state);
+  renderCheckpoints(state);
   renderAgent(state);
-  renderDialogStatus(state);
   renderFastDialogButton(state);
   renderDialogs(state);
   renderEvents(state);
@@ -1443,6 +1678,142 @@ async function refreshState() {
   const response = await fetch("/state");
   const state = await response.json();
   render(state);
+}
+
+async function refreshCheckpoints() {
+  try {
+    const response = await fetch("/checkpoints");
+    const result = await response.json();
+    if (!response.ok || result.ok === false) {
+      throw new Error(result.error || `checkpoints failed: ${response.status}`);
+    }
+    checkpoints = result.checkpoints || [];
+    checkpointsLoaded = true;
+    checkpointError = null;
+  } catch (error) {
+    checkpointError = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (latestState) renderCheckpoints(latestState);
+  }
+}
+
+function resetLocalAfterCheckpointLoad() {
+  navigationCache.clear();
+  selectedRoute = null;
+  activeNavigation = null;
+  navigationRefreshInFlightKey = null;
+  navigationRenderKey = null;
+  navigationLatestEnvironmentKey = null;
+  navigationStableEnvironmentKey = null;
+  navigationRouteRequestId += 1;
+  if (navigationRefreshTimer) {
+    clearTimeout(navigationRefreshTimer);
+    navigationRefreshTimer = null;
+  }
+  agentError = null;
+  agentLastDecision = null;
+}
+
+async function saveCheckpoint() {
+  if (checkpointBusy) return;
+  const label = document.getElementById("checkpointLabel")?.value || "";
+  checkpointBusy = "saving";
+  checkpointStatus = "Saving...";
+  checkpointError = null;
+  if (latestState) renderCheckpoints(latestState);
+  try {
+    const response = await fetch("/checkpoints/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label }),
+    });
+    const result = await response.json();
+    if (!response.ok || result.ok === false) {
+      throw new Error(result.error || `save failed: ${response.status}`);
+    }
+    checkpointStatus = "Saved.";
+    await refreshCheckpoints();
+  } catch (error) {
+    checkpointError = error instanceof Error ? error.message : String(error);
+  } finally {
+    checkpointBusy = null;
+    if (latestState) renderCheckpoints(latestState);
+  }
+}
+
+async function loadCheckpoint(id) {
+  if (checkpointBusy) return;
+  if (!window.confirm(`Load checkpoint ${id}? Current live game state will be replaced.`)) return;
+  checkpointBusy = `loading:${id}`;
+  checkpointStatus = "Loading...";
+  checkpointError = null;
+  if (latestState) renderCheckpoints(latestState);
+  try {
+    const response = await fetch("/checkpoints/load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    const result = await response.json();
+    if (!response.ok || result.ok === false) {
+      throw new Error(result.error || `load failed: ${response.status}`);
+    }
+    checkpointStatus = "Loaded.";
+    resetLocalAfterCheckpointLoad();
+    await refreshCheckpoints();
+    await refreshState();
+  } catch (error) {
+    checkpointError = error instanceof Error ? error.message : String(error);
+  } finally {
+    checkpointBusy = null;
+    if (latestState) renderCheckpoints(latestState);
+  }
+}
+
+async function startNewGame() {
+  if (checkpointBusy) return;
+  checkpointBusy = "starting";
+  checkpointStatus = "Starting new game...";
+  checkpointError = null;
+  if (latestState) renderCheckpoints(latestState);
+  try {
+    const response = await fetch("/startup/new", { method: "POST" });
+    const result = await response.json();
+    if (!response.ok || result.ok === false) {
+      throw new Error(result.error || `start failed: ${response.status}`);
+    }
+    checkpointStatus = "Started.";
+    resetLocalAfterCheckpointLoad();
+    await refreshState();
+  } catch (error) {
+    checkpointError = error instanceof Error ? error.message : String(error);
+  } finally {
+    checkpointBusy = null;
+    if (latestState) renderCheckpoints(latestState);
+  }
+}
+
+async function deleteCheckpoint(id) {
+  if (checkpointBusy) return;
+  if (!window.confirm(`Delete checkpoint ${id}?`)) return;
+  checkpointBusy = `deleting:${id}`;
+  checkpointStatus = "Deleting...";
+  checkpointError = null;
+  if (latestState) renderCheckpoints(latestState);
+  try {
+    const response = await fetch(`/checkpoints/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const result = await response.json();
+    if (!response.ok || result.ok === false) {
+      throw new Error(result.error || `delete failed: ${response.status}`);
+    }
+    checkpointStatus = "Deleted.";
+    await refreshCheckpoints();
+  } catch (error) {
+    checkpointError = error instanceof Error ? error.message : String(error);
+  } finally {
+    checkpointBusy = null;
+    if (latestState) renderCheckpoints(latestState);
+  }
 }
 
 async function askAgent() {
@@ -1736,73 +2107,6 @@ async function navigateToTarget(targetId) {
   }
 }
 
-async function exploreStep() {
-  if (exploreRequestInFlight || sweepIsRunning(latestState)) return;
-  const maxSteps = exploreStepCount();
-  if (exploreStepsInput) exploreStepsInput.value = String(maxSteps);
-  exploreRequestInFlight = true;
-  lastExploreResult = { status: "stepping" };
-  syncExploreAction(latestState);
-  if (latestState) renderExploration(latestState);
-  try {
-    const response = await fetch("/exploration/step", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ max_steps: maxSteps }),
-    });
-    lastExploreResult = await response.json();
-    if (latestState) {
-      if (lastExploreResult.exploration) {
-        latestState._exploration = lastExploreResult.exploration;
-      }
-      render(latestState);
-    }
-  } finally {
-    exploreRequestInFlight = false;
-    syncExploreAction(latestState);
-  }
-}
-
-async function toggleExplorationSweep() {
-  if (sweepRequestInFlight) return;
-  const running = sweepIsRunning(latestState);
-  sweepRequestInFlight = true;
-  lastExploreResult = { status: running ? "stopping" : "running" };
-  syncExploreAction(latestState);
-  if (latestState) renderExploration(latestState);
-  try {
-    const response = await fetch(running ? "/exploration/sweep/stop" : "/exploration/sweep/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    const result = await response.json();
-    lastExploreResult = { status: result.status || (running ? "stopping" : "running") };
-    if (latestState && result.sweep) {
-      latestState._exploration = {
-        ...(latestState._exploration || {}),
-        sweep: result.sweep,
-      };
-      latestState._debug = {
-        ...(latestState._debug || {}),
-        exploration_sweep: result.sweep,
-      };
-      render(latestState);
-    }
-    await refreshState();
-  } finally {
-    sweepRequestInFlight = false;
-    syncExploreAction(latestState);
-  }
-}
-
-async function resetExploration() {
-  if (sweepIsRunning(latestState)) return;
-  await fetch("/exploration/reset", { method: "POST" });
-  lastExploreResult = null;
-  await refreshState();
-}
-
 function renderFrame(buffer) {
   const view = new DataView(buffer);
   if (
@@ -1919,8 +2223,27 @@ document.querySelectorAll("[data-button]").forEach((button) => {
   });
 });
 
+function isEditableKeyTarget(target) {
+  return Boolean(target?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])"));
+}
+
+function checkpointMenuActive() {
+  const openMenu = checkpointsEl?.querySelector(".checkpointMenu[open]");
+  return Boolean(openMenu);
+}
+
+function shouldIgnoreGameKeydown(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  if (event.defaultPrevented) return true;
+  if (isEditableKeyTarget(target)) return true;
+  if (checkpointMenuActive()) return true;
+  return false;
+}
+
 window.addEventListener("keydown", (event) => {
   const target = event.target instanceof Element ? event.target : null;
+  if (shouldIgnoreGameKeydown(event)) return;
+
   if (
     (event.key === "Enter" || event.key === " ") &&
     target?.closest("button, summary")
@@ -1951,4 +2274,5 @@ window.addEventListener("keydown", (event) => {
 
 connectStream();
 connectFrames();
+refreshCheckpoints();
 setConnection();

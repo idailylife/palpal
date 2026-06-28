@@ -10,6 +10,8 @@ GAME_BIN="${PALPAL_GAME_BIN:-$ROOT/vendor/sdlpal/unix/sdlpal}"
 HOST="${PALPAL_HOST:-127.0.0.1}"
 PORT="${PALPAL_PORT:-8765}"
 SAVE_SLOT="${PALPAL_SAVE_SLOT:-0}"
+CHECKPOINT_SLOT="${PALPAL_CHECKPOINT_SLOT:-99}"
+START_MODE="${PALPAL_START_MODE:-wait}"
 HEADLESS="${PALPAL_HEADLESS:-1}"
 
 usage() {
@@ -30,7 +32,7 @@ usage() {
         '' \
         'Useful environment variables:' \
         '  PYTHON, NODE, PALPAL_RUNTIME_DIR, PALPAL_ASSET_DIR, PALPAL_GAME_BIN' \
-        '  PALPAL_HOST, PALPAL_PORT, PALPAL_SAVE_SLOT, PALPAL_HEADLESS' \
+        '  PALPAL_HOST, PALPAL_PORT, PALPAL_SAVE_SLOT, PALPAL_CHECKPOINT_SLOT, PALPAL_START_MODE, PALPAL_HEADLESS' \
         '  PALPAL_HEADLESS=0 starts a visible SDL window for video debugging.'
 }
 
@@ -105,6 +107,8 @@ run_game() {
             PALPAL_HEADLESS=1 \
             PALPAL_RUNTIME_DIR="$RUNTIME_DIR" \
             PALPAL_SAVE_SLOT="$SAVE_SLOT" \
+            PALPAL_CHECKPOINT_SLOT="$CHECKPOINT_SLOT" \
+            PALPAL_START_MODE="$START_MODE" \
             "$GAME_BIN"
     else
         exec env \
@@ -112,6 +116,8 @@ run_game() {
             PALPAL_HEADLESS=0 \
             PALPAL_RUNTIME_DIR="$RUNTIME_DIR" \
             PALPAL_SAVE_SLOT="$SAVE_SLOT" \
+            PALPAL_CHECKPOINT_SLOT="$CHECKPOINT_SLOT" \
+            PALPAL_START_MODE="$START_MODE" \
             "$GAME_BIN"
     fi
 }
@@ -251,7 +257,7 @@ case "$command" in
         run_visual_smoke
         ;;
     clean)
-        rm -rf "$RUNTIME_DIR"
+        prepare_live_runtime
         ;;
     help|-h|--help)
         usage

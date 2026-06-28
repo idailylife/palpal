@@ -1,7 +1,6 @@
 import json
 import os
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -79,27 +78,6 @@ class ExplorationTests(unittest.TestCase):
         room = debug.exploration_room(data, identity)
         room["visited"] = [f"{x},{y}" for x, y in visited]
         debug.write_exploration(data)
-
-    def pending_exploration_step(self, debug, state, visited=None):
-        if visited is not None:
-            self.seed_exploration_room(debug, state, visited)
-        result = debug.exploration_step(state, max_steps=2)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status"], "stepping")
-        try:
-            debug.action_path.unlink()
-        except FileNotFoundError:
-            pass
-        return result
-
-    def wait_for_sweep(self, debug, timeout=2.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            status = debug.exploration_sweep_status()
-            if not status["running"]:
-                return status
-            time.sleep(0.02)
-        self.fail("sweep did not finish before timeout")
 
     def test_update_marks_current_and_frontier(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -183,404 +161,6 @@ class ExplorationTests(unittest.TestCase):
             self.assertNotIn((2, 0), frontier)
             self.assertGreater(summary["blocked_edges"], 0)
 
-    def test_step_sends_straight_safe_segment(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
-            blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
-            state = make_state(width=5, height=5, start=(0, 4), blocked=blocked)
-            self.write_state(debug, state)
-            self.seed_exploration_room(debug, state, [(0, 4), (1, 3), (2, 2), (3, 1)])
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["status"], "stepping")
-            self.assertEqual(result["action"]["buttons"], ["up", "up", "up", "up"])
-            self.assertEqual(result["segment_steps"], 4)
-            self.assertEqual(result["segment_moves"], ["up", "up", "up", "up"])
-            self.assertEqual(result["planned_moves"], ["up", "up", "up", "up"])
-            self.assertEqual(result["target_frontier"], {"x": 64, "y": 0})
-            self.assertEqual(result["route"]["expected_node"], {"grid_x": 4, "grid_y": 0, "x": 64, "y": 0})
-            self.assertTrue(debug.action_path.exists())
-
-    def test_exploration_prefers_far_continuous_goal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(i, 25 - i) for i in range(23)}
-            corridor.add((1, 26))
-            blocked = {(x, y) for y in range(27) for x in range(27) if (x, y) not in corridor}
-            state = make_state(width=27, height=27, start=(0, 25), blocked=blocked, viewport={"x": 0, "y": 0})
-            self.write_state(debug, state)
-            self.seed_exploration_room(debug, state, [(i, 25 - i) for i in range(21)])
-
-            result = debug.exploration_step(state, max_steps=3)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["target_selection"], "distant_exploration_goal")
-            self.assertEqual(result["action"]["buttons"], ["up", "up", "up"])
-            self.assertEqual(result["target_goal"], {"x": 352, "y": 24})
-            self.assertEqual(result["remaining_steps"], 19)
-
-    def test_exploration_step_continues_along_distant_corridor(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(i, 25 - i) for i in range(23)}
-            blocked = {(x, y) for y in range(26) for x in range(23) if (x, y) not in corridor}
-            state = make_state(width=23, height=26, start=(0, 25), blocked=blocked, viewport={"x": 0, "y": 0})
-            self.write_state(debug, state)
-            self.seed_exploration_room(debug, state, [(i, 25 - i) for i in range(21)])
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["target_selection"], "distant_exploration_goal")
-            self.assertEqual(result["segment_moves"], ["up", "up", "up", "up"])
-            self.assertEqual(result["route"]["expected_node"], {"grid_x": 4, "grid_y": 21, "x": 64, "y": 168})
-
-    def test_nearby_remaining_frontier_keeps_exploration_incomplete(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            safe_nodes = {(0, 0), (1, 1), (2, 2), (0, 2), (2, 0)}
-            blocked = {(x, y) for y in range(3) for x in range(3) if (x, y) not in safe_nodes}
-            state = make_state(width=3, height=3, start=(1, 1), blocked=blocked)
-            self.write_state(debug, state)
-            visited = [node for node in safe_nodes if node != (0, 0)]
-            self.seed_exploration_room(debug, state, visited)
-
-            summary = debug.update_exploration(state)
-
-            frontier = {(node["grid_x"], node["grid_y"]) for node in summary["nodes"]["frontier"]}
-            self.assertFalse(summary["complete"])
-            self.assertEqual(summary["explored"], 4)
-            self.assertEqual(summary["explorable"], 5)
-            self.assertIn((0, 0), frontier)
-
-    def test_exploration_step_cleans_up_nearby_remaining_frontier(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            safe_nodes = {(0, 0), (1, 1), (2, 2), (0, 2), (2, 0)}
-            blocked = {(x, y) for y in range(3) for x in range(3) if (x, y) not in safe_nodes}
-            state = make_state(width=3, height=3, start=(1, 1), blocked=blocked)
-            self.write_state(debug, state)
-            visited = [node for node in safe_nodes if node != (0, 0)]
-            self.seed_exploration_room(debug, state, visited)
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["status"], "stepping")
-            self.assertEqual(result["action"]["buttons"], ["left"])
-            self.assertEqual(result["segment_steps"], 1)
-            self.assertEqual(result["route"]["expected_node"], {"grid_x": 0, "grid_y": 0, "x": 0, "y": 0})
-
-    def test_blocked_nearby_node_does_not_prevent_distant_goal(self):
-        blocker = {
-            "id": 74,
-            "x": 16,
-            "y": 40,
-            "state": 2,
-            "trigger_mode": 1,
-            "trigger_script": 8149,
-            "auto_script": 0,
-            "blocking": True,
-            "interactable": True,
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0), (1, 5)}
-            blocked = {(x, y) for y in range(6) for x in range(5) if (x, y) not in corridor}
-            state = make_state(width=5, height=6, start=(0, 4), objects=[blocker], blocked=blocked, viewport={"x": 0, "y": 32})
-            self.write_state(debug, state)
-            self.seed_exploration_room(debug, state, [(0, 4), (1, 3), (2, 2), (3, 1)])
-
-            result = debug.exploration_step(state, max_steps=2)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["target_selection"], "distant_exploration_goal")
-            self.assertEqual(result["action"]["buttons"], ["up", "up"])
-            self.assertTrue(debug.action_path.exists())
-
-    def test_viewport_does_not_limit_distant_exploration_goal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0), (1, 5)}
-            blocked = {(x, y) for y in range(6) for x in range(5) if (x, y) not in corridor}
-            state = make_state(width=5, height=6, start=(0, 4), blocked=blocked, viewport={"x": 1000, "y": 1000})
-            self.write_state(debug, state)
-            self.seed_exploration_room(debug, state, [(0, 4), (1, 3), (2, 2), (3, 1)])
-
-            result = debug.exploration_step(state, max_steps=2)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["target_selection"], "distant_exploration_goal")
-            self.assertEqual(result["action"]["buttons"], ["up", "up"])
-            self.assertTrue(debug.action_path.exists())
-
-    def test_no_viewport_uses_same_distant_goal_selection(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0), (1, 5)}
-            blocked = {(x, y) for y in range(6) for x in range(5) if (x, y) not in corridor}
-            state = make_state(width=5, height=6, start=(0, 4), blocked=blocked)
-            self.write_state(debug, state)
-            self.seed_exploration_room(debug, state, [(0, 4), (1, 3), (2, 2), (3, 1)])
-
-            result = debug.exploration_step(state, max_steps=2)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["target_selection"], "distant_exploration_goal")
-            self.assertEqual(result["action"]["buttons"], ["up", "up"])
-            self.assertEqual(result["target_goal"], {"x": 64, "y": 0})
-
-    def test_partial_pending_exploration_progress_sticks_to_target_goal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
-            blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
-            state = make_state(width=5, height=5, start=(1, 3), blocked=blocked)
-            self.write_state(debug, state)
-
-            identity = debug.room_identity(state)
-            data = debug.empty_exploration()
-            room = debug.exploration_room(data, identity)
-            room["visited"] = ["0,4"]
-            room["frontier"] = ["1,3"]
-            room["last_route"] = {
-                "nodes": [
-                    {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                    {"grid_x": 1, "grid_y": 3, "x": 16, "y": 24},
-                    {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                    {"grid_x": 3, "grid_y": 1, "x": 48, "y": 8},
-                    {"grid_x": 4, "grid_y": 0, "x": 64, "y": 0},
-                ],
-                "start_node": {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                "expected_node": {"grid_x": 4, "grid_y": 0, "x": 64, "y": 0},
-                "target_frontier": {"x": 64, "y": 0},
-                "target_goal": {"x": 64, "y": 0},
-                "pending": True,
-                "sent_at": time.time() - 10,
-            }
-            debug.write_exploration(data)
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["status"], "stepping")
-            self.assertEqual(result["target_selection"], "sticky_exploration_goal")
-            self.assertEqual(result["action"]["buttons"], ["up", "up", "up"])
-            self.assertEqual(result["target_goal"], {"x": 64, "y": 0})
-            self.assertTrue(result["route"]["pending"])
-            room = debug.exploration_room(debug.read_exploration(), identity)
-            self.assertEqual(room["last_route"]["start_node"], {"grid_x": 1, "grid_y": 3, "x": 16, "y": 24})
-
-    def test_completed_segment_continues_to_sticky_goal_instead_of_far_branch(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            main = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
-            branch = {(3, 3), (4, 4), (5, 5), (6, 6)}
-            safe_nodes = main | branch
-            blocked = {(x, y) for y in range(7) for x in range(7) if (x, y) not in safe_nodes}
-            state = make_state(width=7, height=7, start=(2, 2), blocked=blocked)
-            self.write_state(debug, state)
-
-            identity = debug.room_identity(state)
-            data = debug.empty_exploration()
-            room = debug.exploration_room(data, identity)
-            room["visited"] = ["0,4"]
-            room["last_route"] = {
-                "nodes": [
-                    {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                    {"grid_x": 1, "grid_y": 3, "x": 16, "y": 24},
-                    {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                ],
-                "start_node": {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                "expected_node": {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                "target_frontier": {"x": 64, "y": 0},
-                "target_goal": {"x": 64, "y": 0},
-                "pending": True,
-                "sent_at": time.time() - 10,
-            }
-            debug.write_exploration(data)
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["status"], "stepping")
-            self.assertEqual(result["target_selection"], "sticky_exploration_goal")
-            self.assertEqual(result["action"]["buttons"], ["up", "up"])
-            self.assertEqual(result["target_goal"], {"x": 64, "y": 0})
-            room = debug.exploration_room(debug.read_exploration(), identity)
-            self.assertIn("0,4", room["visited"])
-            self.assertIn("1,3", room["visited"])
-            self.assertIn("2,2", room["visited"])
-            self.assertNotIn("3,1", room["visited"])
-            self.assertNotIn("3,3", room["visited"])
-
-    def test_deviated_pending_exploration_records_only_current_node(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            safe_nodes = {(0, 4), (1, 3), (2, 2), (3, 3)}
-            blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in safe_nodes}
-            state = make_state(width=5, height=5, start=(3, 3), blocked=blocked)
-            self.write_state(debug, state)
-
-            identity = debug.room_identity(state)
-            data = debug.empty_exploration()
-            room = debug.exploration_room(data, identity)
-            room["visited"] = ["0,4"]
-            room["last_route"] = {
-                "nodes": [
-                    {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                    {"grid_x": 1, "grid_y": 3, "x": 16, "y": 24},
-                    {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                ],
-                "start_node": {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                "expected_node": {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                "target_frontier": {"x": 32, "y": 16},
-                "target_goal": {"x": 32, "y": 16},
-                "pending": True,
-                "sent_at": time.time() - 10,
-            }
-            debug.write_exploration(data)
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["status"], "position_deviated")
-            room = debug.exploration_room(debug.read_exploration(), identity)
-            self.assertIn("0,4", room["visited"])
-            self.assertIn("3,3", room["visited"])
-            self.assertNotIn("1,3", room["visited"])
-            self.assertNotIn("2,2", room["visited"])
-            self.assertFalse(room["last_route"]["pending"])
-            self.assertEqual(
-                room["last_route"]["position_deviated"]["current"],
-                {"grid_x": 3, "grid_y": 3, "x": 48, "y": 24},
-            )
-
-    def test_interrupted_route_does_not_reuse_sticky_goal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            main = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
-            branch = {(3, 3), (4, 4), (5, 5), (6, 6)}
-            safe_nodes = main | branch
-            blocked = {(x, y) for y in range(7) for x in range(7) if (x, y) not in safe_nodes}
-            state = make_state(width=7, height=7, start=(2, 2), blocked=blocked)
-            self.write_state(debug, state)
-
-            identity = debug.room_identity(state)
-            data = debug.empty_exploration()
-            room = debug.exploration_room(data, identity)
-            room["visited"] = ["0,4", "1,3", "2,2"]
-            room["last_route"] = {
-                "nodes": [
-                    {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                    {"grid_x": 1, "grid_y": 3, "x": 16, "y": 24},
-                    {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                ],
-                "start_node": {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                "expected_node": {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                "target_frontier": {"x": 64, "y": 0},
-                "target_goal": {"x": 64, "y": 0},
-                "pending": False,
-                "interrupted_at": time.time() - 1,
-                "interrupt": {"reason": "dialog"},
-            }
-            debug.write_exploration(data)
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["status"], "stepping")
-            self.assertEqual(result["target_selection"], "distant_exploration_goal")
-            self.assertEqual(result["action"]["buttons"], ["right", "right", "right", "right"])
-            self.assertEqual(result["target_goal"], {"x": 96, "y": 48})
-
-    def test_completed_route_keeps_remaining_frontier_incomplete(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(i, 6 - i) for i in range(7)}
-            blocked = {(x, y) for y in range(7) for x in range(7) if (x, y) not in corridor}
-            state = make_state(width=7, height=7, start=(0, 6), blocked=blocked, viewport={"x": 0, "y": 0})
-            self.write_state(debug, state)
-            self.seed_exploration_room(debug, state, [(0, 6), (1, 5), (2, 4), (3, 3)])
-
-            result = debug.exploration_step(state, max_steps=4)
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["route"]["expected_node"], {"grid_x": 4, "grid_y": 2, "x": 64, "y": 16})
-            try:
-                debug.action_path.unlink()
-            except FileNotFoundError:
-                pass
-
-            moved = make_state(width=7, height=7, start=(4, 2), blocked=blocked, viewport={"x": 0, "y": 0})
-            self.write_state(debug, moved)
-            summary = debug.update_exploration(moved)
-            visited = {(node["grid_x"], node["grid_y"]) for node in summary["nodes"]["visited"]}
-            explorable = {(node["grid_x"], node["grid_y"]) for node in summary["nodes"]["explorable"]}
-            frontier = {(node["grid_x"], node["grid_y"]) for node in summary["nodes"]["frontier"]}
-
-            self.assertIn((4, 2), visited)
-            self.assertNotIn((5, 1), visited)
-            self.assertIn((5, 1), explorable)
-            self.assertIn((5, 1), frontier)
-            self.assertFalse(summary["complete"])
-
-    def test_stuck_pending_exploration_marks_failed_node(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
-            blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
-            state = make_state(width=5, height=5, start=(0, 4), blocked=blocked)
-            self.write_state(debug, state)
-
-            identity = debug.room_identity(state)
-            data = debug.empty_exploration()
-            room = debug.exploration_room(data, identity)
-            room["visited"] = ["0,4"]
-            room["frontier"] = ["1,3"]
-            room["last_route"] = {
-                "nodes": [
-                    {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                    {"grid_x": 1, "grid_y": 3, "x": 16, "y": 24},
-                    {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                ],
-                "start_node": {"grid_x": 0, "grid_y": 4, "x": 0, "y": 32},
-                "expected_node": {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                "target_frontier": {"x": 32, "y": 16},
-                "pending": True,
-                "sent_at": time.time() - 10,
-            }
-            debug.write_exploration(data)
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["status"], "route_blocked")
-            self.assertEqual(result["blocked_node"], {"grid_x": 1, "grid_y": 3, "x": 16, "y": 24})
-            self.assertFalse(debug.action_path.exists())
-            room = debug.exploration_room(debug.read_exploration(), identity)
-            self.assertIn("1,3", room["failed_nodes"])
-            self.assertFalse(room["last_route"]["pending"])
-
-    def test_step_stops_segment_at_turn(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            route_nodes = {(0, 4), (1, 3), (2, 4), (2, 2), (0, 2), (3, 5), (4, 6)}
-            blocked = {(x, y) for y in range(7) for x in range(7) if (x, y) not in route_nodes}
-            state = make_state(width=7, height=7, start=(0, 4), blocked=blocked)
-            self.write_state(debug, state)
-            self.seed_exploration_room(debug, state, [(0, 4), (1, 3), (2, 2), (0, 2)])
-
-            result = debug.exploration_step(state, max_steps=4)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["action"]["buttons"], ["up"])
-            self.assertEqual(result["segment_steps"], 1)
-            self.assertEqual(result["planned_moves"][:2], ["up", "right"])
-            self.assertEqual(result["route"]["expected_node"], {"grid_x": 1, "grid_y": 3, "x": 16, "y": 24})
-
     def test_blocking_nodes_are_not_exploration_frontier(self):
         blocker = {
             "id": 74,
@@ -603,270 +183,6 @@ class ExplorationTests(unittest.TestCase):
 
             self.assertNotIn((2, 0), frontier)
             self.assertGreater(summary["blocked_edges"], 0)
-
-    def test_action_pending_stops_exploration_step(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state()
-            self.write_state(debug, state)
-            debug.action_path.write_text("frames 1\nbutton up\n", encoding="ascii")
-
-            result = debug.exploration_step(state)
-
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["status"], "action_pending")
-
-    def test_stale_state_stops_step(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state()
-            self.write_state(debug, state)
-            old = time.time() - 10
-            os.utime(debug.state_path, (old, old))
-
-            result = debug.exploration_step(state)
-
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["status"], "state_stale")
-
-    def test_dialog_stops_exploration_step(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state()
-            state["dialog"] = {"active": True}
-            self.write_state(debug, state)
-
-            result = debug.exploration_step(state)
-
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["status"], "in_dialog")
-
-    def test_pending_exploration_is_interrupted_by_dialog(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state(width=5, height=5, start=(0, 4))
-            self.write_state(debug, state)
-            self.pending_exploration_step(debug, state)
-
-            state["dialog"] = {
-                "active": True,
-                "latest_event": {"text": "Hello.", "event_object_id": 42},
-            }
-            self.write_state(debug, state)
-            result = debug.exploration_step(state)
-
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["status"], "interrupted_by_dialog")
-            self.assertEqual(result["interrupt"]["reason"], "dialog")
-            self.assertEqual(result["interrupt"]["dialog_text"], "Hello.")
-            self.assertEqual(result["interrupt"]["event_object_id"], 42)
-            self.assertFalse(debug.action_path.exists())
-            room = debug.exploration_room(debug.read_exploration(), debug.room_identity(state))
-            self.assertFalse(room["last_route"]["pending"])
-
-    def test_pending_exploration_is_interrupted_by_battle(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state(width=5, height=5, start=(0, 4))
-            self.write_state(debug, state)
-            self.pending_exploration_step(debug, state)
-
-            state["in_battle"] = True
-            self.write_state(debug, state)
-            result = debug.exploration_step(state)
-
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["status"], "interrupted_by_battle")
-            self.assertEqual(result["interrupt"]["reason"], "battle")
-            self.assertFalse(debug.action_path.exists())
-            room = debug.exploration_room(debug.read_exploration(), debug.room_identity(state))
-            self.assertFalse(room["last_route"]["pending"])
-
-    def test_pending_exploration_is_interrupted_by_room_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state(width=5, height=5, start=(0, 4))
-            self.write_state(debug, state)
-            self.pending_exploration_step(debug, state)
-
-            changed = make_state(width=5, height=5, start=(0, 4))
-            changed["scene_id"] = 4
-            changed["map_id"] = 11
-            changed["room"] = {"key": "new-room"}
-            self.write_state(debug, changed)
-            result = debug.exploration_step(changed)
-
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["status"], "interrupted_by_room_change")
-            self.assertEqual(result["interrupt"]["reason"], "room_changed")
-            self.assertEqual(result["interrupt"]["previous_scene_id"], 3)
-            self.assertFalse(debug.action_path.exists())
-            old_room = debug.read_exploration()["rooms"]["3/10/test-room"]
-            self.assertFalse(old_room["last_route"]["pending"])
-
-    def test_reset_removes_exploration_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state()
-            self.write_state(debug, state)
-            debug.update_exploration(state)
-            self.assertTrue(debug.exploration_path.exists())
-
-            result = debug.reset_exploration()
-
-            self.assertTrue(result["ok"])
-            self.assertFalse(debug.exploration_path.exists())
-
-    def test_sweep_initial_status_is_stopped(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-
-            status = debug.exploration_sweep_status()
-
-            self.assertFalse(status["running"])
-            self.assertIsNone(status["room_id"])
-            self.assertEqual(status["steps_sent"], 0)
-            self.assertEqual(status["segments_sent"], 0)
-
-    def test_sweep_finishes_complete_room(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state(width=1, height=1, start=(0, 0))
-            self.write_state(debug, state)
-
-            result = debug.start_exploration_sweep(state)
-            status = self.wait_for_sweep(debug)
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(result["status"], "started")
-            self.assertFalse(status["running"])
-            self.assertEqual(status["finished_reason"], "complete")
-            self.assertEqual(status["segments_sent"], 0)
-            self.assertEqual(status["steps_sent"], 0)
-
-    def test_wait_for_exploration_segment_ignores_mid_route_position_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            start = make_state(width=4, height=4, start=(0, 0))
-            mid = make_state(width=4, height=4, start=(1, 1))
-            self.write_state(debug, mid)
-            segment = {
-                "route": {
-                    "nodes": [
-                        {"grid_x": 0, "grid_y": 0, "x": 0, "y": 0},
-                        {"grid_x": 1, "grid_y": 1, "x": 16, "y": 8},
-                        {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                    ],
-                    "expected_node": {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                }
-            }
-
-            started = time.monotonic()
-            result = debug.wait_for_exploration_segment(start, segment, timeout=0.16)
-
-            self.assertIsNone(result)
-            self.assertGreaterEqual(time.monotonic() - started, 0.12)
-
-    def test_wait_for_exploration_segment_returns_after_expected_node_arrival(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            start = make_state(width=4, height=4, start=(0, 0))
-            mid = make_state(width=4, height=4, start=(1, 1))
-            expected = make_state(width=4, height=4, start=(2, 2))
-            self.write_state(debug, mid)
-            segment = {
-                "route": {
-                    "nodes": [
-                        {"grid_x": 0, "grid_y": 0, "x": 0, "y": 0},
-                        {"grid_x": 1, "grid_y": 1, "x": 16, "y": 8},
-                        {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                    ],
-                    "expected_node": {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                }
-            }
-            timer = threading.Timer(0.08, lambda: self.write_state(debug, expected))
-            timer.start()
-
-            started = time.monotonic()
-            result = debug.wait_for_exploration_segment(start, segment, timeout=1.0)
-            timer.join()
-
-            self.assertIsNone(result)
-            self.assertLess(time.monotonic() - started, 0.5)
-
-    def test_wait_for_exploration_segment_times_out_after_consumed_unfinished_action(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            start = make_state(width=4, height=4, start=(0, 0))
-            mid = make_state(width=4, height=4, start=(1, 1))
-            self.write_state(debug, mid)
-            debug.action_path.write_text("frames 1\nbutton down\n", encoding="ascii")
-            segment = {
-                "route": {
-                    "nodes": [
-                        {"grid_x": 0, "grid_y": 0, "x": 0, "y": 0},
-                        {"grid_x": 1, "grid_y": 1, "x": 16, "y": 8},
-                        {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                    ],
-                    "expected_node": {"grid_x": 2, "grid_y": 2, "x": 32, "y": 16},
-                }
-            }
-            timer = threading.Timer(0.08, debug.action_path.unlink)
-            timer.start()
-
-            result = debug.wait_for_exploration_segment(start, segment, timeout=0.16)
-            timer.join()
-
-            self.assertIsNone(result)
-
-    def test_normalize_agent_decision_accepts_exploration_sweep(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-
-            decision = debug.normalize_agent_decision(
-                {
-                    "summary": "Cover the remaining room frontier.",
-                    "recommended_intent": "explore_room",
-                    "recommended_action": {"tool": "exploration_sweep", "args": {"max_steps": 99}},
-                    "evidence": {},
-                    "risk": "Sweep stays in the current room.",
-                    "alternatives": [],
-                }
-            )
-
-            self.assertEqual(decision["recommended_action"], {"tool": "exploration_sweep", "args": {}, "dry_run": True})
-            self.assertIn("normalization_warnings", decision["evidence"])
-
-    def test_normalize_agent_decision_does_not_retarget_sweep_from_summary(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-
-            decision = debug.normalize_agent_decision(
-                {
-                    "summary": "Object 25 was just interacted with; sweep the remaining room.",
-                    "recommended_intent": "explore_room",
-                    "recommended_action": {"tool": "exploration_sweep", "args": {}},
-                    "evidence": {},
-                    "risk": "Sweep stays in the current room.",
-                    "alternatives": [],
-                }
-            )
-
-            self.assertEqual(decision["recommended_intent"], "explore_room")
-            self.assertEqual(decision["recommended_action"], {"tool": "exploration_sweep", "args": {}, "dry_run": True})
-            self.assertNotIn("normalization_warnings", decision["evidence"])
-
-    def test_rules_agent_prefers_sweep_for_frontier_only_room(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            debug = self.make_debug_state(tmp)
-            state = make_state(width=3, height=3, start=(1, 1), objects=[])
-            self.write_state(debug, state)
-            state["_exploration"] = debug.update_exploration(state)
-
-            decision = debug.rules_decide_agent(state)
-
-            self.assertEqual(decision["recommended_intent"], "explore_room")
-            self.assertEqual(decision["recommended_action"], {"tool": "exploration_sweep", "args": {}, "dry_run": True})
 
     def test_state_events_record_inventory_change(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -891,17 +207,19 @@ class ExplorationTests(unittest.TestCase):
             state["dialog"] = {
                 "active": True,
                 "position": "lower",
-                "latest_event": {
-                    "sequence": 1,
-                    "frame": 42,
-                    "scene_id": 3,
-                    "map_id": 10,
-                    "event_object_id": 7,
-                    "message_id": 88,
-                    "dialog_position": "lower",
-                    "speaker_hint": "赵灵儿",
-                    "text": "我们走吧。",
-                },
+                "events": [
+                    {
+                        "sequence": 1,
+                        "frame": 42,
+                        "scene_id": 3,
+                        "map_id": 10,
+                        "event_object_id": 7,
+                        "message_id": 88,
+                        "dialog_position": "lower",
+                        "speaker_hint": "赵灵儿",
+                        "text": "我们走吧。",
+                    }
+                ],
             }
 
             debug.record_dialog_event(state)
@@ -913,30 +231,129 @@ class ExplorationTests(unittest.TestCase):
             self.assertEqual(debug.dialog_history[0]["room_key"], "test-room")
             self.assertTrue(debug.dialogs_path.exists())
 
+    def test_dialog_speaker_title_event_is_not_persisted_as_body_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            state["dialog"] = {
+                "events": [
+                    {
+                        "sequence": 1,
+                        "frame": 7842,
+                        "message_id": 635,
+                        "event_object_id": 57,
+                        "speaker_hint": "李大娘",
+                        "text": "李大娘：",
+                    },
+                    {
+                        "sequence": 2,
+                        "frame": 7843,
+                        "message_id": 636,
+                        "event_object_id": 57,
+                        "speaker_hint": "李大娘",
+                        "text": "逍遥你来的正好，快把门口",
+                    },
+                ],
+            }
+
+            debug.record_dialog_event(state)
+            debug.record_dialog_event(state)
+
+            self.assertEqual(len(debug.dialog_history), 1)
+            self.assertEqual(debug.dialog_history[0]["speaker_hint"], "李大娘")
+            self.assertEqual(debug.dialog_history[0]["text"], "逍遥你来的正好，快把门口")
+
+    def test_dialog_event_stream_merges_contiguous_lines_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            state["dialog"] = {
+                "active": False,
+                "position": "upper",
+                "latest_event": {"sequence": 3, "message_id": 638, "event_object_id": 57, "text": "碍咱们做生意"},
+                "events": [
+                    {"sequence": 1, "frame": 7843, "message_id": 636, "event_object_id": 57, "speaker_hint": "李大娘", "text": "逍遥你来的正好，快把门口"},
+                    {"sequence": 2, "frame": 7843, "message_id": 637, "event_object_id": 57, "speaker_hint": "李大娘", "text": "那个臭要饭的赶走，免得妨"},
+                    {"sequence": 3, "frame": 7843, "message_id": 638, "event_object_id": 57, "speaker_hint": "李大娘", "text": "碍咱们做生意"},
+                ],
+            }
+
+            debug.record_dialog_event(state)
+            debug.record_dialog_event(state)
+
+            self.assertEqual(len(debug.dialog_history), 1)
+            self.assertEqual(debug.dialog_history[0]["message_ids"], [636, 637, 638])
+            self.assertEqual(debug.dialog_history[0]["start_sequence"], 1)
+            self.assertEqual(debug.dialog_history[0]["end_sequence"], 3)
+            self.assertEqual(
+                debug.dialog_history[0]["text"],
+                "逍遥你来的正好，快把门口那个臭要饭的赶走，免得妨碍咱们做生意",
+            )
+
+    def test_dialog_event_stream_splits_when_speaker_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            state["dialog"] = {
+                "events": [
+                    {"sequence": 1, "frame": 10, "message_id": 636, "event_object_id": 57, "speaker_hint": "李大娘", "text": "逍遥你来的正好，"},
+                    {"sequence": 2, "frame": 10, "message_id": 637, "event_object_id": 57, "speaker_hint": "李大娘", "text": "快把门口的人赶走。"},
+                    {"sequence": 3, "frame": 11, "message_id": 638, "event_object_id": 57, "speaker_hint": "李逍遥", "text": "啊！"},
+                    {"sequence": 4, "frame": 11, "message_id": 639, "event_object_id": 57, "speaker_hint": "李逍遥", "text": "我马上就去。"},
+                ],
+            }
+
+            debug.record_dialog_event(state)
+
+            self.assertEqual([entry["speaker_hint"] for entry in debug.dialog_history], ["李大娘", "李逍遥"])
+            self.assertEqual(debug.dialog_history[0]["text"], "逍遥你来的正好，快把门口的人赶走。")
+            self.assertEqual(debug.dialog_history[1]["text"], "啊！我马上就去。")
+
+    def test_system_dialog_event_stays_separate_from_character_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            state["dialog"] = {
+                "events": [
+                    {"sequence": 1, "frame": 20, "message_id": 630, "event_object_id": 57, "speaker_hint": "李大娘", "text": "拿去吧。"},
+                    {"sequence": 2, "frame": 21, "message_id": 631, "event_object_id": 57, "speaker_hint": None, "text": "得到５００文钱"},
+                    {"sequence": 3, "frame": 22, "message_id": 632, "event_object_id": 57, "speaker_hint": "李大娘", "text": "别乱花。"},
+                ],
+            }
+
+            debug.record_dialog_event(state)
+
+            self.assertEqual([entry["speaker_hint"] for entry in debug.dialog_history], ["李大娘", "系统", "李大娘"])
+            self.assertEqual([entry["text"] for entry in debug.dialog_history], ["拿去吧。", "得到５００文钱", "别乱花。"])
+
     def test_dialogs_view_filters_by_speaker(self):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
             first = make_state()
             first["dialog"] = {
-                "latest_event": {
-                    "sequence": 1,
-                    "frame": 1,
-                    "message_id": 1,
-                    "event_object_id": 10,
-                    "speaker_hint": "李逍遥",
-                    "text": "好。",
-                },
+                "events": [
+                    {
+                        "sequence": 1,
+                        "frame": 1,
+                        "message_id": 1,
+                        "event_object_id": 10,
+                        "speaker_hint": "李逍遥",
+                        "text": "好。",
+                    }
+                ],
             }
             second = make_state()
             second["dialog"] = {
-                "latest_event": {
-                    "sequence": 2,
-                    "frame": 2,
-                    "message_id": 2,
-                    "event_object_id": 11,
-                    "speaker_hint": "赵灵儿",
-                    "text": "谢谢。",
-                },
+                "events": [
+                    {
+                        "sequence": 2,
+                        "frame": 2,
+                        "message_id": 2,
+                        "event_object_id": 11,
+                        "speaker_hint": "赵灵儿",
+                        "text": "谢谢。",
+                    }
+                ],
             }
 
             debug.record_dialog_event(first)
@@ -975,17 +392,19 @@ class ExplorationTests(unittest.TestCase):
             state["scene_id"] = 1
             state["map_id"] = 12
             state["dialog"] = {
-                "latest_event": {
-                    "sequence": 1,
-                    "frame": 58,
-                    "scene_id": 1,
-                    "map_id": 12,
-                    "event_object_id": 5,
-                    "message_id": 1957,
-                    "dialog_position": "lower",
-                    "speaker_hint": None,
-                    "text": "昨晚做好的密道正好派上用场",
-                },
+                "events": [
+                    {
+                        "sequence": 1,
+                        "frame": 58,
+                        "scene_id": 1,
+                        "map_id": 12,
+                        "event_object_id": 5,
+                        "message_id": 1957,
+                        "dialog_position": "lower",
+                        "speaker_hint": None,
+                        "text": "昨晚做好的密道正好派上用场",
+                    }
+                ],
             }
 
             debug.record_dialog_event(state)
@@ -997,17 +416,19 @@ class ExplorationTests(unittest.TestCase):
             debug = self.make_debug_state(tmp)
             state = make_state()
             state["dialog"] = {
-                "latest_event": {
-                    "sequence": 1,
-                    "frame": 2060,
-                    "scene_id": 3,
-                    "map_id": 10,
-                    "event_object_id": 57,
-                    "message_id": 631,
-                    "dialog_position": "center_window",
-                    "speaker_hint": None,
-                    "text": "得到５００文钱",
-                },
+                "events": [
+                    {
+                        "sequence": 1,
+                        "frame": 2060,
+                        "scene_id": 3,
+                        "map_id": 10,
+                        "event_object_id": 57,
+                        "message_id": 631,
+                        "dialog_position": "center_window",
+                        "speaker_hint": None,
+                        "text": "得到５００文钱",
+                    }
+                ],
             }
 
             debug.record_dialog_event(state)
@@ -1360,7 +781,15 @@ class ExplorationTests(unittest.TestCase):
             to_state["scene_id"] = 4
             to_state["map_id"] = 11
             to_state["room"] = {"key": "next-room"}
-            debug.record_transition_destination(from_identity, 52, debug.room_identity(to_state))
+            to_identity = debug.room_identity(to_state)
+            debug.record_transition_destination(from_identity, 52, to_identity)
+            data = debug.read_exploration()
+            room = debug.exploration_room(data, to_identity)
+            room["visited"] = ["1,1", "2,2"]
+            room["frontier"] = ["3,3"]
+            room["explorable"] = 10
+            room["complete"] = False
+            debug.write_exploration(data)
 
             navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
             target_status = {target["id"]: target for target in navigation["targets"]}
@@ -1369,9 +798,14 @@ class ExplorationTests(unittest.TestCase):
 
             self.assertTrue(target_status[52]["known_destination"])
             self.assertEqual(target_status[52]["known_destination_room_id"], "4/11/next-room")
+            self.assertEqual(target_status[52]["destination_priority"], "partial")
+            self.assertEqual(target_status[52]["destination_exploration"]["frontier"], 1)
             self.assertTrue(route["known_destination"])
             self.assertEqual(route["known_destination_room_id"], "4/11/next-room")
+            self.assertEqual(route["destination_priority"], "partial")
             self.assertEqual(known["known_transitions"]["52"]["to_room_id"], "4/11/next-room")
+            self.assertEqual(known["known_transitions"]["52"]["destination_priority"], "partial")
+            self.assertEqual(known["known_transitions"]["52"]["destination_exploration"]["explored"], 2)
 
     def test_unknown_transition_destination_is_explicit(self):
         target = {
@@ -1395,6 +829,90 @@ class ExplorationTests(unittest.TestCase):
             self.assertFalse(route["known_destination"])
             self.assertIsNone(route["known_destination_room_id"])
             self.assertIsNone(route["known_destination_observed_at"])
+            self.assertEqual(route["destination_priority"], "unknown")
+            self.assertFalse(route["destination_exploration"]["known"])
+
+    def test_recent_transition_destination_is_marked_as_backtrack(self):
+        target = {
+            "id": 52,
+            "x": 32,
+            "y": 0,
+            "sprite_id": 0,
+            "state": 1,
+            "trigger_mode": 4,
+            "trigger_script": 4631,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(objects=[target])
+            previous = make_state(objects=[])
+            previous["scene_id"] = 1
+            previous["map_id"] = 12
+            previous["room"] = {"key": "previous-room"}
+            previous_identity = debug.room_identity(previous)
+            debug.record_transition_destination(debug.room_identity(state), 52, previous_identity)
+            debug.agent_log_path.write_text(
+                json.dumps({"turn": 1, "episode": previous_identity["id"], "decision": {}}) + "\n",
+                encoding="utf-8",
+            )
+
+            navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
+            target_status = {target["id"]: target for target in navigation["targets"]}
+            known = debug.run_agent_tool("get_known_transitions", {}, state)
+
+            self.assertTrue(target_status[52]["returns_to_recent_room"])
+            self.assertEqual(target_status[52]["agent_priority"], "avoid_backtrack")
+            self.assertTrue(known["known_transitions"]["52"]["returns_to_recent_room"])
+            self.assertEqual(known["known_transitions"]["52"]["agent_priority"], "avoid_backtrack")
+
+    def test_rules_prefer_unknown_transition_over_recent_backtrack(self):
+        backtrack = {
+            "id": 52,
+            "x": 32,
+            "y": 0,
+            "sprite_id": 0,
+            "state": 1,
+            "trigger_mode": 4,
+            "trigger_script": 4631,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        unknown = {
+            "id": 53,
+            "x": 64,
+            "y": 0,
+            "sprite_id": 0,
+            "state": 1,
+            "trigger_mode": 4,
+            "trigger_script": 4639,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(width=5, height=3, objects=[backtrack, unknown])
+            self.write_state(debug, state)
+            previous = make_state(objects=[])
+            previous["scene_id"] = 1
+            previous["map_id"] = 12
+            previous["room"] = {"key": "previous-room"}
+            previous_identity = debug.room_identity(previous)
+            debug.record_transition_destination(debug.room_identity(state), 52, previous_identity)
+            debug.agent_log_path.write_text(
+                json.dumps({"turn": 1, "episode": previous_identity["id"], "decision": {}}) + "\n",
+                encoding="utf-8",
+            )
+
+            decision = debug.rules_decide_agent(state)
+
+            self.assertEqual(decision["recommended_intent"], "enter_transition")
+            self.assertEqual(decision["recommended_action"]["args"]["id"], 53)
+            self.assertEqual(decision["evidence"]["target"]["destination_priority"], "unknown")
 
     def test_get_room_exploration_returns_compact_known_and_unknown_status(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1571,9 +1089,9 @@ class ExplorationTests(unittest.TestCase):
             decision = debug.rules_decide_agent(state)
             log = debug.read_agent_log(limit=10)
 
-            self.assertEqual(decision["recommended_intent"], "explore_room")
-            self.assertEqual(decision["recommended_action"]["tool"], "exploration_step")
-            self.assertEqual(decision["recommended_action"]["args"], {})
+            self.assertEqual(decision["recommended_intent"], "wait_runtime")
+            self.assertEqual(decision["recommended_action"]["tool"], "no_op")
+            self.assertEqual(decision["recommended_action"]["args"], {"reason": "no_reachable_target"})
             self.assertEqual(len(log), 1)
             self.assertEqual(log[0]["turn"], 1)
             self.assertEqual(log[0]["episode"], "3/10/test-room")
@@ -1645,7 +1163,7 @@ class ExplorationTests(unittest.TestCase):
             self.assertIn("normalization_warnings", decision["evidence"])
             self.assertFalse(debug.action_path.exists())
 
-    def test_agent_normalizes_explore_room_to_default_exploration_step(self):
+    def test_agent_normalizes_explore_room_to_wait_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
 
@@ -1660,11 +1178,13 @@ class ExplorationTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(decision["recommended_action"]["tool"], "exploration_step")
+            self.assertEqual(decision["recommended_intent"], "wait_runtime")
+            self.assertEqual(decision["recommended_action"]["tool"], "no_op")
             self.assertEqual(decision["recommended_action"]["args"], {})
+            self.assertIn("normalized unknown intent to wait_runtime", decision["evidence"]["normalization_warnings"])
             self.assertFalse(debug.action_path.exists())
 
-    def test_agent_ignores_model_exploration_step_count(self):
+    def test_agent_rejects_model_exploration_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
 
@@ -1679,12 +1199,15 @@ class ExplorationTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(decision["recommended_action"]["tool"], "exploration_step")
-            self.assertEqual(decision["recommended_action"]["args"], {})
-            self.assertIn("ignored agent-provided exploration_step args", decision["evidence"]["normalization_warnings"])
+            self.assertEqual(decision["recommended_intent"], "wait_runtime")
+            self.assertEqual(decision["recommended_action"]["tool"], "no_op")
+            self.assertEqual(decision["recommended_action"]["args"]["reason"], "unsupported_tool")
+            self.assertEqual(decision["recommended_action"]["args"]["tool"], "exploration_step")
+            self.assertIn("normalized unknown intent to wait_runtime", decision["evidence"]["normalization_warnings"])
+            self.assertIn("normalized unknown action tool to no_op", decision["evidence"]["normalization_warnings"])
             self.assertFalse(debug.action_path.exists())
 
-    def test_agent_keeps_targeted_explore_room_as_exploration_step(self):
+    def test_agent_rejects_targeted_explore_room(self):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
 
@@ -1699,10 +1222,12 @@ class ExplorationTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(decision["recommended_intent"], "explore_room")
-            self.assertEqual(decision["recommended_action"]["tool"], "exploration_step")
-            self.assertEqual(decision["recommended_action"]["args"], {})
-            self.assertEqual(decision["evidence"]["normalization_warnings"], ["ignored agent-provided exploration_step args"])
+            self.assertEqual(decision["recommended_intent"], "wait_runtime")
+            self.assertEqual(decision["recommended_action"]["tool"], "no_op")
+            self.assertEqual(decision["recommended_action"]["args"]["reason"], "unsupported_tool")
+            self.assertEqual(decision["recommended_action"]["args"]["tool"], "exploration_step")
+            self.assertIn("normalized unknown intent to wait_runtime", decision["evidence"]["normalization_warnings"])
+            self.assertIn("normalized unknown action tool to no_op", decision["evidence"]["normalization_warnings"])
             self.assertFalse(debug.action_path.exists())
 
     def test_agent_does_not_infer_target_from_summary(self):
@@ -1755,9 +1280,9 @@ class ExplorationTests(unittest.TestCase):
             self.assertEqual(decision["alternatives"][0]["intent"], "inspect_target")
             self.assertEqual(decision["alternatives"][0]["action"]["tool"], "navigation_step")
             self.assertEqual(decision["alternatives"][0]["action"]["args"], {"id": 11})
-            self.assertEqual(decision["alternatives"][1]["intent"], "explore_room")
-            self.assertEqual(decision["alternatives"][1]["action"]["tool"], "exploration_step")
-            self.assertEqual(decision["alternatives"][1]["action"]["args"], {})
+            self.assertEqual(decision["alternatives"][1]["intent"], "wait_runtime")
+            self.assertEqual(decision["alternatives"][1]["action"]["tool"], "no_op")
+            self.assertEqual(decision["alternatives"][1]["action"]["args"], {"reason": "wait_runtime"})
             self.assertFalse(debug.action_path.exists())
 
     def test_agent_context_marks_targets_with_recent_dialog_feedback(self):
@@ -1968,7 +1493,9 @@ class ExplorationTests(unittest.TestCase):
     def test_agent_tool_specs_include_queries_and_submit(self):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
-            names = [tool["function"]["name"] for tool in debug.agent_tool_specs()]
+            tools = debug.agent_tool_specs()
+            names = [tool["function"]["name"] for tool in tools]
+            by_name = {tool["function"]["name"]: tool for tool in tools}
 
             self.assertEqual(
                 set(names),
@@ -1976,6 +1503,8 @@ class ExplorationTests(unittest.TestCase):
                     "get_state_summary",
                     "get_navigation",
                     "get_dialogs",
+                    "get_dialog_speakers",
+                    "get_inventory",
                     "get_events",
                     "get_agent_history",
                     "get_route",
@@ -1984,7 +1513,182 @@ class ExplorationTests(unittest.TestCase):
                     "submit_decision",
                 },
             )
+            dialog_properties = by_name["get_dialogs"]["function"]["parameters"]["properties"]
+            self.assertIn("speaker", dialog_properties)
+            self.assertEqual(dialog_properties["speaker"]["type"], "string")
+            context = debug.agent_tool_initial_context(make_state())
+            self.assertIn("get_dialog_speakers", context["available_query_tools"])
             self.assertEqual(names[-1], "submit_decision")
+
+    def test_agent_get_dialog_speakers_returns_recent_speakers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            debug.dialog_history = [
+                {
+                    "speaker_hint": "李大娘",
+                    "time": 10.0,
+                    "frame": 100,
+                    "end_frame": 101,
+                    "start_sequence": 1,
+                    "end_sequence": 2,
+                    "scene_id": 3,
+                    "map_id": 10,
+                    "room_key": "inn",
+                    "text": "早点回来。",
+                },
+                {
+                    "speaker_hint": "赵灵儿",
+                    "time": 20.0,
+                    "frame": 200,
+                    "end_frame": 201,
+                    "start_sequence": 3,
+                    "end_sequence": 3,
+                    "scene_id": 4,
+                    "map_id": 11,
+                    "room_key": "garden",
+                    "text": "谢谢。",
+                },
+                {
+                    "speaker_hint": "李大娘",
+                    "time": 30.0,
+                    "frame": 300,
+                    "end_frame": 302,
+                    "start_sequence": 4,
+                    "end_sequence": 5,
+                    "scene_id": 5,
+                    "map_id": 12,
+                    "room_key": "street",
+                    "text": "快去吧。",
+                },
+            ]
+
+            result = debug.run_agent_tool("get_dialog_speakers", {}, state)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["total"], 2)
+            self.assertEqual(result["returned"], 2)
+            self.assertEqual([speaker["speaker_hint"] for speaker in result["speakers"]], ["李大娘", "赵灵儿"])
+            self.assertEqual(result["speakers"][0]["dialog_count"], 2)
+            self.assertEqual(result["speakers"][0]["last_time"], 30.0)
+            self.assertEqual(result["speakers"][0]["last_frame"], 300)
+            self.assertEqual(result["speakers"][0]["last_end_frame"], 302)
+            self.assertEqual(result["speakers"][0]["last_sequence"], 4)
+            self.assertEqual(result["speakers"][0]["last_end_sequence"], 5)
+            self.assertEqual(result["speakers"][0]["last_scene_id"], 5)
+            self.assertEqual(result["speakers"][0]["last_map_id"], 12)
+            self.assertEqual(result["speakers"][0]["last_room_key"], "street")
+
+    def test_agent_get_dialog_speakers_excludes_system_and_empty_speakers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            debug.dialog_history = [
+                {"speaker_hint": "系统", "time": 1.0, "text": "得到５００文钱"},
+                {"speaker_hint": "", "time": 2.0, "text": "empty"},
+                {"time": 3.0, "text": "missing"},
+                {"speaker_hint": "李逍遥", "time": 4.0, "frame": 40, "text": "好。"},
+            ]
+
+            result = debug.run_agent_tool("get_dialog_speakers", {}, state)
+
+            self.assertEqual(result["total"], 1)
+            self.assertEqual(result["returned"], 1)
+            self.assertEqual(result["speakers"][0]["speaker_hint"], "李逍遥")
+
+    def test_agent_get_dialogs_filters_by_speaker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            debug.dialog_history = [
+                {"speaker_hint": "李大娘", "time": 10.0, "frame": 100, "end_frame": 101, "text": "早点回来。"},
+                {"speaker_hint": "赵灵儿", "time": 20.0, "frame": 200, "end_frame": 201, "text": "谢谢。"},
+                {"speaker_hint": "李大娘", "time": 30.0, "frame": 300, "end_frame": 301, "text": "快去吧。"},
+            ]
+
+            result = debug.run_agent_tool("get_dialogs", {"speaker": "李大娘", "limit": 10}, state)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["total"], 2)
+            self.assertEqual([dialog["speaker_hint"] for dialog in result["dialogs"]], ["李大娘", "李大娘"])
+            self.assertEqual([dialog["text"] for dialog in result["dialogs"]], ["早点回来。", "快去吧。"])
+            self.assertEqual(result["dialogs"][0]["time"], 10.0)
+            self.assertEqual(result["dialogs"][0]["frame"], 100)
+            self.assertEqual(result["dialogs"][0]["end_frame"], 101)
+
+    def test_agent_get_inventory_returns_current_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            state["inventory"] = [
+                {
+                    "slot": 0,
+                    "item_id": 91,
+                    "name": "十里香",
+                    "price": 640,
+                    "flags": ["usable", "apply_to_all"],
+                    "usable": True,
+                    "apply_to_all": True,
+                    "sellable": True,
+                    "amount": 1,
+                    "amount_in_use": 0,
+                    "equipped_count": 0,
+                },
+                {
+                    "slot": 1,
+                    "item_id": 88,
+                    "name": "止血草",
+                    "price": 50,
+                    "flags": ["usable"],
+                    "usable": True,
+                    "apply_to_all": False,
+                    "sellable": True,
+                    "amount": 5,
+                    "amount_in_use": 0,
+                    "equipped_count": 0,
+                },
+            ]
+
+            result = debug.run_agent_tool("get_inventory", {}, state)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["total"], 2)
+            self.assertEqual(result["returned"], 2)
+            self.assertEqual(
+                result["inventory"][0],
+                {
+                    "slot": 0,
+                    "item_id": 91,
+                    "name": "十里香",
+                    "amount": 1,
+                    "amount_in_use": 0,
+                    "equipped_count": 0,
+                    "usable": True,
+                    "apply_to_all": True,
+                    "sellable": True,
+                    "flags": ["usable", "apply_to_all"],
+                    "price": 640,
+                },
+            )
+
+    def test_agent_get_inventory_limit_and_empty_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            state["inventory"] = [
+                {"slot": 0, "item_id": 1, "name": "one", "amount": 1},
+                {"slot": 1, "item_id": 2, "name": "two", "amount": 2},
+            ]
+
+            limited = debug.run_agent_tool("get_inventory", {"limit": 1}, state)
+            empty = debug.run_agent_tool("get_inventory", {}, {**state, "inventory": []})
+
+            self.assertEqual(limited["total"], 2)
+            self.assertEqual(limited["returned"], 1)
+            self.assertEqual([item["item_id"] for item in limited["inventory"]], [1])
+            self.assertEqual(empty["inventory"], [])
+            self.assertEqual(empty["total"], 0)
+            self.assertEqual(empty["returned"], 0)
 
     def test_agent_tools_return_json_serializable_dicts(self):
         target = {
@@ -2011,6 +1715,8 @@ class ExplorationTests(unittest.TestCase):
                 ("get_navigation", {"mode": "lightweight", "limit": 5}),
                 ("get_navigation", {"mode": "full", "limit": 5}),
                 ("get_dialogs", {"limit": 1}),
+                ("get_dialog_speakers", {"limit": 1}),
+                ("get_inventory", {"limit": 1}),
                 ("get_events", {"limit": 1}),
                 ("get_agent_history", {"limit": 1}),
                 ("get_route", {"id": 48}),
@@ -2055,6 +1761,7 @@ class ExplorationTests(unittest.TestCase):
             state = make_state(objects=[make_touch_object(52, sprite_id=0)])
             self.write_state(debug, state)
             captured = []
+            timeouts = []
             responses = [
                 {
                     "choices": [
@@ -2126,6 +1833,7 @@ class ExplorationTests(unittest.TestCase):
 
             def fake_urlopen(request, timeout):
                 captured.append(json.loads(request.data.decode("utf-8")))
+                timeouts.append(timeout)
                 return FakeResponse(responses.pop(0))
 
             with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}), patch("urllib.request.urlopen", fake_urlopen):
@@ -2147,6 +1855,7 @@ class ExplorationTests(unittest.TestCase):
             self.assertEqual(log[0]["decision"]["state_context"]["frame"], 1)
             self.assertEqual(log[0]["tool_trace"][1]["name"], "get_navigation")
             self.assertEqual(log[0]["decision"]["usage"]["prompt_cache_miss_tokens"], 56)
+            self.assertGreaterEqual(timeouts[0], 89.0)
 
     def test_deepseek_unknown_tool_returns_clear_error(self):
         class FakeResponse:
@@ -2457,13 +2166,12 @@ class ExplorationTests(unittest.TestCase):
             with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}), patch("urllib.request.urlopen", lambda request, timeout: FakeResponse()):
                 decision = debug.deepseek_decide_agent(state)
 
-            self.assertEqual(decision["recommended_intent"], "wait_runtime")
-            self.assertEqual(decision["recommended_action"]["tool"], "no_op")
-            self.assertEqual(decision["recommended_action"]["args"]["reason"], "unsupported_tool")
-            self.assertEqual(decision["recommended_action"]["args"]["tool"], "write_action")
+            self.assertEqual(decision["recommended_intent"], "inspect_target")
+            self.assertEqual(decision["recommended_action"]["tool"], "navigation_step")
+            self.assertEqual(decision["recommended_action"]["args"], {"id": 10})
             self.assertFalse(debug.action_path.exists())
 
-    def test_deepseek_targeted_explore_room_keeps_exploration_step(self):
+    def test_deepseek_targeted_explore_room_is_rejected(self):
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -2510,14 +2218,15 @@ class ExplorationTests(unittest.TestCase):
             with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}), patch("urllib.request.urlopen", lambda request, timeout: FakeResponse()):
                 decision = debug.deepseek_decide_agent(state)
 
-            self.assertEqual(decision["recommended_intent"], "explore_room")
-            self.assertEqual(decision["recommended_action"]["tool"], "exploration_step")
-            self.assertEqual(decision["recommended_action"]["args"], {})
+            self.assertEqual(decision["recommended_intent"], "wait_runtime")
+            self.assertEqual(decision["recommended_action"]["tool"], "no_op")
+            self.assertEqual(decision["recommended_action"]["args"]["reason"], "unsupported_tool")
+            self.assertEqual(decision["recommended_action"]["args"]["tool"], "exploration_step")
             self.assertFalse(debug.action_path.exists())
             log = debug.read_agent_log(limit=1)
-            self.assertEqual(log[0]["decision"]["recommended_action"], {"tool": "exploration_step", "args": {}, "dry_run": True})
+            self.assertEqual(log[0]["decision"]["recommended_action"], {"tool": "no_op", "args": {"reason": "unsupported_tool", "tool": "exploration_step"}, "dry_run": True})
 
-    def test_deepseek_untargeted_explore_room_keeps_empty_exploration_step(self):
+    def test_deepseek_untargeted_explore_room_is_rejected(self):
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -2563,12 +2272,13 @@ class ExplorationTests(unittest.TestCase):
             with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}), patch("urllib.request.urlopen", lambda request, timeout: FakeResponse()):
                 decision = debug.deepseek_decide_agent(state)
 
-            self.assertEqual(decision["recommended_intent"], "explore_room")
-            self.assertEqual(decision["recommended_action"]["tool"], "exploration_step")
-            self.assertEqual(decision["recommended_action"]["args"], {})
+            self.assertEqual(decision["recommended_intent"], "wait_runtime")
+            self.assertEqual(decision["recommended_action"]["tool"], "no_op")
+            self.assertEqual(decision["recommended_action"]["args"]["reason"], "unsupported_tool")
+            self.assertEqual(decision["recommended_action"]["args"]["tool"], "exploration_step")
             self.assertFalse(debug.action_path.exists())
             log = debug.read_agent_log(limit=1)
-            self.assertEqual(log[0]["decision"]["recommended_action"], {"tool": "exploration_step", "args": {}, "dry_run": True})
+            self.assertEqual(log[0]["decision"]["recommended_action"], {"tool": "no_op", "args": {"reason": "unsupported_tool", "tool": "exploration_step"}, "dry_run": True})
 
 
 if __name__ == "__main__":

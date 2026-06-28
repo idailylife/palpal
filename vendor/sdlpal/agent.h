@@ -18,6 +18,26 @@ PALPAL_AgentSaveSlot(
 );
 
 BOOL
+PALPAL_AgentStartupWaitMode(
+   VOID
+);
+
+VOID
+PALPAL_AgentBeginStartupWait(
+   VOID
+);
+
+BOOL
+PALPAL_AgentStartupReady(
+   VOID
+);
+
+INT
+PALPAL_AgentStartupSlot(
+   VOID
+);
+
+BOOL
 PALPAL_AgentHeadless(
    VOID
 );

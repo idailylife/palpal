@@ -48,7 +48,23 @@ PAL_GameMain(
    //
    if (PALPAL_AgentEnabled())
    {
-      gpGlobals->bCurrentSaveSlot = (BYTE)PALPAL_AgentSaveSlot();
+      if (PALPAL_AgentStartupWaitMode())
+      {
+         PALPAL_AgentBeginStartupWait();
+         dwTime = SDL_GetTicks();
+         while (!PALPAL_AgentStartupReady())
+         {
+            PALPAL_AgentWriteState();
+            PAL_ClearKeyState();
+            PAL_DelayUntil(dwTime);
+            dwTime = SDL_GetTicks() + FRAME_TIME;
+         }
+         gpGlobals->bCurrentSaveSlot = (BYTE)PALPAL_AgentStartupSlot();
+      }
+      else
+      {
+         gpGlobals->bCurrentSaveSlot = (BYTE)PALPAL_AgentSaveSlot();
+      }
    }
    else
    {
