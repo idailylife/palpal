@@ -38,8 +38,10 @@ let dialogsRenderKey = null;
 let eventsRenderKey = null;
 let agentRenderKey = null;
 let agentRequestInFlight = false;
+let agentExecutionInFlight = false;
 let agentLastDecision = null;
 let agentError = null;
+let agentActionStatus = "";
 let checkpoints = [];
 let checkpointsLoaded = false;
 let checkpointBusy = null;
@@ -58,7 +60,6 @@ let frameConnected = false;
 let dialogAdvanceActive = false;
 let dialogAdvanceSending = false;
 let dialogAdvanceCount = 0;
-let dialogAdvanceStartMarker = null;
 const repeatableButtons = new Set(["up", "down", "left", "right"]);
 const actionCooldownMs = 180;
 const dialogAdvanceDelayMs = 500;
@@ -238,6 +239,8 @@ agentEl.addEventListener("click", (event) => {
   if (!actionEl || !agentEl.contains(actionEl)) return;
   if (actionEl.dataset.agentAction === "decide") {
     askAgent();
+  } else if (actionEl.dataset.agentAction === "execute") {
+    executeAgentRecommendation();
   }
 });
 
@@ -469,7 +472,7 @@ function renderCheckpoints(state) {
   const stableMainGame = state?.in_main_game !== false && !state?._debug?.runtime_stale && !state?.dialog?.active && !state?.in_battle && !state?.entering_scene && !state?._debug?.action_pending;
   const canSave = !stateBusy && stableMainGame;
   const canLoad = !stateBusy && !state?._debug?.action_pending && (startupWaiting || stableMainGame);
-  const canStartNew = startupWaiting && !stateBusy && !state?._debug?.action_pending;
+  const canStartNew = !stateBusy && !state?._debug?.action_pending && (startupWaiting || stableMainGame);
   const renderKey = JSON.stringify({
     loaded: checkpointsLoaded,
     busy: checkpointBusy,
@@ -542,7 +545,7 @@ function renderCheckpoints(state) {
           <input id="checkpointLabel" type="text" maxlength="120" placeholder="short label" value="${escapeHtml(existingLabel)}" ${stateBusy ? "disabled" : ""} />
           <button id="checkpointSave" data-checkpoint-action="save" ${canSave ? "" : "disabled"}>${checkpointBusy === "saving" ? "Saving..." : "Save"}</button>
         </div>
-        ${startupWaiting ? `<button class="startupButton" data-checkpoint-action="start-new" ${canStartNew ? "" : "disabled"}>${checkpointBusy === "starting" ? "Starting..." : "Start New Game"}</button>` : ""}
+        <button class="startupButton" data-checkpoint-action="start-new" ${canStartNew ? "" : "disabled"}>${checkpointBusy === "starting" ? "Starting..." : "Start New Game"}</button>
         <div class="checkpointMenuMeta">
           <div id="checkpointStatus" class="${checkpointError ? "checkpointStatus is-error" : "checkpointStatus"}">${escapeHtml(statusText)}</div>
           <button class="miniButton" data-checkpoint-action="refresh" ${stateBusy ? "disabled" : ""}>Refresh</button>
@@ -590,167 +593,50 @@ function canAdvanceDialog(state) {
   return Boolean(state?.dialog?.active) && !state?.in_battle && !state?._debug?.runtime_stale;
 }
 
-function dialogText(dialog) {
-  return String(dialog?.text || "").trim();
-}
-
-function dialogSourceKeys(dialog) {
-  const keys = [];
-  if (dialog?.source_key) keys.push(String(dialog.source_key));
-  if (Array.isArray(dialog?.source_keys)) {
-    for (const key of dialog.source_keys) {
-      if (key) keys.push(String(key));
-    }
-  }
-  return [...new Set(keys)];
-}
-
-function dialogMarkerFromEntry(dialog) {
-  if (!dialog) return null;
-  return {
-    time: Number.isFinite(Number(dialog.time)) ? Number(dialog.time) : null,
-    sourceKeys: dialogSourceKeys(dialog),
-  };
-}
-
-function dialogEntryMatchesMarker(dialog, marker) {
-  if (!dialog || !marker?.sourceKeys?.length) return false;
-  const keys = new Set(dialogSourceKeys(dialog));
-  return marker.sourceKeys.some((key) => keys.has(key));
-}
-
-function dialogAdvanceInitialMarker(state) {
-  const dialogs = state?._debug?.recent_dialogs || [];
-  if (!dialogs.length) return null;
-
-  const latestDialog = dialogs[dialogs.length - 1];
-  const latestText = dialogText(latestDialog);
-  const activeText = String(state?.dialog?.latest_event?.text || "").trim();
-  if (state?.dialog?.active && activeText && latestText && (latestText === activeText || latestText.endsWith(activeText))) {
-    return dialogMarkerFromEntry(dialogs[dialogs.length - 2]);
-  }
-  return dialogMarkerFromEntry(latestDialog);
-}
-
-function dialogIdentity(dialog) {
-  if (!dialog || dialog.speaker_hint === "\u7cfb\u7edf") return null;
-  const sceneId = dialog.scene_id ?? "";
-  const mapId = dialog.map_id ?? "";
-  const roomKey = dialog.room_key ?? "";
-  if (dialog.event_object_id != null && dialog.event_object_id !== "") {
-    return `object:${sceneId}:${mapId}:${roomKey}:${dialog.event_object_id}`;
-  }
-  if (dialog.speaker_hint) {
-    return `speaker:${sceneId}:${mapId}:${roomKey}:${dialog.speaker_hint}`;
-  }
-  return null;
-}
-
-function dialogAdvanceRecentDialogs(state) {
-  const dialogs = state?._debug?.recent_dialogs || [];
-  const marker = dialogAdvanceStartMarker;
-  if (!marker) return dialogs.slice();
-
-  const markerIndex = dialogs.findIndex((dialog) => dialogEntryMatchesMarker(dialog, marker));
-  if (markerIndex >= 0) return dialogs.slice(markerIndex + 1);
-
-  if (marker.time != null) {
-    return dialogs.filter((dialog) => {
-      const time = Number(dialog?.time);
-      return Number.isFinite(time) && time > marker.time;
-    });
-  }
-  return dialogs.slice();
-}
-
-function dialogAdvanceReachedRepeatedNpcLine(state) {
-  const candidates = dialogAdvanceRecentDialogs(state)
-    .map((dialog) => ({
-      identity: dialogIdentity(dialog),
-      text: dialogText(dialog),
-    }))
-    .filter((dialog) => dialog.identity && dialog.text);
-  if (candidates.length < 2) return false;
-
-  const previous = candidates[candidates.length - 2];
-  const current = candidates[candidates.length - 1];
-  return previous.identity === current.identity && previous.text === current.text;
-}
-
 function renderFastDialogButton(state) {
   if (!fastDialogButton) return;
 
   const available = canAdvanceDialog(state);
-  if (dialogAdvanceActive && !available) {
+  if (dialogAdvanceActive && !dialogAdvanceSending && !available) {
     dialogAdvanceActive = false;
-    dialogAdvanceStartMarker = null;
   }
 
-  fastDialogButton.disabled = !dialogAdvanceActive && !available;
+  fastDialogButton.disabled = dialogAdvanceSending ? !dialogAdvanceActive : (!dialogAdvanceActive && !available);
   fastDialogButton.classList.toggle("is-running", dialogAdvanceActive);
   fastDialogButton.textContent = dialogAdvanceActive
     ? `Advancing ${dialogAdvanceCount}/${dialogAdvanceMaxPresses}`
     : "Fast Dialog";
 }
 
-function startDialogAdvance() {
+async function startDialogAdvance() {
   if (!canAdvanceDialog(latestState)) return;
   dialogAdvanceActive = true;
-  dialogAdvanceCount = 0;
-  dialogAdvanceStartMarker = dialogAdvanceInitialMarker(latestState);
-  renderFastDialogButton(latestState);
-  maybeContinueDialogAdvance(latestState);
-}
-
-function stopDialogAdvance() {
-  dialogAdvanceActive = false;
-  dialogAdvanceStartMarker = null;
-  renderFastDialogButton(latestState);
-}
-
-function scheduleDialogAdvanceRefresh() {
-  setTimeout(() => {
-    if (!dialogAdvanceActive) return;
-    refreshState().catch((error) => {
-      console.warn("dialog advance refresh failed", error);
-      stopDialogAdvance();
-    });
-  }, dialogAdvanceDelayMs);
-}
-
-function maybeContinueDialogAdvance(state) {
-  if (!dialogAdvanceActive || dialogAdvanceSending) return;
-  if (!canAdvanceDialog(state) || dialogAdvanceCount >= dialogAdvanceMaxPresses) {
-    stopDialogAdvance();
-    return;
-  }
-  if (dialogAdvanceReachedRepeatedNpcLine(state)) {
-    stopDialogAdvance();
-    return;
-  }
-  if (state?._debug?.action_pending) return;
-  void advanceDialogOnce();
-}
-
-async function advanceDialogOnce() {
-  if (!dialogAdvanceActive || dialogAdvanceSending) return;
   dialogAdvanceSending = true;
+  dialogAdvanceCount = 0;
   renderFastDialogButton(latestState);
 
   try {
     flashButton("search");
-    await sendAction(["search"], 1);
-    dialogAdvanceCount += 1;
+    const result = await advanceDialogRequest({
+      max_presses: dialogAdvanceMaxPresses,
+      delay_ms: dialogAdvanceDelayMs,
+      stop_on_repeat: true,
+    });
+    dialogAdvanceCount = Number(result.presses || 0);
   } catch (error) {
     console.warn("dialog advance failed", error);
-    stopDialogAdvance();
   } finally {
+    dialogAdvanceActive = false;
     dialogAdvanceSending = false;
     renderFastDialogButton(latestState);
-    if (dialogAdvanceActive) {
-      scheduleDialogAdvanceRefresh();
-    }
+    refreshState().catch((error) => console.warn("dialog advance refresh failed", error));
   }
+}
+
+function stopDialogAdvance() {
+  dialogAdvanceActive = false;
+  renderFastDialogButton(latestState);
+  fetch("/dialog/advance/stop", { method: "POST" }).catch((error) => console.warn("dialog advance stop failed", error));
 }
 
 function renderDialogs(state) {
@@ -848,6 +734,14 @@ function actionText(action) {
   return `${action.tool || "unknown"} ${args}`;
 }
 
+function agentVisibleDecision(state) {
+  if (agentError) return null;
+  if (agentLastDecision) return agentLastDecision;
+  const log = state?._debug?.recent_agent_decisions || [];
+  const decisionLog = log.filter((entry) => entry?.decision);
+  return decisionLog.length ? decisionLog[decisionLog.length - 1].decision : null;
+}
+
 function agentRuntimeKey(state) {
   const room = state?.room || {};
   return [
@@ -855,6 +749,60 @@ function agentRuntimeKey(state) {
     state?.map_id ?? "",
     room.key ?? state?.region_key ?? "",
   ].join("/");
+}
+
+function stateContextFromState(state) {
+  if (!state || state.status === "waiting_for_game" || state.status === "state_parse_error") {
+    return {};
+  }
+  const sceneId = state.scene_id;
+  const mapId = state.map_id;
+  const room = state.room || {};
+  const roomKey = room.key || "unknown";
+  const regionKey = state.region_key || roomKey;
+  const navRoomId = sceneId != null && mapId != null ? `${sceneId}/${mapId}/${roomKey}` : null;
+  return {
+    scene_id: sceneId,
+    map_id: mapId,
+    room_id: navRoomId ? `${navRoomId}/${regionKey}` : null,
+    room_key: roomKey,
+    region_key: regionKey,
+    nav_room_id: navRoomId,
+  };
+}
+
+function contextsMatchValue(left, right) {
+  if (left == null || left === "" || right == null || right === "") return true;
+  return String(left) === String(right);
+}
+
+function agentDecisionContextMatches(decision, state) {
+  const context = decision?.state_context;
+  if (!context || typeof context !== "object") return true;
+  const current = stateContextFromState(state);
+  return ["scene_id", "map_id", "room_id", "nav_room_id", "room_key", "region_key"]
+    .every((key) => contextsMatchValue(context[key], current[key]));
+}
+
+function agentActionExecutable(action) {
+  return ["press_buttons", "advance_dialog", "navigation_step"].includes(action?.tool);
+}
+
+function agentExecutionDisabledReason(decision, state, agentBusy) {
+  const action = decision?.recommended_action;
+  if (agentBusy || agentExecutionInFlight) return "Agent is busy.";
+  if (activeNavigation) return "Navigation is already running.";
+  if (dialogAdvanceSending) return "Dialog advance is already running.";
+  if (state?._debug?.action_pending) return "An action is already pending.";
+  if (!decision || !action) return "No recommendation to execute.";
+  if (!agentDecisionContextMatches(decision, state)) return "Decision is for an older room. Ask Agent again.";
+  if (action.tool === "no_op") return "Recommendation has no executable action.";
+  if (!agentActionExecutable(action)) return `Unsupported action tool: ${action.tool || "unknown"}.`;
+  if (action.tool === "navigation_step" && !Number(action.args?.id)) return "Navigation target is missing.";
+  if (action.tool === "navigation_step" && !navigationTargetActionable(state, Number(action.args.id))) {
+    return "Navigation target is not actionable now.";
+  }
+  return "";
 }
 
 function evidenceItems(evidence) {
@@ -921,13 +869,16 @@ function agentButtonText(status) {
   return agentRequestInFlight ? "Thinking..." : "Ask Agent";
 }
 
-function agentStatusText(status) {
+function agentStatusText(status, executeDisabledReason, decision) {
   if (agentError) return agentError;
+  if (agentExecutionInFlight) return "Executing recommended action.";
+  if (agentActionStatus) return agentActionStatus;
   if (status?.running) return status.message || "Waiting for agent.";
   if (agentRequestInFlight) return "Waiting for agent.";
-  if (status?.phase === "completed") return status.message || "Decision ready. No actions were executed.";
+  if (decision && executeDisabledReason) return executeDisabledReason;
+  if (status?.phase === "completed") return status.message || "Decision ready. Execute manually.";
   if (status?.phase === "error") return status.error || status.message || "Agent request failed.";
-  return "No actions are executed.";
+  return "Ask Agent for a recommendation.";
 }
 
 function renderAgentProgress(status) {
@@ -948,14 +899,18 @@ function renderAgent(state) {
   const agentStatus = state._debug?.agent_status || {};
   const historyOpen = Boolean(agentEl.querySelector(".agentHistory")?.open);
   const decisionLog = log.filter((entry) => entry?.decision);
-  const latestLogged = decisionLog.length ? decisionLog[decisionLog.length - 1] : null;
-  const decision = agentError ? null : (agentLastDecision || latestLogged?.decision || null);
+  const decision = agentVisibleDecision(state);
   const history = decisionLog.slice(-8).reverse();
-  const agentBusy = agentRequestInFlight || Boolean(agentStatus.running);
+  const agentBusy = agentRequestInFlight || agentExecutionInFlight || Boolean(agentStatus.running);
+  const executeDisabledReason = agentExecutionDisabledReason(decision, state, agentBusy);
+  const executeDisabled = Boolean(executeDisabledReason);
   const status = agentBusy ? "loading" : agentError ? "error" : decision ? "ready" : "idle";
   const renderKey = JSON.stringify({
     status,
     error: agentError,
+    agentActionStatus,
+    agentExecutionInFlight,
+    executeDisabledReason,
     agentStatus: [
       agentStatus.running,
       agentStatus.backend,
@@ -981,7 +936,8 @@ function renderAgent(state) {
   agentRenderKey = setPanelHtml(agentEl, `
     <div class="agentControls">
       <button data-agent-action="decide" ${agentBusy ? "disabled" : ""}>${escapeHtml(agentButtonText(agentStatus))}</button>
-      <span class="agentStatusText">${escapeHtml(agentStatusText(agentStatus))}</span>
+      <button data-agent-action="execute" ${executeDisabled ? "disabled" : ""}>${agentExecutionInFlight ? "Executing..." : "Execute Action"}</button>
+      <span class="agentStatusText">${escapeHtml(agentStatusText(agentStatus, executeDisabledReason, decision))}</span>
     </div>
     ${renderAgentProgress(agentStatus)}
     ${agentError ? renderAgentError(agentError) : renderAgentDecision(decision)}
@@ -1624,7 +1580,6 @@ function render(state) {
   renderObjects(state);
   drawOverlay(state);
   scheduleNavigationRefresh(state);
-  maybeContinueDialogAdvance(state);
 }
 
 async function useInventoryItem(itemId, target) {
@@ -1711,6 +1666,8 @@ function resetLocalAfterCheckpointLoad() {
     navigationRefreshTimer = null;
   }
   agentError = null;
+  agentActionStatus = "";
+  agentExecutionInFlight = false;
   agentLastDecision = null;
 }
 
@@ -1772,6 +1729,9 @@ async function loadCheckpoint(id) {
 
 async function startNewGame() {
   if (checkpointBusy) return;
+  if (!latestState || latestState.status !== "startup_waiting") {
+    if (!window.confirm("Start a new game? Current live game state will be replaced.")) return;
+  }
   checkpointBusy = "starting";
   checkpointStatus = "Starting new game...";
   checkpointError = null;
@@ -1820,6 +1780,7 @@ async function askAgent() {
   if (agentRequestInFlight) return;
   agentRequestInFlight = true;
   agentError = null;
+  agentActionStatus = "";
   if (latestState) renderAgent(latestState);
 
   try {
@@ -1839,6 +1800,64 @@ async function askAgent() {
     agentError = error instanceof Error ? error.message : String(error);
   } finally {
     agentRequestInFlight = false;
+    if (latestState) renderAgent(latestState);
+  }
+}
+
+async function executeAgentRecommendation() {
+  if (agentExecutionInFlight) return;
+  const decision = agentVisibleDecision(latestState);
+  const action = decision?.recommended_action;
+  const disabledReason = agentExecutionDisabledReason(
+    decision,
+    latestState,
+    agentRequestInFlight || Boolean(latestState?._debug?.agent_status?.running)
+  );
+  if (disabledReason) {
+    agentActionStatus = disabledReason;
+    if (latestState) renderAgent(latestState);
+    return;
+  }
+
+  agentExecutionInFlight = true;
+  agentActionStatus = "";
+  if (latestState) renderAgent(latestState);
+
+  try {
+    if (action.tool === "press_buttons") {
+      const args = action.args || {};
+      const rawButtons = Array.isArray(args.buttons) ? args.buttons : [args.buttons].filter(Boolean);
+      const buttons = rawButtons.map((button) => String(button).trim().toLowerCase()).filter(Boolean);
+      if (!buttons.length) throw new Error("press_buttons action has no buttons");
+      const parsedFrames = Number.isFinite(Number(args.frames)) ? Number(args.frames) : 1;
+      const frames = Math.max(1, Math.min(Math.trunc(parsedFrames), 300));
+      await sendAction(buttons, frames);
+      agentActionStatus = `Executed ${actionText(action)}.`;
+      await refreshState();
+      return;
+    }
+
+    if (action.tool === "advance_dialog") {
+      await advanceDialogRequest(action.args || {});
+      agentActionStatus = "Advanced dialog.";
+      await refreshState();
+      return;
+    }
+
+    if (action.tool === "navigation_step") {
+      const targetId = Number(action.args?.id || 0);
+      if (!targetId) throw new Error("navigation target is missing");
+      await navigateToTarget(targetId);
+      agentActionStatus = `Executed navigation_step {"id":${targetId}}.`;
+      await refreshState();
+      return;
+    }
+
+    agentActionStatus = "Recommendation has no executable action.";
+  } catch (error) {
+    agentActionStatus = `Action failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    agentExecutionInFlight = false;
     if (latestState) renderAgent(latestState);
   }
 }
@@ -2149,6 +2168,19 @@ async function sendAction(buttons, frames = 1) {
   const result = await response.json().catch(() => ({}));
   if (!response.ok || result.ok === false) {
     throw new Error(result.error || `action failed: ${response.status}`);
+  }
+  return result;
+}
+
+async function advanceDialogRequest(options) {
+  const response = await fetch("/dialog/advance", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(options || {}),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.ok === false) {
+    throw new Error(result.error || result.status || `dialog advance failed: ${response.status}`);
   }
   return result;
 }

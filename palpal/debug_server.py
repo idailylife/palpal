@@ -45,7 +45,7 @@ VALID_BUTTONS = {
     "end",
 }
 STALE_AFTER_SECONDS = 2.0
-EXPLORATION_VERSION = 2
+EXPLORATION_VERSION = 3
 MAX_NAVIGATION_SEGMENT_STEPS = 8
 VIEWPORT_WIDTH = 320
 VIEWPORT_HEIGHT = 200
@@ -55,6 +55,9 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_TIMEOUT = 90.0
 MAX_AGENT_TOOL_ROUNDS = 8
 MAX_AGENT_TOOL_CALLS = 40
+DEFAULT_DIALOG_ADVANCE_DELAY_MS = 500
+DEFAULT_DIALOG_ADVANCE_MAX_PRESSES = 100
+DIALOG_ADVANCE_ACTION_TIMEOUT = 2.5
 CHECKPOINT_MANIFEST_VERSION = 1
 DEFAULT_CHECKPOINT_SLOT = 99
 CHECKPOINT_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -63,8 +66,10 @@ CHECKPOINT_COMPANION_FILES = (
     Path("exploration.json"),
     Path("events.json"),
     Path("agent_log.jsonl"),
+    Path("agent_llm_log.jsonl"),
     Path("logs") / "navigation.log",
 )
+CHECKPOINT_COMPANION_RESET_FILES = frozenset(CHECKPOINT_COMPANION_FILES)
 MOVE_DELTAS = {
     "up": (1, -1),
     "right": (1, 1),
@@ -334,7 +339,13 @@ class DebugState:
         self.last_observed_state: dict | None = None
         self.pending_transition_observation: dict | None = None
         self.last_snapshot_frame: int | None = None
+        self.logical_frame_offset = 0
+        self.last_raw_frame: int | None = None
+        self.last_logical_frame: int | None = None
+        self.pending_checkpoint_frame_reset: dict | None = None
         self.exploration_lock = threading.Lock()
+        self.dialog_advance_lock = threading.Lock()
+        self.dialog_advance_cancel = threading.Event()
         self.agent_status_lock = threading.Lock()
         self.agent_status = self.empty_agent_status()
 
@@ -461,6 +472,10 @@ class DebugState:
     def agent_log_path(self) -> Path:
         return self.runtime_dir / "agent_log.jsonl"
 
+    @property
+    def agent_llm_log_path(self) -> Path:
+        return self.runtime_dir / "agent_llm_log.jsonl"
+
     def companion_live_path(self, relative_path: Path) -> Path:
         return self.runtime_dir / relative_path
 
@@ -494,12 +509,18 @@ class DebugState:
         return files
 
     def checkpoint_context(self, state: dict) -> dict:
+        identity = self.room_identity(state)
         room = state.get("room") if isinstance(state.get("room"), dict) else {}
         return {
             "scene_id": state.get("scene_id"),
             "map_id": state.get("map_id"),
-            "room_key": room.get("key") or state.get("region_key"),
+            "room_id": identity["id"] if identity else None,
+            "room_key": identity["room_key"] if identity else room.get("key"),
+            "region_key": identity["region_key"] if identity else state.get("region_key"),
+            "nav_room_id": identity["nav_room_id"] if identity else None,
             "frame": state.get("frame"),
+            "logical_frame": state.get("logical_frame", state.get("frame")),
+            "raw_frame": state.get("raw_frame"),
             "dialog_active": bool((state.get("dialog") or {}).get("active")),
             "entering_scene": bool(state.get("entering_scene")),
         }
@@ -556,6 +577,130 @@ class DebugState:
         self.dialog_source_keys = self.dialog_history_source_keys(self.dialog_history)
         self.last_observed_state = None
         self.pending_transition_observation = None
+
+    def int_frame(self, value) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def logical_frame_for_raw(self, raw_frame) -> int | None:
+        raw = self.int_frame(raw_frame)
+        if raw is None:
+            return None
+        return raw + self.logical_frame_offset
+
+    def seed_timeline_from_state(self, state: dict) -> None:
+        raw_frame = self.int_frame(state.get("raw_frame", state.get("frame")))
+        if raw_frame is None:
+            return
+        logical_frame = raw_frame + self.logical_frame_offset
+        if self.last_raw_frame is None:
+            self.last_raw_frame = raw_frame
+        if self.last_logical_frame is None:
+            self.last_logical_frame = logical_frame
+        self.last_snapshot_frame = self.last_logical_frame
+
+    def mark_checkpoint_frame_reset_pending(self, checkpoint_id: str, state: dict) -> None:
+        previous_logical = self.last_logical_frame
+        previous_raw = self.last_raw_frame
+        if state.get("in_main_game") is not False and state.get("status") not in {"startup_waiting", "waiting_for_game"}:
+            self.seed_timeline_from_state(state)
+            previous_logical = self.last_logical_frame
+            previous_raw = self.last_raw_frame
+        companion_logical = self.max_companion_logical_frame()
+        candidates = [value for value in (previous_logical, companion_logical) if value is not None]
+        self.pending_checkpoint_frame_reset = {
+            "checkpoint_id": checkpoint_id,
+            "previous_raw_frame": previous_raw,
+            "previous_logical_frame": max(candidates) if candidates else None,
+            "time": time.time(),
+        }
+
+    def apply_frame_timeline(self, state: dict) -> None:
+        raw_frame = self.int_frame(state.get("raw_frame", state.get("frame")))
+        if raw_frame is None:
+            return
+
+        frame_restarted = self.last_raw_frame is not None and raw_frame + 5 < self.last_raw_frame
+        pending_checkpoint_reset = self.pending_checkpoint_frame_reset is not None
+        pending_previous_logical = (
+            self.pending_checkpoint_frame_reset.get("previous_logical_frame")
+            if pending_checkpoint_reset
+            else None
+        )
+        pending_needs_adjustment = (
+            pending_checkpoint_reset
+            and pending_previous_logical is not None
+            and raw_frame + self.logical_frame_offset <= pending_previous_logical
+        )
+        if (frame_restarted or pending_needs_adjustment) and self.pending_checkpoint_frame_reset is not None:
+            previous_logical = self.last_logical_frame
+            checkpoint = self.pending_checkpoint_frame_reset
+            baseline_logical = checkpoint.get("previous_logical_frame")
+            if previous_logical is not None:
+                baseline_logical = (
+                    max(previous_logical, baseline_logical)
+                    if baseline_logical is not None
+                    else previous_logical
+                )
+            if baseline_logical is not None and raw_frame + self.logical_frame_offset <= baseline_logical:
+                self.logical_frame_offset = baseline_logical + 1 - raw_frame
+            self.pending_checkpoint_frame_reset = None
+            logical_frame = raw_frame + self.logical_frame_offset
+            state["raw_frame"] = raw_frame
+            state["logical_frame"] = logical_frame
+            state["frame"] = logical_frame
+            self.append_navigation_diagnostic(
+                "timeline_adjusted",
+                {
+                    "reason": "checkpoint_restore",
+                    "checkpoint_id": checkpoint.get("checkpoint_id"),
+                    "raw_frame": raw_frame,
+                    "previous_raw_frame": checkpoint.get("previous_raw_frame"),
+                    "previous_logical_frame": checkpoint.get("previous_logical_frame"),
+                    "logical_frame": logical_frame,
+                    "logical_frame_offset": self.logical_frame_offset,
+                },
+                state=state,
+            )
+        elif frame_restarted:
+            state["raw_frame"] = raw_frame
+            state["logical_frame"] = raw_frame
+            state["frame"] = raw_frame
+            self.clear_runtime_history(reason="raw_frame_restarted", state=state)
+            self.logical_frame_offset = 0
+            self.pending_checkpoint_frame_reset = None
+
+        logical_frame = raw_frame + self.logical_frame_offset
+        state["raw_frame"] = raw_frame
+        state["logical_frame"] = logical_frame
+        state["frame"] = logical_frame
+        self.last_raw_frame = raw_frame
+        self.last_logical_frame = logical_frame
+        self.last_snapshot_frame = logical_frame
+
+    def max_companion_logical_frame(self) -> int | None:
+        values: list[int] = []
+        for entry in self.dialog_history:
+            if not isinstance(entry, dict):
+                continue
+            for key in ("end_logical_frame", "logical_frame", "end_frame", "frame"):
+                frame = self.int_frame(entry.get(key))
+                if frame is not None:
+                    values.append(frame)
+                    break
+        for entry in self.event_log:
+            if not isinstance(entry, dict):
+                continue
+            frame = self.int_frame(entry.get("logical_frame", entry.get("frame")))
+            if frame is not None:
+                values.append(frame)
+        for entry in self.read_agent_log(limit=500):
+            frame = self.int_frame(entry.get("logical_frame", entry.get("frame")))
+            if frame is not None:
+                values.append(frame)
+        return max(values) if values else None
 
     def write_slot_action(self, command: str, slot: int) -> dict:
         if command not in {"save_slot", "load_slot", "start_slot"}:
@@ -637,12 +782,39 @@ class DebugState:
             copied[key] = self.file_info(target)
         return copied
 
+    def checkpoint_companion_compatible(self, checkpoint_dir: Path, manifest: dict | None = None) -> bool:
+        if isinstance(manifest, dict):
+            try:
+                if int(manifest.get("companion_version")) == EXPLORATION_VERSION:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        exploration = read_optional_json(self.companion_checkpoint_path(checkpoint_dir, Path("exploration.json")))
+        try:
+            return int(exploration.get("version")) == EXPLORATION_VERSION
+        except (TypeError, ValueError):
+            return False
+
     def restore_companion_from_checkpoint(self, checkpoint_dir: Path) -> dict:
         restored: dict[str, dict] = {}
+        manifest = self.checkpoint_manifest(checkpoint_dir)
+        compatible = self.checkpoint_companion_compatible(checkpoint_dir, manifest)
         for relative_path in CHECKPOINT_COMPANION_FILES:
             source = self.companion_checkpoint_path(checkpoint_dir, relative_path)
             target = self.companion_live_path(relative_path)
             key = relative_path.as_posix()
+            if not compatible and relative_path in CHECKPOINT_COMPANION_RESET_FILES:
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+                restored[key] = {
+                    "available": False,
+                    "discarded": True,
+                    "reason": "incompatible_companion_version",
+                    "expected_version": EXPLORATION_VERSION,
+                }
+                continue
             if not source.exists():
                 try:
                     target.unlink()
@@ -677,6 +849,7 @@ class DebugState:
                 "id": checkpoint_id,
                 "label": (label or "").strip()[:120],
                 "created_at": utc_timestamp(),
+                "companion_version": EXPLORATION_VERSION,
                 "checkpoint_slot": slot,
                 "state": self.checkpoint_context(state),
                 "native_result": command_result["result"],
@@ -703,6 +876,12 @@ class DebugState:
         command_result = self.run_slot_command("load_slot", slot)
         restored = self.restore_companion_from_checkpoint(checkpoint_dir)
         self.refresh_companion_caches()
+        self.mark_checkpoint_frame_reset_pending(checkpoint_id, state)
+        self.append_navigation_diagnostic(
+            "checkpoint_restored",
+            {"checkpoint_id": checkpoint_id, "restored": restored},
+            state=state,
+        )
         return {
             "ok": True,
             "checkpoint": self.checkpoint_manifest(checkpoint_dir),
@@ -713,9 +892,13 @@ class DebugState:
     def start_new_game(self) -> dict:
         state = read_json(self.state_path)
         self.preflight_checkpoint_action(state, allow_startup_waiting=True)
-        if state.get("status") != "startup_waiting":
-            raise RuntimeError("already_in_game")
         command_result = self.run_slot_command("start_slot", 0)
+        self.clear_runtime_history(reason="start_new_game", state=state)
+        self.logical_frame_offset = 0
+        self.last_raw_frame = None
+        self.last_logical_frame = None
+        self.last_snapshot_frame = None
+        self.pending_checkpoint_frame_reset = None
         return {
             "ok": True,
             "native_result": command_result["result"],
@@ -740,17 +923,54 @@ class DebugState:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(entry, dict) and self.agent_log_entry_compatible(entry):
+                entries.append(entry)
+        return entries
+
+    def current_agent_turn(self) -> int:
+        latest = self.read_agent_log(limit=1)
+        if not latest:
+            return 0
+        try:
+            return max(0, int(latest[-1].get("turn") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def read_agent_llm_log(self, limit: int = 100) -> list[dict]:
+        limit = max(1, min(int(limit), 200))
+        try:
+            lines = self.agent_llm_log_path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        entries = []
+        for line in lines[-limit:]:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if isinstance(entry, dict):
                 entries.append(entry)
         return entries
 
+    def agent_log_entry_compatible(self, entry: dict) -> bool:
+        episode = entry.get("episode")
+        if isinstance(episode, str) and episode.count("/") == 2 and "nav_room_id" not in entry:
+            return False
+        return True
+
     def state_context(self, state: dict) -> dict:
+        identity = self.room_identity(state)
         room = state.get("room") if isinstance(state.get("room"), dict) else {}
         return {
             "scene_id": state.get("scene_id"),
             "map_id": state.get("map_id"),
-            "room_key": room.get("key") or state.get("region_key"),
+            "room_id": identity["id"] if identity else None,
+            "room_key": identity["room_key"] if identity else room.get("key"),
+            "region_key": identity["region_key"] if identity else state.get("region_key"),
+            "nav_room_id": identity["nav_room_id"] if identity else None,
             "frame": state.get("frame"),
+            "logical_frame": state.get("logical_frame", state.get("frame")),
+            "raw_frame": state.get("raw_frame"),
         }
 
     def attach_decision_context(self, state: dict, decision: dict) -> dict:
@@ -761,8 +981,9 @@ class DebugState:
         self.attach_decision_context(state, decision)
         latest = self.read_agent_log(limit=1)
         turn = int(latest[-1].get("turn") or 0) + 1 if latest else 1
-        room = state.get("room") or {}
-        episode = "/".join(
+        room = state.get("room") if isinstance(state.get("room"), dict) else {}
+        identity = self.room_identity(state)
+        episode = identity["id"] if identity else "/".join(
             str(value)
             for value in (
                 state.get("scene_id", "unknown"),
@@ -775,18 +996,32 @@ class DebugState:
             "episode": episode,
             "turn": turn,
             "frame": state.get("frame"),
+            "logical_frame": state.get("logical_frame", state.get("frame")),
+            "raw_frame": state.get("raw_frame"),
             "scene_id": state.get("scene_id"),
             "map_id": state.get("map_id"),
-            "room_key": room.get("key"),
+            "room_key": identity["room_key"] if identity else room.get("key"),
+            "region_key": identity["region_key"] if identity else state.get("region_key"),
+            "nav_room_id": identity["nav_room_id"] if identity else None,
             "state_context": decision.get("state_context"),
             "decision": decision,
         }
-        for key in ("backend", "model", "usage", "tool_trace"):
+        for key in ("backend", "model", "usage", "tool_trace", "llm_call_id"):
             if key in decision:
                 entry[key] = decision[key]
         with self.agent_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
         return entry
+
+    def append_agent_llm_log(self, state: dict, entry: dict) -> dict:
+        payload = {
+            "time": time.time(),
+            "state_context": self.state_context(state),
+            **entry,
+        }
+        with self.agent_llm_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        return payload
 
     def append_agent_error(
         self,
@@ -798,11 +1033,13 @@ class DebugState:
         tool_trace: list[dict] | None = None,
         tool_calls: int | None = None,
         rounds: int | None = None,
+        llm_call_id: str | None = None,
     ) -> dict:
         latest = self.read_agent_log(limit=1)
         turn = int(latest[-1].get("turn") or 0) + 1 if latest else 1
         room = state.get("room") or {}
-        episode = "/".join(
+        identity = self.room_identity(state)
+        episode = identity["id"] if identity else "/".join(
             str(value)
             for value in (
                 state.get("scene_id", "unknown"),
@@ -815,9 +1052,13 @@ class DebugState:
             "episode": episode,
             "turn": turn,
             "frame": state.get("frame"),
+            "logical_frame": state.get("logical_frame", state.get("frame")),
+            "raw_frame": state.get("raw_frame"),
             "scene_id": state.get("scene_id"),
             "map_id": state.get("map_id"),
-            "room_key": room.get("key"),
+            "room_key": identity["room_key"] if identity else room.get("key"),
+            "region_key": identity["region_key"] if identity else state.get("region_key"),
+            "nav_room_id": identity["nav_room_id"] if identity else None,
             "state_context": self.state_context(state),
             "ok": False,
             "backend": backend,
@@ -833,11 +1074,13 @@ class DebugState:
             entry["tool_calls"] = tool_calls
         if rounds is not None:
             entry["rounds"] = rounds
+        if llm_call_id:
+            entry["llm_call_id"] = llm_call_id
         with self.agent_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
         return entry
 
-    def clear_runtime_history(self) -> None:
+    def clear_runtime_history(self, reason: str = "reset", state: dict | None = None) -> None:
         self.action_log = []
         self.event_log = []
         self.dialog_history = []
@@ -847,6 +1090,7 @@ class DebugState:
         for path in (
             self.action_result_path,
             self.agent_log_path,
+            self.agent_llm_log_path,
             self.events_path,
             self.dialogs_path,
             self.exploration_path,
@@ -856,15 +1100,14 @@ class DebugState:
                 path.unlink()
             except FileNotFoundError:
                 pass
+        self.append_navigation_diagnostic(
+            "runtime_history_cleared",
+            {"reason": reason},
+            state=state,
+        )
 
     def reset_history_if_frame_restarted(self, state: dict) -> None:
-        try:
-            frame = int(state.get("frame"))
-        except (TypeError, ValueError):
-            return
-        if self.last_snapshot_frame is not None and frame + 5 < self.last_snapshot_frame:
-            self.clear_runtime_history()
-        self.last_snapshot_frame = frame
+        self.apply_frame_timeline(state)
 
     def read_events(self) -> list[dict]:
         try:
@@ -894,12 +1137,18 @@ class DebugState:
         os.replace(tmp, self.dialogs_path)
 
     def append_event(self, state: dict, event_type: str, payload: dict) -> None:
+        identity = self.room_identity(state)
         event = {
             "time": time.time(),
             "frame": state.get("frame"),
+            "logical_frame": state.get("logical_frame", state.get("frame")),
+            "raw_frame": state.get("raw_frame"),
             "scene_id": state.get("scene_id"),
             "map_id": state.get("map_id"),
-            "room_key": (state.get("room") or {}).get("key"),
+            "room_id": identity["id"] if identity else None,
+            "room_key": identity["room_key"] if identity else (state.get("room") or {}).get("key"),
+            "region_key": identity["region_key"] if identity else state.get("region_key"),
+            "nav_room_id": identity["nav_room_id"] if identity else None,
             "type": event_type,
             **payload,
         }
@@ -920,6 +1169,8 @@ class DebugState:
             entry.update(
                 {
                     "frame": state.get("frame"),
+                    "logical_frame": state.get("logical_frame", state.get("frame")),
+                    "raw_frame": state.get("raw_frame"),
                     "scene_id": state.get("scene_id"),
                     "map_id": state.get("map_id"),
                     "room_key": (state.get("room") or {}).get("key"),
@@ -936,20 +1187,47 @@ class DebugState:
         with self.navigation_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
-    def dialog_source_key(self, event: dict) -> str:
-        return ":".join(
-            str(event.get(key))
-            for key in ("sequence", "frame", "message_id", "event_object_id", "text")
+    def dialog_source_key(self, event: dict, state: dict | None = None) -> str:
+        room = state.get("room") if isinstance(state, dict) and isinstance(state.get("room"), dict) else {}
+        identity = self.room_identity(state) if isinstance(state, dict) else None
+        room_key = (
+            event.get("room_id")
+            or (identity["id"] if identity else None)
+            or ":".join(str(value) for value in (event.get("room_key") or room.get("key") or "", event.get("region_key") or ""))
         )
+        return ":".join(
+            ["dialog", str(room_key)]
+            + [str(event.get(key)) for key in ("event_object_id", "message_id", "text")]
+        )
+
+    def dialog_entry_stable_source_key(self, entry: dict) -> str | None:
+        if not isinstance(entry, dict) or not entry.get("text"):
+            return None
+        return self.dialog_source_key(entry)
+
+    def dialog_source_keys_for_entry(self, entry: dict) -> set[str]:
+        keys: set[str] = set()
+        source_keys = entry.get("source_keys")
+        if isinstance(source_keys, list):
+            keys.update(str(key) for key in source_keys if key)
+        if entry.get("source_key"):
+            keys.add(str(entry.get("source_key")))
+        stable_key = self.dialog_entry_stable_source_key(entry)
+        if stable_key:
+            keys.add(stable_key)
+        return keys
+
+    def dialog_event_frame(self, state: dict, event: dict) -> tuple[int | None, int | None]:
+        raw_frame = self.int_frame(event.get("frame", state.get("raw_frame", state.get("frame"))))
+        logical_frame = self.logical_frame_for_raw(raw_frame)
+        if logical_frame is None:
+            logical_frame = self.int_frame(state.get("logical_frame", state.get("frame")))
+        return raw_frame, logical_frame
 
     def dialog_history_source_keys(self, history: list[dict]) -> set[str]:
         keys: set[str] = set()
         for entry in history:
-            source_keys = entry.get("source_keys")
-            if isinstance(source_keys, list):
-                keys.update(str(key) for key in source_keys if key)
-            if entry.get("source_key"):
-                keys.add(str(entry.get("source_key")))
+            keys.update(self.dialog_source_keys_for_entry(entry))
         return keys
 
     def dialog_speaker_hint(self, event: dict) -> str | None:
@@ -987,7 +1265,9 @@ class DebugState:
 
     def dialog_turn_from_event(self, state: dict, dialog: dict, event: dict, source_key: str) -> dict:
         sequence = self.int_or_none(event.get("sequence"))
-        frame = event.get("frame", state.get("frame"))
+        raw_frame, logical_frame = self.dialog_event_frame(state, event)
+        frame = logical_frame if logical_frame is not None else state.get("frame")
+        identity = self.room_identity(state)
         return {
             "time": time.time(),
             "source_key": source_key,
@@ -997,10 +1277,17 @@ class DebugState:
             "end_sequence": sequence if sequence is not None else event.get("sequence"),
             "frame": frame,
             "end_frame": frame,
+            "logical_frame": frame,
+            "end_logical_frame": frame,
+            "raw_frame": raw_frame,
+            "end_raw_frame": raw_frame,
             "scene_id": event.get("scene_id", state.get("scene_id")),
             "map_id": event.get("map_id", state.get("map_id")),
-            "room_key": (state.get("room") or {}).get("key"),
-            "region_key": state.get("region_key"),
+            "room_id": identity["id"] if identity else None,
+            "room_key": identity["room_key"] if identity else (state.get("room") or {}).get("key"),
+            "region_key": identity["region_key"] if identity else state.get("region_key"),
+            "nav_room_id": identity["nav_room_id"] if identity else None,
+            "agent_turn": self.current_agent_turn(),
             "event_object_id": event.get("event_object_id"),
             "message_id": event.get("message_id"),
             "message_ids": self.dialog_message_ids(event),
@@ -1034,7 +1321,7 @@ class DebugState:
     def can_merge_dialog_turn(self, previous: dict, current: dict) -> bool:
         if not previous or previous.get("speaker_hint") == "系统" or current.get("speaker_hint") == "系统":
             return False
-        for key in ("speaker_hint", "event_object_id", "scene_id", "map_id", "room_key"):
+        for key in ("speaker_hint", "event_object_id", "scene_id", "map_id", "room_id", "room_key", "region_key"):
             if previous.get(key) != current.get(key):
                 return False
         return self.dialog_events_are_contiguous(previous, current)
@@ -1043,6 +1330,8 @@ class DebugState:
         previous["text"] = f"{previous.get('text') or ''}{current.get('text') or ''}"
         previous["end_sequence"] = current.get("end_sequence")
         previous["end_frame"] = current.get("end_frame", current.get("frame"))
+        previous["end_logical_frame"] = current.get("end_logical_frame", current.get("logical_frame", current.get("end_frame", current.get("frame"))))
+        previous["end_raw_frame"] = current.get("end_raw_frame", current.get("raw_frame"))
         previous["message_id"] = current.get("message_id")
         previous["dialog_position"] = current.get("dialog_position") or previous.get("dialog_position")
         source_keys = previous.setdefault("source_keys", [])
@@ -1075,7 +1364,7 @@ class DebugState:
             if not isinstance(event, dict) or not event.get("text"):
                 continue
 
-            source_key = self.dialog_source_key(event)
+            source_key = self.dialog_source_key(event, state)
             if source_key in self.dialog_source_keys:
                 continue
 
@@ -1098,6 +1387,94 @@ class DebugState:
             self.dialog_source_keys = self.dialog_history_source_keys(self.dialog_history)
             self.dialog_source_keys.update(processed_source_keys)
             self.write_dialog_history()
+
+    def dialog_advance_source_keys(self, entry: dict | None) -> list[str]:
+        if not isinstance(entry, dict):
+            return []
+        keys = []
+        if entry.get("source_key"):
+            keys.append(str(entry.get("source_key")))
+        source_keys = entry.get("source_keys")
+        if isinstance(source_keys, list):
+            keys.extend(str(key) for key in source_keys if key)
+        return list(dict.fromkeys(keys))
+
+    def dialog_advance_marker_from_entry(self, entry: dict | None) -> dict | None:
+        if not isinstance(entry, dict):
+            return None
+        try:
+            entry_time = float(entry.get("time"))
+        except (TypeError, ValueError):
+            entry_time = None
+        return {"time": entry_time, "source_keys": self.dialog_advance_source_keys(entry)}
+
+    def dialog_advance_entry_matches_marker(self, entry: dict, marker: dict | None) -> bool:
+        marker_keys = marker.get("source_keys") if isinstance(marker, dict) else None
+        if not isinstance(marker_keys, list) or not marker_keys:
+            return False
+        entry_keys = set(self.dialog_advance_source_keys(entry))
+        return any(key in entry_keys for key in marker_keys)
+
+    def dialog_advance_initial_marker(self, state: dict) -> dict | None:
+        if not self.dialog_history:
+            return None
+        latest = self.dialog_history[-1]
+        latest_text = str(latest.get("text") or "").strip()
+        active_text = str(((state.get("dialog") or {}).get("latest_event") or {}).get("text") or "").strip()
+        if (
+            (state.get("dialog") or {}).get("active")
+            and active_text
+            and latest_text
+            and (latest_text == active_text or latest_text.endswith(active_text))
+        ):
+            return self.dialog_advance_marker_from_entry(self.dialog_history[-2] if len(self.dialog_history) >= 2 else None)
+        return self.dialog_advance_marker_from_entry(latest)
+
+    def dialog_advance_recent_dialogs(self, marker: dict | None) -> list[dict]:
+        if not marker:
+            return self.dialog_history[:]
+        for index in range(len(self.dialog_history) - 1, -1, -1):
+            if self.dialog_advance_entry_matches_marker(self.dialog_history[index], marker):
+                return self.dialog_history[index + 1 :]
+        marker_time = marker.get("time") if isinstance(marker, dict) else None
+        if marker_time is not None:
+            recent = []
+            for entry in self.dialog_history:
+                try:
+                    entry_time = float(entry.get("time"))
+                except (TypeError, ValueError):
+                    continue
+                if entry_time > marker_time:
+                    recent.append(entry)
+            return recent
+        return self.dialog_history[:]
+
+    def dialog_advance_identity(self, entry: dict) -> str | None:
+        if not isinstance(entry, dict) or entry.get("speaker_hint") == "系统":
+            return None
+        scene_id = entry.get("scene_id", "")
+        map_id = entry.get("map_id", "")
+        room_key = entry.get("room_key", "")
+        event_object_id = entry.get("event_object_id")
+        if event_object_id not in (None, ""):
+            return f"object:{scene_id}:{map_id}:{room_key}:{event_object_id}"
+        speaker = entry.get("speaker_hint")
+        if speaker:
+            return f"speaker:{scene_id}:{map_id}:{room_key}:{speaker}"
+        return None
+
+    def dialog_advance_reached_repeated_npc_line(self, marker: dict | None) -> bool:
+        candidates = []
+        for entry in self.dialog_advance_recent_dialogs(marker):
+            identity = self.dialog_advance_identity(entry)
+            text = str(entry.get("text") or "").strip()
+            if identity and text:
+                candidates.append({"identity": identity, "text": text})
+        if len(candidates) < 2:
+            return False
+        previous = candidates[-2]
+        current = candidates[-1]
+        return previous["identity"] == current["identity"] and previous["text"] == current["text"]
 
     def dialogs_view(self, limit: int = 100, speaker: str | None = None) -> dict:
         limit = max(1, min(int(limit), 500))
@@ -1331,13 +1708,17 @@ class DebugState:
         map_id = state.get("map_id")
         if scene_id is None or map_id is None:
             return None
-        room = state.get("room") or {}
-        room_key = room.get("key") or state.get("region_key") or "unknown"
+        room = state.get("room") if isinstance(state.get("room"), dict) else {}
+        room_key = room.get("key") or "unknown"
+        region_key = state.get("region_key") or room_key
+        nav_room_id = f"{scene_id}/{map_id}/{room_key}"
         return {
-            "id": f"{scene_id}/{map_id}/{room_key}",
+            "id": f"{nav_room_id}/{region_key}",
             "scene_id": scene_id,
             "map_id": map_id,
             "room_key": room_key,
+            "region_key": region_key,
+            "nav_room_id": nav_room_id,
         }
 
     def empty_exploration(self) -> dict:
@@ -1371,6 +1752,8 @@ class DebugState:
                 "scene_id": None,
                 "map_id": None,
                 "room_key": None,
+                "region_key": None,
+                "nav_room_id": None,
                 "complete": False,
                 "explored": 0,
                 "explorable": 0,
@@ -1386,6 +1769,8 @@ class DebugState:
                 "scene_id": None,
                 "map_id": None,
                 "room_key": None,
+                "region_key": None,
+                "nav_room_id": None,
                 "complete": False,
                 "explored": 0,
                 "explorable": 0,
@@ -1398,6 +1783,8 @@ class DebugState:
             "scene_id": room.get("scene_id"),
             "map_id": room.get("map_id"),
             "room_key": room.get("room_key"),
+            "region_key": room.get("region_key"),
+            "nav_room_id": room.get("nav_room_id"),
             "complete": bool(room.get("complete")),
             "explored": len(room.get("visited") or []),
             "explorable": int(room.get("explorable") or 0),
@@ -1493,6 +1880,8 @@ class DebugState:
                 "to_scene_id": to_identity["scene_id"],
                 "to_map_id": to_identity["map_id"],
                 "to_room_key": to_identity["room_key"],
+                "to_region_key": to_identity["region_key"],
+                "to_nav_room_id": to_identity["nav_room_id"],
                 "observed": True,
                 "observed_at": observed_at,
             }
@@ -1542,6 +1931,8 @@ class DebugState:
                 "scene_id": identity["scene_id"],
                 "map_id": identity["map_id"],
                 "room_key": identity["room_key"],
+                "region_key": identity["region_key"],
+                "nav_room_id": identity["nav_room_id"],
                 "visited": [],
                 "frontier": [],
                 "explorable": 0,
@@ -1747,6 +2138,8 @@ class DebugState:
             "scene_id": identity["scene_id"] if identity else None,
             "map_id": identity["map_id"] if identity else None,
             "room_key": identity["room_key"] if identity else None,
+            "region_key": identity["region_key"] if identity else None,
+            "nav_room_id": identity["nav_room_id"] if identity else None,
             "visited": len(room.get("visited") or []),
             "explored": len(room.get("visited") or []),
             "explorable": len(explorable_nodes),
@@ -1789,6 +2182,8 @@ class DebugState:
                 "scene_id": None,
                 "map_id": None,
                 "room_key": None,
+                "region_key": None,
+                "nav_room_id": None,
                 "complete": False,
                 "explored": 0,
                 "explorable": 0,
@@ -1833,6 +2228,8 @@ class DebugState:
                     "to_scene_id": record.get("to_scene_id"),
                     "to_map_id": record.get("to_map_id"),
                     "to_room_key": record.get("to_room_key"),
+                    "to_region_key": record.get("to_region_key"),
+                    "to_nav_room_id": record.get("to_nav_room_id"),
                     "observed": bool(record.get("observed")),
                     "observed_at": record.get("observed_at"),
                 }
@@ -2427,14 +2824,154 @@ class DebugState:
             "action_result_file": self.file_info(self.action_result_path),
             "recent_agent_decisions": self.read_agent_log(limit=20),
             "agent_status": self.agent_status_snapshot(),
+            "timeline": {
+                "raw_frame": state.get("raw_frame"),
+                "logical_frame": state.get("logical_frame", state.get("frame")),
+                "logical_frame_offset": self.logical_frame_offset,
+                "last_raw_frame": self.last_raw_frame,
+                "last_logical_frame": self.last_logical_frame,
+                "pending_checkpoint_frame_reset": self.pending_checkpoint_frame_reset is not None,
+            },
         }
         return state
+
+    def dialog_advance_int(self, value, default: int, lower: int, upper: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(lower, min(parsed, upper))
+
+    def normalize_dialog_advance_args(self, args: dict | None = None) -> dict:
+        args = args if isinstance(args, dict) else {}
+        return {
+            "max_presses": self.dialog_advance_int(
+                args.get("max_presses"),
+                DEFAULT_DIALOG_ADVANCE_MAX_PRESSES,
+                1,
+                DEFAULT_DIALOG_ADVANCE_MAX_PRESSES,
+            ),
+            "delay_ms": self.dialog_advance_int(args.get("delay_ms"), DEFAULT_DIALOG_ADVANCE_DELAY_MS, 100, 2000),
+            "stop_on_repeat": args.get("stop_on_repeat") is not False,
+        }
+
+    def wait_for_action_clear(self, timeout: float = DIALOG_ADVANCE_ACTION_TIMEOUT) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.action_path.exists():
+                return True
+            time.sleep(0.05)
+        return not self.action_path.exists()
+
+    def dialog_advance_stop_status(self, state: dict) -> str | None:
+        if state.get("status") == "waiting_for_game":
+            return "waiting_for_game"
+        if state.get("status") == "state_parse_error":
+            return "state_parse_error"
+        if state.get("_debug", {}).get("runtime_stale"):
+            return "runtime_stale"
+        if state.get("in_battle"):
+            return "in_battle"
+        if state.get("in_main_game") is False:
+            return "not_in_main_game"
+        if not (state.get("dialog") or {}).get("active"):
+            return "dialog_inactive"
+        return None
+
+    def advance_dialog(self, args: dict | None = None) -> dict:
+        options = self.normalize_dialog_advance_args(args)
+        if not self.dialog_advance_lock.acquire(blocking=False):
+            return {"ok": False, "status": "already_running", **options}
+        try:
+            self.dialog_advance_cancel.clear()
+            presses = 0
+            dialogs_at_start = len(self.dialog_history)
+            state = self.snapshot()
+            marker = self.dialog_advance_initial_marker(state)
+            stop_status = self.dialog_advance_stop_status(state)
+            if stop_status:
+                return {
+                    "ok": stop_status == "dialog_inactive",
+                    "status": stop_status,
+                    "presses": presses,
+                    "dialogs": [],
+                    **options,
+                }
+
+            while presses < options["max_presses"]:
+                if self.dialog_advance_cancel.is_set():
+                    return {
+                        "ok": True,
+                        "status": "cancelled",
+                        "presses": presses,
+                        "dialogs": self.dialog_history[dialogs_at_start:],
+                        **options,
+                    }
+                if options["stop_on_repeat"] and self.dialog_advance_reached_repeated_npc_line(marker):
+                    break
+                if self.action_path.exists():
+                    return {
+                        "ok": False,
+                        "status": "action_pending_timeout",
+                        "presses": presses,
+                        "dialogs": self.dialog_history[dialogs_at_start:],
+                        **options,
+                    }
+
+                self.write_action(["search"], 1)
+                presses += 1
+                if not self.wait_for_action_clear():
+                    return {
+                        "ok": False,
+                        "status": "action_pending_timeout",
+                        "presses": presses,
+                        "dialogs": self.dialog_history[dialogs_at_start:],
+                        **options,
+                    }
+
+                time.sleep(options["delay_ms"] / 1000)
+                if self.dialog_advance_cancel.is_set():
+                    return {
+                        "ok": True,
+                        "status": "cancelled",
+                        "presses": presses,
+                        "dialogs": self.dialog_history[dialogs_at_start:],
+                        **options,
+                    }
+                state = self.snapshot()
+                stop_status = self.dialog_advance_stop_status(state)
+                if stop_status:
+                    return {
+                        "ok": True,
+                        "status": stop_status,
+                        "presses": presses,
+                        "dialogs": self.dialog_history[dialogs_at_start:],
+                        **options,
+                    }
+
+            status = "repeated_dialog" if options["stop_on_repeat"] and self.dialog_advance_reached_repeated_npc_line(marker) else "max_presses"
+            return {
+                "ok": True,
+                "status": status,
+                "presses": presses,
+                "dialogs": self.dialog_history[dialogs_at_start:],
+                **options,
+            }
+        finally:
+            self.dialog_advance_lock.release()
+
+    def cancel_dialog_advance(self) -> dict:
+        running = self.dialog_advance_lock.locked()
+        if running:
+            self.dialog_advance_cancel.set()
+        return {"ok": True, "status": "cancelling" if running else "idle", "running": running}
 
     def action_preview(self, tool: str, args: dict) -> dict:
         return {"tool": tool, "args": args, "dry_run": True}
 
     def decision_base(self, state: dict, navigation: dict, dialogs: dict, events: list[dict]) -> dict:
         room = state.get("room") or {}
+        identity = self.room_identity(state)
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
         return {
@@ -2447,8 +2984,11 @@ class DebugState:
                 "frame": state.get("frame"),
                 "scene_id": state.get("scene_id"),
                 "map_id": state.get("map_id"),
+                "room_id": identity["id"] if identity else None,
                 "room": room.get("key"),
-                "region_key": state.get("region_key"),
+                "room_key": identity["room_key"] if identity else room.get("key"),
+                "region_key": identity["region_key"] if identity else state.get("region_key"),
+                "nav_room_id": identity["nav_room_id"] if identity else None,
                 "position": {"x": pos.get("x"), "y": pos.get("y")},
                 "dialog_active": bool(dialog.get("active")),
                 "navigation_status": navigation.get("status"),
@@ -2548,7 +3088,7 @@ class DebugState:
                 {
                     "summary": "Dialog is active; the next safest step is to read or advance it.",
                     "recommended_intent": "advance_dialog",
-                    "recommended_action": self.action_preview("press_buttons", {"buttons": ["search"], "frames": 1}),
+                    "recommended_action": self.action_preview("advance_dialog", {}),
                     "evidence": {
                         **decision["evidence"],
                         "dialog": {
@@ -2579,7 +3119,15 @@ class DebugState:
             and not target.get("transition_candidate")
             and target.get("agent_priority") != "avoid_repeat"
         ]
-        reachable.sort(key=lambda target: (target.get("steps") is None, target.get("steps") or 0, target.get("id") or 0))
+        priority_rank = {"normal": 0, "soft_avoid": 1}
+        reachable.sort(
+            key=lambda target: (
+                priority_rank.get(str(target.get("agent_priority") or "normal"), 0),
+                target.get("steps") is None,
+                target.get("steps") or 0,
+                target.get("id") or 0,
+            )
+        )
         if reachable:
             target = reachable[0]
             route = self.route_to_object(state, int(target.get("id") or 0), avoid_transitions=True)
@@ -2686,7 +3234,7 @@ class DebugState:
                         {"id": target.get("id"), "status": target.get("status"), "kind": target.get("kind")}
                         for target in targets[:20]
                     ],
-                    "deprioritized_targets": [
+                    "recent_dialog_targets": [
                         {
                             "id": target.get("id"),
                             "kind": target.get("kind"),
@@ -2695,6 +3243,27 @@ class DebugState:
                         }
                         for target in targets[:20]
                         if target.get("agent_priority") == "avoid_repeat"
+                        and target.get("interaction_state") == "recent_dialog"
+                    ],
+                    "soft_avoid_targets": [
+                        {
+                            "id": target.get("id"),
+                            "kind": target.get("kind"),
+                            "interaction_state": target.get("interaction_state"),
+                            "reason": target.get("deprioritize_reason"),
+                        }
+                        for target in targets[:20]
+                        if target.get("agent_priority") == "soft_avoid"
+                    ],
+                    "recently_cleared_targets": [
+                        {
+                            "id": target.get("id"),
+                            "kind": target.get("kind"),
+                            "interaction_state": target.get("interaction_state"),
+                            "reason": target.get("deprioritize_reason"),
+                        }
+                        for target in targets[:20]
+                        if target.get("interaction_state") == "recently_cleared"
                     ],
                 },
                 "risk": "There is no explicit object or transition target to act on safely.",
@@ -2723,20 +3292,178 @@ class DebugState:
                 {
                     "frame": entry.get("frame"),
                     "end_frame": entry.get("end_frame"),
+                    "raw_frame": entry.get("raw_frame"),
+                    "end_raw_frame": entry.get("end_raw_frame"),
                     "speaker_hint": entry.get("speaker_hint"),
                     "text": entry.get("text"),
                     "message_id": entry.get("message_id"),
                     "message_ids": entry.get("message_ids"),
+                    "room_id": entry.get("room_id"),
+                    "room_key": entry.get("room_key"),
+                    "region_key": entry.get("region_key"),
+                    "nav_room_id": entry.get("nav_room_id"),
+                    "agent_turn": entry.get("agent_turn"),
+                    "turn": entry.get("turn"),
                 }
             )
         return {obj_id: entries[-limit_per_object:] for obj_id, entries in feedback.items()}
 
+    def dialog_entry_matches_current_room(self, state: dict, entry: dict) -> bool:
+        identity = self.room_identity(state)
+        if identity is None:
+            return False
+        if entry.get("scene_id") not in (None, identity["scene_id"]):
+            return False
+        if entry.get("map_id") not in (None, identity["map_id"]):
+            return False
+
+        entry_room_id = entry.get("room_id")
+        if entry_room_id:
+            return str(entry_room_id) == identity["id"]
+
+        entry_room_key = entry.get("room_key")
+        entry_region_key = entry.get("region_key")
+        return (
+            bool(entry_room_key)
+            and bool(entry_region_key)
+            and str(entry_room_key) == str(identity["room_key"])
+            and str(entry_region_key) == str(identity["region_key"])
+        )
+
+    def dialog_entry_has_different_full_room(self, state: dict, entry: dict) -> bool:
+        identity = self.room_identity(state)
+        if identity is None:
+            return False
+        entry_room_id = entry.get("room_id")
+        return bool(entry_room_id) and str(entry_room_id) != identity["id"]
+
+    def same_room_dialog_feedback_by_object(
+        self,
+        state: dict,
+        dialogs: list[dict],
+        limit_per_object: int = 4,
+    ) -> dict[int, list[dict]]:
+        same_room = [entry for entry in dialogs if self.dialog_entry_matches_current_room(state, entry)]
+        return self.dialog_feedback_by_object(same_room, limit_per_object=limit_per_object)
+
+    def latest_feedback_agent_turn(self, feedback: list[dict]) -> int | None:
+        latest_turn = None
+        for entry in feedback:
+            turn = self.int_frame(entry.get("agent_turn", entry.get("turn")))
+            if turn is not None:
+                latest_turn = turn if latest_turn is None else max(latest_turn, turn)
+        return latest_turn
+
+    def ensure_dialog_feedback_turn(self, state: dict, target_id: int) -> None:
+        current_turn = self.current_agent_turn()
+        changed = False
+        for entry in self.dialog_history:
+            if not isinstance(entry, dict) or not self.dialog_entry_matches_current_room(state, entry):
+                continue
+            try:
+                obj_id = int(entry.get("event_object_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if obj_id != target_id:
+                continue
+            if entry.get("agent_turn") is None and entry.get("turn") is None:
+                entry["agent_turn"] = current_turn
+                changed = True
+        if changed:
+            self.write_dialog_history()
+
+    def dialog_feedback_decay(self, feedback: list[dict]) -> dict:
+        current_turn = self.current_agent_turn()
+        feedback_turn = self.latest_feedback_agent_turn(feedback)
+        if feedback_turn is None:
+            feedback_turn = current_turn
+        turns_since = max(0, current_turn - feedback_turn)
+        if turns_since >= 3:
+            return {
+                "interaction_state": "fresh",
+                "agent_priority": "normal",
+                "dialog_feedback_state": "decayed",
+                "dialog_feedback_turns_since": turns_since,
+            }
+        if turns_since == 2:
+            return {
+                "interaction_state": "recent_dialog",
+                "agent_priority": "soft_avoid",
+                "dialog_feedback_state": "soft_avoid",
+                "dialog_feedback_turns_since": turns_since,
+            }
+        return {
+            "interaction_state": "recent_dialog",
+            "agent_priority": "avoid_repeat",
+            "dialog_feedback_state": "recent_dialog",
+            "dialog_feedback_turns_since": turns_since,
+        }
+
+    def stale_different_room_dialog_feedback_for_target(self, state: dict, target_id: int) -> list[dict]:
+        stale = []
+        for entry in self.dialog_history:
+            if not isinstance(entry, dict) or not self.dialog_entry_has_different_full_room(state, entry):
+                continue
+            try:
+                obj_id = int(entry.get("event_object_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if obj_id == target_id:
+                stale.append(entry)
+        return self.dialog_feedback_by_object(stale, limit_per_object=1).get(target_id, [])
+
+    def target_changed_after_dialog_feedback(self, state: dict, target_id: int, feedback: list[dict]) -> bool:
+        latest_frame = None
+        for entry in feedback:
+            frame = self.int_frame(entry.get("end_frame", entry.get("frame")))
+            if frame is not None:
+                latest_frame = frame if latest_frame is None else max(latest_frame, frame)
+        identity = self.room_identity(state)
+        room_key = identity["room_key"] if identity else (((state.get("room") or {}).get("key") if isinstance(state.get("room"), dict) else None) or "")
+        for event in reversed(self.event_log[-100:]):
+            if event.get("type") != "object_changed":
+                continue
+            if event.get("scene_id") not in (None, state.get("scene_id")):
+                continue
+            if event.get("map_id") not in (None, state.get("map_id")):
+                continue
+            if identity is not None and event.get("room_id") and str(event.get("room_id")) != identity["id"]:
+                continue
+            event_room_key = event.get("room_key")
+            if event_room_key not in (None, "", room_key):
+                continue
+            try:
+                if int(event.get("object_id") or 0) != target_id:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            event_frame = self.int_frame(event.get("frame"))
+            if latest_frame is None or event_frame is None or event_frame >= latest_frame:
+                return True
+        return False
+
+    def dialog_feedback_for_target(self, state: dict, target_id: int) -> list[dict]:
+        self.ensure_dialog_feedback_turn(state, target_id)
+        feedback = self.same_room_dialog_feedback_by_object(state, self.dialog_history).get(target_id, [])
+        if feedback and not self.target_changed_after_dialog_feedback(state, target_id, feedback):
+            return feedback
+        return []
+
     def event_matches_room(self, state: dict, event: dict) -> bool:
         if event.get("scene_id") != state.get("scene_id") or event.get("map_id") != state.get("map_id"):
             return False
-        room_key = (state.get("room") or {}).get("key")
+        identity = self.room_identity(state)
+        if identity is not None and event.get("room_id"):
+            return str(event.get("room_id")) == identity["id"]
+        room_key = identity["room_key"] if identity else (state.get("room") or {}).get("key")
+        region_key = identity["region_key"] if identity else state.get("region_key")
         event_room_key = event.get("room_key")
-        return not room_key or not event_room_key or room_key == event_room_key
+        event_region_key = event.get("region_key")
+        if event_room_key and room_key and event_room_key != room_key:
+            return False
+        if event_region_key and region_key and event_region_key != region_key:
+            return False
+        return True
 
     def object_change_cleared_blocker(self, event: dict) -> bool:
         if event.get("type") != "object_changed":
@@ -2793,6 +3520,34 @@ class DebugState:
                 "agent_priority": "avoid_repeat",
                 "deprioritize_reason": "Target was recently interacted with and changed from blocking to non-blocking.",
             }
+        dialog_feedback = self.dialog_feedback_for_target(state, target_id)
+        if dialog_feedback:
+            decay = self.dialog_feedback_decay(dialog_feedback)
+            if decay["dialog_feedback_state"] == "decayed":
+                return {
+                    "interaction_state": "fresh",
+                    "agent_priority": "normal",
+                }
+            reason = (
+                "Target produced dialog in this room two agent decisions ago; prefer fresh same-room targets first."
+                if decay["agent_priority"] == "soft_avoid"
+                else "Target recently produced dialog in this room and no state change was observed afterward."
+            )
+            return {
+                "interaction_state": decay["interaction_state"],
+                "agent_priority": decay["agent_priority"],
+                "dialog_feedback_state": decay["dialog_feedback_state"],
+                "dialog_feedback_turns_since": decay["dialog_feedback_turns_since"],
+                "deprioritize_reason": reason,
+                "recent_dialog_feedback": dialog_feedback,
+            }
+        stale_feedback = self.stale_different_room_dialog_feedback_for_target(state, target_id)
+        if stale_feedback:
+            return {
+                "interaction_state": "fresh",
+                "agent_priority": "normal",
+                "dialog_feedback_state": "stale_different_room",
+            }
         return {
             "interaction_state": "fresh",
             "agent_priority": "normal",
@@ -2834,6 +3589,18 @@ class DebugState:
         dialog = state.get("dialog") or {}
         latest = dialog.get("latest_event") if isinstance(dialog.get("latest_event"), dict) else {}
         room = state.get("room") if isinstance(state.get("room"), dict) else {}
+        identity = self.room_identity(state)
+        room_payload = dict(room)
+        if identity is not None:
+            room_payload.update(
+                {
+                    "id": identity["id"],
+                    "key": identity["room_key"],
+                    "room_key": identity["room_key"],
+                    "region_key": identity["region_key"],
+                    "nav_room_id": identity["nav_room_id"],
+                }
+            )
         party = state.get("party") if isinstance(state.get("party"), list) else []
         inventory = state.get("inventory") if isinstance(state.get("inventory"), list) else []
         try:
@@ -2847,8 +3614,11 @@ class DebugState:
             "frame": state.get("frame"),
             "scene_id": state.get("scene_id"),
             "map_id": state.get("map_id"),
-            "room": room,
-            "region_key": state.get("region_key"),
+            "room": room_payload,
+            "room_id": identity["id"] if identity else None,
+            "room_key": identity["room_key"] if identity else room.get("key"),
+            "region_key": identity["region_key"] if identity else state.get("region_key"),
+            "nav_room_id": identity["nav_room_id"] if identity else None,
             "in_main_game": state.get("in_main_game"),
             "in_battle": state.get("in_battle"),
             "party_position": {"x": pos.get("x"), "y": pos.get("y")},
@@ -2921,6 +3691,10 @@ class DebugState:
         )
         return {
             "status": exploration.get("status"),
+            "room_id": exploration.get("room_id"),
+            "room_key": exploration.get("room_key"),
+            "region_key": exploration.get("region_key"),
+            "nav_room_id": exploration.get("nav_room_id"),
             "explored": exploration.get("explored", exploration.get("visited")),
             "visited": exploration.get("visited"),
             "frontier": exploration.get("frontier"),
@@ -2945,7 +3719,7 @@ class DebugState:
                 "properties": {
                     "tool": {
                         "type": "string",
-                        "enum": ["no_op", "press_buttons", "navigation_step"],
+                        "enum": ["no_op", "press_buttons", "advance_dialog", "navigation_step"],
                     },
                     "args": {"type": "object"},
                     "dry_run": {"type": "boolean"},
@@ -3128,6 +3902,7 @@ class DebugState:
                 "Do not claim an action was executed.",
                 "Do not invent object labels, plot facts, or room identity beyond tool results.",
                 "Use get_route for a specific object instead of asking for large route payloads upfront.",
+                "When dialog.active is true, recommend advance_dialog instead of raw button presses.",
                 "Use navigation_step(id) only for a specific object target; otherwise recommend no_op with wait_runtime.",
             ],
         }
@@ -3290,8 +4065,21 @@ class DebugState:
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
         latest = dialog.get("latest_event") or {}
+        identity = self.room_identity(state)
+        room = state.get("room") if isinstance(state.get("room"), dict) else {}
+        room_payload = dict(room)
+        if identity is not None:
+            room_payload.update(
+                {
+                    "id": identity["id"],
+                    "key": identity["room_key"],
+                    "room_key": identity["room_key"],
+                    "region_key": identity["region_key"],
+                    "nav_room_id": identity["nav_room_id"],
+                }
+            )
         recent_dialogs = (dialogs.get("dialogs") or [])[-10:]
-        feedback_by_object = self.dialog_feedback_by_object(recent_dialogs)
+        feedback_by_object = self.same_room_dialog_feedback_by_object(state, recent_dialogs)
         targets = []
         for target in (navigation.get("targets") or [])[:20]:
             target_payload = dict(target)
@@ -3301,7 +4089,7 @@ class DebugState:
                 target_id = 0
             if target_id in feedback_by_object:
                 target_payload["recent_dialog_feedback"] = feedback_by_object[target_id]
-                dialog_reason = "Recent dialog was produced by this same object; treat it as feedback from a recent interaction."
+                dialog_reason = "Recent dialog was produced by this object in this room; treat it as room-scoped feedback."
                 existing_reason = target_payload.get("deprioritize_reason")
                 target_payload["deprioritize_reason"] = (
                     f"{existing_reason} {dialog_reason}" if existing_reason else dialog_reason
@@ -3313,8 +4101,11 @@ class DebugState:
                 "frame": state.get("frame"),
                 "scene_id": state.get("scene_id"),
                 "map_id": state.get("map_id"),
-                "room": state.get("room"),
-                "region_key": state.get("region_key"),
+                "room": room_payload,
+                "room_id": identity["id"] if identity else None,
+                "room_key": identity["room_key"] if identity else room.get("key"),
+                "region_key": identity["region_key"] if identity else state.get("region_key"),
+                "nav_room_id": identity["nav_room_id"] if identity else None,
                 "in_main_game": state.get("in_main_game"),
                 "in_battle": state.get("in_battle"),
                 "party_position": {"x": pos.get("x"), "y": pos.get("y")},
@@ -3346,7 +4137,8 @@ class DebugState:
             "{summary:string,recommended_intent:string,recommended_action:{tool:string,args:object,dry_run:true},"
             "evidence:object,risk:string,alternatives:[{intent:string,action:{tool:string,args:object,dry_run:true},reason:string}]}. "
             "Allowed intents: advance_dialog, inspect_target, enter_transition, wait_runtime. "
-            "Allowed tools in recommendations: no_op, press_buttons, navigation_step. "
+            "Allowed tools in recommendations: no_op, press_buttons, advance_dialog, navigation_step. "
+            "When dialog.active is true, use recommended_action {tool:'advance_dialog', args:{}, dry_run:true}. "
             "When recommending inspect_target or enter_transition, put the selected object id in evidence.target.id "
             "and use recommended_action {tool:'navigation_step', args:{id:<target id>}, dry_run:true}. "
             "When no explicit safe target is available, recommend wait_runtime with no_op. "
@@ -3358,9 +4150,12 @@ class DebugState:
             "Decision policy and field guide. "
             "Return a dry-run decision only; never execute actions. "
             "Do not invent object labels, plot facts, or room identity beyond provided fields. "
-            "Recent dialog history is authoritative feedback from previous interactions; cite it when it changes the next goal. "
-            "recent_dialog_feedback means the same object was just tried; do not recommend interacting with that same target again unless state changed. "
-            "Targets with agent_priority avoid_repeat or interaction_state recently_cleared were just handled; do not recommend them unless no other meaningful action exists. "
+            "speaker_hint is dialog metadata only; never infer labels like ID X (speaker) from it. "
+            "Recent dialog history is room-scoped feedback from observed dialog; cite it when it changes the next goal. "
+            "recent_dialog_feedback means the object produced dialog in this room; do not recommend interacting with that same target again unless state changed or feedback has decayed. "
+            "Report recent_dialog, soft_avoid, and recently_cleared separately when comparing targets. "
+            "Targets with agent_priority avoid_repeat, interaction_state recent_dialog, or recent_dialog_feedback take priority over fresh-looking labels; do not recommend them unless no other meaningful action exists. "
+            "Targets with agent_priority soft_avoid may be used if no fresh same-room target is better. "
             "Transition targets include destination_priority, destination_exploration, and returns_to_recent_room. "
             "When comparing transitions, prefer unknown, unexplored, or partial destination rooms before complete rooms. "
             "Avoid transitions with returns_to_recent_room true or agent_priority avoid_backtrack unless dialog explicitly requires returning or no other transition is usable. "
@@ -3404,7 +4199,7 @@ class DebugState:
 
     def normalize_agent_decision(self, raw: dict) -> dict:
         allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "wait_runtime"}
-        allowed_tools = {"no_op", "press_buttons", "navigation_step"}
+        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step"}
 
         def positive_int(value) -> int:
             try:
@@ -3459,6 +4254,10 @@ class DebugState:
                     return intent, "navigation_step", {"id": target_id}, warnings
                 warnings.append(f"normalized {intent} action to wait_runtime")
                 return "wait_runtime", "no_op", {"reason": f"missing target id for {intent}"}, warnings
+            if intent == "advance_dialog":
+                if tool != "advance_dialog":
+                    warnings.append("normalized advance_dialog action to advance_dialog")
+                return intent, "advance_dialog", self.normalize_dialog_advance_args(raw_args), warnings
             if tool not in allowed_tools:
                 warnings.append("normalized unknown action tool to no_op")
                 return "wait_runtime", "no_op", {"reason": "unsupported_tool", "tool": str(tool or "")}, warnings
@@ -3586,6 +4385,8 @@ class DebugState:
             except (TypeError, ValueError):
                 frames = 1
             return {"buttons": buttons or ["search"], "frames": max(1, min(frames, 300))}
+        if tool == "advance_dialog":
+            return self.normalize_dialog_advance_args(args)
         if tool == "navigation_step":
             try:
                 return {"id": int(args.get("id") or args.get("target_id") or 0)}
@@ -3616,6 +4417,7 @@ class DebugState:
         except ValueError:
             timeout = DEFAULT_DEEPSEEK_TIMEOUT
 
+        llm_call_id = f"{int(time.time() * 1000)}-{threading.get_ident()}"
         messages = self.agent_tool_messages(state)
         tools = self.agent_tool_specs()
         deadline = time.monotonic() + timeout
@@ -3648,6 +4450,7 @@ class DebugState:
                     "temperature": 0.2,
                 }
                 raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                request_started = time.monotonic()
                 request = urllib.request.Request(
                     f"{base_url}/chat/completions",
                     data=raw,
@@ -3660,21 +4463,111 @@ class DebugState:
                 )
                 try:
                     with urllib.request.urlopen(request, timeout=max(0.1, remaining)) as response:
-                        response_data = json.loads(response.read().decode("utf-8"))
+                        response_body = response.read().decode("utf-8")
+                    response_data = json.loads(response_body)
+                    self.append_agent_llm_log(
+                        state,
+                        {
+                            "ok": True,
+                            "backend": "deepseek",
+                            "model": model,
+                            "llm_call_id": llm_call_id,
+                            "round": rounds_attempted,
+                            "url": f"{base_url}/chat/completions",
+                            "elapsed_ms": round((time.monotonic() - request_started) * 1000, 3),
+                            "request": payload,
+                            "response": response_data,
+                        },
+                    )
                 except urllib.error.HTTPError as exc:
                     detail = ""
                     try:
-                        detail = exc.read().decode("utf-8", errors="replace")[:500]
+                        detail = exc.read().decode("utf-8", errors="replace")
                     except Exception:
                         detail = ""
-                    suffix = f": {detail}" if detail else ""
+                    self.append_agent_llm_log(
+                        state,
+                        {
+                            "ok": False,
+                            "backend": "deepseek",
+                            "model": model,
+                            "llm_call_id": llm_call_id,
+                            "round": rounds_attempted,
+                            "url": f"{base_url}/chat/completions",
+                            "elapsed_ms": round((time.monotonic() - request_started) * 1000, 3),
+                            "request": payload,
+                            "http_status": exc.code,
+                            "response_text": detail,
+                            "error": f"HTTP {exc.code}",
+                        },
+                    )
+                    suffix = f": {detail[:500]}" if detail else ""
                     raise RuntimeError(f"DeepSeek tool-call request failed with HTTP {exc.code}{suffix}") from exc
+                except json.JSONDecodeError as exc:
+                    self.append_agent_llm_log(
+                        state,
+                        {
+                            "ok": False,
+                            "backend": "deepseek",
+                            "model": model,
+                            "llm_call_id": llm_call_id,
+                            "round": rounds_attempted,
+                            "url": f"{base_url}/chat/completions",
+                            "elapsed_ms": round((time.monotonic() - request_started) * 1000, 3),
+                            "request": payload,
+                            "response_text": response_body,
+                            "error": f"invalid JSON response: {exc}",
+                        },
+                    )
+                    raise RuntimeError("DeepSeek response was not valid JSON") from exc
                 except (TimeoutError, socket.timeout) as exc:
+                    self.append_agent_llm_log(
+                        state,
+                        {
+                            "ok": False,
+                            "backend": "deepseek",
+                            "model": model,
+                            "llm_call_id": llm_call_id,
+                            "round": rounds_attempted,
+                            "url": f"{base_url}/chat/completions",
+                            "elapsed_ms": round((time.monotonic() - request_started) * 1000, 3),
+                            "request": payload,
+                            "error": f"timed out after {timeout:g}s",
+                        },
+                    )
                     raise RuntimeError(f"DeepSeek request timed out after {timeout:g}s") from exc
                 except urllib.error.URLError as exc:
                     reason = getattr(exc, "reason", None)
                     if isinstance(reason, (TimeoutError, socket.timeout)):
+                        self.append_agent_llm_log(
+                            state,
+                            {
+                                "ok": False,
+                                "backend": "deepseek",
+                                "model": model,
+                                "llm_call_id": llm_call_id,
+                                "round": rounds_attempted,
+                                "url": f"{base_url}/chat/completions",
+                                "elapsed_ms": round((time.monotonic() - request_started) * 1000, 3),
+                                "request": payload,
+                                "error": f"timed out after {timeout:g}s",
+                            },
+                        )
                         raise RuntimeError(f"DeepSeek request timed out after {timeout:g}s") from exc
+                    self.append_agent_llm_log(
+                        state,
+                        {
+                            "ok": False,
+                            "backend": "deepseek",
+                            "model": model,
+                            "llm_call_id": llm_call_id,
+                            "round": rounds_attempted,
+                            "url": f"{base_url}/chat/completions",
+                            "elapsed_ms": round((time.monotonic() - request_started) * 1000, 3),
+                            "request": payload,
+                            "error": str(reason or exc),
+                        },
+                    )
                     raise RuntimeError("DeepSeek request failed before receiving a response") from exc
 
                 self.merge_agent_usage(usage_total, response_data)
@@ -3733,6 +4626,7 @@ class DebugState:
                         decision = result["decision"]
                         decision["backend"] = "deepseek"
                         decision["model"] = model
+                        decision["llm_call_id"] = llm_call_id
                         decision["tool_trace"] = tool_trace
                         if usage_total:
                             decision["usage"] = usage_total
@@ -3758,6 +4652,7 @@ class DebugState:
                 tool_trace=tool_trace,
                 tool_calls=total_tool_calls,
                 rounds=rounds_attempted,
+                llm_call_id=llm_call_id,
             )
             raise
 
@@ -3877,6 +4772,15 @@ class Handler(BaseHTTPRequestHandler):
                 limit = 100
             self.send_json({"decisions": self.server.state.read_agent_log(limit=limit)})
             return
+        if parsed.path == "/agent/llm-log":
+            query = parse_qs(parsed.query)
+            raw_limit = (query.get("limit") or ["100"])[0]
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                limit = 100
+            self.send_json({"requests": self.server.state.read_agent_llm_log(limit=limit)})
+            return
         if parsed.path == "/checkpoints":
             self.send_json(self.server.state.list_checkpoints())
             return
@@ -3924,6 +4828,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "action": result})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/dialog/advance":
+            try:
+                payload = self.read_body_json()
+                result = self.server.state.advance_dialog(payload)
+                status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                self.send_json(result, status)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/dialog/advance/stop":
+            result = self.server.state.cancel_dialog_advance()
+            self.send_json(result)
             return
 
         if self.path == "/agent/decide":

@@ -49,7 +49,8 @@ typedef enum tagPALPALAGENTSLOTCOMMAND
 {
    kPalpalAgentSlotCommandNone = 0,
    kPalpalAgentSlotCommandSave,
-   kPalpalAgentSlotCommandLoad
+   kPalpalAgentSlotCommandLoad,
+   kPalpalAgentSlotCommandStart
 } PALPALAGENTSLOTCOMMAND;
 
 static const char * const g_agent_equipment_slot_keys[MAX_PLAYER_EQUIPMENTS] = {
@@ -715,6 +716,20 @@ PALPAL_AgentDoLoadSlot(
    PALPAL_AgentWriteSlotResult(TRUE, "load_scheduled", "load_slot", slot, NULL);
 }
 
+static VOID
+PALPAL_AgentDoStartSlot(
+   int slot
+)
+{
+   if (!PALPAL_AgentSlotCommandAllowed("start_slot", slot))
+   {
+      return;
+   }
+
+   PAL_ReloadInNextTick(slot);
+   PALPAL_AgentWriteSlotResult(TRUE, "start_scheduled", "start_slot", slot, NULL);
+}
+
 static BOOL
 PALPAL_AgentPartyHasRole(
    WORD role_id
@@ -965,6 +980,11 @@ PALPAL_AgentLoadActionFile(
          pending_slot_command = kPalpalAgentSlotCommandLoad;
          pending_slot = atoi(value);
       }
+      else if (strcmp(key, "start_slot") == 0)
+      {
+         pending_slot_command = kPalpalAgentSlotCommandStart;
+         pending_slot = atoi(value);
+      }
    }
 
    fclose(fp);
@@ -977,6 +997,10 @@ PALPAL_AgentLoadActionFile(
    else if (pending_slot_command == kPalpalAgentSlotCommandLoad)
    {
       PALPAL_AgentDoLoadSlot(pending_slot);
+   }
+   else if (pending_slot_command == kPalpalAgentSlotCommandStart)
+   {
+      PALPAL_AgentDoStartSlot(pending_slot);
    }
    if (pending_use_item)
    {

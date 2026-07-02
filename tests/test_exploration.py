@@ -79,6 +79,24 @@ class ExplorationTests(unittest.TestCase):
         room["visited"] = [f"{x},{y}" for x, y in visited]
         debug.write_exploration(data)
 
+    def test_room_identity_separates_region_from_nav_room(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            lower = make_state()
+            lower["region_key"] = "3:10:1:1"
+            upper = make_state()
+            upper["region_key"] = "3:10:1:2"
+
+            lower_identity = debug.room_identity(lower)
+            upper_identity = debug.room_identity(upper)
+
+            self.assertEqual(lower_identity["id"], "3/10/test-room/3:10:1:1")
+            self.assertEqual(upper_identity["id"], "3/10/test-room/3:10:1:2")
+            self.assertNotEqual(lower_identity["id"], upper_identity["id"])
+            self.assertEqual(lower_identity["nav_room_id"], upper_identity["nav_room_id"])
+            self.assertEqual(lower_identity["room_key"], "test-room")
+            self.assertEqual(upper_identity["region_key"], "3:10:1:2")
+
     def test_update_marks_current_and_frontier(self):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
@@ -755,10 +773,13 @@ class ExplorationTests(unittest.TestCase):
             debug.snapshot()
 
             data = debug.read_exploration()
-            record = data["transitions"]["3/10/test-room"]["52"]
+            from_identity = debug.room_identity(state)
+            to_identity = debug.room_identity(next_state)
+            record = data["transitions"][from_identity["id"]]["52"]
             self.assertTrue(record["observed"])
-            self.assertEqual(record["from_room_id"], "3/10/test-room")
-            self.assertEqual(record["to_room_id"], "4/11/next-room")
+            self.assertEqual(record["from_room_id"], from_identity["id"])
+            self.assertEqual(record["to_room_id"], to_identity["id"])
+            self.assertEqual(record["to_nav_room_id"], to_identity["nav_room_id"])
 
     def test_navigation_and_route_include_known_transition_destination(self):
         target = {
@@ -797,13 +818,14 @@ class ExplorationTests(unittest.TestCase):
             known = debug.run_agent_tool("get_known_transitions", {}, state)
 
             self.assertTrue(target_status[52]["known_destination"])
-            self.assertEqual(target_status[52]["known_destination_room_id"], "4/11/next-room")
+            self.assertEqual(target_status[52]["known_destination_room_id"], to_identity["id"])
             self.assertEqual(target_status[52]["destination_priority"], "partial")
             self.assertEqual(target_status[52]["destination_exploration"]["frontier"], 1)
             self.assertTrue(route["known_destination"])
-            self.assertEqual(route["known_destination_room_id"], "4/11/next-room")
+            self.assertEqual(route["known_destination_room_id"], to_identity["id"])
             self.assertEqual(route["destination_priority"], "partial")
-            self.assertEqual(known["known_transitions"]["52"]["to_room_id"], "4/11/next-room")
+            self.assertEqual(known["known_transitions"]["52"]["to_room_id"], to_identity["id"])
+            self.assertEqual(known["known_transitions"]["52"]["to_nav_room_id"], to_identity["nav_room_id"])
             self.assertEqual(known["known_transitions"]["52"]["destination_priority"], "partial")
             self.assertEqual(known["known_transitions"]["52"]["destination_exploration"]["explored"], 2)
 
@@ -920,22 +942,25 @@ class ExplorationTests(unittest.TestCase):
             state = make_state()
             self.write_state(debug, state)
             debug.update_exploration(state)
+            identity = debug.room_identity(state)
 
-            known = debug.run_agent_tool("get_room_exploration", {"room_id": "3/10/test-room"}, state)["exploration"]
+            known = debug.run_agent_tool("get_room_exploration", {"room_id": identity["id"]}, state)["exploration"]
             unknown = debug.run_agent_tool("get_room_exploration", {"room_id": "9/9/missing"}, state)["exploration"]
 
             self.assertTrue(known["known"])
-            self.assertEqual(known["room_id"], "3/10/test-room")
+            self.assertEqual(known["room_id"], identity["id"])
             self.assertEqual(known["scene_id"], 3)
             self.assertEqual(known["map_id"], 10)
             self.assertEqual(known["room_key"], "test-room")
+            self.assertEqual(known["region_key"], "test-room")
+            self.assertEqual(known["nav_room_id"], "3/10/test-room")
             self.assertEqual(known["explored"], 1)
             self.assertEqual(known["frontier"], 4)
             self.assertIn("explorable", known)
             self.assertFalse(unknown["known"])
             self.assertEqual(unknown["room_id"], "9/9/missing")
 
-    def test_exploration_without_transition_records_still_reads(self):
+    def test_old_exploration_version_is_discarded(self):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
             debug.exploration_path.write_text(
@@ -944,10 +969,32 @@ class ExplorationTests(unittest.TestCase):
             )
 
             data = debug.read_exploration()
-            known = debug.run_agent_tool("get_known_transitions", {"from_room_id": "3/10/test-room"}, make_state())
 
+            self.assertEqual(data["version"], 3)
+            self.assertEqual(data["rooms"], {})
             self.assertEqual(data["transitions"], {})
-            self.assertEqual(known["known_transitions"], {})
+
+    def test_old_agent_log_room_ids_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            debug.agent_log_path.write_text(
+                json.dumps({"turn": 1, "episode": "3/10/test-room", "decision": {}}) + "\n"
+                + json.dumps(
+                    {
+                        "turn": 2,
+                        "episode": debug.room_identity(state)["id"],
+                        "decision": {},
+                        "nav_room_id": "3/10/test-room",
+                    }
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            log = debug.read_agent_log(limit=10)
+
+            self.assertEqual(len(log), 1)
+            self.assertEqual(log[0]["turn"], 2)
 
     def test_dialog_stops_navigation_step(self):
         target = {
@@ -1024,7 +1071,32 @@ class ExplorationTests(unittest.TestCase):
             decision = debug.rules_decide_agent(state)
 
             self.assertEqual(decision["recommended_intent"], "advance_dialog")
-            self.assertEqual(decision["recommended_action"]["args"]["buttons"], ["search"])
+            self.assertEqual(decision["recommended_action"]["tool"], "advance_dialog")
+            self.assertEqual(decision["recommended_action"]["args"], {})
+            self.assertFalse(debug.action_path.exists())
+
+    def test_advance_dialog_clamps_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+
+            options = debug.normalize_dialog_advance_args(
+                {"max_presses": 999, "delay_ms": 1, "stop_on_repeat": False}
+            )
+
+            self.assertEqual(options, {"max_presses": 100, "delay_ms": 100, "stop_on_repeat": False})
+
+    def test_advance_dialog_stops_when_dialog_inactive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state()
+            self.write_state(debug, state)
+            debug.frame_path.write_bytes(b"frame")
+
+            result = debug.advance_dialog({"max_presses": 5})
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "dialog_inactive")
+            self.assertEqual(result["presses"], 0)
             self.assertFalse(debug.action_path.exists())
 
     def test_agent_decide_recommends_reachable_non_transition_target(self):
@@ -1094,7 +1166,7 @@ class ExplorationTests(unittest.TestCase):
             self.assertEqual(decision["recommended_action"]["args"], {"reason": "no_reachable_target"})
             self.assertEqual(len(log), 1)
             self.assertEqual(log[0]["turn"], 1)
-            self.assertEqual(log[0]["episode"], "3/10/test-room")
+            self.assertEqual(log[0]["episode"], debug.room_identity(state)["id"])
             self.assertEqual(log[0]["decision"]["recommended_intent"], decision["recommended_intent"])
             self.assertNotIn("api_key", json.dumps(log[0]).lower())
             self.assertNotIn("prompt", json.dumps(log[0]).lower())
@@ -1125,7 +1197,88 @@ class ExplorationTests(unittest.TestCase):
             self.assertFalse(debug.events_path.exists())
             self.assertFalse(debug.dialogs_path.exists())
 
-    def test_agent_normalizes_model_button_aliases(self):
+    def test_dialog_dedupe_uses_room_object_message_and_text_not_frame_or_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            first = make_state()
+            first["frame"] = 10
+            first["dialog"] = {
+                "events": [
+                    {
+                        "sequence": 1,
+                        "frame": 10,
+                        "message_id": 588,
+                        "event_object_id": 25,
+                        "speaker_hint": "李大娘",
+                        "text": "呵～累了，想早點休息",
+                    }
+                ]
+            }
+            second = make_state()
+            second["frame"] = 20
+            second["dialog"] = {
+                "events": [
+                    {
+                        "sequence": 99,
+                        "frame": 20,
+                        "message_id": 588,
+                        "event_object_id": 25,
+                        "speaker_hint": "李大娘",
+                        "text": "呵～累了，想早點休息",
+                    }
+                ]
+            }
+
+            debug.apply_frame_timeline(first)
+            debug.record_dialog_event(first)
+            debug.apply_frame_timeline(second)
+            debug.record_dialog_event(second)
+
+            self.assertEqual(len(debug.dialog_history), 1)
+            self.assertEqual(debug.dialog_history[0]["text"], "呵～累了，想早點休息")
+            self.assertEqual(debug.dialog_history[0]["raw_frame"], 10)
+
+    def test_dialog_dedupe_keeps_identical_lines_in_different_full_rooms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            lower = make_state()
+            lower["region_key"] = "3:10:lower-region"
+            lower["dialog"] = {
+                "events": [
+                    {
+                        "sequence": 1,
+                        "frame": 10,
+                        "message_id": 588,
+                        "event_object_id": 57,
+                        "speaker_hint": "李大娘",
+                        "text": "呵～累了，想早點休息",
+                    }
+                ]
+            }
+            upper = make_state()
+            upper["region_key"] = "3:10:upper-region"
+            upper["dialog"] = {
+                "events": [
+                    {
+                        "sequence": 1,
+                        "frame": 20,
+                        "message_id": 588,
+                        "event_object_id": 57,
+                        "speaker_hint": "李大娘",
+                        "text": "呵～累了，想早點休息",
+                    }
+                ]
+            }
+
+            debug.apply_frame_timeline(lower)
+            debug.record_dialog_event(lower)
+            debug.apply_frame_timeline(upper)
+            debug.record_dialog_event(upper)
+
+            self.assertEqual(len(debug.dialog_history), 2)
+            self.assertNotEqual(debug.dialog_history[0]["room_id"], debug.dialog_history[1]["room_id"])
+
+    def test_agent_normalizes_dialog_intent_to_advance_dialog(self):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
 
@@ -1140,7 +1293,11 @@ class ExplorationTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(decision["recommended_action"]["args"]["buttons"], ["search"])
+            self.assertEqual(decision["recommended_action"]["tool"], "advance_dialog")
+            self.assertEqual(
+                decision["recommended_action"]["args"],
+                {"max_presses": 100, "delay_ms": 500, "stop_on_repeat": True},
+            )
             self.assertFalse(debug.action_path.exists())
 
     def test_agent_normalizes_target_intent_to_navigation_step(self):
@@ -1300,10 +1457,17 @@ class ExplorationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
             state = make_state(objects=[target])
+            identity = debug.room_identity(state)
             dialogs = {
                 "dialogs": [
                     {
                         "frame": 50,
+                        "scene_id": 3,
+                        "map_id": 10,
+                        "room_id": identity["id"],
+                        "room_key": identity["room_key"],
+                        "region_key": identity["region_key"],
+                        "nav_room_id": identity["nav_room_id"],
                         "event_object_id": 10,
                         "message_id": 588,
                         "speaker_hint": "李大娘",
@@ -1317,7 +1481,310 @@ class ExplorationTests(unittest.TestCase):
 
             self.assertIn("recent_dialog_feedback", target_context[10])
             self.assertEqual(target_context[10]["recent_dialog_feedback"][0]["text"], "還不快出來幫忙招呼客人")
-            self.assertIn("same object", target_context[10]["deprioritize_reason"])
+            self.assertIn("in this room", target_context[10]["deprioritize_reason"])
+
+    def test_navigation_does_not_apply_dialog_feedback_across_full_rooms(self):
+        target = {
+            "id": 25,
+            "x": 16,
+            "y": 8,
+            "state": 1,
+            "trigger_mode": 1,
+            "trigger_script": 100,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(objects=[target])
+            state["region_key"] = "3:10:upper-region"
+            debug.dialog_history = [
+                {
+                    "frame": 50,
+                    "room_id": "3/10/test-room/3:10:lower-region",
+                    "room_key": "test-room",
+                    "region_key": "3:10:lower-region",
+                    "nav_room_id": "3/10/test-room",
+                    "scene_id": 3,
+                    "map_id": 10,
+                    "event_object_id": 25,
+                    "message_id": 588,
+                    "speaker_hint": "李大娘",
+                    "text": "呵～累了，想早點休息",
+                }
+            ]
+
+            navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
+            targets = {item["id"]: item for item in navigation["targets"]}
+
+            self.assertEqual(targets[25]["interaction_state"], "fresh")
+            self.assertEqual(targets[25]["agent_priority"], "normal")
+            self.assertEqual(targets[25]["dialog_feedback_state"], "stale_different_room")
+            self.assertNotIn("recent_dialog_feedback", targets[25])
+
+    def test_navigation_marks_same_full_room_object_with_recent_dialog(self):
+        target = {
+            "id": 57,
+            "x": 16,
+            "y": 8,
+            "state": 1,
+            "trigger_mode": 1,
+            "trigger_script": 100,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(objects=[target])
+            identity = debug.room_identity(state)
+            debug.dialog_history = [
+                {
+                    "frame": 50,
+                    "room_id": identity["id"],
+                    "room_key": identity["room_key"],
+                    "region_key": identity["region_key"],
+                    "nav_room_id": identity["nav_room_id"],
+                    "scene_id": identity["scene_id"],
+                    "map_id": identity["map_id"],
+                    "event_object_id": 57,
+                    "message_id": 588,
+                    "speaker_hint": "李大娘",
+                    "text": "呵～累了，想早點休息",
+                    "agent_turn": 1,
+                }
+            ]
+            debug.agent_log_path.write_text(
+                json.dumps({"turn": 1, "episode": identity["id"], "nav_room_id": identity["nav_room_id"], "decision": {}}) + "\n",
+                encoding="utf-8",
+            )
+
+            navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
+            targets = {item["id"]: item for item in navigation["targets"]}
+
+            self.assertEqual(targets[57]["interaction_state"], "recent_dialog")
+            self.assertEqual(targets[57]["agent_priority"], "avoid_repeat")
+            self.assertEqual(targets[57]["dialog_feedback_state"], "recent_dialog")
+            self.assertEqual(targets[57]["recent_dialog_feedback"][0]["text"], "呵～累了，想早點休息")
+
+    def test_legacy_dialog_feedback_requires_room_and_region_match(self):
+        target = {
+            "id": 57,
+            "x": 16,
+            "y": 8,
+            "state": 1,
+            "trigger_mode": 1,
+            "trigger_script": 100,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        weak_target = {
+            "id": 58,
+            "x": 32,
+            "y": 16,
+            "state": 1,
+            "trigger_mode": 1,
+            "trigger_script": 101,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(objects=[target, weak_target])
+            state["region_key"] = "3:10:upper-region"
+            identity = debug.room_identity(state)
+            debug.dialog_history = [
+                {
+                    "frame": 50,
+                    "room_key": identity["room_key"],
+                    "region_key": identity["region_key"],
+                    "scene_id": identity["scene_id"],
+                    "map_id": identity["map_id"],
+                    "event_object_id": 57,
+                    "message_id": 588,
+                    "speaker_hint": "李大娘",
+                    "text": "還不快出來幫忙招呼客人",
+                    "agent_turn": 1,
+                },
+                {
+                    "frame": 51,
+                    "room_key": identity["room_key"],
+                    "scene_id": identity["scene_id"],
+                    "map_id": identity["map_id"],
+                    "event_object_id": 58,
+                    "message_id": 589,
+                    "speaker_hint": "李大娘",
+                    "text": "weak legacy entry",
+                    "agent_turn": 1,
+                },
+            ]
+            debug.agent_log_path.write_text(
+                json.dumps({"turn": 1, "episode": identity["id"], "nav_room_id": identity["nav_room_id"], "decision": {}}) + "\n",
+                encoding="utf-8",
+            )
+
+            navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
+            targets = {item["id"]: item for item in navigation["targets"]}
+
+            self.assertEqual(targets[57]["interaction_state"], "recent_dialog")
+            self.assertEqual(targets[57]["agent_priority"], "avoid_repeat")
+            self.assertEqual(targets[58]["interaction_state"], "fresh")
+            self.assertEqual(targets[58]["agent_priority"], "normal")
+            self.assertNotIn("recent_dialog_feedback", targets[58])
+
+    def test_recent_dialog_feedback_decays_by_agent_turn(self):
+        dialog_target = {
+            "id": 57,
+            "x": 16,
+            "y": 8,
+            "state": 1,
+            "trigger_mode": 1,
+            "trigger_script": 100,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        fresh_target = {
+            "id": 58,
+            "x": 32,
+            "y": 16,
+            "state": 1,
+            "trigger_mode": 1,
+            "trigger_script": 101,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(objects=[dialog_target, fresh_target])
+            self.write_state(debug, state)
+            identity = debug.room_identity(state)
+            debug.dialog_history = [
+                {
+                    "frame": 50,
+                    "room_id": identity["id"],
+                    "room_key": identity["room_key"],
+                    "region_key": identity["region_key"],
+                    "nav_room_id": identity["nav_room_id"],
+                    "scene_id": identity["scene_id"],
+                    "map_id": identity["map_id"],
+                    "event_object_id": 57,
+                    "message_id": 588,
+                    "speaker_hint": "苗人頭領",
+                    "text": "你們跑不掉了",
+                    "agent_turn": 1,
+                }
+            ]
+            debug.agent_log_path.write_text(
+                "\n".join(
+                    json.dumps({"turn": turn, "episode": identity["id"], "nav_room_id": identity["nav_room_id"], "decision": {}})
+                    for turn in (1, 2, 3)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
+            targets = {item["id"]: item for item in navigation["targets"]}
+            self.assertEqual(targets[57]["agent_priority"], "soft_avoid")
+            self.assertEqual(targets[57]["dialog_feedback_state"], "soft_avoid")
+
+            decision = debug.rules_decide_agent(state)
+            self.assertEqual(decision["recommended_action"]["args"], {"id": 58})
+
+            debug.agent_log_path.write_text(
+                "\n".join(
+                    json.dumps({"turn": turn, "episode": identity["id"], "nav_room_id": identity["nav_room_id"], "decision": {}})
+                    for turn in (1, 2, 3, 4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
+            targets = {item["id"]: item for item in navigation["targets"]}
+            self.assertEqual(targets[57]["interaction_state"], "fresh")
+            self.assertEqual(targets[57]["agent_priority"], "normal")
+            self.assertNotIn("recent_dialog_feedback", targets[57])
+
+    def test_agent_context_does_not_label_object_from_speaker_hint(self):
+        target = {
+            "id": 57,
+            "x": 16,
+            "y": 8,
+            "state": 1,
+            "trigger_mode": 1,
+            "trigger_script": 100,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(objects=[target])
+            identity = debug.room_identity(state)
+            dialogs = {
+                "dialogs": [
+                    {
+                        "frame": 50,
+                        "scene_id": identity["scene_id"],
+                        "map_id": identity["map_id"],
+                        "room_id": identity["id"],
+                        "room_key": identity["room_key"],
+                        "region_key": identity["region_key"],
+                        "nav_room_id": identity["nav_room_id"],
+                        "event_object_id": 57,
+                        "message_id": 588,
+                        "speaker_hint": "苗人頭領",
+                        "text": "你們跑不掉了",
+                    }
+                ]
+            }
+
+            context = debug.agent_context(state, debug.navigation(state), dialogs, events=[])
+            payload = json.dumps(context, ensure_ascii=False)
+
+            self.assertIn("苗人頭領", payload)
+            self.assertNotIn("ID 57 (苗人頭領)", payload)
+            self.assertNotIn("#57 (苗人頭領)", payload)
+
+    def test_navigation_does_not_apply_dialog_feedback_from_different_room(self):
+        target = {
+            "id": 25,
+            "x": 16,
+            "y": 8,
+            "state": 1,
+            "trigger_mode": 1,
+            "trigger_script": 100,
+            "auto_script": 0,
+            "blocking": False,
+            "interactable": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = self.make_debug_state(tmp)
+            state = make_state(objects=[target])
+            debug.dialog_history = [
+                {
+                    "frame": 50,
+                    "room_key": "other-room",
+                    "scene_id": 3,
+                    "map_id": 10,
+                    "event_object_id": 25,
+                    "message_id": 588,
+                    "speaker_hint": "李大娘",
+                    "text": "呵～累了，想早點休息",
+                }
+            ]
+
+            navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
+            targets = {item["id"]: item for item in navigation["targets"]}
+
+            self.assertEqual(targets[25]["interaction_state"], "fresh")
+            self.assertEqual(targets[25]["agent_priority"], "normal")
+            self.assertNotIn("recent_dialog_feedback", targets[25])
 
     def test_agent_tools_mark_recently_cleared_search_targets(self):
         left_door = {
@@ -1346,6 +1813,15 @@ class ExplorationTests(unittest.TestCase):
             debug = self.make_debug_state(tmp)
             state = make_state(objects=[left_door, right_door])
             self.write_state(debug, state)
+            identity = debug.room_identity(state)
+            debug.agent_log_path.write_text(
+                "\n".join(
+                    json.dumps({"turn": turn, "episode": identity["id"], "nav_room_id": identity["nav_room_id"], "decision": {}})
+                    for turn in (1, 2, 3, 4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             debug.event_log = [
                 {
                     "frame": 20,
@@ -1448,10 +1924,17 @@ class ExplorationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             debug = self.make_debug_state(tmp)
             state = make_state(objects=[transition, search])
+            identity = debug.room_identity(state)
             dialogs = {
                 "dialogs": [
                     {
                         "frame": 50,
+                        "scene_id": identity["scene_id"],
+                        "map_id": identity["map_id"],
+                        "room_id": identity["id"],
+                        "room_key": identity["room_key"],
+                        "region_key": identity["region_key"],
+                        "nav_room_id": identity["nav_room_id"],
                         "event_object_id": 10,
                         "message_id": 588,
                         "speaker_hint": "李大娘",
@@ -1459,6 +1942,12 @@ class ExplorationTests(unittest.TestCase):
                     },
                     {
                         "frame": 51,
+                        "scene_id": identity["scene_id"],
+                        "map_id": identity["map_id"],
+                        "room_id": identity["id"],
+                        "room_key": identity["room_key"],
+                        "region_key": identity["region_key"],
+                        "nav_room_id": identity["nav_room_id"],
                         "event_object_id": 10,
                         "message_id": 590,
                         "speaker_hint": "李逍遙",
@@ -1720,7 +2209,7 @@ class ExplorationTests(unittest.TestCase):
                 ("get_events", {"limit": 1}),
                 ("get_agent_history", {"limit": 1}),
                 ("get_route", {"id": 48}),
-                ("get_room_exploration", {"room_id": "3/10/test-room"}),
+                ("get_room_exploration", {"room_id": debug.room_identity(state)["id"]}),
                 ("get_known_transitions", {}),
                 (
                     "submit_decision",
@@ -1843,7 +2332,11 @@ class ExplorationTests(unittest.TestCase):
             self.assertEqual(decision["usage"]["prompt_cache_hit_tokens"], 64)
             self.assertEqual(decision["usage"]["prompt_tokens"], 20)
             self.assertEqual(decision["recommended_action"]["args"], {"id": 52})
-            self.assertEqual(decision["state_context"], {"scene_id": 3, "map_id": 10, "room_key": "test-room", "frame": 1})
+            self.assertEqual(decision["state_context"]["room_id"], debug.room_identity(state)["id"])
+            self.assertEqual(decision["state_context"]["room_key"], "test-room")
+            self.assertEqual(decision["state_context"]["region_key"], "test-room")
+            self.assertEqual(decision["state_context"]["nav_room_id"], "3/10/test-room")
+            self.assertEqual(decision["state_context"]["frame"], 1)
             self.assertEqual([message["role"] for message in captured[0]["messages"]], ["system", "system", "user"])
             self.assertNotIn("response_format", captured[0])
             self.assertIn("tools", captured[0])
@@ -1855,6 +2348,15 @@ class ExplorationTests(unittest.TestCase):
             self.assertEqual(log[0]["decision"]["state_context"]["frame"], 1)
             self.assertEqual(log[0]["tool_trace"][1]["name"], "get_navigation")
             self.assertEqual(log[0]["decision"]["usage"]["prompt_cache_miss_tokens"], 56)
+            self.assertEqual(log[0]["llm_call_id"], decision["llm_call_id"])
+            llm_log = debug.read_agent_llm_log(limit=10)
+            self.assertEqual(len(llm_log), 3)
+            self.assertTrue(all(entry["ok"] for entry in llm_log))
+            self.assertEqual({entry["llm_call_id"] for entry in llm_log}, {decision["llm_call_id"]})
+            self.assertEqual(llm_log[0]["request"]["model"], "deepseek-v4-pro")
+            self.assertEqual([message["role"] for message in llm_log[0]["request"]["messages"]], ["system", "system", "user"])
+            self.assertNotIn("Authorization", llm_log[0])
+            self.assertEqual(llm_log[-1]["response"]["usage"]["total_tokens"], 7)
             self.assertGreaterEqual(timeouts[0], 89.0)
 
     def test_deepseek_unknown_tool_returns_clear_error(self):
