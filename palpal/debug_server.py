@@ -4676,6 +4676,8 @@ class DebugState:
         if invalid:
             raise ValueError(f"invalid buttons: {', '.join(invalid)}")
         frames = max(1, min(int(frames), 300))
+        if self.action_path.exists():
+            raise RuntimeError("action_pending")
 
         lines = [f"frames {frames}"]
         lines.extend(f"button {button}" for button in buttons)

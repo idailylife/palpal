@@ -1,4 +1,7 @@
 .env
+.coverage
+.venv/
+*.egg-info/
 data/
 runtime/
 build/
