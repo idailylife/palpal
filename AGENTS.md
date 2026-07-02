@@ -154,6 +154,13 @@ Run after Python/server changes:
 PYTHONPYCACHEPREFIX=.pycache python3 -m py_compile palpal/debug_server.py scripts/fetch_assets.py
 ```
 
+Run Python tests:
+
+```sh
+.venv/bin/python -m pytest
+.venv/bin/python -m pytest --cov
+```
+
 Smoke test the server:
 
 ```sh

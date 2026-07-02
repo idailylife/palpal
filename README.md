@@ -154,6 +154,10 @@ curl -X POST http://127.0.0.1:8765/action \
   -d '{"buttons":["up"],"frames":2}'
 ```
 
+`/action` writes one pending `runtime/action.txt` command at a time. If SDLPAL
+has not consumed the previous action yet, the server returns `400` with
+`action_pending` instead of overwriting it.
+
 Live stream:
 
 ```text
@@ -203,6 +207,8 @@ and semantic categories should be added as a separate annotation layer.
 ./run dev    # explicit alias for ./run
 ./run visual-smoke  # verify the browser canvas renders live raw frames
 ./run clean  # remove runtime files
+.venv/bin/python -m pytest      # run Python tests
+.venv/bin/python -m pytest --cov  # run tests with coverage
 ```
 
 `./run visual-smoke` starts the headless game and debug server, opens the UI in
