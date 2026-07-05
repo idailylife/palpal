@@ -57,10 +57,23 @@ MAX_AGENT_TOOL_ROUNDS = 8
 MAX_AGENT_TOOL_CALLS = 40
 DEFAULT_DIALOG_ADVANCE_DELAY_MS = 500
 DEFAULT_DIALOG_ADVANCE_MAX_PRESSES = 100
+DIALOG_ADVANCE_BUTTON = "search"
 DIALOG_ADVANCE_ACTION_TIMEOUT = 2.5
+DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS = 3
+DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL = 0.25
 CHECKPOINT_MANIFEST_VERSION = 1
 DEFAULT_CHECKPOINT_SLOT = 99
 CHECKPOINT_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+OBJECT_OBSERVATION_FIELDS = (
+    "state",
+    "interactable",
+    "blocking",
+    "vanish_time",
+    "sprite_id",
+    "trigger_mode",
+    "trigger_script",
+    "auto_script",
+)
 CHECKPOINT_COMPANION_FILES = (
     Path("dialog_history.json"),
     Path("exploration.json"),
@@ -343,14 +356,31 @@ class DebugState:
         self.last_raw_frame: int | None = None
         self.last_logical_frame: int | None = None
         self.pending_checkpoint_frame_reset: dict | None = None
+        self.state_lock = threading.RLock()
+        self.action_lock = threading.Lock()
         self.exploration_lock = threading.Lock()
         self.dialog_advance_lock = threading.Lock()
         self.dialog_advance_cancel = threading.Event()
+        self.dialog_advance_status_lock = threading.Lock()
+        self.dialog_advance_status = self.empty_dialog_advance_status()
         self.agent_status_lock = threading.Lock()
         self.agent_status = self.empty_agent_status()
 
     def config_value(self, key: str, default: str | None = None) -> str | None:
         return os.environ.get(key) or self.env_file.get(key) or default
+
+    def atomic_write_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> None:
+        tmp = path.with_name(
+            f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+        )
+        try:
+            tmp.write_text(text, encoding=encoding)
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
     def empty_agent_status(self) -> dict:
         return {
@@ -370,6 +400,64 @@ class DebugState:
     def agent_status_snapshot(self) -> dict:
         with self.agent_status_lock:
             return dict(self.agent_status)
+
+    def empty_dialog_advance_status(self) -> dict:
+        return {
+            "running": False,
+            "status": "idle",
+            "presses": 0,
+            "max_presses": DEFAULT_DIALOG_ADVANCE_MAX_PRESSES,
+            "delay_ms": DEFAULT_DIALOG_ADVANCE_DELAY_MS,
+            "stop_on_repeat": True,
+            "started_at": None,
+            "updated_at": None,
+        }
+
+    def dialog_advance_status_snapshot(self) -> dict:
+        with self.dialog_advance_status_lock:
+            return dict(self.dialog_advance_status)
+
+    def begin_dialog_advance_status(self, options: dict) -> dict:
+        now = time.time()
+        status = self.empty_dialog_advance_status()
+        status.update(
+            {
+                **options,
+                "running": True,
+                "status": "running",
+                "presses": 0,
+                "started_at": now,
+                "updated_at": now,
+            }
+        )
+        with self.dialog_advance_status_lock:
+            self.dialog_advance_status = status
+            return dict(self.dialog_advance_status)
+
+    def update_dialog_advance_status(self, **updates) -> dict:
+        with self.dialog_advance_status_lock:
+            status = dict(self.dialog_advance_status)
+            status.update(updates)
+            status["updated_at"] = time.time()
+            self.dialog_advance_status = status
+            return dict(self.dialog_advance_status)
+
+    def finish_dialog_advance_status(self, final_status: str, presses: int, options: dict) -> dict:
+        with self.dialog_advance_status_lock:
+            status = dict(self.dialog_advance_status)
+            status.update(
+                {
+                    **options,
+                    "running": False,
+                    "status": final_status,
+                    "presses": presses,
+                    "updated_at": time.time(),
+                }
+            )
+            if not status.get("started_at"):
+                status["started_at"] = status["updated_at"]
+            self.dialog_advance_status = status
+            return dict(self.dialog_advance_status)
 
     def begin_agent_status(self, backend: str, model: str | None = None) -> dict:
         now = time.time()
@@ -705,19 +793,18 @@ class DebugState:
     def write_slot_action(self, command: str, slot: int) -> dict:
         if command not in {"save_slot", "load_slot", "start_slot"}:
             raise ValueError("unsupported slot command")
-        if self.action_path.exists():
-            raise RuntimeError("action_pending")
-        try:
-            self.action_result_path.unlink()
-        except FileNotFoundError:
-            pass
-        tmp = self.runtime_dir / "action.txt.tmp"
-        tmp.write_text(f"{command} {int(slot)}\n", encoding="ascii")
-        os.replace(tmp, self.action_path)
-        entry = {"time": time.time(), "command": command, "slot": int(slot)}
-        self.action_log.append(entry)
-        self.append_navigation_diagnostic("action_written", {"action": entry})
-        return entry
+        with self.action_lock:
+            if self.action_path.exists():
+                raise RuntimeError("action_pending")
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            self.atomic_write_text(self.action_path, f"{command} {int(slot)}\n", encoding="ascii")
+            entry = {"time": time.time(), "command": command, "slot": int(slot)}
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+            return entry
 
     def wait_for_slot_result(self, command: str, slot: int, start_time: float, timeout: float = 5.0) -> dict:
         deadline = time.monotonic() + timeout
@@ -1081,30 +1168,31 @@ class DebugState:
         return entry
 
     def clear_runtime_history(self, reason: str = "reset", state: dict | None = None) -> None:
-        self.action_log = []
-        self.event_log = []
-        self.dialog_history = []
-        self.dialog_source_keys = set()
-        self.last_observed_state = None
-        self.pending_transition_observation = None
-        for path in (
-            self.action_result_path,
-            self.agent_log_path,
-            self.agent_llm_log_path,
-            self.events_path,
-            self.dialogs_path,
-            self.exploration_path,
-            self.navigation_log_path,
-        ):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-        self.append_navigation_diagnostic(
-            "runtime_history_cleared",
-            {"reason": reason},
-            state=state,
-        )
+        with self.state_lock:
+            self.action_log = []
+            self.event_log = []
+            self.dialog_history = []
+            self.dialog_source_keys = set()
+            self.last_observed_state = None
+            self.pending_transition_observation = None
+            for path in (
+                self.action_result_path,
+                self.agent_log_path,
+                self.agent_llm_log_path,
+                self.events_path,
+                self.dialogs_path,
+                self.exploration_path,
+                self.navigation_log_path,
+            ):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            self.append_navigation_diagnostic(
+                "runtime_history_cleared",
+                {"reason": reason},
+                state=state,
+            )
 
     def reset_history_if_frame_restarted(self, state: dict) -> None:
         self.apply_frame_timeline(state)
@@ -1117,9 +1205,11 @@ class DebugState:
         return data if isinstance(data, list) else []
 
     def write_events(self) -> None:
-        tmp = self.runtime_dir / "events.json.tmp"
-        tmp.write_text(json.dumps(self.event_log[-200:], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, self.events_path)
+        self.atomic_write_text(
+            self.events_path,
+            json.dumps(self.event_log[-200:], ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def read_dialog_history(self) -> list[dict]:
         try:
@@ -1129,12 +1219,11 @@ class DebugState:
         return data if isinstance(data, list) else []
 
     def write_dialog_history(self) -> None:
-        tmp = self.runtime_dir / "dialog_history.json.tmp"
-        tmp.write_text(
+        self.atomic_write_text(
+            self.dialogs_path,
             json.dumps(self.dialog_history[-2000:], ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        os.replace(tmp, self.dialogs_path)
 
     def append_event(self, state: dict, event_type: str, payload: dict) -> None:
         identity = self.room_identity(state)
@@ -1476,6 +1565,105 @@ class DebugState:
         current = candidates[-1]
         return previous["identity"] == current["identity"] and previous["text"] == current["text"]
 
+    def normalized_dialog_speaker(self, value) -> str:
+        return str(value or "").strip().replace("遥", "遙")
+
+    def dialog_advance_party_speakers(self, state: dict) -> set[str]:
+        names = {"李逍遙"}
+        party = state.get("party") if isinstance(state, dict) and isinstance(state.get("party"), list) else []
+        for role in party:
+            if not isinstance(role, dict):
+                continue
+            for key in ("name", "role_name", "display_name"):
+                name = self.normalized_dialog_speaker(role.get(key))
+                if name:
+                    names.add(name)
+        return names
+
+    def dialog_advance_event_info_available(self, event: dict) -> bool:
+        if not isinstance(event, dict) or not str(event.get("text") or "").strip():
+            return False
+        return any(event.get(key) not in (None, "") for key in ("speaker_hint", "event_object_id", "message_id"))
+
+    def dialog_advance_event_observation_key(self, state: dict, event: dict) -> tuple | None:
+        if not isinstance(event, dict) or not str(event.get("text") or "").strip():
+            return None
+        identity = self.room_identity(state) if isinstance(state, dict) else None
+        room_id = identity["id"] if identity else event.get("room_id") or event.get("room_key") or ""
+        return (
+            room_id,
+            event.get("event_object_id"),
+            event.get("message_id"),
+            str(event.get("text") or "").strip(),
+            event.get("sequence"),
+            event.get("frame"),
+        )
+
+    def dialog_advance_opponent_event_key(self, state: dict, event: dict) -> tuple | None:
+        if not isinstance(event, dict):
+            return None
+        text = str(event.get("text") or "").strip()
+        if not text:
+            return None
+        speaker = self.dialog_speaker_hint(event)
+        normalized_speaker = self.normalized_dialog_speaker(speaker)
+        if not normalized_speaker or normalized_speaker == "系统":
+            return None
+        if normalized_speaker in self.dialog_advance_party_speakers(state):
+            return None
+
+        identity = self.room_identity(state) if isinstance(state, dict) else None
+        room_id = identity["id"] if identity else event.get("room_id") or event.get("room_key") or ""
+        return (
+            room_id,
+            event.get("event_object_id"),
+            normalized_speaker,
+            event.get("message_id"),
+            text,
+        )
+
+    def dialog_advance_observe_events(
+        self,
+        state: dict,
+        observed_event_keys: set[tuple],
+        seen_opponent_keys: set[tuple],
+        *,
+        detect_repeats: bool,
+    ) -> dict:
+        dialog = state.get("dialog") if isinstance(state, dict) else {}
+        events = dialog.get("events") if isinstance(dialog, dict) else None
+        if not isinstance(events, list):
+            return {"has_event_info": False, "repeated": False}
+
+        has_event_info = False
+        repeated = False
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if self.dialog_advance_event_info_available(event):
+                has_event_info = True
+            observation_key = self.dialog_advance_event_observation_key(state, event)
+            if observation_key is None or observation_key in observed_event_keys:
+                continue
+            observed_event_keys.add(observation_key)
+
+            opponent_key = self.dialog_advance_opponent_event_key(state, event)
+            if opponent_key is None:
+                continue
+            if detect_repeats and opponent_key in seen_opponent_keys:
+                repeated = True
+            seen_opponent_keys.add(opponent_key)
+        return {"has_event_info": has_event_info, "repeated": repeated}
+
+    def dialog_advance_active_event_key(self, state: dict) -> str | None:
+        dialog = state.get("dialog") if isinstance(state, dict) else {}
+        if not isinstance(dialog, dict) or not dialog.get("active"):
+            return None
+        latest = dialog.get("latest_event")
+        if not isinstance(latest, dict) or not str(latest.get("text") or "").strip():
+            return None
+        return self.dialog_source_key(latest, state)
+
     def dialogs_view(self, limit: int = 100, speaker: str | None = None) -> dict:
         limit = max(1, min(int(limit), 500))
         dialogs = self.dialog_history
@@ -1609,13 +1797,9 @@ class DebugState:
         observed = {}
         for obj in state.get("objects") or []:
             obj_id = int(obj.get("id") or 0)
-            observed[obj_id] = {
-                "state": obj.get("state"),
-                "interactable": bool(obj.get("interactable")),
-                "blocking": bool(obj.get("blocking")),
-                "vanish_time": obj.get("vanish_time"),
-                "sprite_id": obj.get("sprite_id"),
-            }
+            observed[obj_id] = {key: obj.get(key) for key in OBJECT_OBSERVATION_FIELDS}
+            observed[obj_id]["interactable"] = bool(obj.get("interactable"))
+            observed[obj_id]["blocking"] = bool(obj.get("blocking"))
         return observed
 
     def record_state_events(self, state: dict) -> None:
@@ -1654,11 +1838,72 @@ class DebugState:
             after = current["objects"][obj_id]
             changes = {
                 key: {"from": before.get(key), "to": after.get(key)}
-                for key in ("state", "interactable", "blocking", "vanish_time", "sprite_id")
+                for key in OBJECT_OBSERVATION_FIELDS
                 if before.get(key) != after.get(key)
             }
             if changes:
                 self.append_event(state, "object_changed", {"object_id": obj_id, "changes": changes})
+
+    def object_history_view(self, state: dict, object_id: int, limit: int = 20) -> dict:
+        current = self.target_object(state, object_id)
+        current_payload = None
+        if current is not None:
+            current_payload = {
+                key: current.get(key)
+                for key in (
+                    "id",
+                    "x",
+                    "y",
+                    "sprite_id",
+                    "state",
+                    "trigger_mode",
+                    "trigger_script",
+                    "auto_script",
+                    "blocking",
+                    "interactable",
+                    "vanish_time",
+                )
+            }
+            current_payload["kind"] = trigger_kind(int(current.get("trigger_mode") or 0))
+            current_payload["transition_candidate"] = transition_candidate(current)
+
+        history = []
+        for event in self.event_log:
+            if int(event.get("object_id") or 0) != object_id:
+                continue
+            history.append({**event, "source": "events"})
+        for dialog in self.dialog_history:
+            if int(dialog.get("event_object_id") or 0) != object_id:
+                continue
+            history.append(
+                {
+                    "source": "dialogs",
+                    "type": "dialog",
+                    "time": dialog.get("time"),
+                    "frame": dialog.get("frame"),
+                    "end_frame": dialog.get("end_frame"),
+                    "scene_id": dialog.get("scene_id"),
+                    "map_id": dialog.get("map_id"),
+                    "room_id": dialog.get("room_id"),
+                    "room_key": dialog.get("room_key"),
+                    "region_key": dialog.get("region_key"),
+                    "nav_room_id": dialog.get("nav_room_id"),
+                    "event_object_id": dialog.get("event_object_id"),
+                    "message_id": dialog.get("message_id"),
+                    "message_ids": dialog.get("message_ids"),
+                    "speaker_hint": dialog.get("speaker_hint"),
+                    "text": dialog.get("text"),
+                }
+            )
+        history.sort(key=lambda entry: (entry.get("time") is None, entry.get("time") or 0, entry.get("frame") or 0))
+        rows = history[-limit:]
+        return {
+            "object_id": object_id,
+            "current": current_payload,
+            "history": rows,
+            "total": len(history),
+            "returned": len(rows),
+        }
 
     def target_object(self, state: dict, target_id: int) -> dict | None:
         for obj in state.get("objects") or []:
@@ -1740,9 +1985,11 @@ class DebugState:
         return data
 
     def write_exploration(self, data: dict) -> None:
-        tmp = self.runtime_dir / "exploration.json.tmp"
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, self.exploration_path)
+        self.atomic_write_text(
+            self.exploration_path,
+            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     def room_exploration_summary_from_data(self, data: dict, room_id: str | None) -> dict:
         if not room_id:
@@ -2008,11 +2255,65 @@ class DebugState:
             if isinstance(node, dict)
         ]
         confirmed: set[tuple[int, int]] = set()
+        found_current = False
         for node in route_node_list:
             confirmed.add(node)
             if node == current:
+                found_current = True
                 break
+        if not found_current:
+            return set()
         return confirmed
+
+    def remember_navigation_route(
+        self,
+        state: dict,
+        target_id: int,
+        route: dict,
+        segment_steps: int,
+        remaining_steps: int,
+        status: str,
+    ) -> None:
+        grid = decode_nav_grid(state)
+        identity = self.room_identity(state)
+        if grid is None or identity is None:
+            return
+
+        route_nodes: list[dict] = []
+        for payload in route.get("nodes") or []:
+            if not isinstance(payload, dict):
+                continue
+            try:
+                node = grid_node(grid, int(payload.get("x")), int(payload.get("y")))
+            except (TypeError, ValueError):
+                node = None
+            if node is not None:
+                route_nodes.append(node_payload(grid, node))
+        if not route_nodes:
+            return
+
+        expected_node = route_nodes[segment_steps] if len(route_nodes) > segment_steps else route_nodes[-1]
+        target = self.target_object(state, target_id) or {}
+        target_selection = {
+            "id": target_id,
+            "kind": trigger_kind(int(target.get("trigger_mode") or 0)),
+            "status": status,
+        }
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = self.exploration_room(data, identity)
+            room["last_route"] = {
+                "pending": True,
+                "target_id": target_id,
+                "target_selection": target_selection,
+                "segment_steps": segment_steps,
+                "remaining_steps": remaining_steps,
+                "expected_node": expected_node,
+                "nodes": route_nodes,
+                "updated_at": time.time(),
+            }
+            self.write_exploration(data)
 
     def exploration_safe_and_reachable(
         self,
@@ -2053,6 +2354,9 @@ class DebugState:
         if isinstance(last_route, dict) and last_route.get("pending"):
             expected = last_route.get("expected_node") or {}
             expected_node = (int(expected.get("grid_x", -1)), int(expected.get("grid_y", -1)))
+            route_node_set = self.route_nodes_through(last_route, current) if current is not None else set()
+            if route_node_set:
+                explored.update(node for node in route_node_set if node in reachable_safe)
             if current == expected_node:
                 explored.update(node for node in self.route_nodes_through(last_route, current) if node in reachable_safe)
                 last_route["pending"] = False
@@ -2471,6 +2775,15 @@ class DebugState:
                 action = self.write_action(segment_moves, 1)
                 route_nodes = interaction_route.get("nodes") or []
                 expected_node = route_nodes[segment_steps] if len(route_nodes) > segment_steps else None
+                remaining_steps = max(0, len(moves) - segment_steps)
+                self.remember_navigation_route(
+                    state,
+                    target_id,
+                    interaction_route,
+                    segment_steps,
+                    remaining_steps,
+                    "blocked_by_interactable",
+                )
                 return {
                     "ok": True,
                     "status": "stepping",
@@ -2480,7 +2793,7 @@ class DebugState:
                     "segment_moves": segment_moves,
                     "expected_node": expected_node,
                     "action": action,
-                    "remaining_steps": max(0, len(moves) - segment_steps),
+                    "remaining_steps": remaining_steps,
                     "route": interaction_route,
                     "blocked_route": route.get("blocked_route"),
                     "blocker": route.get("blocker"),
@@ -2558,6 +2871,15 @@ class DebugState:
         action = self.write_action(segment_moves, 1)
         route_nodes = route.get("route", {}).get("nodes") or []
         expected_node = route_nodes[segment_steps] if len(route_nodes) > segment_steps else None
+        remaining_steps = max(0, len(moves) - segment_steps)
+        self.remember_navigation_route(
+            state,
+            target_id,
+            route.get("route") or {},
+            segment_steps,
+            remaining_steps,
+            route.get("status") or "reachable",
+        )
         if route.get("status") == "transition" and segment_steps >= len(moves):
             self.mark_pending_transition_observation(state, target_id)
         return {
@@ -2569,7 +2891,7 @@ class DebugState:
             "segment_moves": segment_moves,
             "expected_node": expected_node,
             "action": action,
-            "remaining_steps": max(0, len(moves) - segment_steps),
+            "remaining_steps": remaining_steps,
             "route": route.get("route"),
         }
 
@@ -2799,14 +3121,26 @@ class DebugState:
         state = read_json(self.state_path)
         state_info = self.file_info(self.state_path)
         frame_info = self.file_info(self.frame_path)
-        if state_info.get("available"):
-            self.reset_history_if_frame_restarted(state)
-            self.observe_pending_transition_destination(state)
-            self.record_state_events(state)
-            self.record_dialog_event(state)
-        if state_info.get("available") and "nav_grid" in state:
-            state["_navigation"] = self.lightweight_navigation(state)
-            state["_exploration"] = self.update_exploration(state)
+        with self.state_lock:
+            if state_info.get("available"):
+                self.reset_history_if_frame_restarted(state)
+                self.observe_pending_transition_destination(state)
+                self.record_state_events(state)
+                self.record_dialog_event(state)
+            if state_info.get("available") and "nav_grid" in state:
+                state["_navigation"] = self.lightweight_navigation(state)
+                state["_exploration"] = self.update_exploration(state)
+            recent_actions = list(self.action_log[-20:])
+            recent_events = list(self.event_log[-20:])
+            recent_dialogs = list(self.dialog_history[-20:])
+            timeline = {
+                "raw_frame": state.get("raw_frame"),
+                "logical_frame": state.get("logical_frame", state.get("frame")),
+                "logical_frame_offset": self.logical_frame_offset,
+                "last_raw_frame": self.last_raw_frame,
+                "last_logical_frame": self.last_logical_frame,
+                "pending_checkpoint_frame_reset": self.pending_checkpoint_frame_reset is not None,
+            }
         state["_debug"] = {
             "runtime_dir": str(self.runtime_dir),
             "asset_dir": str(self.asset_dir),
@@ -2817,21 +3151,15 @@ class DebugState:
             "runtime_stale": state_info.get("stale", True) or frame_info.get("stale", True),
             "action_pending": self.action_path.exists(),
             "stale_after_seconds": STALE_AFTER_SECONDS,
-            "recent_actions": self.action_log[-20:],
-            "recent_events": self.event_log[-20:],
-            "recent_dialogs": self.dialog_history[-20:],
+            "recent_actions": recent_actions,
+            "recent_events": recent_events,
+            "recent_dialogs": recent_dialogs,
             "action_result": read_optional_json(self.action_result_path),
             "action_result_file": self.file_info(self.action_result_path),
             "recent_agent_decisions": self.read_agent_log(limit=20),
             "agent_status": self.agent_status_snapshot(),
-            "timeline": {
-                "raw_frame": state.get("raw_frame"),
-                "logical_frame": state.get("logical_frame", state.get("frame")),
-                "logical_frame_offset": self.logical_frame_offset,
-                "last_raw_frame": self.last_raw_frame,
-                "last_logical_frame": self.last_logical_frame,
-                "pending_checkpoint_frame_reset": self.pending_checkpoint_frame_reset is not None,
-            },
+            "dialog_advance_status": self.dialog_advance_status_snapshot(),
+            "timeline": timeline,
         }
         return state
 
@@ -2878,85 +3206,97 @@ class DebugState:
             return "dialog_inactive"
         return None
 
+    def dialog_advance_confirm_stop_status(self, status: str | None) -> str | None:
+        if status != "dialog_inactive":
+            return status
+        for _ in range(DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS):
+            if self.dialog_advance_cancel.is_set():
+                return "cancelled"
+            time.sleep(DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL)
+            state = self.snapshot()
+            next_status = self.dialog_advance_stop_status(state)
+            if next_status is None:
+                return None
+            if next_status != "dialog_inactive":
+                return next_status
+        return status
+
     def advance_dialog(self, args: dict | None = None) -> dict:
         options = self.normalize_dialog_advance_args(args)
         if not self.dialog_advance_lock.acquire(blocking=False):
             return {"ok": False, "status": "already_running", **options}
         try:
             self.dialog_advance_cancel.clear()
+            self.begin_dialog_advance_status(options)
             presses = 0
             dialogs_at_start = len(self.dialog_history)
-            state = self.snapshot()
-            marker = self.dialog_advance_initial_marker(state)
-            stop_status = self.dialog_advance_stop_status(state)
-            if stop_status:
+
+            def finish_result(status: str, *, ok: bool = True) -> dict:
+                self.finish_dialog_advance_status(status, presses, options)
                 return {
-                    "ok": stop_status == "dialog_inactive",
-                    "status": stop_status,
+                    "ok": ok,
+                    "status": status,
                     "presses": presses,
-                    "dialogs": [],
+                    "dialogs": self.dialog_history[dialogs_at_start:],
                     **options,
                 }
 
+            state = self.snapshot()
+            previous_active_key = self.dialog_advance_active_event_key(state)
+            repeated_active_presses = 0
+            observed_event_keys: set[tuple] = set()
+            seen_opponent_keys: set[tuple] = set()
+            event_observation = self.dialog_advance_observe_events(
+                state,
+                observed_event_keys,
+                seen_opponent_keys,
+                detect_repeats=False,
+            )
+            has_dialog_event_info = bool(event_observation["has_event_info"])
+            stop_status = self.dialog_advance_stop_status(state)
+            stop_status = self.dialog_advance_confirm_stop_status(stop_status)
+            if stop_status:
+                return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "cancelled"})
+
             while presses < options["max_presses"]:
                 if self.dialog_advance_cancel.is_set():
-                    return {
-                        "ok": True,
-                        "status": "cancelled",
-                        "presses": presses,
-                        "dialogs": self.dialog_history[dialogs_at_start:],
-                        **options,
-                    }
-                if options["stop_on_repeat"] and self.dialog_advance_reached_repeated_npc_line(marker):
-                    break
+                    return finish_result("cancelled")
                 if self.action_path.exists():
-                    return {
-                        "ok": False,
-                        "status": "action_pending_timeout",
-                        "presses": presses,
-                        "dialogs": self.dialog_history[dialogs_at_start:],
-                        **options,
-                    }
+                    return finish_result("action_pending_timeout", ok=False)
 
-                self.write_action(["search"], 1)
+                self.write_action([DIALOG_ADVANCE_BUTTON], 1)
                 presses += 1
+                self.update_dialog_advance_status(presses=presses)
                 if not self.wait_for_action_clear():
-                    return {
-                        "ok": False,
-                        "status": "action_pending_timeout",
-                        "presses": presses,
-                        "dialogs": self.dialog_history[dialogs_at_start:],
-                        **options,
-                    }
+                    return finish_result("action_pending_timeout", ok=False)
 
                 time.sleep(options["delay_ms"] / 1000)
                 if self.dialog_advance_cancel.is_set():
-                    return {
-                        "ok": True,
-                        "status": "cancelled",
-                        "presses": presses,
-                        "dialogs": self.dialog_history[dialogs_at_start:],
-                        **options,
-                    }
+                    return finish_result("cancelled")
                 state = self.snapshot()
                 stop_status = self.dialog_advance_stop_status(state)
+                stop_status = self.dialog_advance_confirm_stop_status(stop_status)
                 if stop_status:
-                    return {
-                        "ok": True,
-                        "status": stop_status,
-                        "presses": presses,
-                        "dialogs": self.dialog_history[dialogs_at_start:],
-                        **options,
-                    }
+                    return finish_result(stop_status)
+                event_observation = self.dialog_advance_observe_events(
+                    state,
+                    observed_event_keys,
+                    seen_opponent_keys,
+                    detect_repeats=True,
+                )
+                has_dialog_event_info = has_dialog_event_info or bool(event_observation["has_event_info"])
+                if options["stop_on_repeat"] and event_observation["repeated"]:
+                    return finish_result("repeated_dialog_opponent_line")
+                active_key = self.dialog_advance_active_event_key(state)
+                if not has_dialog_event_info and active_key and active_key == previous_active_key:
+                    repeated_active_presses += 1
+                else:
+                    repeated_active_presses = 0
+                    previous_active_key = active_key
+                if options["stop_on_repeat"] and repeated_active_presses >= 2:
+                    return finish_result("repeated_dialog")
 
-            status = "repeated_dialog" if options["stop_on_repeat"] and self.dialog_advance_reached_repeated_npc_line(marker) else "max_presses"
-            return {
-                "ok": True,
-                "status": status,
-                "presses": presses,
-                "dialogs": self.dialog_history[dialogs_at_start:],
-                **options,
-            }
+            return finish_result("max_presses")
         finally:
             self.dialog_advance_lock.release()
 
@@ -2964,6 +3304,7 @@ class DebugState:
         running = self.dialog_advance_lock.locked()
         if running:
             self.dialog_advance_cancel.set()
+            self.update_dialog_advance_status(status="cancelling")
         return {"ok": True, "status": "cancelling" if running else "idle", "running": running}
 
     def action_preview(self, tool: str, args: dict) -> dict:
@@ -3465,6 +3806,35 @@ class DebugState:
             return False
         return True
 
+    def object_event_matches_nav_room(self, state: dict, event: dict) -> bool:
+        if event.get("scene_id") != state.get("scene_id") or event.get("map_id") != state.get("map_id"):
+            return False
+        identity = self.room_identity(state)
+        room = state.get("room") if isinstance(state.get("room"), dict) else {}
+        room_key = identity["room_key"] if identity else room.get("key")
+        nav_room_id = identity["nav_room_id"] if identity else None
+
+        event_nav_room_id = event.get("nav_room_id")
+        if nav_room_id and event_nav_room_id:
+            return str(event_nav_room_id) == str(nav_room_id)
+
+        event_room_key = event.get("room_key")
+        if room_key and event_room_key:
+            return str(event_room_key) == str(room_key)
+
+        event_room_id = event.get("room_id")
+        if identity is not None and event_room_id:
+            event_room_id = str(event_room_id)
+            if event_room_id == identity["id"]:
+                return True
+            return event_room_id.startswith(f"{identity['nav_room_id']}/")
+
+        region_key = identity["region_key"] if identity else state.get("region_key")
+        event_region_key = event.get("region_key")
+        if region_key and event_region_key:
+            return str(event_region_key) == str(region_key)
+        return True
+
     def object_change_cleared_blocker(self, event: dict) -> bool:
         if event.get("type") != "object_changed":
             return False
@@ -3487,7 +3857,7 @@ class DebugState:
         cleared: set[int] = set()
         cleared_scripts: set[int] = set()
         for event in self.event_log[-event_limit:]:
-            if not self.event_matches_room(state, event) or not self.object_change_cleared_blocker(event):
+            if not self.object_event_matches_nav_room(state, event) or not self.object_change_cleared_blocker(event):
                 continue
             try:
                 obj_id = int(event.get("object_id") or 0)
@@ -3814,6 +4184,22 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_object_history",
+                    "description": "Return the current object snapshot plus recent state-change and dialog history for one object/event_object_id.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer", "minimum": 1},
+                            "object_id": {"type": "integer", "minimum": 1},
+                            "event_object_id": {"type": "integer", "minimum": 1},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_agent_history",
                     "description": "Return recent previous dry-run agent decisions.",
                     "parameters": {
@@ -3891,6 +4277,7 @@ class DebugState:
                 "get_dialog_speakers",
                 "get_inventory",
                 "get_events",
+                "get_object_history",
                 "get_agent_history",
                 "get_route",
                 "get_room_exploration",
@@ -3966,6 +4353,20 @@ class DebugState:
         if name == "get_events":
             limit = self.agent_tool_limit(arguments.get("limit"), 10, 100)
             return {"ok": True, "events": self.event_log[-limit:], "total": len(self.event_log)}
+        if name == "get_object_history":
+            try:
+                object_id = int(
+                    arguments.get("id")
+                    or arguments.get("object_id")
+                    or arguments.get("event_object_id")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                object_id = 0
+            if object_id <= 0:
+                return {"ok": False, "error": "get_object_history requires a positive id, object_id, or event_object_id"}
+            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
+            return {"ok": True, **self.object_history_view(state, object_id, limit=limit)}
         if name == "get_agent_history":
             limit = self.agent_tool_limit(arguments.get("limit"), 5, 50)
             history = self.agent_recent_decision_context(limit=limit)
@@ -4156,6 +4557,7 @@ class DebugState:
             "Report recent_dialog, soft_avoid, and recently_cleared separately when comparing targets. "
             "Targets with agent_priority avoid_repeat, interaction_state recent_dialog, or recent_dialog_feedback take priority over fresh-looking labels; do not recommend them unless no other meaningful action exists. "
             "Targets with agent_priority soft_avoid may be used if no fresh same-room target is better. "
+            "Use get_object_history for a target that was just interacted with or may have changed trigger kind, script, or transition status. "
             "Transition targets include destination_priority, destination_exploration, and returns_to_recent_room. "
             "When comparing transitions, prefer unknown, unexplored, or partial destination rooms before complete rooms. "
             "Avoid transitions with returns_to_recent_room true or agent_priority avoid_backtrack unless dialog explicitly requires returning or no other transition is usable. "
@@ -4676,19 +5078,18 @@ class DebugState:
         if invalid:
             raise ValueError(f"invalid buttons: {', '.join(invalid)}")
         frames = max(1, min(int(frames), 300))
-        if self.action_path.exists():
-            raise RuntimeError("action_pending")
+        with self.action_lock:
+            if self.action_path.exists():
+                raise RuntimeError("action_pending")
 
-        lines = [f"frames {frames}"]
-        lines.extend(f"button {button}" for button in buttons)
-        tmp = self.runtime_dir / "action.txt.tmp"
-        tmp.write_text("\n".join(lines) + "\n", encoding="ascii")
-        os.replace(tmp, self.action_path)
+            lines = [f"frames {frames}"]
+            lines.extend(f"button {button}" for button in buttons)
+            self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")
 
-        entry = {"time": time.time(), "buttons": buttons, "frames": frames}
-        self.action_log.append(entry)
-        self.append_navigation_diagnostic("action_written", {"action": entry})
-        return entry
+            entry = {"time": time.time(), "buttons": buttons, "frames": frames}
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+            return entry
 
     def write_use_item_action(self, item_id: int, role_id: int | None = None, target: str | None = None) -> dict:
         item_id = int(item_id)
@@ -4704,21 +5105,23 @@ class DebugState:
                 raise ValueError("role_id must be non-negative")
             target_value = str(role_value)
 
-        lines = [f"use_item {item_id} {target_value}"]
-        tmp = self.runtime_dir / "action.txt.tmp"
-        tmp.write_text("\n".join(lines) + "\n", encoding="ascii")
-        os.replace(tmp, self.action_path)
+        with self.action_lock:
+            if self.action_path.exists():
+                raise RuntimeError("action_pending")
 
-        entry = {
-            "time": time.time(),
-            "command": "use_item",
-            "item_id": item_id,
-            "role_id": role_value,
-            "target": "all" if target_value == "all" else "role",
-        }
-        self.action_log.append(entry)
-        self.append_navigation_diagnostic("action_written", {"action": entry})
-        return entry
+            lines = [f"use_item {item_id} {target_value}"]
+            self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")
+
+            entry = {
+                "time": time.time(),
+                "command": "use_item",
+                "item_id": item_id,
+                "role_id": role_value,
+                "target": "all" if target_value == "all" else "role",
+            }
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+            return entry
 
 
 class Handler(BaseHTTPRequestHandler):

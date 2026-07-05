@@ -215,6 +215,68 @@ def test_agent_tools_mark_recently_cleared_search_targets():
 
 
 
+def test_recently_cleared_search_targets_survive_region_changes():
+    left_door = {'id': 74, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    right_door = {'id': 75, 'x': 32, 'y': 16, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[left_door, right_door])
+        state['region_key'] = '3:10:22:44'
+        write_state(debug, state)
+        identity = debug.room_identity(state)
+        debug.event_log = [
+            {
+                'frame': 20,
+                'scene_id': identity['scene_id'],
+                'map_id': identity['map_id'],
+                'room_id': f"{identity['nav_room_id']}/3:10:22:45",
+                'room_key': identity['room_key'],
+                'region_key': '3:10:22:45',
+                'nav_room_id': identity['nav_room_id'],
+                'type': 'object_changed',
+                'object_id': 75,
+                'changes': {'state': {'from': 2, 'to': 1}, 'blocking': {'from': True, 'to': False}},
+            }
+        ]
+        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        targets = {target['id']: target for target in navigation['targets']}
+        route = debug.run_agent_tool('get_route', {'id': 74}, state)['route']
+        assert targets[75]['interaction_state'] == 'recently_cleared'
+        assert targets[75]['agent_priority'] == 'avoid_repeat'
+        assert targets[74]['interaction_state'] == 'recently_cleared'
+        assert targets[74]['agent_priority'] == 'avoid_repeat'
+        assert route['interaction_state'] == 'recently_cleared'
+        assert route['agent_priority'] == 'avoid_repeat'
+
+
+
+def test_recently_cleared_search_targets_do_not_cross_nav_rooms():
+    door = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[door])
+        write_state(debug, state)
+        debug.event_log = [
+            {
+                'frame': 20,
+                'scene_id': 3,
+                'map_id': 10,
+                'room_id': '3/10/other-room/3:10:22:45',
+                'room_key': 'other-room',
+                'region_key': '3:10:22:45',
+                'nav_room_id': '3/10/other-room',
+                'type': 'object_changed',
+                'object_id': 75,
+                'changes': {'state': {'from': 2, 'to': 1}, 'blocking': {'from': True, 'to': False}},
+            }
+        ]
+        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        targets = {target['id']: target for target in navigation['targets']}
+        assert targets[75]['interaction_state'] == 'fresh'
+        assert targets[75]['agent_priority'] == 'normal'
+
+
+
 def test_agent_rules_skip_recently_cleared_search_target():
     opened_door = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
     fresh_target = {'id': 80, 'x': 32, 'y': 16, 'state': 1, 'trigger_mode': 1, 'trigger_script': 9000, 'auto_script': 0, 'blocking': False, 'interactable': True}
@@ -253,13 +315,41 @@ def test_agent_tool_specs_include_queries_and_submit():
         tools = debug.agent_tool_specs()
         names = [tool['function']['name'] for tool in tools]
         by_name = {tool['function']['name']: tool for tool in tools}
-        assert set(names) == {'get_state_summary', 'get_navigation', 'get_dialogs', 'get_dialog_speakers', 'get_inventory', 'get_events', 'get_agent_history', 'get_route', 'get_room_exploration', 'get_known_transitions', 'submit_decision'}
+        assert set(names) == {'get_state_summary', 'get_navigation', 'get_dialogs', 'get_dialog_speakers', 'get_inventory', 'get_events', 'get_object_history', 'get_agent_history', 'get_route', 'get_room_exploration', 'get_known_transitions', 'submit_decision'}
         dialog_properties = by_name['get_dialogs']['function']['parameters']['properties']
         assert 'speaker' in dialog_properties
         assert dialog_properties['speaker']['type'] == 'string'
+        object_history_properties = by_name['get_object_history']['function']['parameters']['properties']
+        assert 'object_id' in object_history_properties
+        assert 'event_object_id' in object_history_properties
         context = debug.agent_tool_initial_context(make_state())
         assert 'get_dialog_speakers' in context['available_query_tools']
+        assert 'get_object_history' in context['available_query_tools']
         assert names[-1] == 'submit_decision'
+
+
+
+def test_agent_get_object_history_returns_state_events_and_dialogs():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[{'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4520, 'auto_script': 0, 'blocking': False, 'interactable': True}])
+        debug.event_log = [
+            {'type': 'object_changed', 'object_id': 9, 'changes': {'state': {'from': 1, 'to': 0}}, 'time': 1.0, 'frame': 1},
+            {'type': 'object_changed', 'object_id': 10, 'changes': {'trigger_mode': {'from': 1, 'to': 4}}, 'time': 2.0, 'frame': 2},
+        ]
+        debug.dialog_history = [
+            {'event_object_id': 10, 'speaker_hint': '系统', 'text': '机关打开了。', 'time': 3.0, 'frame': 3, 'message_id': 123},
+            {'event_object_id': 11, 'speaker_hint': '系统', 'text': '其他对象。', 'time': 4.0, 'frame': 4, 'message_id': 124},
+        ]
+        result = debug.run_agent_tool('get_object_history', {'object_id': 10}, state)
+        assert result['ok']
+        assert result['object_id'] == 10
+        assert result['current']['kind'] == 'touch'
+        assert result['current']['transition_candidate']
+        assert result['total'] == 2
+        assert [entry['source'] for entry in result['history']] == ['events', 'dialogs']
+        assert result['history'][0]['changes']['trigger_mode'] == {'from': 1, 'to': 4}
+        assert result['history'][1]['text'] == '机关打开了。'
 
 
 
@@ -350,7 +440,7 @@ def test_agent_tools_return_json_serializable_dicts():
         write_state(debug, state)
         debug.event_log = [{'type': 'inventory_changed'}]
         debug.dialog_history = [{'text': 'hello'}]
-        calls = [('get_state_summary', {}), ('get_navigation', {'mode': 'lightweight', 'limit': 5}), ('get_navigation', {'mode': 'full', 'limit': 5}), ('get_dialogs', {'limit': 1}), ('get_dialog_speakers', {'limit': 1}), ('get_inventory', {'limit': 1}), ('get_events', {'limit': 1}), ('get_agent_history', {'limit': 1}), ('get_route', {'id': 48}), ('get_room_exploration', {'room_id': debug.room_identity(state)['id']}), ('get_known_transitions', {}), ('submit_decision', {'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})]
+        calls = [('get_state_summary', {}), ('get_navigation', {'mode': 'lightweight', 'limit': 5}), ('get_navigation', {'mode': 'full', 'limit': 5}), ('get_dialogs', {'limit': 1}), ('get_dialog_speakers', {'limit': 1}), ('get_inventory', {'limit': 1}), ('get_events', {'limit': 1}), ('get_object_history', {'id': 48, 'limit': 1}), ('get_agent_history', {'limit': 1}), ('get_route', {'id': 48}), ('get_room_exploration', {'room_id': debug.room_identity(state)['id']}), ('get_known_transitions', {}), ('submit_decision', {'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})]
         for (name, arguments) in calls:
             result = debug.run_agent_tool(name, arguments, state)
             assert isinstance(result, dict)

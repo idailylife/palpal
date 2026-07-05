@@ -60,6 +60,7 @@ let frameConnected = false;
 let dialogAdvanceActive = false;
 let dialogAdvanceSending = false;
 let dialogAdvanceCount = 0;
+let dialogAdvanceObservedStartedAt = null;
 const repeatableButtons = new Set(["up", "down", "left", "right"]);
 const actionCooldownMs = 180;
 const dialogAdvanceDelayMs = 500;
@@ -264,7 +265,7 @@ checkpointsEl?.addEventListener("click", (event) => {
 
 fastDialogButton?.addEventListener("click", () => {
   fastDialogButton.blur();
-  if (dialogAdvanceActive) {
+  if (dialogAdvanceActive || latestState?._debug?.dialog_advance_status?.running) {
     stopDialogAdvance();
   } else {
     startDialogAdvance();
@@ -597,14 +598,25 @@ function renderFastDialogButton(state) {
   if (!fastDialogButton) return;
 
   const available = canAdvanceDialog(state);
-  if (dialogAdvanceActive && !dialogAdvanceSending && !available) {
+  const status = state?._debug?.dialog_advance_status || {};
+  const serverRunning = Boolean(status.running);
+  if (serverRunning) {
+    dialogAdvanceObservedStartedAt = status.started_at || dialogAdvanceObservedStartedAt;
+  }
+  const currentServerStatus = serverRunning ||
+    (dialogAdvanceActive && dialogAdvanceObservedStartedAt && status.started_at === dialogAdvanceObservedStartedAt);
+  const displayedActive = dialogAdvanceActive || serverRunning;
+  const displayedCount = currentServerStatus ? Number(status.presses || 0) : dialogAdvanceCount;
+  const displayedMax = currentServerStatus ? Number(status.max_presses || dialogAdvanceMaxPresses) : dialogAdvanceMaxPresses;
+
+  if (dialogAdvanceActive && !dialogAdvanceSending && !available && !serverRunning) {
     dialogAdvanceActive = false;
   }
 
-  fastDialogButton.disabled = dialogAdvanceSending ? !dialogAdvanceActive : (!dialogAdvanceActive && !available);
-  fastDialogButton.classList.toggle("is-running", dialogAdvanceActive);
-  fastDialogButton.textContent = dialogAdvanceActive
-    ? `Advancing ${dialogAdvanceCount}/${dialogAdvanceMaxPresses}`
+  fastDialogButton.disabled = dialogAdvanceSending ? !displayedActive : (!displayedActive && !available);
+  fastDialogButton.classList.toggle("is-running", displayedActive);
+  fastDialogButton.textContent = displayedActive
+    ? `Advancing ${displayedCount}/${displayedMax}`
     : "Fast Dialog";
 }
 
@@ -613,6 +625,7 @@ async function startDialogAdvance() {
   dialogAdvanceActive = true;
   dialogAdvanceSending = true;
   dialogAdvanceCount = 0;
+  dialogAdvanceObservedStartedAt = null;
   renderFastDialogButton(latestState);
 
   try {
@@ -628,6 +641,7 @@ async function startDialogAdvance() {
   } finally {
     dialogAdvanceActive = false;
     dialogAdvanceSending = false;
+    dialogAdvanceObservedStartedAt = null;
     renderFastDialogButton(latestState);
     refreshState().catch((error) => console.warn("dialog advance refresh failed", error));
   }

@@ -80,6 +80,24 @@ def test_visible_unreachable_nodes_are_not_marked_visited():
 
 
 
+def test_update_marks_confirmed_pending_route_nodes_as_visited():
+    target = {'id': 48, 'x': 64, 'y': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(width=5, height=5, start=(0, 4), objects=[target])
+        write_state(debug, state)
+        result = debug.navigation_step(state, target_id=48)
+        assert result['ok']
+        assert result['status'] == 'stepping'
+
+        midway = make_state(width=5, height=5, start=(2, 2), objects=[target])
+        summary = debug.update_exploration(midway)
+        visited = {(node['grid_x'], node['grid_y']) for node in summary['nodes']['visited']}
+        assert {(0, 4), (1, 3), (2, 2)} <= visited
+        assert (3, 1) not in visited
+
+
+
 def test_touch_trigger_nodes_are_not_frontier():
     touch_on_up_node = {'id': 48, 'x': 32, 'y': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
     with tempfile.TemporaryDirectory() as tmp:

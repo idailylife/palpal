@@ -11,7 +11,7 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: 320px minmax(520px, 1fr) 420px;
+  grid-template-columns: 320px minmax(520px, 1fr) 480px;
   min-height: 100vh;
   min-width: 0;
 }
@@ -1034,7 +1034,7 @@ pre {
   overflow-y: auto;
 }
 
-@media (max-width: 1180px) {
+@media (max-width: 1320px) {
   .layout {
     grid-template-columns: 300px minmax(520px, 1fr);
   }

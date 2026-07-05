@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 
 from conftest import make_debug_state, make_state, write_state
 
@@ -21,6 +22,22 @@ def test_state_events_record_inventory_change():
 
 
 
+def test_state_events_record_trigger_metadata_change():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        closed = make_state(objects=[{'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 1, 'trigger_script': 100, 'auto_script': 0, 'blocking': False, 'interactable': True}])
+        opened = make_state(objects=[{'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4520, 'auto_script': 0, 'blocking': False, 'interactable': True}])
+        debug.record_state_events(closed)
+        debug.record_state_events(opened)
+        assert len(debug.event_log) == 1
+        event = debug.event_log[0]
+        assert event['type'] == 'object_changed'
+        assert event['object_id'] == 10
+        assert event['changes']['trigger_mode'] == {'from': 1, 'to': 4}
+        assert event['changes']['trigger_script'] == {'from': 100, 'to': 4520}
+
+
+
 def test_dialog_event_is_persisted_once():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -33,6 +50,32 @@ def test_dialog_event_is_persisted_once():
         assert debug.dialog_history[0]['text'] == '我们走吧。'
         assert debug.dialog_history[0]['room_key'] == 'test-room'
         assert debug.dialogs_path.exists()
+
+
+def test_dialog_history_write_is_safe_when_requests_overlap():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        debug.dialog_history = [{'speaker_hint': '赵灵儿', 'text': '我们走吧。'}]
+        errors = []
+        barrier = threading.Barrier(8)
+
+        def write_many():
+            barrier.wait()
+            for _ in range(50):
+                try:
+                    debug.write_dialog_history()
+                except Exception as exc:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=write_many) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert json.loads(debug.dialogs_path.read_text(encoding='utf-8')) == debug.dialog_history
+        assert list(debug.runtime_dir.glob('dialog_history.json.*.tmp')) == []
 
 
 
