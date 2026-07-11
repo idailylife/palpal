@@ -21,6 +21,26 @@ def test_state_events_record_inventory_change():
         assert debug.events_path.exists()
 
 
+def test_state_events_record_party_scene_sprite_change():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        before = make_state()
+        before['party'] = [{'index': 0, 'role_id': 0, 'name': '李逍遙', 'scene_sprite_id': 2}]
+        after = make_state(frame=2)
+        after['party'] = [{'index': 0, 'role_id': 0, 'name': '李逍遙', 'scene_sprite_id': 208}]
+
+        debug.record_state_events(before)
+        debug.record_state_events(after)
+
+        event = debug.event_log[0]
+        assert event['type'] == 'party_sprite_changed'
+        assert event['role_id'] == 0
+        assert event['party_index'] == 0
+        assert event['name'] == '李逍遙'
+        assert event['from_scene_sprite_id'] == 2
+        assert event['to_scene_sprite_id'] == 208
+
+
 
 def test_state_events_record_trigger_metadata_change():
     with tempfile.TemporaryDirectory() as tmp:

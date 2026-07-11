@@ -21,9 +21,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from palpal.visual_annotations import attach_party_visual_annotations
-
-
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
 VALID_BUTTONS = {
@@ -1948,6 +1945,23 @@ class DebugState:
             observed[obj_id]["blocking"] = bool(obj.get("blocking"))
         return observed
 
+    def observed_party_sprites(self, state: dict) -> dict[int, dict]:
+        observed = {}
+        for index, role in enumerate(state.get("party") or []):
+            if not isinstance(role, dict):
+                continue
+            try:
+                role_id = int(role.get("role_id"))
+                scene_sprite_id = int(role.get("scene_sprite_id"))
+            except (TypeError, ValueError):
+                continue
+            observed[role_id] = {
+                "party_index": index,
+                "name": role.get("name"),
+                "scene_sprite_id": scene_sprite_id,
+            }
+        return observed
+
     def record_state_events(self, state: dict) -> None:
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
             return
@@ -1956,6 +1970,7 @@ class DebugState:
             "cash": int(state.get("cash") or 0),
             "inventory": self.observed_inventory(state),
             "objects": self.observed_objects(state),
+            "party_sprites": self.observed_party_sprites(state),
         }
         previous = self.last_observed_state
         self.last_observed_state = current
@@ -1965,6 +1980,23 @@ class DebugState:
         cash_delta = current["cash"] - previous["cash"]
         if cash_delta:
             self.append_event(state, "cash_changed", {"delta": cash_delta, "cash": current["cash"]})
+
+        role_ids = set(previous.get("party_sprites", {})) & set(current["party_sprites"])
+        for role_id in sorted(role_ids):
+            before = previous["party_sprites"][role_id]
+            after = current["party_sprites"][role_id]
+            if before["scene_sprite_id"] != after["scene_sprite_id"]:
+                self.append_event(
+                    state,
+                    "party_sprite_changed",
+                    {
+                        "role_id": role_id,
+                        "party_index": after["party_index"],
+                        "name": after["name"],
+                        "from_scene_sprite_id": before["scene_sprite_id"],
+                        "to_scene_sprite_id": after["scene_sprite_id"],
+                    },
+                )
 
         item_ids = set(previous["inventory"]) | set(current["inventory"])
         for item_id in sorted(item_ids):
@@ -2458,7 +2490,6 @@ class DebugState:
         }
 
     def attach_logical_room_fields(self, state: dict) -> None:
-        attach_party_visual_annotations(state)
         identity = self.logical_room_identity(state)
         if identity is None:
             return
@@ -5628,8 +5659,6 @@ class DebugState:
                 {
                     "role_id": role.get("role_id"),
                     "scene_sprite_id": role.get("scene_sprite_id"),
-                    "visual_annotation": role.get("visual_annotation"),
-                    "visual_overlays": role.get("visual_overlays", []),
                     "level": role.get("level"),
                     "hp": role.get("hp"),
                     "max_hp": role.get("max_hp"),
@@ -6202,8 +6231,6 @@ class DebugState:
                     {
                         "role_id": role.get("role_id"),
                         "scene_sprite_id": role.get("scene_sprite_id"),
-                        "visual_annotation": role.get("visual_annotation"),
-                        "visual_overlays": role.get("visual_overlays", []),
                     }
                     for role in state.get("party", [])
                     if isinstance(role, dict)

@@ -737,6 +737,9 @@ function eventText(event) {
       .join(", ");
     return `object #${event.object_id}: ${changes}`;
   }
+  if (event.type === "party_sprite_changed") {
+    return `role #${event.role_id} scene sprite #${event.from_scene_sprite_id} -> #${event.to_scene_sprite_id}`;
+  }
   return event.type || "event";
 }
 
@@ -755,6 +758,9 @@ function renderEvents(state) {
     event.cash,
     event.object_id,
     event.changes,
+    event.role_id,
+    event.from_scene_sprite_id,
+    event.to_scene_sprite_id,
   ]));
   eventsRenderKey = setPanelHtml(eventsEl, events
     .map((event) => `<div class="event">
@@ -1078,16 +1084,12 @@ function renderEquipment(state) {
     role.role_id,
     role.name,
     role.scene_sprite_id,
-    role.visual_annotation?.label,
-    role.visual_annotation?.confidence,
-    role.visual_overlays,
     (role.equipment || []).map((item) => [item.slot_key, item.item_id, item.name]),
   ]));
   equipmentRenderKey = setPanelHtml(equipmentEl, party.map((role) => `
     <div class="equipmentRole">
       <strong>${escapeHtml(role.name || `role #${role.role_id}`)}</strong>
-      ${role.scene_sprite_id != null ? `<div><em>scene</em>#${role.scene_sprite_id} ${escapeHtml(role.visual_annotation?.label || "待确认造型")}</div>` : ""}
-      ${(role.visual_overlays || []).map((overlay) => `<div><em>overlay</em>${escapeHtml(overlay.label || "未标注视觉叠加")}</div>`).join("")}
+      ${role.scene_sprite_id != null ? `<div><em>scene sprite</em>#${role.scene_sprite_id}</div>` : ""}
       <div>${(role.equipment || []).map((item) => `
         <span><em>${escapeHtml(item.slot_key)}</em>${escapeHtml(item.name || (item.item_id ? `#${item.item_id}` : "-"))}</span>
       `).join("")}</div>
