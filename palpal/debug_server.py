@@ -5629,6 +5629,7 @@ class DebugState:
                     "role_id": role.get("role_id"),
                     "scene_sprite_id": role.get("scene_sprite_id"),
                     "visual_annotation": role.get("visual_annotation"),
+                    "visual_overlays": role.get("visual_overlays", []),
                     "level": role.get("level"),
                     "hp": role.get("hp"),
                     "max_hp": role.get("max_hp"),
@@ -6202,6 +6203,7 @@ class DebugState:
                         "role_id": role.get("role_id"),
                         "scene_sprite_id": role.get("scene_sprite_id"),
                         "visual_annotation": role.get("visual_annotation"),
+                        "visual_overlays": role.get("visual_overlays", []),
                     }
                     for role in state.get("party", [])
                     if isinstance(role, dict)

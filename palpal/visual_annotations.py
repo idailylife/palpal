@@ -24,6 +24,8 @@ LI_XIAOYAO_SCENE_SPRITE_ANNOTATIONS = {
     208: {
         "label": "酒菜餐盘（独立精灵）",
         "tags": ["food_tray", "scene_sprite"],
+        "render_role": "party_overlay",
+        "semantic_kind": "food_tray",
         "confidence": "verified",
         "source": "mgo_visual_review_v1",
     },
@@ -40,6 +42,7 @@ def attach_party_visual_annotations(state: dict) -> None:
         if not isinstance(role, dict):
             continue
         role.pop("visual_annotation", None)
+        role.pop("visual_overlays", None)
         if role.get("role_id") != 0:
             continue
         try:
@@ -54,3 +57,13 @@ def attach_party_visual_annotations(state: dict) -> None:
                 "confidence": annotation["confidence"],
                 "source": annotation["source"],
             }
+            if annotation.get("render_role") == "party_overlay":
+                role["visual_overlays"] = [{
+                    "active": True,
+                    "sprite_id": sprite_id,
+                    "label": annotation["label"],
+                    "semantic_kind": annotation["semantic_kind"],
+                    "confidence": annotation["confidence"],
+                    "source": annotation["source"],
+                }]
+                continue

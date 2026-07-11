@@ -11,6 +11,8 @@ def test_li_xiaoyao_candidate_sprite_set_includes_food_tray_state():
     assert LI_XIAOYAO_SCENE_SPRITE_ANNOTATIONS[208] == {
         "label": "酒菜餐盘（独立精灵）",
         "tags": ["food_tray", "scene_sprite"],
+        "render_role": "party_overlay",
+        "semantic_kind": "food_tray",
         "confidence": "verified",
         "source": "mgo_visual_review_v1",
     }
@@ -28,8 +30,18 @@ def test_party_visual_annotation_is_limited_to_known_li_xiaoyao_scene_sprites():
     attach_party_visual_annotations(state)
 
     assert state["party"][0]["visual_annotation"]["label"] == "酒菜餐盘（独立精灵）"
+    assert state["party"][0]["visual_overlays"] == [{
+        "active": True,
+        "sprite_id": 208,
+        "label": "酒菜餐盘（独立精灵）",
+        "semantic_kind": "food_tray",
+        "confidence": "verified",
+        "source": "mgo_visual_review_v1",
+    }]
     assert "visual_annotation" not in state["party"][1]
+    assert "visual_overlays" not in state["party"][1]
     assert "visual_annotation" not in state["party"][2]
+    assert "visual_overlays" not in state["party"][2]
 
 
 def test_debug_state_attaches_annotations_to_agent_context(tmp_path):
@@ -43,7 +55,20 @@ def test_debug_state_attaches_annotations_to_agent_context(tmp_path):
     assert context["party"] == [{
         "role_id": 0,
         "scene_sprite_id": 208,
-        "visual_annotation": LI_XIAOYAO_SCENE_SPRITE_ANNOTATIONS[208],
+        "visual_annotation": {
+            "label": "酒菜餐盘（独立精灵）",
+            "tags": ["food_tray", "scene_sprite"],
+            "confidence": "verified",
+            "source": "mgo_visual_review_v1",
+        },
+        "visual_overlays": [{
+            "active": True,
+            "sprite_id": 208,
+            "label": "酒菜餐盘（独立精灵）",
+            "semantic_kind": "food_tray",
+            "confidence": "verified",
+            "source": "mgo_visual_review_v1",
+        }],
         "level": None,
         "hp": None,
         "max_hp": None,

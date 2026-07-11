@@ -1080,12 +1080,14 @@ function renderEquipment(state) {
     role.scene_sprite_id,
     role.visual_annotation?.label,
     role.visual_annotation?.confidence,
+    role.visual_overlays,
     (role.equipment || []).map((item) => [item.slot_key, item.item_id, item.name]),
   ]));
   equipmentRenderKey = setPanelHtml(equipmentEl, party.map((role) => `
     <div class="equipmentRole">
       <strong>${escapeHtml(role.name || `role #${role.role_id}`)}</strong>
       ${role.scene_sprite_id != null ? `<div><em>scene</em>#${role.scene_sprite_id} ${escapeHtml(role.visual_annotation?.label || "待确认造型")}</div>` : ""}
+      ${(role.visual_overlays || []).map((overlay) => `<div><em>overlay</em>${escapeHtml(overlay.label || "未标注视觉叠加")}</div>`).join("")}
       <div>${(role.equipment || []).map((item) => `
         <span><em>${escapeHtml(item.slot_key)}</em>${escapeHtml(item.name || (item.item_id ? `#${item.item_id}` : "-"))}</span>
       `).join("")}</div>
