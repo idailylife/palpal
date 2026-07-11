@@ -42,6 +42,7 @@ let agentExecutionInFlight = false;
 let agentLastDecision = null;
 let agentError = null;
 let agentActionStatus = "";
+let selectedAgentModel = null;
 let checkpoints = [];
 let checkpointsLoaded = false;
 let checkpointBusy = null;
@@ -66,7 +67,8 @@ const actionCooldownMs = 180;
 const dialogAdvanceDelayMs = 500;
 const dialogAdvanceMaxPresses = 100;
 const jsonUpdateIntervalMs = 1000;
-const navigationSettleMs = 250;
+const navigationSettleMs = 400;
+const fallbackAgentModels = ["deepseek-v4-pro", "deepseek-v4-flash"];
 const lastActionAt = new Map();
 const directionButtons = { 2: "up", 3: "right", 0: "down", 1: "left" };
 
@@ -93,7 +95,6 @@ function navigationDiagnosticContext(state) {
 function navigationEnvironmentContext(state) {
   const pos = state?.party_position || {};
   const dialog = state?.dialog || {};
-  const latest = dialog.latest_event || {};
   const objects = (state?.objects || [])
     .filter((obj) => obj.interactable)
     .map((obj) => ({
@@ -106,14 +107,19 @@ function navigationEnvironmentContext(state) {
       sprite_id: obj.sprite_id ?? null,
       blocking: Boolean(obj.blocking),
       interactable: Boolean(obj.interactable),
-      vanish_time: obj.vanish_time ?? null,
     }))
     .sort((a, b) => a.id - b.id);
   return {
     room: {
       scene_id: state?.scene_id ?? null,
       map_id: state?.map_id ?? null,
+      logical_room_id: state?.logical_room_id ?? state?._logical_room?.id ?? null,
+      logical_room_label: state?.logical_room_label ?? state?._logical_room?.label ?? null,
       key: state?.room?.key ?? null,
+      room_key: state?.room?.key ?? null,
+      region_key: state?.region_key ?? null,
+      legacy_room_id: state?.legacy_room_id ?? state?._logical_room?.legacy_room_id ?? null,
+      legacy_nav_room_id: state?.legacy_nav_room_id ?? state?._logical_room?.legacy_nav_room_id ?? null,
     },
     party_position: {
       x: pos.x ?? null,
@@ -121,12 +127,6 @@ function navigationEnvironmentContext(state) {
     },
     dialog: {
       active: Boolean(dialog.active),
-      latest_event: {
-        sequence: latest.sequence ?? null,
-        message_id: latest.message_id ?? null,
-        event_object_id: latest.event_object_id ?? null,
-        text: latest.text ?? null,
-      },
     },
     objects,
   };
@@ -147,6 +147,10 @@ function stableJsonStringify(value) {
 
 function navigationEnvironmentKey(state) {
   return stableJsonStringify(navigationEnvironmentContext(state));
+}
+
+function navigationForEnvironmentKey(navigation, key) {
+  return { ...navigation, environment_key: key };
 }
 
 function updateNavigationEnvironmentKey(state) {
@@ -243,6 +247,12 @@ agentEl.addEventListener("click", (event) => {
   } else if (actionEl.dataset.agentAction === "execute") {
     executeAgentRecommendation();
   }
+});
+
+agentEl.addEventListener("change", (event) => {
+  const modelEl = event.target.closest("[data-agent-model]");
+  if (!modelEl || !agentEl.contains(modelEl)) return;
+  selectedAgentModel = modelEl.value;
 });
 
 checkpointsEl?.addEventListener("click", (event) => {
@@ -425,6 +435,7 @@ function renderSummary(state) {
   const rows = [
     ["frame", state.frame],
     ["scene/map", `${state.scene_id ?? "-"} / ${state.map_id ?? "-"}`],
+    ["logical room", state.logical_room_label || state._logical_room?.label],
     ["region", state.region_key],
     ["room", state.room?.key],
     ["battle", state.in_battle],
@@ -473,7 +484,15 @@ function renderCheckpoints(state) {
   const stableMainGame = state?.in_main_game !== false && !state?._debug?.runtime_stale && !state?.dialog?.active && !state?.in_battle && !state?.entering_scene && !state?._debug?.action_pending;
   const canSave = !stateBusy && stableMainGame;
   const canLoad = !stateBusy && !state?._debug?.action_pending && (startupWaiting || stableMainGame);
-  const canStartNew = !stateBusy && !state?._debug?.action_pending && (startupWaiting || stableMainGame);
+  // Starting over is a reset, not a checkpoint operation: the opening scene
+  // immediately shows dialog, so requiring a stable save point here makes the
+  // control appear permanently unavailable after the first start.
+  const canStartNew = !stateBusy
+    && !state?._debug?.action_pending
+    && !state?.in_battle
+    && !state?.entering_scene
+    && (startupWaiting || !state?._debug?.runtime_stale)
+    && !["waiting_for_game", "state_parse_error"].includes(state?.status);
   const renderKey = JSON.stringify({
     loaded: checkpointsLoaded,
     busy: checkpointBusy,
@@ -761,6 +780,7 @@ function agentRuntimeKey(state) {
   return [
     state?.scene_id ?? "",
     state?.map_id ?? "",
+    state?.logical_room_id ?? state?._logical_room?.id ?? "",
     room.key ?? state?.region_key ?? "",
   ].join("/");
 }
@@ -774,14 +794,19 @@ function stateContextFromState(state) {
   const room = state.room || {};
   const roomKey = room.key || "unknown";
   const regionKey = state.region_key || roomKey;
-  const navRoomId = sceneId != null && mapId != null ? `${sceneId}/${mapId}/${roomKey}` : null;
+  const logicalRoomId = state.logical_room_id || state._logical_room?.id || null;
+  const navRoomId = logicalRoomId || (sceneId != null && mapId != null ? `${sceneId}/${mapId}/${roomKey}` : null);
   return {
     scene_id: sceneId,
     map_id: mapId,
-    room_id: navRoomId ? `${navRoomId}/${regionKey}` : null,
+    room_id: logicalRoomId || (navRoomId ? `${navRoomId}/${regionKey}` : null),
+    logical_room_id: logicalRoomId,
+    logical_room_label: state.logical_room_label || state._logical_room?.label || null,
     room_key: roomKey,
     region_key: regionKey,
     nav_room_id: navRoomId,
+    legacy_room_id: state.legacy_room_id || state._logical_room?.legacy_room_id || null,
+    legacy_nav_room_id: state.legacy_nav_room_id || state._logical_room?.legacy_nav_room_id || null,
   };
 }
 
@@ -794,7 +819,7 @@ function agentDecisionContextMatches(decision, state) {
   const context = decision?.state_context;
   if (!context || typeof context !== "object") return true;
   const current = stateContextFromState(state);
-  return ["scene_id", "map_id", "room_id", "nav_room_id", "room_key", "region_key"]
+  return ["scene_id", "map_id", "logical_room_id", "room_id", "nav_room_id"]
     .every((key) => contextsMatchValue(context[key], current[key]));
 }
 
@@ -899,6 +924,7 @@ function renderAgentProgress(status) {
   if (!status?.running) return "";
   const fields = [
     status.backend ? `backend ${status.backend}` : "",
+    status.model ? `model ${status.model}` : "",
     status.phase ? `phase ${status.phase}` : "",
     Number(status.round || 0) > 0 ? `round ${status.round}` : "",
     Number(status.tool_calls || 0) > 0 ? `tools ${status.tool_calls}` : "",
@@ -906,6 +932,25 @@ function renderAgentProgress(status) {
   ].filter(Boolean);
   if (!fields.length) return "";
   return `<div class="agentProgress">${escapeHtml(fields.join(" · "))}</div>`;
+}
+
+function agentModelOptions(state) {
+  const models = state?._debug?.agent_config?.models;
+  return Array.isArray(models) && models.length ? models : fallbackAgentModels;
+}
+
+function currentAgentModel(state) {
+  const models = agentModelOptions(state);
+  const configured = state?._debug?.agent_config?.default_model;
+  const running = state?._debug?.agent_status?.model;
+  if (!selectedAgentModel || !models.includes(selectedAgentModel)) {
+    selectedAgentModel = models.includes(running)
+      ? running
+      : models.includes(configured)
+        ? configured
+        : models[0];
+  }
+  return selectedAgentModel;
 }
 
 function renderAgent(state) {
@@ -918,6 +963,11 @@ function renderAgent(state) {
   const agentBusy = agentRequestInFlight || agentExecutionInFlight || Boolean(agentStatus.running);
   const executeDisabledReason = agentExecutionDisabledReason(decision, state, agentBusy);
   const executeDisabled = Boolean(executeDisabledReason);
+  const modelOptions = agentModelOptions(state);
+  const selectedModel = currentAgentModel(state);
+  const modelSelect = `<select class="agentModelSelect" data-agent-model ${agentBusy ? "disabled" : ""} aria-label="Agent model">
+    ${modelOptions.map((model) => `<option value="${escapeHtml(model)}" ${model === selectedModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}
+  </select>`;
   const status = agentBusy ? "loading" : agentError ? "error" : decision ? "ready" : "idle";
   const renderKey = JSON.stringify({
     status,
@@ -925,6 +975,8 @@ function renderAgent(state) {
     agentActionStatus,
     agentExecutionInFlight,
     executeDisabledReason,
+    selectedModel,
+    modelOptions,
     agentStatus: [
       agentStatus.running,
       agentStatus.backend,
@@ -949,6 +1001,7 @@ function renderAgent(state) {
   });
   agentRenderKey = setPanelHtml(agentEl, `
     <div class="agentControls">
+      ${modelSelect}
       <button data-agent-action="decide" ${agentBusy ? "disabled" : ""}>${escapeHtml(agentButtonText(agentStatus))}</button>
       <button data-agent-action="execute" ${executeDisabled ? "disabled" : ""}>${agentExecutionInFlight ? "Executing..." : "Execute Action"}</button>
       <span class="agentStatusText">${escapeHtml(agentStatusText(agentStatus, executeDisabledReason, decision))}</span>
@@ -1177,6 +1230,7 @@ function renderNavigation(state) {
         displayFullDetails ? target.kind : "",
         displayFullDetails && Number.isFinite(target.steps) ? `${target.steps} steps` : "",
         displayFullDetails && target.required_direction ? `face ${target.required_direction}` : "",
+        displayFullDetails && target.to_semantic_room ? `to ${escapeHtml(target.to_semantic_room)}` : "",
       ]
         .filter(Boolean)
         .join(" · ");
@@ -1242,13 +1296,23 @@ async function refreshNavigationForKey(requestKey) {
     }
     const navigation = await response.json();
     const returnedKey = navigation.environment_key || requestKey;
+    const requestNavigation = navigationForEnvironmentKey(navigation, requestKey);
     navigationCache.set(returnedKey, navigation);
+    navigationCache.set(requestKey, requestNavigation);
+    if (returnedKey !== requestKey) {
+      sendNavigationDiagnostic("navigation_key_mismatch", {
+        request_key_length: requestKey.length,
+        returned_key_length: returnedKey.length,
+        request_key_prefix: requestKey.slice(0, 160),
+        returned_key_prefix: returnedKey.slice(0, 160),
+      });
+    }
     if (
       latestState &&
-      returnedKey === navigationStableEnvironmentKey &&
-      navigationEnvironmentKey(latestState) === returnedKey
+      requestKey === navigationStableEnvironmentKey &&
+      navigationEnvironmentKey(latestState) === requestKey
     ) {
-      latestState._navigation = navigation;
+      latestState._navigation = requestNavigation;
       renderNavigation(latestState);
       renderObjects(latestState);
       drawOverlay(latestState);
@@ -1259,7 +1323,7 @@ async function refreshNavigationForKey(requestKey) {
     if (navigationRefreshInFlightKey === requestKey) {
       navigationRefreshInFlightKey = null;
     }
-    if (latestState && navigationEnvironmentKey(latestState) !== requestKey) {
+    if (latestState && !navigationFullReady(latestState)) {
       scheduleNavigationRefresh(latestState);
     }
   }
@@ -1801,7 +1865,7 @@ async function askAgent() {
     const response = await fetch("/agent/decide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: "{}",
+      body: JSON.stringify({ model: currentAgentModel(latestState) }),
     });
     const result = await response.json();
     if (!response.ok || !result.ok) {

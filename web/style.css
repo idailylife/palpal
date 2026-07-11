@@ -487,9 +487,20 @@ pre {
 
 .agentControls {
   display: grid;
-  grid-template-columns: minmax(0, 120px) minmax(0, 130px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.95fr) minmax(0, 1.05fr);
   align-items: center;
   gap: 8px;
+}
+
+.agentModelSelect {
+  min-height: 36px;
+  min-width: 0;
+  width: 100%;
+  padding: 6px 8px;
+  color: #e6edf3;
+  background: #111820;
+  border: 1px solid #31404c;
+  border-radius: 6px;
 }
 
 .agentControls button {
@@ -505,6 +516,8 @@ pre {
 }
 
 .agentStatusText {
+  grid-column: 1 / -1;
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
@@ -1105,7 +1118,7 @@ pre {
   }
 
   .agentControls {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .agentControls span {

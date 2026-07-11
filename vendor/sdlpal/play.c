@@ -20,6 +20,7 @@
 //
 
 #include "main.h"
+#include "agent.h"
 
 VOID
 PAL_GameUpdate(
@@ -150,7 +151,9 @@ PAL_GameUpdate(
                //
                // Execute the script.
                //
+               PALPAL_AgentBeginTriggerScript(wEventObjectID, p->wTriggerScript);
                p->wTriggerScript = PAL_RunTriggerScript(p->wTriggerScript, wEventObjectID);
+               PALPAL_AgentEndTriggerScript(wEventObjectID);
 
                PAL_ClearKeyState();
 

@@ -45,7 +45,8 @@ def test_deepseek_tool_decision_records_usage_trace_and_no_action():
         assert decision['state_context']['room_id'] == debug.room_identity(state)['id']
         assert decision['state_context']['room_key'] == 'test-room'
         assert decision['state_context']['region_key'] == 'test-room'
-        assert decision['state_context']['nav_room_id'] == '3/10/test-room'
+        assert decision['state_context']['nav_room_id'] == decision['state_context']['logical_room_id']
+        assert decision['state_context']['legacy_nav_room_id'] == '3/10/test-room'
         assert decision['state_context']['frame'] == 1
         assert [message['role'] for message in captured[0]['messages']] == ['system', 'system', 'user']
         assert 'response_format' not in captured[0]
@@ -68,6 +69,101 @@ def test_deepseek_tool_decision_records_usage_trace_and_no_action():
         assert 'Authorization' not in llm_log[0]
         assert llm_log[-1]['response']['usage']['total_tokens'] == 7
         assert timeouts[0] >= 89.0
+
+
+
+def test_deepseek_timeout_applies_to_each_model_round():
+
+    class FakeResponse:
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode('utf-8')
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state()
+        timeouts = []
+        responses = [
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_state', 'type': 'function', 'function': {'name': 'get_state_summary', 'arguments': '{}'}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_nav', 'type': 'function', 'function': {'name': 'get_navigation', 'arguments': '{"mode":"full","limit":5}'}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})}}]}}]},
+        ]
+        clock = [100.0]
+
+        def fake_monotonic():
+            clock[0] += 1.0
+            return clock[0]
+
+        def fake_urlopen(request, timeout):
+            timeouts.append(timeout)
+            return FakeResponse(responses.pop(0))
+        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key', 'DEEPSEEK_TIMEOUT': '3'}), patch('palpal.debug_server.time.monotonic', fake_monotonic), patch('urllib.request.urlopen', fake_urlopen):
+            decision = debug.deepseek_decide_agent(state)
+        assert decision['recommended_intent'] == 'wait_runtime'
+        assert timeouts == [3.0, 3.0, 3.0]
+
+
+
+def test_deepseek_decide_agent_accepts_whitelisted_model():
+
+    class FakeResponse:
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})}}]}}]}).encode('utf-8')
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state()
+        captured = []
+
+        def fake_urlopen(request, timeout):
+            captured.append(json.loads(request.data.decode('utf-8')))
+            return FakeResponse()
+        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', fake_urlopen):
+            decision = debug.deepseek_decide_agent(state, model='deepseek-v4-flash')
+        assert captured[0]['model'] == 'deepseek-v4-flash'
+        assert decision['model'] == 'deepseek-v4-flash'
+        assert debug.read_agent_llm_log(limit=1)[0]['request']['model'] == 'deepseek-v4-flash'
+
+
+
+def test_deepseek_decide_agent_rejects_unknown_model_name():
+
+    class FakeResponse:
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})}}]}}]}).encode('utf-8')
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state()
+        captured = []
+
+        def fake_urlopen(request, timeout):
+            captured.append(json.loads(request.data.decode('utf-8')))
+            return FakeResponse()
+        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key', 'DEEPSEEK_MODEL': 'not-a-real-model'}), patch('urllib.request.urlopen', fake_urlopen):
+            decision = debug.deepseek_decide_agent(state, model='bad-model')
+        assert captured[0]['model'] == 'deepseek-v4-pro'
+        assert decision['model'] == 'deepseek-v4-pro'
 
 
 
@@ -227,7 +323,7 @@ def test_deepseek_submit_decision_downgrades_stale_navigation_target():
 
 
 
-def test_deepseek_submit_decision_downgrades_illegal_action():
+def test_deepseek_submit_decision_repairs_illegal_action():
 
     class FakeResponse:
 
@@ -238,21 +334,34 @@ def test_deepseek_submit_decision_downgrades_illegal_action():
             return False
 
         def read(self):
-            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'write_action', 'args': {'id': 10}}, 'evidence': {'target': {'id': 10}}, 'risk': 'Low.', 'alternatives': []})}}]}}]}).encode('utf-8')
+            return json.dumps(responses.pop(0)).encode('utf-8')
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state(objects=[make_touch_object(10)])
         write_state(debug, state)
-        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', lambda request, timeout: FakeResponse()):
+        responses = [
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_bad_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'write_action', 'args': {'id': 10}}, 'evidence': {'target': {'id': 10}}, 'risk': 'Low.', 'alternatives': []})}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_fixed_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'navigation_step', 'args': {'id': 10}}, 'evidence': {'target': {'id': 10}}, 'risk': 'Low.', 'alternatives': []})}}]}}]},
+        ]
+        captured = []
+
+        def fake_urlopen(request, timeout):
+            captured.append(json.loads(request.data.decode('utf-8')))
+            return FakeResponse()
+        with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', fake_urlopen):
             decision = debug.deepseek_decide_agent(state)
         assert decision['recommended_intent'] == 'inspect_target'
         assert decision['recommended_action']['tool'] == 'navigation_step'
         assert decision['recommended_action']['args'] == {'id': 10}
+        assert [entry['name'] for entry in decision['tool_trace']] == ['submit_decision', 'submit_decision']
+        repair_message = captured[1]['messages'][-1]
+        assert repair_message['role'] == 'tool'
+        assert json.loads(repair_message['content'])['error']['code'] == 'invalid_decision_submission'
         assert not debug.action_path.exists()
 
 
 
-def test_deepseek_targeted_explore_room_is_rejected():
+def test_deepseek_submit_decision_fails_after_one_unsuccessful_repair():
 
     class FakeResponse:
 
@@ -263,24 +372,23 @@ def test_deepseek_targeted_explore_room_is_rejected():
             return False
 
         def read(self):
-            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Explore one step toward object #74.', 'recommended_intent': 'explore_room', 'recommended_action': {'tool': 'exploration_step', 'args': {'max_steps': 1}}, 'evidence': {'target': {'id': 74}}, 'risk': 'Low.', 'alternatives': []})}}]}}]}).encode('utf-8')
+            return json.dumps(response).encode('utf-8')
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state(objects=[make_touch_object(74)])
         write_state(debug, state)
+        response = {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Explore one step.', 'recommended_intent': 'explore_room', 'recommended_action': {'tool': 'exploration_step', 'args': {'max_steps': 1}}, 'evidence': {'target': {'id': 74}}, 'risk': 'Low.', 'alternatives': []})}}]}}]}
         with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', lambda request, timeout: FakeResponse()):
-            decision = debug.deepseek_decide_agent(state)
-        assert decision['recommended_intent'] == 'wait_runtime'
-        assert decision['recommended_action']['tool'] == 'no_op'
-        assert decision['recommended_action']['args']['reason'] == 'unsupported_tool'
-        assert decision['recommended_action']['args']['tool'] == 'exploration_step'
+            with pytest.raises(RuntimeError, match='remained invalid after 1 repair attempt'):
+                debug.deepseek_decide_agent(state)
         assert not debug.action_path.exists()
         log = debug.read_agent_log(limit=1)
-        assert log[0]['decision']['recommended_action'] == {'tool': 'no_op', 'args': {'reason': 'unsupported_tool', 'tool': 'exploration_step'}, 'dry_run': True}
+        assert log[0]['ok'] is False
+        assert [entry['name'] for entry in log[0]['tool_trace']] == ['submit_decision', 'submit_decision']
 
 
 
-def test_deepseek_untargeted_explore_room_is_rejected():
+def test_deepseek_submit_decision_repairs_missing_target_id():
 
     class FakeResponse:
 
@@ -291,16 +399,18 @@ def test_deepseek_untargeted_explore_room_is_rejected():
             return False
 
         def read(self):
-            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Explore current room coverage.', 'recommended_intent': 'explore_room', 'recommended_action': {'tool': 'exploration_step', 'args': {'max_steps': 1}}, 'evidence': {}, 'risk': 'Low.', 'alternatives': []})}}]}}]}).encode('utf-8')
+            return json.dumps(responses.pop(0)).encode('utf-8')
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
-        state = make_state()
+        state = make_state(objects=[make_touch_object(10)])
+        write_state(debug, state)
+        responses = [
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_bad_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': None, 'args': {}}, 'evidence': {}, 'risk': 'Low.', 'alternatives': []})}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_fixed_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'navigation_step', 'args': {'id': 10}}, 'evidence': {'target': {'id': 10}}, 'risk': 'Low.', 'alternatives': []})}}]}}]},
+        ]
         with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', lambda request, timeout: FakeResponse()):
             decision = debug.deepseek_decide_agent(state)
-        assert decision['recommended_intent'] == 'wait_runtime'
-        assert decision['recommended_action']['tool'] == 'no_op'
-        assert decision['recommended_action']['args']['reason'] == 'unsupported_tool'
-        assert decision['recommended_action']['args']['tool'] == 'exploration_step'
+        assert decision['recommended_intent'] == 'inspect_target'
+        assert decision['recommended_action']['args'] == {'id': 10}
+        assert [entry['name'] for entry in decision['tool_trace']] == ['submit_decision', 'submit_decision']
         assert not debug.action_path.exists()
-        log = debug.read_agent_log(limit=1)
-        assert log[0]['decision']['recommended_action'] == {'tool': 'no_op', 'args': {'reason': 'unsupported_tool', 'tool': 'exploration_step'}, 'dry_run': True}

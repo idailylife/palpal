@@ -174,7 +174,7 @@ def test_agent_context_marks_targets_with_recent_dialog_feedback():
         target_context = {item['id']: item for item in context['navigation']['targets']}
         assert 'recent_dialog_feedback' in target_context[10]
         assert target_context[10]['recent_dialog_feedback'][0]['text'] == '還不快出來幫忙招呼客人'
-        assert 'in this room' in target_context[10]['deprioritize_reason']
+        assert '本房间' in target_context[10]['deprioritize_reason']
 
 
 
@@ -206,11 +206,58 @@ def test_agent_tools_mark_recently_cleared_search_targets():
         navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
         targets = {target['id']: target for target in navigation['targets']}
         route = debug.run_agent_tool('get_route', {'id': 75}, state)['route']
-        assert targets[75]['interaction_state'] == 'recently_cleared'
+        assert targets[75]['interaction_state'] == 'previously_cleared'
         assert targets[75]['agent_priority'] == 'avoid_repeat'
-        assert targets[74]['interaction_state'] == 'recently_cleared'
+        assert targets[74]['interaction_state'] == 'previously_cleared'
         assert targets[74]['agent_priority'] == 'avoid_repeat'
-        assert route['interaction_state'] == 'recently_cleared'
+        assert route['interaction_state'] == 'previously_cleared'
+        assert route['agent_priority'] == 'avoid_repeat'
+
+
+def test_interaction_no_effect_is_recorded_and_deprioritizes_target():
+    target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target], frame=20)
+        write_state(debug, state)
+        debug.mark_pending_interaction_observation(
+            state,
+            75,
+            action={'buttons': ['search'], 'frames': 1},
+        )
+        next_state = make_state(objects=[target], frame=30)
+        debug.observe_pending_interaction_outcome(next_state)
+
+        assert debug.event_log[-1]['type'] == 'interaction_no_effect'
+        assert debug.event_log[-1]['object_id'] == 75
+        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, next_state)['navigation']
+        targets = {target['id']: target for target in navigation['targets']}
+        history = debug.run_agent_tool('get_object_history', {'id': 75}, next_state)
+        assert targets[75]['interaction_state'] == 'previously_tried'
+        assert targets[75]['agent_priority'] == 'avoid_repeat'
+        assert history['history'][-1]['type'] == 'interaction_no_effect'
+
+
+def test_interaction_effect_attributes_inventory_change_to_target():
+    target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target], frame=20)
+        state['inventory'] = []
+        debug.mark_pending_interaction_observation(
+            state,
+            75,
+            action={'buttons': ['search'], 'frames': 1},
+        )
+        next_state = make_state(objects=[target], frame=22)
+        next_state['inventory'] = [{'item_id': 201, 'amount': 1, 'amount_in_use': 0}]
+        debug.observe_pending_interaction_outcome(next_state)
+
+        assert debug.event_log[-1]['type'] == 'interaction_effect'
+        assert debug.event_log[-1]['object_id'] == 75
+        assert debug.event_log[-1]['inventory_changes'] == [{'item_id': 201, 'delta': 1, 'amount': 1}]
+        route = debug.run_agent_tool('get_route', {'id': 75}, next_state)['route']
+        assert route['interaction_state'] == 'previously_tried'
         assert route['agent_priority'] == 'avoid_repeat'
 
 
@@ -225,14 +272,15 @@ def test_recently_cleared_search_targets_survive_region_changes():
         write_state(debug, state)
         identity = debug.room_identity(state)
         debug.event_log = [
-            {
-                'frame': 20,
-                'scene_id': identity['scene_id'],
-                'map_id': identity['map_id'],
-                'room_id': f"{identity['nav_room_id']}/3:10:22:45",
-                'room_key': identity['room_key'],
-                'region_key': '3:10:22:45',
-                'nav_room_id': identity['nav_room_id'],
+                {
+                    'frame': 20,
+                    'scene_id': identity['scene_id'],
+                    'map_id': identity['map_id'],
+                    'room_id': identity['id'],
+                    'logical_room_id': identity['id'],
+                    'room_key': identity['room_key'],
+                    'region_key': '3:10:22:45',
+                    'nav_room_id': identity['nav_room_id'],
                 'type': 'object_changed',
                 'object_id': 75,
                 'changes': {'state': {'from': 2, 'to': 1}, 'blocking': {'from': True, 'to': False}},
@@ -241,11 +289,11 @@ def test_recently_cleared_search_targets_survive_region_changes():
         navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
         targets = {target['id']: target for target in navigation['targets']}
         route = debug.run_agent_tool('get_route', {'id': 74}, state)['route']
-        assert targets[75]['interaction_state'] == 'recently_cleared'
+        assert targets[75]['interaction_state'] == 'previously_cleared'
         assert targets[75]['agent_priority'] == 'avoid_repeat'
-        assert targets[74]['interaction_state'] == 'recently_cleared'
+        assert targets[74]['interaction_state'] == 'previously_cleared'
         assert targets[74]['agent_priority'] == 'avoid_repeat'
-        assert route['interaction_state'] == 'recently_cleared'
+        assert route['interaction_state'] == 'previously_cleared'
         assert route['agent_priority'] == 'avoid_repeat'
 
 
@@ -300,7 +348,11 @@ def test_agent_messages_put_stable_policy_before_dynamic_context():
         messages = debug.agent_messages(state, debug.navigation(state), {'dialogs': []}, events=[])
         assert [message['role'] for message in messages] == ['system', 'system', 'user']
         assert 'JSON object' in messages[0]['content']
-        assert 'greet guests' in messages[1]['content']
+        assert '距离是成本信号，不是优先级规则' in messages[1]['content']
+        assert '不要匹配固定剧情短语' in messages[1]['content']
+        assert 'prefer the nearest reachable non-transition target' not in messages[1]['content']
+        assert 'greet guests' not in messages[1]['content']
+        assert 'secret passage' not in messages[1]['content']
         dynamic = json.loads(messages[2]['content'])
         assert 'state' in dynamic
         assert 'exploration' in dynamic
@@ -315,16 +367,21 @@ def test_agent_tool_specs_include_queries_and_submit():
         tools = debug.agent_tool_specs()
         names = [tool['function']['name'] for tool in tools]
         by_name = {tool['function']['name']: tool for tool in tools}
-        assert set(names) == {'get_state_summary', 'get_navigation', 'get_dialogs', 'get_dialog_speakers', 'get_inventory', 'get_events', 'get_object_history', 'get_agent_history', 'get_route', 'get_room_exploration', 'get_known_transitions', 'submit_decision'}
+        assert set(names) == {'get_tasks', 'upsert_task', 'get_state_summary', 'get_navigation', 'get_dialogs', 'get_dialog_speakers', 'get_inventory', 'get_events', 'get_object_history', 'get_agent_history', 'get_route', 'get_room_exploration', 'get_known_transitions', 'submit_decision'}
         dialog_properties = by_name['get_dialogs']['function']['parameters']['properties']
         assert 'speaker' in dialog_properties
         assert dialog_properties['speaker']['type'] == 'string'
         object_history_properties = by_name['get_object_history']['function']['parameters']['properties']
         assert 'object_id' in object_history_properties
         assert 'event_object_id' in object_history_properties
+        assert '返回导航目标' in by_name['get_navigation']['function']['description']
+        assert '提交最终 dry-run 决策' in by_name['submit_decision']['function']['description']
         context = debug.agent_tool_initial_context(make_state())
+        assert 'get_tasks' in context['available_query_tools']
+        assert context['active_tasks'] == []
         assert 'get_dialog_speakers' in context['available_query_tools']
         assert 'get_object_history' in context['available_query_tools']
+        assert any('所有建议' in item for item in context['constraints'])
         assert names[-1] == 'submit_decision'
 
 
@@ -440,7 +497,7 @@ def test_agent_tools_return_json_serializable_dicts():
         write_state(debug, state)
         debug.event_log = [{'type': 'inventory_changed'}]
         debug.dialog_history = [{'text': 'hello'}]
-        calls = [('get_state_summary', {}), ('get_navigation', {'mode': 'lightweight', 'limit': 5}), ('get_navigation', {'mode': 'full', 'limit': 5}), ('get_dialogs', {'limit': 1}), ('get_dialog_speakers', {'limit': 1}), ('get_inventory', {'limit': 1}), ('get_events', {'limit': 1}), ('get_object_history', {'id': 48, 'limit': 1}), ('get_agent_history', {'limit': 1}), ('get_route', {'id': 48}), ('get_room_exploration', {'room_id': debug.room_identity(state)['id']}), ('get_known_transitions', {}), ('submit_decision', {'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})]
+        calls = [('get_tasks', {}), ('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('get_state_summary', {}), ('get_navigation', {'mode': 'lightweight', 'limit': 5}), ('get_navigation', {'mode': 'full', 'limit': 5}), ('get_dialogs', {'limit': 1}), ('get_dialog_speakers', {'limit': 1}), ('get_inventory', {'limit': 1}), ('get_events', {'limit': 1}), ('get_object_history', {'id': 48, 'limit': 1}), ('get_agent_history', {'limit': 1}), ('get_route', {'id': 48}), ('get_room_exploration', {'room_id': debug.room_identity(state)['id']}), ('get_known_transitions', {}), ('submit_decision', {'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})]
         for (name, arguments) in calls:
             result = debug.run_agent_tool(name, arguments, state)
             assert isinstance(result, dict)

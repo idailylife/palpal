@@ -37,6 +37,29 @@ def test_state_events_record_trigger_metadata_change():
         assert event['changes']['trigger_script'] == {'from': 100, 'to': 4520}
 
 
+def test_state_events_ignore_auto_script_only_changes():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        first = make_state(objects=[{'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 1, 'trigger_script': 100, 'auto_script': 5014, 'blocking': False, 'interactable': True}])
+        second = make_state(objects=[{'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 1, 'trigger_script': 100, 'auto_script': 5015, 'blocking': False, 'interactable': True}])
+        debug.record_state_events(first)
+        debug.record_state_events(second)
+        assert debug.event_log == []
+
+
+def test_state_events_keep_semantic_changes_when_auto_script_also_changes():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        first = make_state(objects=[{'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 1, 'trigger_script': 100, 'auto_script': 5014, 'blocking': False, 'interactable': True}])
+        second = make_state(objects=[{'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 2, 'trigger_mode': 1, 'trigger_script': 100, 'auto_script': 5015, 'blocking': False, 'interactable': True}])
+        debug.record_state_events(first)
+        debug.record_state_events(second)
+        assert len(debug.event_log) == 1
+        event = debug.event_log[0]
+        assert event['type'] == 'object_changed'
+        assert event['changes'] == {'state': {'from': 1, 'to': 2}}
+
+
 
 def test_dialog_event_is_persisted_once():
     with tempfile.TemporaryDirectory() as tmp:
@@ -193,7 +216,7 @@ def test_snapshot_clears_runtime_history_when_frame_restarts():
 
 
 
-def test_dialog_dedupe_uses_room_object_message_and_text_not_frame_or_sequence():
+def test_dialog_dedupe_uses_event_frame_not_current_state_room_or_sequence():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         first = make_state()
@@ -201,7 +224,8 @@ def test_dialog_dedupe_uses_room_object_message_and_text_not_frame_or_sequence()
         first['dialog'] = {'events': [{'sequence': 1, 'frame': 10, 'message_id': 588, 'event_object_id': 25, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]}
         second = make_state()
         second['frame'] = 20
-        second['dialog'] = {'events': [{'sequence': 99, 'frame': 20, 'message_id': 588, 'event_object_id': 25, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]}
+        second['region_key'] = '3:10:moved-region'
+        second['dialog'] = {'events': [{'sequence': 99, 'frame': 10, 'message_id': 588, 'event_object_id': 25, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]}
         debug.apply_frame_timeline(first)
         debug.record_dialog_event(first)
         debug.apply_frame_timeline(second)
@@ -211,8 +235,21 @@ def test_dialog_dedupe_uses_room_object_message_and_text_not_frame_or_sequence()
         assert debug.dialog_history[0]['raw_frame'] == 10
 
 
+def test_dialog_history_keeps_true_repeated_line_at_later_event_frame():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        first = make_state()
+        first['dialog'] = {'events': [{'sequence': 1, 'frame': 10, 'message_id': 588, 'event_object_id': 25, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]}
+        second = make_state()
+        second['dialog'] = {'events': [{'sequence': 1, 'frame': 200, 'message_id': 588, 'event_object_id': 25, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]}
+        debug.record_dialog_event(first)
+        debug.record_dialog_event(second)
+        assert len(debug.dialog_history) == 2
+        assert [entry['raw_frame'] for entry in debug.dialog_history] == [10, 200]
 
-def test_dialog_dedupe_keeps_identical_lines_in_different_full_rooms():
+
+
+def test_dialog_dedupe_collapses_identical_lines_across_regions():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         lower = make_state()
@@ -220,13 +257,46 @@ def test_dialog_dedupe_keeps_identical_lines_in_different_full_rooms():
         lower['dialog'] = {'events': [{'sequence': 1, 'frame': 10, 'message_id': 588, 'event_object_id': 57, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]}
         upper = make_state()
         upper['region_key'] = '3:10:upper-region'
-        upper['dialog'] = {'events': [{'sequence': 1, 'frame': 20, 'message_id': 588, 'event_object_id': 57, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]}
+        upper['dialog'] = {'events': [{'sequence': 1, 'frame': 10, 'message_id': 588, 'event_object_id': 57, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]}
         debug.apply_frame_timeline(lower)
         debug.record_dialog_event(lower)
         debug.apply_frame_timeline(upper)
         debug.record_dialog_event(upper)
-        assert len(debug.dialog_history) == 2
-        assert debug.dialog_history[0]['room_id'] != debug.dialog_history[1]['room_id']
+        assert len(debug.dialog_history) == 1
+        assert debug.dialog_history[0]['room_id'] == debug.room_identity(lower)['id']
+
+
+def test_dialog_event_from_old_scene_does_not_get_current_room_metadata():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state()
+        state['scene_id'] = 3
+        state['map_id'] = 10
+        state['region_key'] = '3:10:16:52'
+        state['dialog'] = {'events': [{'sequence': 1, 'frame': 10, 'scene_id': 1, 'map_id': 12, 'message_id': 588, 'event_object_id': 20, 'speaker_hint': '李大娘', 'text': '別愣在這裡，幫幫忙吧'}]}
+        debug.record_dialog_event(state)
+        assert len(debug.dialog_history) == 1
+        entry = debug.dialog_history[0]
+        assert entry['scene_id'] == 1
+        assert entry['map_id'] == 12
+        assert entry['room_id'] is None
+        assert entry['nav_room_id'] is None
+        assert entry['region_key'] is None
+        assert entry['source_key'] == 'dialog:1:12:10:20:588:別愣在這裡，幫幫忙吧'
+
+
+def test_dialog_history_cleaning_removes_mismatched_room_metadata_and_dedupes():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        dirty = [
+            {'source_key': 'old-a', 'scene_id': 1, 'map_id': 12, 'room_id': '3/10/test-room/3:10:16:52', 'nav_room_id': '3/10/test-room', 'room_key': 'test-room', 'region_key': '3:10:16:52', 'event_object_id': 20, 'message_id': 588, 'text': '幫幫忙吧'},
+            {'source_key': 'old-b', 'scene_id': 1, 'map_id': 12, 'room_id': '1/12/test-room/1:12:10:34', 'nav_room_id': '1/12/test-room', 'room_key': 'test-room', 'region_key': '1:12:10:34', 'event_object_id': 20, 'message_id': 588, 'text': '幫幫忙吧'},
+        ]
+        cleaned = debug.clean_dialog_history_entries(dirty)
+        assert len(cleaned) == 1
+        assert cleaned[0]['source_key'] == 'dialog:1:12::20:588:幫幫忙吧'
+        assert cleaned[0]['room_id'] == '1/12/test-room/1:12:10:34'
+        assert cleaned[0]['nav_room_id'] == '1/12/test-room'
 
 
 
@@ -249,6 +319,7 @@ def test_recent_dialog_feedback_decays_by_agent_turn():
         debug.agent_log_path.write_text('\n'.join((json.dumps({'turn': turn, 'episode': identity['id'], 'nav_room_id': identity['nav_room_id'], 'decision': {}}) for turn in (1, 2, 3, 4))) + '\n', encoding='utf-8')
         navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
         targets = {item['id']: item for item in navigation['targets']}
-        assert targets[57]['interaction_state'] == 'fresh'
-        assert targets[57]['agent_priority'] == 'normal'
-        assert 'recent_dialog_feedback' not in targets[57]
+        assert targets[57]['interaction_state'] == 'recent_dialog'
+        assert targets[57]['agent_priority'] == 'soft_avoid'
+        assert targets[57]['dialog_feedback_state'] == 'soft_avoid'
+        assert targets[57]['recent_dialog_feedback'][0]['text'] == '你們跑不掉了'

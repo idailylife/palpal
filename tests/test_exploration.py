@@ -4,7 +4,7 @@ from conftest import make_debug_state, make_state, write_state
 
 
 
-def test_room_identity_separates_region_from_nav_room():
+def test_room_identity_uses_stable_logical_room_and_keeps_legacy_fields():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         lower = make_state()
@@ -13,12 +13,73 @@ def test_room_identity_separates_region_from_nav_room():
         upper['region_key'] = '3:10:1:2'
         lower_identity = debug.room_identity(lower)
         upper_identity = debug.room_identity(upper)
-        assert lower_identity['id'] == '3/10/test-room/3:10:1:1'
-        assert upper_identity['id'] == '3/10/test-room/3:10:1:2'
-        assert lower_identity['id'] != upper_identity['id']
+        assert lower_identity['id'].startswith('lr0:3:10:')
+        assert lower_identity['id'] == upper_identity['id']
         assert lower_identity['nav_room_id'] == upper_identity['nav_room_id']
+        assert lower_identity['nav_room_id'] == lower_identity['id']
+        assert lower_identity['legacy_room_id'] == '3/10/test-room/3:10:1:1'
+        assert upper_identity['legacy_room_id'] == '3/10/test-room/3:10:1:2'
+        assert lower_identity['legacy_nav_room_id'] == '3/10/test-room'
         assert lower_identity['room_key'] == 'test-room'
         assert upper_identity['region_key'] == '3:10:1:2'
+
+
+def test_logical_room_hash_is_stable_within_portal_cut_component():
+    portal = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        left = make_state(width=7, height=5, start=(0, 4), objects=[portal])
+        lower_left = make_state(width=7, height=5, start=(1, 3), objects=[portal])
+        assert debug.room_identity(left)['id'] == debug.room_identity(lower_left)['id']
+
+
+def test_logical_room_hash_splits_same_scene_map_by_transition_range():
+    portal = {'id': 48, 'x': 32, 'y': 16, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
+        blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
+        left = make_state(width=5, height=5, start=(0, 4), objects=[portal], blocked=blocked)
+        right = make_state(width=5, height=5, start=(4, 0), objects=[portal], blocked=blocked)
+        assert debug.room_identity(left)['id'] != debug.room_identity(right)['id']
+
+
+def test_logical_room_uses_full_transition_range_not_only_center_tile():
+    portal = {'id': 48, 'x': 32, 'y': 24, 'sprite_id': 0, 'state': 1, 'trigger_mode': 5, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
+        blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
+        left = make_state(width=5, height=5, start=(0, 4), objects=[portal], blocked=blocked)
+        right = make_state(width=5, height=5, start=(4, 0), objects=[portal], blocked=blocked)
+        assert debug.room_identity(left)['id'] != debug.room_identity(right)['id']
+
+
+def test_logical_room_ignores_npc_blocker_search_and_item_state():
+    blocker = {'id': 74, 'x': 32, 'y': 0, 'state': 2, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': True, 'interactable': True}
+    item = {'id': 75, 'x': 48, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 99, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    npc = {'id': 76, 'x': 64, 'y': 16, 'sprite_id': 123, 'state': 1, 'trigger_mode': 4, 'trigger_script': 100, 'auto_script': 0, 'blocking': True, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        base = make_state(width=6, height=6, start=(2, 2), objects=[blocker, item, npc])
+        changed = make_state(width=6, height=6, start=(2, 2), objects=[
+            {**blocker, 'state': 1, 'blocking': False},
+            {**item, 'interactable': False},
+            {**npc, 'x': 80, 'blocking': False},
+        ])
+        assert debug.room_identity(base)['id'] == debug.room_identity(changed)['id']
+
+
+def test_logical_room_seed_on_transition_area_uses_nearest_stable_component():
+    portal = {'id': 48, 'x': 32, 'y': 16, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
+        blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
+        on_portal = make_state(width=5, height=5, start=(2, 2), objects=[portal], blocked=blocked)
+        near_portal = make_state(width=5, height=5, start=(3, 1), objects=[portal], blocked=blocked)
+        assert debug.logical_room_identity(on_portal)['seed_adjusted']
+        assert debug.room_identity(on_portal)['id'] == debug.room_identity(near_portal)['id']
 
 
 
@@ -111,7 +172,7 @@ def test_touch_trigger_nodes_are_not_frontier():
 
 
 
-def test_blocking_nodes_are_not_exploration_frontier():
+def test_blocking_nodes_do_not_change_logical_exploration_component():
     blocker = {'id': 74, 'x': 32, 'y': 0, 'state': 2, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': True, 'interactable': True}
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -119,8 +180,8 @@ def test_blocking_nodes_are_not_exploration_frontier():
         write_state(debug, state)
         summary = debug.update_exploration(state)
         frontier = {(node['grid_x'], node['grid_y']) for node in summary['nodes']['frontier']}
-        assert (2, 0) not in frontier
-        assert summary['blocked_edges'] > 0
+        assert (2, 0) in frontier
+        assert summary['explorable'] == 5
 
 
 
@@ -161,7 +222,9 @@ def test_get_room_exploration_returns_compact_known_and_unknown_status():
         assert known['map_id'] == 10
         assert known['room_key'] == 'test-room'
         assert known['region_key'] == 'test-room'
-        assert known['nav_room_id'] == '3/10/test-room'
+        assert known['logical_room_id'] == identity['id']
+        assert known['nav_room_id'] == identity['id']
+        assert known['legacy_nav_room_id'] == '3/10/test-room'
         assert known['explored'] == 1
         assert known['frontier'] == 4
         assert 'explorable' in known

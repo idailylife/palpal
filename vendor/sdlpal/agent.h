@@ -74,6 +74,20 @@ PALPAL_AgentObserveDialogText(
    LPCWSTR    lpszText
 );
 
+/* Record that a concrete event object's trigger script ran.  This is used by
+ * the companion to attribute a later room change without guessing from map
+ * geometry alone. */
+VOID
+PALPAL_AgentBeginTriggerScript(
+   WORD       wEventObjectID,
+   WORD       wTriggerScript
+);
+
+VOID
+PALPAL_AgentEndTriggerScript(
+   WORD       wEventObjectID
+);
+
 PAL_C_LINKAGE_END
 
 #endif

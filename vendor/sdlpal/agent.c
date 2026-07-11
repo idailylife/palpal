@@ -27,6 +27,21 @@ static DWORD g_agent_last_dialog_ticks = 0;
 static DWORD g_agent_dialog_sequence = 0;
 static WCHAR g_agent_dialog_speaker[64];
 
+typedef struct tagPALPALAGENTTRIGGEROBSERVATION
+{
+   BOOL valid;
+   BOOL completed;
+   DWORD generation;
+   WORD event_object_id;
+   WORD trigger_script;
+   WORD source_scene_id;
+   WORD source_map_id;
+   int source_x;
+   int source_y;
+} PALPALAGENTTRIGGEROBSERVATION;
+
+static PALPALAGENTTRIGGEROBSERVATION g_agent_trigger_observation;
+
 #define PALPAL_AGENT_MAX_ACTION_STEPS 64
 #define PALPAL_AGENT_DIALOG_EVENT_CAPACITY 32
 
@@ -44,6 +59,8 @@ static BOOL g_agent_waiting_for_move = FALSE;
 static int g_agent_wait_x = 0;
 static int g_agent_wait_y = 0;
 static DWORD g_agent_wait_ticks = 0;
+
+static VOID PALPAL_AgentClearActionQueue(VOID);
 
 typedef enum tagPALPALAGENTSLOTCOMMAND
 {
@@ -222,6 +239,40 @@ PALPAL_AgentCurrentMapId(
       return gpGlobals->g.rgScene[scene_index].wMapNum;
    }
    return 0;
+}
+
+VOID
+PALPAL_AgentBeginTriggerScript(
+   WORD       wEventObjectID,
+   WORD       wTriggerScript
+)
+{
+   if (!PALPAL_AgentEnabled() || gpGlobals == NULL || !gpGlobals->fInMainGame || wEventObjectID == 0xFFFF)
+   {
+      return;
+   }
+
+   g_agent_trigger_observation.valid = TRUE;
+   g_agent_trigger_observation.completed = FALSE;
+   g_agent_trigger_observation.generation++;
+   g_agent_trigger_observation.event_object_id = wEventObjectID;
+   g_agent_trigger_observation.trigger_script = wTriggerScript;
+   g_agent_trigger_observation.source_scene_id = gpGlobals->wNumScene;
+   g_agent_trigger_observation.source_map_id = PALPAL_AgentCurrentMapId();
+   g_agent_trigger_observation.source_x = PAL_X(gpGlobals->viewport) + PAL_X(gpGlobals->partyoffset);
+   g_agent_trigger_observation.source_y = PAL_Y(gpGlobals->viewport) + PAL_Y(gpGlobals->partyoffset);
+}
+
+VOID
+PALPAL_AgentEndTriggerScript(
+   WORD       wEventObjectID
+)
+{
+   /* The bridge reports execution, not a guessed room. */
+   if (g_agent_trigger_observation.valid && g_agent_trigger_observation.event_object_id == wEventObjectID)
+   {
+      g_agent_trigger_observation.completed = TRUE;
+   }
 }
 
 static VOID
@@ -721,11 +772,38 @@ PALPAL_AgentDoStartSlot(
    int slot
 )
 {
-   if (!PALPAL_AgentSlotCommandAllowed("start_slot", slot))
+   /*
+    * A new game is an explicit reset, not a checkpoint load.  In particular,
+    * the first new game immediately enters the opening dialog; rejecting a
+    * later start request while that dialog is active left the Web UI unable to
+    * start over again.  End the dialog and defer the reload to the main loop.
+    */
+   if (slot < 0)
    {
+      PALPAL_AgentWriteSlotResult(FALSE, "invalid_slot", "start_slot", slot, "invalid_slot");
+      return;
+   }
+   if (gpGlobals == NULL || !gpGlobals->fInMainGame)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "not_in_main_game", "start_slot", slot, "not_in_main_game");
+      return;
+   }
+   if (gpGlobals->fInBattle)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "in_battle", "start_slot", slot, "in_battle");
+      return;
+   }
+   if (gpGlobals->fEnteringScene)
+   {
+      PALPAL_AgentWriteSlotResult(FALSE, "entering_scene", "start_slot", slot, "entering_scene");
       return;
    }
 
+   PALPAL_AgentClearActionQueue();
+   if (PAL_IsInDialog())
+   {
+      PAL_EndDialog();
+   }
    PAL_ReloadInNextTick(slot);
    PALPAL_AgentWriteSlotResult(TRUE, "start_scheduled", "start_slot", slot, NULL);
 }
@@ -2075,6 +2153,21 @@ PALPAL_AgentWriteState(
    fprintf(fp, "\"party_direction\":%u,", gpGlobals->wPartyDirection);
    fprintf(fp, "\"region_key\":\"%u:%u:%d:%d\",",
       gpGlobals->wNumScene, map_id, player_x / 64, player_y / 32);
+   if (g_agent_trigger_observation.valid)
+   {
+      fprintf(fp,
+         "\"trigger_observation\":{\"generation\":%u,\"event_object_id\":%u,"
+         "\"trigger_script\":%u,\"completed\":%s,\"source\":{\"scene_id\":%u,"
+         "\"map_id\":%u,\"x\":%d,\"y\":%d}},",
+         (unsigned int)g_agent_trigger_observation.generation,
+         (unsigned int)g_agent_trigger_observation.event_object_id,
+         (unsigned int)g_agent_trigger_observation.trigger_script,
+         g_agent_trigger_observation.completed ? "true" : "false",
+         (unsigned int)g_agent_trigger_observation.source_scene_id,
+         (unsigned int)g_agent_trigger_observation.source_map_id,
+         g_agent_trigger_observation.source_x,
+         g_agent_trigger_observation.source_y);
+   }
    PALPAL_AgentWriteRoom(fp, gpGlobals->wNumScene, map_id, player_x, player_y);
    fprintf(fp, ",");
    PALPAL_AgentWriteDialog(fp);
