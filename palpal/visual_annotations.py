@@ -11,8 +11,8 @@ LI_XIAOYAO_SCENE_SPRITES = (
 
 _UNKNOWN_LI_XIAOYAO_SPRITE = {
     sprite_id: {
-        "label": f"李逍遥剧情造型 #{sprite_id}",
-        "tags": ["li_xiaoyao", "story_sprite"],
+        "label": f"未标注场景精灵 #{sprite_id}",
+        "tags": ["scene_sprite", "unreviewed"],
         "confidence": "unknown",
         "source": "li_xiaoyao_scene_sprite_v1",
     }
@@ -21,17 +21,11 @@ _UNKNOWN_LI_XIAOYAO_SPRITE = {
 
 LI_XIAOYAO_SCENE_SPRITE_ANNOTATIONS = {
     **_UNKNOWN_LI_XIAOYAO_SPRITE,
-    2: {
-        "label": "李逍遥常规场景造型",
-        "tags": ["li_xiaoyao", "default_scene_sprite"],
-        "confidence": "verified",
-        "source": "li_xiaoyao_scene_sprite_v1",
-    },
     208: {
-        "label": "李逍遥端着酒菜餐盘",
-        "tags": ["li_xiaoyao", "carrying_food_tray", "story_progress"],
+        "label": "酒菜餐盘（独立精灵）",
+        "tags": ["food_tray", "scene_sprite"],
         "confidence": "verified",
-        "source": "li_xiaoyao_scene_sprite_v1",
+        "source": "mgo_visual_review_v1",
     },
 }
 

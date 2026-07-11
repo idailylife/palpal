@@ -9,10 +9,10 @@ from conftest import make_debug_state, make_state
 def test_li_xiaoyao_candidate_sprite_set_includes_food_tray_state():
     assert len(LI_XIAOYAO_SCENE_SPRITES) == 27
     assert LI_XIAOYAO_SCENE_SPRITE_ANNOTATIONS[208] == {
-        "label": "李逍遥端着酒菜餐盘",
-        "tags": ["li_xiaoyao", "carrying_food_tray", "story_progress"],
+        "label": "酒菜餐盘（独立精灵）",
+        "tags": ["food_tray", "scene_sprite"],
         "confidence": "verified",
-        "source": "li_xiaoyao_scene_sprite_v1",
+        "source": "mgo_visual_review_v1",
     }
 
 
@@ -27,7 +27,7 @@ def test_party_visual_annotation_is_limited_to_known_li_xiaoyao_scene_sprites():
 
     attach_party_visual_annotations(state)
 
-    assert state["party"][0]["visual_annotation"]["label"] == "李逍遥端着酒菜餐盘"
+    assert state["party"][0]["visual_annotation"]["label"] == "酒菜餐盘（独立精灵）"
     assert "visual_annotation" not in state["party"][1]
     assert "visual_annotation" not in state["party"][2]
 
