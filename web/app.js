@@ -1077,11 +1077,15 @@ function renderEquipment(state) {
   const renderKey = JSON.stringify(party.map((role) => [
     role.role_id,
     role.name,
+    role.scene_sprite_id,
+    role.visual_annotation?.label,
+    role.visual_annotation?.confidence,
     (role.equipment || []).map((item) => [item.slot_key, item.item_id, item.name]),
   ]));
   equipmentRenderKey = setPanelHtml(equipmentEl, party.map((role) => `
     <div class="equipmentRole">
       <strong>${escapeHtml(role.name || `role #${role.role_id}`)}</strong>
+      ${role.scene_sprite_id != null ? `<div><em>scene</em>#${role.scene_sprite_id} ${escapeHtml(role.visual_annotation?.label || "待确认造型")}</div>` : ""}
       <div>${(role.equipment || []).map((item) => `
         <span><em>${escapeHtml(item.slot_key)}</em>${escapeHtml(item.name || (item.item_id ? `#${item.item_id}` : "-"))}</span>
       `).join("")}</div>

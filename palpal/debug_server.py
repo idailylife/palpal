@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from palpal.visual_annotations import attach_party_visual_annotations
+
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
@@ -2456,6 +2458,7 @@ class DebugState:
         }
 
     def attach_logical_room_fields(self, state: dict) -> None:
+        attach_party_visual_annotations(state)
         identity = self.logical_room_identity(state)
         if identity is None:
             return
@@ -5624,6 +5627,8 @@ class DebugState:
             "party": [
                 {
                     "role_id": role.get("role_id"),
+                    "scene_sprite_id": role.get("scene_sprite_id"),
+                    "visual_annotation": role.get("visual_annotation"),
                     "level": role.get("level"),
                     "hp": role.get("hp"),
                     "max_hp": role.get("max_hp"),
@@ -6192,6 +6197,15 @@ class DebugState:
                 "in_battle": state.get("in_battle"),
                 "party_position": {"x": pos.get("x"), "y": pos.get("y")},
                 "party_direction": state.get("party_direction"),
+                "party": [
+                    {
+                        "role_id": role.get("role_id"),
+                        "scene_sprite_id": role.get("scene_sprite_id"),
+                        "visual_annotation": role.get("visual_annotation"),
+                    }
+                    for role in state.get("party", [])
+                    if isinstance(role, dict)
+                ],
                 "dialog": {
                     "active": bool(dialog.get("active")),
                     "position": dialog.get("position"),

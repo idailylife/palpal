@@ -1537,9 +1537,10 @@ PALPAL_AgentWriteParty(
       WORD role = gpGlobals->rgParty[i].wPlayerRole;
       if (i > 0) fprintf(fp, ",");
       fprintf(fp,
-         "{\"index\":%d,\"role_id\":%u,\"name\":",
+         "{\"index\":%d,\"role_id\":%u,\"scene_sprite_id\":%u,\"name\":",
          i,
-         role);
+         role,
+         gpGlobals->g.PlayerRoles.rgwSpriteNum[role]);
       PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(gpGlobals->g.PlayerRoles.rgwName[role]));
       fprintf(fp,
          ",\"level\":%u,\"hp\":%u,\"max_hp\":%u,"
