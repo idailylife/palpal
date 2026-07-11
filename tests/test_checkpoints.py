@@ -55,7 +55,7 @@ def test_start_new_game_allowed_while_game_is_running():
         debug.dialogs_path.write_text('[{"source_key":"old","text":"old"}]', encoding='utf-8')
         debug.events_path.write_text('[{"type":"old"}]', encoding='utf-8')
         debug.agent_log_path.write_text('{"turn":9}\n', encoding='utf-8')
-        debug.exploration_path.write_text('{"version":6,"rooms":{},"transitions":{},"object_interactions":{"room":{"75":{"attempt_count":1}}}}', encoding='utf-8')
+        debug.exploration_path.write_text('{"version":7,"rooms":{},"transitions":{},"object_interactions":{"room":{"75":{"attempt_count":1}}}}', encoding='utf-8')
         debug.snapshot()
 
         def run(command, slot):
@@ -103,7 +103,7 @@ def test_save_checkpoint_writes_manifest_game_and_existing_companion_files():
         debug = make_debug_state(tmp)
         write_state(debug)
         debug.dialogs_path.write_text('[{"source_key":"d1","text":"hi"}]', encoding='utf-8')
-        debug.exploration_path.write_text('{"version":6,"rooms":{},"transitions":{}}', encoding='utf-8')
+        debug.exploration_path.write_text('{"version":7,"rooms":{},"transitions":{}}', encoding='utf-8')
         debug.navigation_log_path.parent.mkdir(parents=True, exist_ok=True)
         debug.navigation_log_path.write_text('{"type":"route"}\n', encoding='utf-8')
         with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
@@ -112,7 +112,7 @@ def test_save_checkpoint_writes_manifest_game_and_existing_companion_files():
         checkpoint_dir = debug.checkpoint_dir('before-door')
         assert result['ok']
         assert checkpoint['version'] == 1
-        assert checkpoint['companion_version'] == 6
+        assert checkpoint['companion_version'] == 7
         assert checkpoint['label'] == 'Before Door'
         assert checkpoint['state']['scene_id'] == 3
         assert checkpoint['state']['room_id'].startswith('lr0:3:10:')
@@ -133,7 +133,7 @@ def test_load_checkpoint_restores_companion_files_and_refreshes_caches():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         write_state(debug)
-        debug.exploration_path.write_text('{"version":6,"rooms":{},"transitions":{}}', encoding='utf-8')
+        debug.exploration_path.write_text('{"version":7,"rooms":{},"transitions":{}}', encoding='utf-8')
         with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
             debug.save_checkpoint('cp1', 'CP1')
         debug.dialogs_path.write_text('[{"source_key":"old","text":"old"}]', encoding='utf-8')
@@ -163,10 +163,10 @@ def test_checkpoint_load_keeps_history_and_continues_logical_frame_after_raw_rol
         checkpoint_dir = debug.checkpoint_dir('cp1')
         (checkpoint_dir / 'companion').mkdir(parents=True)
         (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z', 'companion_version': 6}), encoding='utf-8')
+        (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z', 'companion_version': 7}), encoding='utf-8')
         (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"d1","text":"checkpoint dialog","room_key":"test-room","event_object_id":25}]', encoding='utf-8')
         (checkpoint_dir / 'companion' / 'events.json').write_text('[{"type":"checkpoint_event"}]', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":6,"rooms":{},"transitions":{}}', encoding='utf-8')
+        (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":7,"rooms":{},"transitions":{}}', encoding='utf-8')
         (checkpoint_dir / 'companion' / 'agent_log.jsonl').write_text('{"turn":7}\n', encoding='utf-8')
         with patch.object(debug, 'run_slot_command', side_effect=fake_load_command), patch.object(debug, 'clear_runtime_history', wraps=debug.clear_runtime_history) as clear_history:
             result = debug.load_checkpoint('cp1')
@@ -190,10 +190,10 @@ def test_checkpoint_load_from_startup_uses_companion_history_for_logical_frame_b
         checkpoint_dir = debug.checkpoint_dir('cp1')
         (checkpoint_dir / 'companion').mkdir(parents=True)
         (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z', 'companion_version': 6}), encoding='utf-8')
+        (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z', 'companion_version': 7}), encoding='utf-8')
         (checkpoint_dir / 'companion' / 'dialog_history.json').write_text(json.dumps([{'source_key': 'd1', 'text': '呵～累了，想早點休息', 'room_key': 'test-room', 'event_object_id': 25, 'logical_frame': 4659, 'end_logical_frame': 4659}], ensure_ascii=False), encoding='utf-8')
         (checkpoint_dir / 'companion' / 'events.json').write_text('[]', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":6,"rooms":{},"transitions":{}}', encoding='utf-8')
+        (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":7,"rooms":{},"transitions":{}}', encoding='utf-8')
         (checkpoint_dir / 'companion' / 'agent_log.jsonl').write_text(json.dumps({'turn': 6, 'frame': 4729, 'logical_frame': 4729, 'episode': '1/12/test-room/test-room', 'nav_room_id': '1/12/test-room'}) + '\n', encoding='utf-8')
         write_state(debug, make_startup_state())
         with patch.object(debug, 'run_slot_command', side_effect=fake_load_command), patch.object(debug, 'clear_runtime_history', wraps=debug.clear_runtime_history) as clear_history:
@@ -223,7 +223,7 @@ def test_load_checkpoint_discards_incompatible_companion_files():
         debug.dialogs_path.write_text('[{"source_key":"live","text":"live"}]', encoding='utf-8')
         debug.events_path.write_text('[{"type":"live"}]', encoding='utf-8')
         debug.agent_log_path.write_text('{"turn":99}\n', encoding='utf-8')
-        debug.exploration_path.write_text('{"version":6,"rooms":{"live":{}},"transitions":{}}', encoding='utf-8')
+        debug.exploration_path.write_text('{"version":7,"rooms":{"live":{}},"transitions":{}}', encoding='utf-8')
         with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
             result = debug.load_checkpoint('old-cp')
         assert result['ok']

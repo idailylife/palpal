@@ -45,7 +45,7 @@ VALID_BUTTONS = {
     "end",
 }
 STALE_AFTER_SECONDS = 2.0
-EXPLORATION_VERSION = 6
+EXPLORATION_VERSION = 7
 MAX_OBJECT_INTERACTION_HISTORY = 20
 MAX_TASK_HISTORY = 20
 TRANSITION_OBSERVATION_TIMEOUT_SECONDS = 4.0
@@ -2366,6 +2366,26 @@ class DebugState:
             component = {current}
         return component, portal_cut, current
 
+    def static_room_component_for_state(
+        self,
+        state: dict,
+        grid: dict,
+    ) -> tuple[set[tuple[int, int]], tuple[int, int] | None]:
+        """Return the native static walkable component without event-object cuts."""
+        passable = {
+            (x, y)
+            for y in range(grid["height"])
+            for x in range(grid["width"])
+            if nav_bit(grid, (x, y))
+        }
+        pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
+        seed, _ = self.logical_room_seed(grid, current, passable)
+        component = self.logical_room_component(grid, seed, passable) if seed is not None else set()
+        if not component and current in passable:
+            component = {current}
+        return component, current
+
     def logical_room_hash(self, scene_id, map_id, grid: dict, nodes: set[tuple[int, int]]) -> str:
         absolute_nodes = [list(world_pos(grid, node)) for node in sorted(nodes, key=lambda item: (item[1], item[0]))]
         payload = [scene_id, map_id, absolute_nodes]
@@ -2391,7 +2411,7 @@ class DebugState:
                 "map_id": map_id,
                 "full_hash": full_hash,
                 "hash8": full_hash[:8],
-                "algorithm": "portal-cut-v0",
+                "algorithm": "static-component-v1",
                 "fallback": "legacy_no_nav_grid",
                 "component_size": 0,
                 "portal_cut_size": 0,
@@ -2404,7 +2424,8 @@ class DebugState:
                 "region_key": legacy["region_key"],
             }
 
-        component, portal_cut, current = self.logical_room_component_for_state(state, grid)
+        component, current = self.static_room_component_for_state(state, grid)
+        portal_cut = self.logical_room_cut_nodes(state, grid) & component
         seed_payload = None
         seed_adjusted = False
         if component:
@@ -2421,7 +2442,7 @@ class DebugState:
             "map_id": map_id,
             "full_hash": full_hash,
             "hash8": full_hash[:8],
-            "algorithm": "portal-cut-v0",
+            "algorithm": "static-component-v1",
             "fallback": None,
             "component_size": len(component),
             "portal_cut_size": len(portal_cut),
@@ -2487,7 +2508,7 @@ class DebugState:
         if not isinstance(object_interactions, dict):
             data["object_interactions"] = {}
         # Tasks are companion memory inferred by the agent, rather than game facts.
-        # Keep version-6 exploration files usable by supplying this additive ledger.
+        # Keep current exploration files usable when the additive task ledger is absent.
         tasks = data.get("tasks")
         if not isinstance(tasks, dict):
             data["tasks"] = {}
@@ -3053,11 +3074,14 @@ class DebugState:
         by_room = transitions.get(from_logical_room_id) if isinstance(transitions, dict) else None
         if not isinstance(by_room, dict):
             return None
+        exact_lookup = transition_key is not None or isinstance(state, dict)
         if transition_key is None and isinstance(state, dict):
             observation = self.transition_observation_from_state(state, object_id)
             transition_key = observation.get("transition_key") if isinstance(observation, dict) else None
         if transition_key and isinstance(by_room.get(transition_key), dict):
             return by_room[transition_key]
+        if exact_lookup:
+            return None
         matches = [
             record
             for record in by_room.values()
@@ -3545,10 +3569,9 @@ class DebugState:
         )
 
         safe, reachable_safe, failed_nodes = self.exploration_safe_and_reachable(state, grid, room, current)
+        static_component, _ = self.static_room_component_for_state(state, grid)
         explored = {parse_node_key(key) for key in room.get("visited", [])}
-        explored = {node for node in explored if node is not None}
-        if reachable_safe:
-            explored = {node for node in explored if node in reachable_safe}
+        explored = {node for node in explored if node is not None and node in static_component}
         if current is not None and current in safe:
             explored.add(current)
 
@@ -3750,6 +3773,20 @@ class DebugState:
             for object_key, record in sorted(by_transition.items(), key=transition_sort_key):
                 if not isinstance(record, dict):
                     continue
+                if state is not None:
+                    try:
+                        record_object_id = int(record.get("object_id") or 0)
+                    except (TypeError, ValueError):
+                        record_object_id = 0
+                    current_object = self.target_object(state, record_object_id) if record_object_id > 0 else None
+                    if current_object is not None:
+                        identity = self.room_identity(state)
+                        current_key = self.transition_key_from_fields(
+                            self.transition_key_fields(identity, current_object, record_object_id)
+                        ) if identity is not None else None
+                        recorded_key = record.get("transition_key") or str(object_key)
+                        if current_key != recorded_key:
+                            continue
                 payload = {
                     "transition_key": record.get("transition_key") or str(object_key),
                     "transition_key_fields": record.get("transition_key_fields"),

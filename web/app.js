@@ -18,6 +18,7 @@ const fastDialogButton = document.getElementById("fastDialog");
 const connectionEl = document.getElementById("connection");
 const runtimeStatusEl = document.getElementById("runtimeStatus");
 const overlay = document.getElementById("overlay");
+const logicalRoomEl = document.getElementById("logicalRoom");
 const frameCtx = frameCanvas.getContext("2d");
 const ctx = overlay.getContext("2d");
 
@@ -435,7 +436,6 @@ function renderSummary(state) {
   const rows = [
     ["frame", state.frame],
     ["scene/map", `${state.scene_id ?? "-"} / ${state.map_id ?? "-"}`],
-    ["logical room", state.logical_room_label || state._logical_room?.label],
     ["region", state.region_key],
     ["room", state.room?.key],
     ["battle", state.in_battle],
@@ -450,6 +450,9 @@ function renderSummary(state) {
   summaryRenderKey = setPanelHtml(summaryEl, rows
     .map(([key, value]) => `<div>${key}</div><strong>${value ?? "-"}</strong>`)
     .join(""), renderKey, summaryRenderKey);
+
+  const logicalRoom = state.logical_room_label || state._logical_room?.label || "-";
+  logicalRoomEl.textContent = logicalRoom;
 }
 
 function checkpointFileSummary(checkpoint) {

@@ -33,7 +33,7 @@ def test_logical_room_hash_is_stable_within_portal_cut_component():
         assert debug.room_identity(left)['id'] == debug.room_identity(lower_left)['id']
 
 
-def test_logical_room_hash_splits_same_scene_map_by_transition_range():
+def test_logical_room_hash_ignores_transition_range_changes():
     portal = {'id': 48, 'x': 32, 'y': 16, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -41,10 +41,10 @@ def test_logical_room_hash_splits_same_scene_map_by_transition_range():
         blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
         left = make_state(width=5, height=5, start=(0, 4), objects=[portal], blocked=blocked)
         right = make_state(width=5, height=5, start=(4, 0), objects=[portal], blocked=blocked)
-        assert debug.room_identity(left)['id'] != debug.room_identity(right)['id']
+        assert debug.room_identity(left)['id'] == debug.room_identity(right)['id']
 
 
-def test_logical_room_uses_full_transition_range_not_only_center_tile():
+def test_logical_room_ignores_full_transition_range():
     portal = {'id': 48, 'x': 32, 'y': 24, 'sprite_id': 0, 'state': 1, 'trigger_mode': 5, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -52,7 +52,42 @@ def test_logical_room_uses_full_transition_range_not_only_center_tile():
         blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
         left = make_state(width=5, height=5, start=(0, 4), objects=[portal], blocked=blocked)
         right = make_state(width=5, height=5, start=(4, 0), objects=[portal], blocked=blocked)
-        assert debug.room_identity(left)['id'] != debug.room_identity(right)['id']
+        assert debug.room_identity(left)['id'] == debug.room_identity(right)['id']
+
+
+def test_logical_room_is_stable_when_search_object_becomes_transition():
+    closed = {'id': 10, 'x': 32, 'y': 16, 'sprite_id': 0, 'state': 1, 'trigger_mode': 2, 'trigger_script': 4510, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    opened = {**closed, 'trigger_mode': 4, 'trigger_script': 4520}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        before = make_state(width=7, height=5, start=(0, 4), objects=[closed])
+        after = make_state(width=7, height=5, start=(0, 4), objects=[opened])
+        before_identity = debug.logical_room_identity(before)
+        after_identity = debug.logical_room_identity(after)
+        assert before_identity['id'] == after_identity['id']
+        assert before_identity['component_size'] == after_identity['component_size']
+        assert before_identity['portal_cut_size'] == 0
+        assert after_identity['portal_cut_size'] > 0
+        assert after_identity['algorithm'] == 'static-component-v1'
+
+
+def test_transition_activation_does_not_discard_visited_nodes_in_same_static_room():
+    closed = {'id': 10, 'x': 32, 'y': 16, 'sprite_id': 0, 'state': 1, 'trigger_mode': 2, 'trigger_script': 4510, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    opened = {**closed, 'trigger_mode': 4, 'trigger_script': 4520}
+    corridor = {(0, 4), (1, 3), (2, 2), (3, 1), (4, 0)}
+    blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        before = make_state(width=5, height=5, start=(0, 4), objects=[closed], blocked=blocked)
+        identity = debug.room_identity(before)
+        data = debug.empty_exploration()
+        room = debug.exploration_room(data, identity)
+        room['visited'] = ['0,4', '4,0']
+        debug.write_exploration(data)
+        after = make_state(width=5, height=5, start=(0, 4), objects=[opened], blocked=blocked)
+        summary = debug.update_exploration(after)
+        visited = {(node['grid_x'], node['grid_y']) for node in summary['nodes']['visited']}
+        assert {(0, 4), (4, 0)} <= visited
 
 
 def test_logical_room_ignores_npc_blocker_search_and_item_state():
@@ -70,7 +105,7 @@ def test_logical_room_ignores_npc_blocker_search_and_item_state():
         assert debug.room_identity(base)['id'] == debug.room_identity(changed)['id']
 
 
-def test_logical_room_seed_on_transition_area_uses_nearest_stable_component():
+def test_logical_room_identity_on_transition_area_uses_static_component():
     portal = {'id': 48, 'x': 32, 'y': 16, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -78,7 +113,8 @@ def test_logical_room_seed_on_transition_area_uses_nearest_stable_component():
         blocked = {(x, y) for y in range(5) for x in range(5) if (x, y) not in corridor}
         on_portal = make_state(width=5, height=5, start=(2, 2), objects=[portal], blocked=blocked)
         near_portal = make_state(width=5, height=5, start=(3, 1), objects=[portal], blocked=blocked)
-        assert debug.logical_room_identity(on_portal)['seed_adjusted']
+        identity = debug.logical_room_identity(on_portal)
+        assert not identity['seed_adjusted']
         assert debug.room_identity(on_portal)['id'] == debug.room_identity(near_portal)['id']
 
 

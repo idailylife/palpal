@@ -69,6 +69,23 @@ body {
     0 0 3px #000;
 }
 
+.logicalRoomOverlay {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  z-index: 3;
+  max-width: calc(100% - 24px);
+  color: #eef5fb;
+  font: 700 18px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  text-align: right;
+  text-shadow:
+    0 1px 1px #000,
+    1px 0 1px #000,
+    0 0 4px #000;
+}
+
 #frame,
 #overlay {
   position: absolute;

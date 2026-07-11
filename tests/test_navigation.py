@@ -144,14 +144,14 @@ def test_navigation_attaches_logical_room_once_for_raw_state(monkeypatch):
         debug = make_debug_state(tmp)
         state = make_state(objects=[target])
         calls = 0
-        original = debug.logical_room_component_for_state
+        original = debug.static_room_component_for_state
 
         def counted(*args, **kwargs):
             nonlocal calls
             calls += 1
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(debug, "logical_room_component_for_state", counted)
+        monkeypatch.setattr(debug, "static_room_component_for_state", counted)
         navigation = debug.navigation(state)
         assert navigation["status"] == "ok"
         assert state.get("_logical_room", {}).get("id")

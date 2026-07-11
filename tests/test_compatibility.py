@@ -10,7 +10,7 @@ def test_old_exploration_version_is_discarded():
         debug = make_debug_state(tmp)
         debug.exploration_path.write_text(json.dumps({'version': 2, 'rooms': {'3/10/test-room': {'scene_id': 3}}}), encoding='utf-8')
         data = debug.read_exploration()
-        assert data['version'] == 6
+        assert data['version'] == 7
         assert data['rooms'] == {}
         assert data['transitions'] == {}
 

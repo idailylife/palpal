@@ -31,7 +31,7 @@ def test_task_ledger_is_additive_and_survives_checkpoint_round_trip():
         state = make_checkpoint_state()
         write_state(debug, state)
         debug.save_slot_path().write_bytes(b"task-checkpoint")
-        debug.exploration_path.write_text('{"version":6,"rooms":{},"transitions":{}}', encoding="utf-8")
+        debug.exploration_path.write_text('{"version":7,"rooms":{},"transitions":{}}', encoding="utf-8")
         assert debug.read_exploration()["tasks"] == {}
         created = debug.run_agent_tool("upsert_task", {
             "description": "Reach the courtyard",
