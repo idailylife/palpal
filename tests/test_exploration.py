@@ -1,4 +1,5 @@
 import tempfile
+import re
 
 from conftest import make_debug_state, make_state, write_state
 
@@ -13,7 +14,12 @@ def test_room_identity_uses_stable_logical_room_and_keeps_legacy_fields():
         upper['region_key'] = '3:10:1:2'
         lower_identity = debug.room_identity(lower)
         upper_identity = debug.room_identity(upper)
-        assert lower_identity['id'].startswith('lr0:3:10:')
+        assert re.fullmatch(r'S3/M10:[0-9A-F]{12}', lower_identity['id'])
+        assert lower_identity['logical_room_label'] == lower_identity['id']
+        logical = debug.logical_room_identity(lower)
+        assert logical['hash12'] == lower_identity['id'].rsplit(':', 1)[-1]
+        assert 'full_hash' not in logical
+        assert 'hash8' not in logical
         assert lower_identity['id'] == upper_identity['id']
         assert lower_identity['nav_room_id'] == upper_identity['nav_room_id']
         assert lower_identity['nav_room_id'] == lower_identity['id']

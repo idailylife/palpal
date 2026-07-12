@@ -52,6 +52,7 @@
               <button id="fastDialog" class="dialogAdvanceButton" type="button" disabled>Fast Dialog</button>
               <button data-button="menu">Menu / Cancel</button>
               <button data-button="status">Status</button>
+              <button id="transitionsButton" type="button">Transitions</button>
             </div>
           </section>
           <details class="controlGroup advancedGroup">
@@ -120,6 +121,16 @@
         </section>
       </aside>
     </main>
+    <dialog id="transitionsDialog" class="transitionsDialog" aria-labelledby="transitionsTitle">
+      <div class="transitionsDialogHeader">
+        <div>
+          <h2 id="transitionsTitle">Known Transitions</h2>
+          <div id="transitionsRoom" class="transitionsRoom"></div>
+        </div>
+        <button id="transitionsClose" class="transitionsClose" type="button" aria-label="Close transitions">Close</button>
+      </div>
+      <div id="transitionsContent" class="transitionsContent" aria-live="polite"></div>
+    </dialog>
     <script src="/app.js"></script>
   </body>
 </html>

@@ -176,6 +176,70 @@ button.is-active {
   border-color: #66e3ff;
 }
 
+.transitionsDialog {
+  width: min(620px, calc(100vw - 32px));
+  max-height: min(720px, calc(100vh - 32px));
+  padding: 0;
+  border: 1px solid #46586b;
+  border-radius: 8px;
+  background: #151b21;
+  color: #e8edf2;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 55%);
+}
+
+.transitionsDialog::backdrop {
+  background: rgb(0 0 0 / 65%);
+}
+
+.transitionsDialogHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 16px;
+  border-bottom: 1px solid #303840;
+}
+
+.transitionsDialogHeader h2 { margin: 0; }
+
+.transitionsRoom {
+  margin-top: 3px;
+  color: #9fb1c1;
+  overflow-wrap: anywhere;
+}
+
+.transitionsClose { min-height: 36px; padding: 6px 10px; }
+
+.transitionsContent {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.transitionLink {
+  display: grid;
+  grid-template-columns: auto 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #303840;
+  border-radius: 6px;
+  background: #101419;
+}
+
+.transitionDestination { overflow-wrap: anywhere; }
+
+.transitionsMessage { color: #9fb1c1; }
+
+.transitionArrow { color: #66e3ff; font-size: 20px; text-align: center; }
+.transitionsError { color: #ff9f9f; }
+
+@media (max-width: 560px) {
+  .transitionLink { grid-template-columns: 1fr; }
+  .transitionArrow { text-align: left; transform: rotate(90deg); transform-origin: center; }
+}
+
 .primaryAction {
   background: #2f4a38;
   border-color: #5f896c;

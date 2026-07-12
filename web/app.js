@@ -15,12 +15,18 @@ const inventoryEl = document.getElementById("inventory");
 const equipmentEl = document.getElementById("equipment");
 const frameCanvas = document.getElementById("frame");
 const fastDialogButton = document.getElementById("fastDialog");
+const transitionsButton = document.getElementById("transitionsButton");
+const transitionsDialog = document.getElementById("transitionsDialog");
+const transitionsClose = document.getElementById("transitionsClose");
+const transitionsRoom = document.getElementById("transitionsRoom");
+const transitionsContent = document.getElementById("transitionsContent");
 const connectionEl = document.getElementById("connection");
 const runtimeStatusEl = document.getElementById("runtimeStatus");
 const overlay = document.getElementById("overlay");
 const logicalRoomEl = document.getElementById("logicalRoom");
 const frameCtx = frameCanvas.getContext("2d");
 const ctx = overlay.getContext("2d");
+const defaultDocumentTitle = document.title;
 
 let latestState = null;
 let selectedRoute = null;
@@ -43,6 +49,8 @@ let agentExecutionInFlight = false;
 let agentLastDecision = null;
 let agentError = null;
 let agentActionStatus = "";
+let agentResultTitlePending = false;
+let agentResultTitleTimer = null;
 let selectedAgentModel = null;
 let checkpoints = [];
 let checkpointsLoaded = false;
@@ -68,6 +76,35 @@ const actionCooldownMs = 180;
 const dialogAdvanceDelayMs = 500;
 const dialogAdvanceMaxPresses = 100;
 const jsonUpdateIntervalMs = 1000;
+
+function showAgentResultInTitle() {
+  clearAgentResultTitle();
+  agentResultTitlePending = true;
+  let highlighted = false;
+  const updateTitle = () => {
+    highlighted = !highlighted;
+    document.title = `${highlighted ? "🤖" : "✨"} ${defaultDocumentTitle}`;
+  };
+  updateTitle();
+  agentResultTitleTimer = window.setInterval(updateTitle, 700);
+}
+
+function clearAgentResultTitle() {
+  if (agentResultTitleTimer !== null) {
+    window.clearInterval(agentResultTitleTimer);
+    agentResultTitleTimer = null;
+  }
+  if (!agentResultTitlePending && document.title === defaultDocumentTitle) return;
+  agentResultTitlePending = false;
+  document.title = defaultDocumentTitle;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) clearAgentResultTitle();
+});
+window.addEventListener("focus", clearAgentResultTitle);
+document.addEventListener("pointerdown", clearAgentResultTitle);
+document.addEventListener("keydown", clearAgentResultTitle);
 const navigationSettleMs = 400;
 const fallbackAgentModels = ["deepseek-v4-pro", "deepseek-v4-flash"];
 const lastActionAt = new Map();
@@ -301,6 +338,63 @@ jsonDetailsEl?.addEventListener("toggle", () => {
   } else {
     updateJsonStatus();
   }
+});
+
+function logicalRoomId(state) {
+  return state?.logical_room_id ?? state?._logical_room?.id ?? null;
+}
+
+function renderTransitionLinks(payload) {
+  const transitions = Array.isArray(payload.transitions) ? payload.transitions : [];
+  transitionsRoom.textContent = payload.from_logical_room_id || "Current logical room unavailable";
+  if (!transitions.length) {
+    transitionsContent.innerHTML = '<div class="transitionsMessage">No known transitions from this logical room.</div>';
+    return;
+  }
+  transitionsContent.innerHTML = transitions.map((transition) => {
+    const objectId = transition.object_id ?? transition.object?.id ?? "-";
+    const destination = transition.intra_room_transition
+      ? `same room${transition.to_subregion_id || ""}`
+      : (transition.to_logical_room_label || transition.to_logical_room_id || transition.to_room_id || "-");
+    return `<div class="transitionLink">
+      <strong class="transitionPoint">#${escapeHtml(objectId)}</strong>
+      <span class="transitionArrow" aria-hidden="true">→</span>
+      <strong class="transitionDestination">${escapeHtml(destination)}</strong>
+    </div>`;
+  }).join("");
+}
+
+async function openTransitionsDialog() {
+  if (!transitionsDialog || !transitionsContent) return;
+  const requestedRoomId = logicalRoomId(latestState);
+  transitionsRoom.textContent = requestedRoomId || "Current logical room unavailable";
+  transitionsContent.innerHTML = '<div class="transitionsMessage">Loading known transitions…</div>';
+  if (!transitionsDialog.open) transitionsDialog.showModal();
+  try {
+    const response = await fetch("/navigation/transitions");
+    if (!response.ok) throw new Error(`request failed: ${response.status}`);
+    const payload = await response.json();
+    if (!transitionsDialog.open) return;
+    if (requestedRoomId !== logicalRoomId(latestState) || payload.from_logical_room_id !== requestedRoomId) {
+      transitionsContent.innerHTML = '<div class="transitionsMessage">The current logical room changed. Close and reopen to refresh.</div>';
+      return;
+    }
+    renderTransitionLinks(payload);
+  } catch (error) {
+    if (!transitionsDialog.open) return;
+    const message = error instanceof Error ? error.message : String(error);
+    transitionsContent.innerHTML = `<div class="transitionsError">Could not load transitions: ${escapeHtml(message)}</div><button id="transitionsRetry" type="button">Retry</button>`;
+    document.getElementById("transitionsRetry")?.addEventListener("click", openTransitionsDialog, { once: true });
+  }
+}
+
+transitionsButton?.addEventListener("click", () => {
+  transitionsButton.blur();
+  openTransitionsDialog();
+});
+transitionsClose?.addEventListener("click", () => transitionsDialog?.close());
+transitionsDialog?.addEventListener("click", (event) => {
+  if (event.target === transitionsDialog) transitionsDialog.close();
 });
 
 function setPanelHtml(element, html, key, currentKey, onChange) {
@@ -1867,6 +1961,7 @@ async function deleteCheckpoint(id) {
 
 async function askAgent() {
   if (agentRequestInFlight) return;
+  clearAgentResultTitle();
   agentRequestInFlight = true;
   agentError = null;
   agentActionStatus = "";
@@ -1884,6 +1979,7 @@ async function askAgent() {
     }
     agentLastDecision = result.decision;
     await refreshState();
+    showAgentResultInTitle();
   } catch (error) {
     agentLastDecision = null;
     agentError = error instanceof Error ? error.message : String(error);
@@ -2165,6 +2261,18 @@ async function navigateToTarget(targetId) {
         return;
       }
 
+      if (result.ok && result.status === "transition_observing") {
+        await sleep(80);
+        await refreshState();
+        continue;
+      }
+
+      if (result.ok && result.status === "transitioned") {
+        unlockNavigation("transitioned");
+        await refreshState();
+        return;
+      }
+
       if (!result.ok && result.status === "action_pending") {
         await sleep(120);
         continue;
@@ -2358,6 +2466,7 @@ function shouldIgnoreGameKeydown(event) {
   if (event.defaultPrevented) return true;
   if (isEditableKeyTarget(target)) return true;
   if (checkpointMenuActive()) return true;
+  if (transitionsDialog?.open) return true;
   return false;
 }
 

@@ -44,7 +44,8 @@ VALID_BUTTONS = {
     "end",
 }
 STALE_AFTER_SECONDS = 2.0
-EXPLORATION_VERSION = 7
+EXPLORATION_VERSION = 11
+LOGICAL_ROOM_ID_RE = re.compile(r"^S\d+/M\d+:[0-9A-F]{12}$")
 MAX_OBJECT_INTERACTION_HISTORY = 20
 MAX_TASK_HISTORY = 20
 TRANSITION_OBSERVATION_TIMEOUT_SECONDS = 4.0
@@ -68,6 +69,10 @@ DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS = 3
 DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL = 0.25
 CHECKPOINT_MANIFEST_VERSION = 1
 DEFAULT_CHECKPOINT_SLOT = 99
+
+
+def is_logical_room_id(value: object) -> bool:
+    return isinstance(value, str) and LOGICAL_ROOM_ID_RE.fullmatch(value) is not None
 CHECKPOINT_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 OBJECT_OBSERVATION_FIELDS = (
     "state",
@@ -374,6 +379,7 @@ class DebugState:
         self.dialog_history: list[dict] = self.read_dialog_history()
         self.dialog_source_keys: set[str] = self.dialog_history_source_keys(self.dialog_history)
         self.last_observed_state: dict | None = None
+        self.last_stable_room_state: dict | None = None
         self.pending_transition_observation: dict | None = None
         self.pending_interaction_observation: dict | None = None
         self.last_snapshot_frame: int | None = None
@@ -708,6 +714,7 @@ class DebugState:
         self.dialog_history = self.read_dialog_history()
         self.dialog_source_keys = self.dialog_history_source_keys(self.dialog_history)
         self.last_observed_state = None
+        self.last_stable_room_state = None
         self.pending_transition_observation = None
 
     def int_frame(self, value) -> int | None:
@@ -1087,6 +1094,8 @@ class DebugState:
 
     def agent_log_entry_compatible(self, entry: dict) -> bool:
         episode = entry.get("episode")
+        if isinstance(episode, str) and episode.startswith("lr0:"):
+            return False
         if isinstance(episode, str) and episode.count("/") == 2 and "nav_room_id" not in entry:
             return False
         return True
@@ -1228,6 +1237,7 @@ class DebugState:
             self.dialog_history = []
             self.dialog_source_keys = set()
             self.last_observed_state = None
+            self.last_stable_room_state = None
             self.pending_transition_observation = None
             for path in (
                 self.action_result_path,
@@ -2425,7 +2435,18 @@ class DebugState:
         payload = [scene_id, map_id, absolute_nodes]
         return hashlib.sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
 
+    def room_state_stable(self, state: dict) -> bool:
+        return (
+            isinstance(state, dict)
+            and state.get("status") not in {"waiting_for_game", "state_parse_error", "startup_waiting"}
+            and state.get("in_main_game") is not False
+            and not state.get("entering_scene")
+            and decode_nav_grid(state) is not None
+        )
+
     def logical_room_identity(self, state: dict) -> dict | None:
+        if not self.room_state_stable(state):
+            return None
         cached = state.get("_logical_room") if isinstance(state.get("_logical_room"), dict) else None
         if cached is not None and cached.get("id"):
             return cached
@@ -2437,14 +2458,14 @@ class DebugState:
         grid = decode_nav_grid(state)
         if grid is None:
             payload = [scene_id, map_id, legacy["id"]]
-            full_hash = hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode("utf-8")).hexdigest()
+            hash12 = hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode("utf-8")).hexdigest()[:12].upper()
+            logical_room_id = f"S{scene_id}/M{map_id}:{hash12}"
             return {
-                "id": f"lr0:{scene_id}:{map_id}:{full_hash}",
-                "label": f"S{scene_id}/M{map_id}:{full_hash[:8]}",
+                "id": logical_room_id,
+                "label": logical_room_id,
                 "scene_id": scene_id,
                 "map_id": map_id,
-                "full_hash": full_hash,
-                "hash8": full_hash[:8],
+                "hash12": hash12,
                 "algorithm": "static-component-v1",
                 "fallback": "legacy_no_nav_grid",
                 "component_size": 0,
@@ -2468,14 +2489,14 @@ class DebugState:
             else:
                 seed, seed_adjusted = self.logical_room_seed(grid, current, component)
             seed_payload = node_payload(grid, seed) if seed is not None else None
-        full_hash = self.logical_room_hash(scene_id, map_id, grid, component)
+        hash12 = self.logical_room_hash(scene_id, map_id, grid, component)[:12].upper()
+        logical_room_id = f"S{scene_id}/M{map_id}:{hash12}"
         return {
-            "id": f"lr0:{scene_id}:{map_id}:{full_hash}",
-            "label": f"S{scene_id}/M{map_id}:{full_hash[:8]}",
+            "id": logical_room_id,
+            "label": logical_room_id,
             "scene_id": scene_id,
             "map_id": map_id,
-            "full_hash": full_hash,
-            "hash8": full_hash[:8],
+            "hash12": hash12,
             "algorithm": "static-component-v1",
             "fallback": None,
             "component_size": len(component),
@@ -2490,6 +2511,10 @@ class DebugState:
         }
 
     def attach_logical_room_fields(self, state: dict) -> None:
+        if not self.room_state_stable(state):
+            for key in ("_logical_room", "logical_room_id", "logical_room_label", "legacy_room_id", "legacy_nav_room_id"):
+                state.pop(key, None)
+            return
         identity = self.logical_room_identity(state)
         if identity is None:
             return
@@ -2694,7 +2719,7 @@ class DebugState:
     def object_event_room_id(self, event: dict, state: dict | None = None) -> str | None:
         for key in ("logical_room_id", "room_id"):
             value = event.get(key)
-            if isinstance(value, str) and value.startswith("lr0:"):
+            if is_logical_room_id(value):
                 return value
         if isinstance(state, dict):
             identity = self.room_identity(state)
@@ -3192,6 +3217,12 @@ class DebugState:
                 "from_semantic_room": record.get("from_semantic_room"),
                 "to_semantic_room": record.get("to_semantic_room"),
                 "confidence": record.get("confidence"),
+                "intra_room_transition": bool(record.get("intra_room_transition")),
+                "from_location_id": record.get("from_location_id") or record.get("from_room_id"),
+                "to_location_id": record.get("to_location_id") or record.get("to_room_id"),
+                "from_subregion_id": record.get("from_subregion_id"),
+                "to_subregion_id": record.get("to_subregion_id"),
+                "native_destination": record.get("native_destination"),
             }
         )
         if returns_to_recent_room:
@@ -3250,6 +3281,8 @@ class DebugState:
         transition_key_fields: dict | None = None,
         observed_from_state: dict | None = None,
         confirmation: str = "human_confirmed",
+        intra_room_transition: bool = False,
+        native_destination: dict | None = None,
     ) -> dict:
         observed_at = time.time()
         transition_key_fields = transition_key_fields or self.transition_key_fields(from_identity, from_object, object_id)
@@ -3288,7 +3321,28 @@ class DebugState:
                 "observed_at": observed_at,
                 "observed_from_state": observed_from_state or self.transition_observed_state(from_state, from_identity),
                 "observed_to_state": self.transition_observed_state(to_state, to_identity),
+                "intra_room_transition": bool(intra_room_transition),
+                "native_destination": native_destination,
             }
+            if intra_room_transition:
+                from_subregion_id = f".{int(object_id)}"
+                nearest = self.nearest_transition_candidate(to_state or {}, native_destination)
+                to_subregion_id = f".{nearest[0]}" if nearest else None
+                record.update({
+                    "from_subregion_id": from_subregion_id,
+                    "to_subregion_id": to_subregion_id,
+                    "from_location_id": f"{from_identity['id']}{from_subregion_id}",
+                    "to_location_id": f"{to_identity['id']}{to_subregion_id}" if to_subregion_id else to_identity["id"],
+                    "subregion_basis": "native_trigger_destination_nearest_active_transition" if nearest else None,
+                    "subregion_match_distance": nearest[1] if nearest else None,
+                })
+            else:
+                record.update({
+                    "from_subregion_id": None,
+                    "to_subregion_id": None,
+                    "from_location_id": from_identity["id"],
+                    "to_location_id": to_identity["id"],
+                })
             if existing.get("to_room_id") and existing.get("to_room_id") != to_identity["id"]:
                 previous = {key: value for key, value in existing.items() if key != "observations"}
                 observations = existing.get("observations") if isinstance(existing.get("observations"), list) else []
@@ -3345,6 +3399,17 @@ class DebugState:
             return None
         return observation
 
+    def native_trigger_generation(self, state: dict) -> dict | None:
+        observation = state.get("trigger_observation") if isinstance(state.get("trigger_observation"), dict) else None
+        if not observation:
+            return None
+        try:
+            generation = int(observation.get("generation") or 0)
+            object_id = int(observation.get("event_object_id") or 0)
+        except (TypeError, ValueError):
+            return None
+        return observation if generation > 0 and object_id > 0 else None
+
     def clear_pending_transition_observation(self, object_id: int | None = None) -> None:
         pending = self.pending_transition_observation
         if object_id is None or (isinstance(pending, dict) and pending.get("object_id") == object_id):
@@ -3361,6 +3426,7 @@ class DebugState:
             baseline_generation = 0
         self.pending_transition_observation = {
             **observation,
+            "frozen_source_state": state,
             "object_id": int(object_id),
             "sent_at": time.time(),
             "baseline_trigger_generation": baseline_generation,
@@ -3369,6 +3435,123 @@ class DebugState:
             "stable_snapshots": 0,
             "last_frame": None,
         }
+
+    def discover_native_transition_observation(self, state: dict) -> None:
+        if isinstance(self.pending_transition_observation, dict):
+            return
+        previous = self.last_stable_room_state
+        native = self.native_trigger_generation(state)
+        if not isinstance(previous, dict) or native is None:
+            return
+        previous_native = self.native_trigger_generation(previous)
+        try:
+            generation = int(native.get("generation") or 0)
+            previous_generation = int(previous_native.get("generation") or 0) if previous_native else 0
+            object_id = int(native.get("event_object_id") or 0)
+            trigger_script = int(native.get("trigger_script") or 0)
+        except (TypeError, ValueError):
+            return
+        if generation <= previous_generation or object_id <= 0:
+            return
+        source = native.get("source") if isinstance(native.get("source"), dict) else {}
+        obj = self.target_object(previous, object_id)
+        if not isinstance(obj, dict):
+            self.append_navigation_diagnostic(
+                "native_transition_rejected",
+                {"reason": "source_object_missing", "object_id": object_id, "generation": generation},
+                state,
+            )
+            return
+        try:
+            source_matches = (
+                int(source.get("scene_id")) == int(previous.get("scene_id"))
+                and int(source.get("map_id")) == int(previous.get("map_id"))
+            )
+        except (TypeError, ValueError):
+            self.append_navigation_diagnostic(
+                "native_transition_rejected",
+                {"reason": "invalid_source_scene", "object_id": object_id, "generation": generation},
+                state,
+            )
+            return
+        if not source_matches:
+            self.append_navigation_diagnostic(
+                "native_transition_rejected",
+                {"reason": "source_scene_mismatch", "object_id": object_id, "generation": generation, "source": source},
+                state,
+            )
+            return
+        if trigger_script != int(obj.get("trigger_script") or 0):
+            self.append_navigation_diagnostic(
+                "native_transition_rejected",
+                {"reason": "trigger_script_mismatch", "object_id": object_id, "generation": generation},
+                state,
+            )
+            return
+        from_identity = self.room_identity(previous)
+        if from_identity is None:
+            return
+        self.mark_pending_transition_observation(previous, object_id)
+        pending = self.pending_transition_observation
+        if not isinstance(pending, dict):
+            return
+        pending["trigger_generation"] = generation
+        observed_from = pending.get("observed_from_state") if isinstance(pending, dict) else None
+        if isinstance(observed_from, dict):
+            observed_from["party_position"] = {"x": source.get("x"), "y": source.get("y")}
+        self.append_navigation_diagnostic(
+            "native_transition_detected",
+            {
+                "object_id": object_id,
+                "generation": generation,
+                "trigger_script": trigger_script,
+                "source": source,
+                "from_room_id": from_identity["id"],
+                "completed": native.get("completed") is True,
+            },
+            state,
+        )
+
+    def nearest_transition_candidate(self, state: dict, position: dict | None = None) -> tuple[int, float] | None:
+        pos = position if isinstance(position, dict) else (
+            state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        )
+        try:
+            px, py = int(pos.get("x")), int(pos.get("y"))
+        except (TypeError, ValueError):
+            return None
+        candidates = []
+        for obj in state.get("objects") if isinstance(state.get("objects"), list) else []:
+            if (
+                not isinstance(obj, dict)
+                or not transition_candidate(obj)
+                or int(obj.get("state") or 0) <= 0
+            ):
+                continue
+            try:
+                object_id = int(obj.get("id") or 0)
+                dx, dy = int(obj.get("x")) - px, int(obj.get("y")) - py
+            except (TypeError, ValueError):
+                continue
+            if object_id > 0:
+                candidates.append((dx * dx + dy * dy, object_id))
+        if not candidates:
+            return None
+        distance_squared, object_id = min(candidates, key=lambda item: (item[0], item[1]))
+        return object_id, distance_squared ** 0.5
+
+    def state_at_native_destination(self, state: dict, destination: dict | None) -> dict:
+        if not isinstance(destination, dict):
+            return state
+        try:
+            x, y = int(destination.get("x")), int(destination.get("y"))
+        except (TypeError, ValueError):
+            return state
+        seeded = dict(state)
+        seeded["party_position"] = {"x": x, "y": y}
+        for key in ("_logical_room", "logical_room_id", "logical_room_label", "legacy_room_id", "legacy_nav_room_id"):
+            seeded.pop(key, None)
+        return seeded
 
     def observe_pending_transition_destination(self, state: dict) -> dict | None:
         pending = self.pending_transition_observation
@@ -3382,14 +3565,16 @@ class DebugState:
             self.pending_transition_observation = None
             return None
         if sent_at and time.time() - sent_at > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
+            self.append_navigation_diagnostic(
+                "native_transition_rejected",
+                {"reason": "destination_unstable_timeout", "object_id": object_id},
+                state,
+            )
             self.pending_transition_observation = None
             return None
         from_identity = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
-        to_identity = self.room_identity(state)
         if object_id <= 0 or from_identity is None:
             self.pending_transition_observation = None
-            return None
-        if to_identity is None:
             return None
         native = self.native_trigger_observation(state)
         if pending.get("trigger_generation") is None:
@@ -3405,9 +3590,42 @@ class DebugState:
             if generation <= baseline_generation or native_object_id != object_id or native_script != expected_script:
                 return None
             pending["trigger_generation"] = generation
+        elif native is None:
+            return None
+        else:
+            try:
+                if (
+                    int(native.get("generation") or 0) != int(pending.get("trigger_generation") or 0)
+                    or int(native.get("event_object_id") or 0) != object_id
+                ):
+                    return None
+            except (TypeError, ValueError):
+                return None
+        destination = native.get("destination") if isinstance(native.get("destination"), dict) else None
+        if destination is not None:
+            try:
+                destination_matches_state = (
+                    int(destination.get("scene_id")) == int(state.get("scene_id"))
+                    and int(destination.get("map_id")) == int(state.get("map_id"))
+                )
+            except (TypeError, ValueError):
+                return None
+            if not destination_matches_state:
+                return None
+        destination_state = self.state_at_native_destination(state, destination)
+        to_identity = self.room_identity(destination_state)
+        if to_identity is None:
+            return None
         if state.get("entering_scene"):
             return None
-        if to_identity["id"] == from_identity.get("id"):
+        from_pos = (pending.get("observed_from_state") or {}).get("party_position") or {}
+        to_pos = destination if destination is not None else (
+            state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        )
+        position_changed = (from_pos.get("x"), from_pos.get("y")) != (to_pos.get("x"), to_pos.get("y"))
+        same_room = to_identity["id"] == from_identity.get("id")
+        if same_room and not position_changed:
+            self.pending_transition_observation = None
             return None
         frame = self.int_frame(state.get("logical_frame", state.get("frame")))
         if frame is None or frame == pending.get("last_frame"):
@@ -3421,7 +3639,7 @@ class DebugState:
         if pending["stable_snapshots"] < TRANSITION_STABLE_SNAPSHOTS:
             return None
         self.pending_transition_observation = None
-        return self.record_transition_destination(
+        record = self.record_transition_destination(
             from_identity,
             object_id,
             to_identity,
@@ -3431,7 +3649,21 @@ class DebugState:
             transition_key_fields=pending.get("transition_key_fields") if isinstance(pending.get("transition_key_fields"), dict) else None,
             observed_from_state=pending.get("observed_from_state") if isinstance(pending.get("observed_from_state"), dict) else None,
             confirmation="native_trigger",
+            intra_room_transition=same_room,
+            native_destination=destination,
         )
+        self.append_navigation_diagnostic(
+            "native_transition_confirmed",
+            {
+                "object_id": object_id,
+                "generation": pending.get("trigger_generation"),
+                "from_room_id": from_identity.get("id"),
+                "to_room_id": to_identity.get("id"),
+                "transition_key": record.get("transition_key"),
+            },
+            state,
+        )
+        return record
 
     def exploration_room(self, data: dict, identity: dict) -> dict:
         rooms = data.setdefault("rooms", {})
@@ -3852,6 +4084,14 @@ class DebugState:
                     "observed_at": record.get("observed_at"),
                     "observed_from_state": record.get("observed_from_state"),
                     "observed_to_state": record.get("observed_to_state"),
+                    "intra_room_transition": bool(record.get("intra_room_transition")),
+                    "from_subregion_id": record.get("from_subregion_id"),
+                    "to_subregion_id": record.get("to_subregion_id"),
+                    "from_location_id": record.get("from_location_id") or record.get("from_room_id"),
+                    "to_location_id": record.get("to_location_id") or record.get("to_room_id"),
+                    "subregion_basis": record.get("subregion_basis"),
+                    "subregion_match_distance": record.get("subregion_match_distance"),
+                    "native_destination": record.get("native_destination"),
                 }
                 confirmed = record.get("confirmation") in {"native_trigger", "human_confirmed"}
                 destination = self.room_exploration_summary_from_data(
@@ -3863,11 +4103,19 @@ class DebugState:
                     record.get("to_map_id"),
                     record.get("to_semantic_room"),
                 )
-                returns_to_recent_room = confirmed and (str(record.get("to_room_id")) in recent or (
+                returns_to_recent_room = (not record.get("intra_room_transition")) and confirmed and (str(record.get("to_room_id")) in recent or (
                     bool(to_semantic_key) and to_semantic_key in recent_semantic
                 ))
                 payload.update(
                     {
+                        "to_logical_room_label": destination.get("logical_room_label") or (
+                            f"S{record.get('to_scene_id')}/M{record.get('to_map_id')}:"
+                            f"{str(record.get('to_room_id')).rsplit(':', 1)[-1][:12].upper()}"
+                            if record.get("to_scene_id") is not None
+                            and record.get("to_map_id") is not None
+                            and record.get("to_room_id")
+                            else None
+                        ),
                         "destination_exploration": destination,
                         "destination_priority": self.destination_priority(destination),
                         "returns_to_recent_room": returns_to_recent_room,
@@ -4122,8 +4370,33 @@ class DebugState:
             return {"ok": False, "status": "in_dialog", "target_id": target_id}
         if state.get("in_main_game") is False:
             return {"ok": False, "status": "not_in_main_game", "target_id": target_id}
+        if not self.room_state_stable(state):
+            return {"ok": False, "status": "entering_scene" if state.get("entering_scene") else "unstable_room_state", "target_id": target_id}
         if self.action_path.exists():
             return {"ok": False, "status": "action_pending", "target_id": target_id}
+
+        pending = self.pending_transition_observation
+        if isinstance(pending, dict) and pending.get("object_id") == target_id:
+            transition = self.observe_pending_transition_destination(state)
+            if transition is not None:
+                return {
+                    "ok": True,
+                    "status": "transitioned",
+                    "target_id": target_id,
+                    "transition": transition,
+                }
+            pending = self.pending_transition_observation
+            if isinstance(pending, dict) and pending.get("object_id") == target_id:
+                from_room = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
+                current_room = self.room_identity(state)
+                if from_room is not None and current_room is not None and current_room["id"] != from_room.get("id"):
+                    return {
+                        "ok": True,
+                        "status": "transition_observing",
+                        "target_id": target_id,
+                        "stable_snapshots": int(pending.get("stable_snapshots") or 0),
+                        "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
+                    }
 
         route = self.route_to_object(state, target_id, avoid_transitions=True)
         if route.get("status") == "blocked_by_interactable":
@@ -4348,6 +4621,8 @@ class DebugState:
     def navigation(self, state: dict) -> dict:
         self.attach_logical_room_fields(state)
         environment_payload = self.navigation_environment_payload(state)
+        if not self.room_state_stable(state):
+            return {"status": "entering_scene" if state.get("entering_scene") else "unstable_room_state", "targets": [], **environment_payload}
         grid = decode_nav_grid(state)
         if grid is None:
             return {"status": "no_nav_grid", "targets": [], **environment_payload}
@@ -4467,6 +4742,8 @@ class DebugState:
 
     def lightweight_navigation(self, state: dict) -> dict:
         self.attach_logical_room_fields(state)
+        if not self.room_state_stable(state):
+            return {"status": "entering_scene" if state.get("entering_scene") else "unstable_room_state", "targets": []}
         grid = decode_nav_grid(state)
         if grid is None:
             return {"status": "no_nav_grid", "targets": []}
@@ -4510,20 +4787,30 @@ class DebugState:
 
     def snapshot(self) -> dict:
         state = read_json(self.state_path)
-        if isinstance(state, dict):
+        stable_room_state = self.room_state_stable(state)
+        if stable_room_state:
             self.attach_logical_room_fields(state)
         state_info = self.file_info(self.state_path)
         frame_info = self.file_info(self.frame_path)
         with self.state_lock:
             if state_info.get("available"):
                 self.reset_history_if_frame_restarted(state)
-                self.observe_pending_transition_destination(state)
+                self.discover_native_transition_observation(state)
+                if stable_room_state:
+                    self.observe_pending_transition_destination(state)
+                    self.last_stable_room_state = state
+                elif state.get("entering_scene"):
+                    self.append_navigation_diagnostic("unstable_room_state_ignored", {"reason": "entering_scene"}, state)
                 self.record_state_events(state)
                 self.record_dialog_event(state)
                 self.observe_pending_interaction_outcome(state)
-            if state_info.get("available") and "nav_grid" in state:
+            if state_info.get("available") and stable_room_state:
                 state["_navigation"] = self.lightweight_navigation(state)
-                state["_exploration"] = self.update_exploration(state)
+                if self.pending_transition_observation is None:
+                    state["_exploration"] = self.update_exploration(state)
+                else:
+                    frozen_source = self.pending_transition_observation.get("frozen_source_state")
+                    state["_exploration"] = self.current_exploration(frozen_source if isinstance(frozen_source, dict) else state)
             recent_actions = list(self.action_log[-20:])
             recent_events = list(self.event_log[-20:])
             recent_dialogs = list(self.dialog_history[-20:])
@@ -5111,7 +5398,7 @@ class DebugState:
             return str(entry_logical_room_id) == str(identity["id"])
 
         entry_room_id = entry.get("room_id")
-        if entry_room_id and str(entry_room_id).startswith("lr0:"):
+        if is_logical_room_id(entry_room_id):
             return str(entry_room_id) == str(identity["id"])
 
         entry_nav_room_id = entry.get("nav_room_id")
@@ -5154,7 +5441,7 @@ class DebugState:
 
         entry_room_id = entry.get("room_id")
         if entry_room_id:
-            if str(entry_room_id).startswith("lr0:"):
+            if is_logical_room_id(entry_room_id):
                 return str(entry_room_id) != str(identity["id"])
             legacy_room_id = identity.get("legacy_room_id")
             legacy_nav_room_id = identity.get("legacy_nav_room_id")
@@ -5316,7 +5603,7 @@ class DebugState:
                 return str(event_logical_room_id) == str(identity["id"])
             event_room_id = event.get("room_id")
             if event_room_id:
-                if str(event_room_id).startswith("lr0:"):
+                if is_logical_room_id(event_room_id):
                     return str(event_room_id) == str(identity["id"])
                 return str(event_room_id) == str(identity.get("legacy_room_id"))
         room_key = identity["room_key"] if identity else (state.get("room") or {}).get("key")
@@ -5344,7 +5631,7 @@ class DebugState:
         event_room_id = event.get("room_id")
         if identity is not None and event_room_id:
             event_room_id = str(event_room_id)
-            if event_room_id.startswith("lr0:"):
+            if is_logical_room_id(event_room_id):
                 return event_room_id == identity["id"]
             legacy_room_id = identity.get("legacy_room_id")
             legacy_nav_room_id = identity.get("legacy_nav_room_id")
@@ -7008,6 +7295,28 @@ class Handler(BaseHTTPRequestHandler):
             state = read_json(self.server.state.state_path)
             self.server.state.attach_logical_room_fields(state)
             self.send_json(self.server.state.navigation(state))
+            return
+        if parsed.path == "/navigation/transitions":
+            state = read_json(self.server.state.state_path)
+            self.server.state.attach_logical_room_fields(state)
+            identity = self.server.state.room_identity(state)
+            from_room_id = identity["id"] if identity else None
+            payload = self.server.state.known_transitions_summary(from_room_id, state)
+            payload["transitions"] = [
+                transition
+                for transition in payload.get("transitions", [])
+                if transition.get("confirmation") in {"native_trigger", "human_confirmed"}
+            ]
+            payload["known_transitions"] = {
+                transition["transition_key"]: transition
+                for transition in payload["transitions"]
+            }
+            payload["known_transitions_by_object"] = {}
+            for transition in payload["transitions"]:
+                payload["known_transitions_by_object"].setdefault(
+                    str(transition.get("object_id")), []
+                ).append(transition)
+            self.send_json(payload)
             return
         if parsed.path == "/navigation/route":
             query = parse_qs(parsed.query)

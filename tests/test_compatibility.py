@@ -8,9 +8,9 @@ from conftest import make_debug_state, make_state
 def test_old_exploration_version_is_discarded():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
-        debug.exploration_path.write_text(json.dumps({'version': 2, 'rooms': {'3/10/test-room': {'scene_id': 3}}}), encoding='utf-8')
+        debug.exploration_path.write_text(json.dumps({'version': 8, 'rooms': {'transient': {'scene_id': 3}}}), encoding='utf-8')
         data = debug.read_exploration()
-        assert data['version'] == 7
+        assert data['version'] == 11
         assert data['rooms'] == {}
         assert data['transitions'] == {}
 
@@ -20,7 +20,7 @@ def test_old_agent_log_room_ids_are_ignored():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state()
-        debug.agent_log_path.write_text(json.dumps({'turn': 1, 'episode': '3/10/test-room', 'decision': {}}) + '\n' + json.dumps({'turn': 2, 'episode': debug.room_identity(state)['id'], 'decision': {}, 'nav_room_id': '3/10/test-room'}) + '\n', encoding='utf-8')
+        debug.agent_log_path.write_text(json.dumps({'turn': 1, 'episode': 'lr0:3:10:' + 'a' * 64, 'decision': {}, 'nav_room_id': 'lr0:3:10:' + 'a' * 64}) + '\n' + json.dumps({'turn': 2, 'episode': debug.room_identity(state)['id'], 'decision': {}, 'nav_room_id': debug.room_identity(state)['id']}) + '\n', encoding='utf-8')
         log = debug.read_agent_log(limit=10)
         assert len(log) == 1
         assert log[0]['turn'] == 2

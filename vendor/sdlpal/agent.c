@@ -38,6 +38,11 @@ typedef struct tagPALPALAGENTTRIGGEROBSERVATION
    WORD source_map_id;
    int source_x;
    int source_y;
+   WORD destination_scene_id;
+   WORD destination_map_id;
+   int destination_x;
+   int destination_y;
+   DWORD destination_frame;
 } PALPALAGENTTRIGGEROBSERVATION;
 
 static PALPALAGENTTRIGGEROBSERVATION g_agent_trigger_observation;
@@ -261,6 +266,11 @@ PALPAL_AgentBeginTriggerScript(
    g_agent_trigger_observation.source_map_id = PALPAL_AgentCurrentMapId();
    g_agent_trigger_observation.source_x = PAL_X(gpGlobals->viewport) + PAL_X(gpGlobals->partyoffset);
    g_agent_trigger_observation.source_y = PAL_Y(gpGlobals->viewport) + PAL_Y(gpGlobals->partyoffset);
+   g_agent_trigger_observation.destination_scene_id = 0;
+   g_agent_trigger_observation.destination_map_id = 0;
+   g_agent_trigger_observation.destination_x = 0;
+   g_agent_trigger_observation.destination_y = 0;
+   g_agent_trigger_observation.destination_frame = 0;
 }
 
 VOID
@@ -271,6 +281,11 @@ PALPAL_AgentEndTriggerScript(
    /* The bridge reports execution, not a guessed room. */
    if (g_agent_trigger_observation.valid && g_agent_trigger_observation.event_object_id == wEventObjectID)
    {
+      g_agent_trigger_observation.destination_scene_id = gpGlobals->wNumScene;
+      g_agent_trigger_observation.destination_map_id = PALPAL_AgentCurrentMapId();
+      g_agent_trigger_observation.destination_x = PAL_X(gpGlobals->viewport) + PAL_X(gpGlobals->partyoffset);
+      g_agent_trigger_observation.destination_y = PAL_Y(gpGlobals->viewport) + PAL_Y(gpGlobals->partyoffset);
+      g_agent_trigger_observation.destination_frame = gpGlobals->dwFrameNum;
       g_agent_trigger_observation.completed = TRUE;
    }
 }
@@ -2159,7 +2174,7 @@ PALPAL_AgentWriteState(
       fprintf(fp,
          "\"trigger_observation\":{\"generation\":%u,\"event_object_id\":%u,"
          "\"trigger_script\":%u,\"completed\":%s,\"source\":{\"scene_id\":%u,"
-         "\"map_id\":%u,\"x\":%d,\"y\":%d}},",
+         "\"map_id\":%u,\"x\":%d,\"y\":%d}",
          (unsigned int)g_agent_trigger_observation.generation,
          (unsigned int)g_agent_trigger_observation.event_object_id,
          (unsigned int)g_agent_trigger_observation.trigger_script,
@@ -2168,6 +2183,17 @@ PALPAL_AgentWriteState(
          (unsigned int)g_agent_trigger_observation.source_map_id,
          g_agent_trigger_observation.source_x,
          g_agent_trigger_observation.source_y);
+      if (g_agent_trigger_observation.completed)
+      {
+         fprintf(fp,
+            ",\"destination\":{\"scene_id\":%u,\"map_id\":%u,\"x\":%d,\"y\":%d,\"frame\":%u}",
+            (unsigned int)g_agent_trigger_observation.destination_scene_id,
+            (unsigned int)g_agent_trigger_observation.destination_map_id,
+            g_agent_trigger_observation.destination_x,
+            g_agent_trigger_observation.destination_y,
+            (unsigned int)g_agent_trigger_observation.destination_frame);
+      }
+      fprintf(fp, "},");
    }
    PALPAL_AgentWriteRoom(fp, gpGlobals->wNumScene, map_id, player_x, player_y);
    fprintf(fp, ",");

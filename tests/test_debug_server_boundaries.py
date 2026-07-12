@@ -88,6 +88,45 @@ def test_http_handler_serves_state_frame_action_and_404(http_server):
     assert "invalid buttons" in payload["error"]
 
 
+def test_http_handler_serves_only_confirmed_current_room_transitions(http_server):
+    base_url, debug = http_server
+    target = {
+        "id": 52, "x": 32, "y": 0, "sprite_id": 0, "state": 1,
+        "trigger_mode": 4, "trigger_script": 4631, "auto_script": 0,
+        "blocking": False, "interactable": True,
+    }
+    state = make_state(objects=[target], frame=8)
+    destination = make_state(objects=[], frame=9)
+    destination.update({"scene_id": 4, "map_id": 11, "room": {"key": "next-room"}})
+    record = debug.record_transition_destination(
+        debug.room_identity(state),
+        52,
+        debug.room_identity(destination),
+        from_object=target,
+        from_state=state,
+        to_state=destination,
+    )
+    write_state(debug, state)
+
+    status, _, raw = http_request(base_url, "/navigation/transitions")
+    payload = json.loads(raw)
+    assert status == 200
+    assert payload["from_logical_room_id"] == debug.room_identity(state)["id"]
+    assert [row["object_id"] for row in payload["transitions"]] == [52]
+    assert payload["transitions"][0]["to_logical_room_id"] == debug.room_identity(destination)["id"]
+    assert payload["transitions"][0]["to_logical_room_label"] == debug.room_identity(destination)["logical_room_label"]
+
+    data = debug.read_exploration()
+    data["transitions"][debug.room_identity(state)["nav_room_id"]][record["transition_key"]].pop("confirmation")
+    debug.write_exploration(data)
+    status, _, raw = http_request(base_url, "/navigation/transitions")
+    payload = json.loads(raw)
+    assert status == 200
+    assert payload["transitions"] == []
+    assert payload["known_transitions"] == {}
+    assert payload["known_transitions_by_object"] == {}
+
+
 def test_http_handler_deletes_checkpoints_and_reports_missing(http_server):
     base_url, debug = http_server
     checkpoint_dir = debug.checkpoint_dir("cp1")

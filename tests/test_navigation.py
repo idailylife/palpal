@@ -282,6 +282,98 @@ def test_navigation_transition_records_observed_destination():
         assert record['observed_from_state']['party_position'] == {'x': 16, 'y': 8}
         assert record['observed_to_state']['room_key'] == 'next-room'
         assert record['confirmation'] == 'native_trigger'
+        assert record['intra_room_transition'] is False
+        assert record['from_subregion_id'] is None
+        assert record['to_subregion_id'] is None
+        assert record['from_location_id'] == from_identity['id']
+        assert record['to_location_id'] == to_identity['id']
+
+
+def test_navigation_step_keeps_pending_transition_until_destination_is_stable():
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target])
+        write_state(debug, state)
+        assert debug.navigation_step(state, target_id=52)['ok']
+        debug.action_path.unlink()
+
+        destination = make_state(objects=[])
+        destination['scene_id'] = 4
+        destination['map_id'] = 11
+        destination['room'] = {'key': 'next-room'}
+        destination['trigger_observation'] = {
+            'generation': 1,
+            'event_object_id': 52,
+            'trigger_script': 4631,
+            'completed': True,
+        }
+        write_state(debug, destination)
+        observing = debug.navigation_step(destination, target_id=52)
+        assert observing['ok']
+        assert observing['status'] == 'transition_observing'
+        assert observing['stable_snapshots'] == 1
+        assert debug.pending_transition_observation is not None
+        assert debug.read_exploration()['transitions'] == {}
+
+        destination['frame'] += 1
+        write_state(debug, destination)
+        transitioned = debug.navigation_step(destination, target_id=52)
+        assert transitioned['ok']
+        assert transitioned['status'] == 'transitioned'
+        assert debug.pending_transition_observation is None
+
+        from_identity = debug.room_identity(state)
+        to_identity = debug.room_identity(destination)
+        transition_key = debug.transition_observation_from_state(state, 52)['transition_key']
+        record = debug.read_exploration()['transitions'][from_identity['nav_room_id']][transition_key]
+        assert record['transition_key'] == transition_key
+        assert record['from_room_id'] == from_identity['id']
+        assert record['object']['id'] == 52
+        assert record['to_room_id'] == to_identity['id']
+
+
+def test_navigation_step_does_not_discard_changed_room_observation_without_matching_trigger():
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target])
+        write_state(debug, state)
+        assert debug.navigation_step(state, target_id=52)['ok']
+        debug.action_path.unlink()
+
+        destination = make_state(objects=[])
+        destination['scene_id'] = 4
+        destination['map_id'] = 11
+        destination['trigger_observation'] = {
+            'generation': 1,
+            'event_object_id': 99,
+            'trigger_script': 1,
+            'completed': True,
+        }
+        write_state(debug, destination)
+        result = debug.navigation_step(destination, target_id=52)
+        assert result['ok']
+        assert result['status'] == 'transition_observing'
+        assert debug.pending_transition_observation is not None
+        assert debug.read_exploration()['transitions'] == {}
+
+
+def test_navigation_step_unknown_target_in_original_room_clears_pending_transition():
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target])
+        write_state(debug, state)
+        assert debug.navigation_step(state, target_id=52)['ok']
+        debug.action_path.unlink()
+
+        missing = make_state(objects=[])
+        write_state(debug, missing)
+        result = debug.navigation_step(missing, target_id=52)
+        assert not result['ok']
+        assert result['status'] == 'unknown_target'
+        assert debug.pending_transition_observation is None
 
 
 def test_transition_observation_ignores_logical_room_change_without_native_trigger():
@@ -327,6 +419,160 @@ def test_transition_observation_requires_matching_native_object_and_stable_desti
         write_state(debug, changed)
         debug.snapshot()
         assert debug.read_exploration()['transitions']
+
+
+def test_manual_movement_records_native_transition_after_stable_destination():
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        source = make_state(objects=[target], frame=10)
+        write_state(debug, source)
+        debug.snapshot()
+
+        transient = make_state(objects=[], frame=11)
+        transient.update({'scene_id': 4, 'map_id': 11, 'room': {'key': 'mixed-old-resources'}, 'entering_scene': True})
+        transient['trigger_observation'] = {
+            'generation': 1,
+            'event_object_id': 52,
+            'trigger_script': 4631,
+            'completed': True,
+            'source': {'scene_id': 3, 'map_id': 10, 'x': 48, 'y': -8},
+        }
+        write_state(debug, transient)
+        transient_result = debug.snapshot()
+        assert transient_result.get('logical_room_id') is None
+        assert debug.last_stable_room_state['scene_id'] == 3
+        assert list(debug.read_exploration()['rooms']) == [debug.room_identity(source)['id']]
+
+        destination = make_state(objects=[], frame=12)
+        destination.update({'scene_id': 4, 'map_id': 11, 'room': {'key': 'stairs-destination'}})
+        destination['trigger_observation'] = dict(transient['trigger_observation'])
+        write_state(debug, destination)
+        debug.snapshot()
+        assert debug.pending_transition_observation is not None
+        assert debug.read_exploration()['transitions'] == {}
+
+        destination['frame'] += 1
+        write_state(debug, destination)
+        debug.snapshot()
+        source_identity = debug.room_identity(source)
+        records = debug.read_exploration()['transitions'][source_identity['id']]
+        assert len(records) == 1
+        record = next(iter(records.values()))
+        assert record['object_id'] == 52
+        assert record['to_room_id'] == debug.room_identity(destination)['id']
+        assert record['confirmation'] == 'native_trigger'
+        assert record['observed_from_state']['party_position'] == {'x': 48, 'y': -8}
+
+
+def test_manual_movement_ignores_native_trigger_with_mismatched_source_scene():
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        source = make_state(objects=[target], frame=10)
+        write_state(debug, source)
+        debug.snapshot()
+        destination = make_state(objects=[], frame=11)
+        destination.update({'scene_id': 4, 'map_id': 11, 'room': {'key': 'stairs-destination'}})
+        destination['trigger_observation'] = {
+            'generation': 1,
+            'event_object_id': 52,
+            'trigger_script': 4631,
+            'completed': True,
+            'source': {'scene_id': 99, 'map_id': 10, 'x': 999, 'y': 999},
+        }
+        write_state(debug, destination)
+        debug.snapshot()
+        destination['frame'] += 1
+        write_state(debug, destination)
+        debug.snapshot()
+        assert debug.pending_transition_observation is None
+        assert debug.read_exploration()['transitions'] == {}
+        diagnostic = json.loads(debug.navigation_log_path.read_text(encoding='utf-8').splitlines()[-1])
+        assert diagnostic['type'] == 'native_transition_rejected'
+        assert diagnostic['reason'] == 'source_scene_mismatch'
+
+
+def test_intra_room_transition_freezes_source_and_uses_nearest_portal():
+    source_portal = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    target_portal = {**source_portal, 'id': 47, 'x': 48, 'y': 8}
+    tied_portal = {**source_portal, 'id': 49, 'x': 48, 'y': 8}
+    inactive_portal = {**source_portal, 'id': 46, 'x': 48, 'y': 8, 'state': 0}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        source = make_state(width=6, height=4, start=(1, 1), objects=[source_portal, target_portal, tied_portal, inactive_portal], frame=10)
+        source_identity = debug.room_identity(source)
+        write_state(debug, source)
+        debug.snapshot()
+
+        started = dict(source)
+        started['frame'] = 11
+        started['trigger_observation'] = {
+            'generation': 1, 'event_object_id': 48, 'trigger_script': 4631, 'completed': False,
+            'source': {'scene_id': 3, 'map_id': 10, 'x': 16, 'y': 8},
+        }
+        write_state(debug, started)
+        debug.snapshot()
+        assert debug.pending_transition_observation is not None, debug.navigation_log_path.read_text(encoding='utf-8')
+        assert debug.pending_transition_observation['from_room']['id'] == source_identity['id']
+
+        middle = make_state(width=2, height=2, start=(0, 0), objects=[], frame=12)
+        middle['trigger_observation'] = {
+            **started['trigger_observation'],
+            'completed': True,
+            'destination': {'scene_id': 3, 'map_id': 10, 'x': 48, 'y': 8, 'frame': 11},
+        }
+        write_state(debug, middle)
+        debug.snapshot()
+        assert debug.read_exploration()['transitions'] == {}
+        assert debug.room_identity(middle)['id'] not in debug.read_exploration()['rooms']
+
+        destination = make_state(width=6, height=4, start=(5, 2), objects=[inactive_portal, tied_portal, target_portal, source_portal], frame=13)
+        destination['_logical_room'] = debug.logical_room_identity(source)
+        destination['trigger_observation'] = dict(middle['trigger_observation'])
+        assert debug.room_identity(destination)['id'] == source_identity['id']
+        write_state(debug, destination)
+        debug.snapshot()
+        destination['frame'] = 14
+        write_state(debug, destination)
+        debug.snapshot()
+
+        records = debug.read_exploration()['transitions'][source_identity['id']]
+        record = next(iter(records.values()))
+        assert record['intra_room_transition'] is True
+        assert record['from_subregion_id'] == '.48'
+        assert record['to_subregion_id'] == '.47'
+        assert record['from_location_id'] == f"{source_identity['id']}.48"
+        assert record['to_location_id'] == f"{source_identity['id']}.47"
+        assert record['subregion_basis'] == 'native_trigger_destination_nearest_active_transition'
+        assert record['subregion_match_distance'] == 0
+        assert record['native_destination']['x'] == 48
+        assert record['observed_to_state']['party_position'] == {'x': 80, 'y': 16}
+
+        known = debug.known_transitions_summary(source_identity['id'], destination)['transitions'][0]
+        assert known['intra_room_transition'] is True
+        assert known['from_location_id'].endswith('.48')
+        assert known['to_location_id'].endswith('.47')
+        assert known['returns_to_recent_room'] is False
+
+
+def test_same_room_trigger_without_position_jump_is_not_recorded():
+    portal = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        source = make_state(objects=[portal], frame=10)
+        write_state(debug, source)
+        debug.snapshot()
+        triggered = make_state(start=(2, 2), objects=[portal], frame=11)
+        triggered['trigger_observation'] = {
+            'generation': 1, 'event_object_id': 48, 'trigger_script': 4631, 'completed': True,
+            'source': {'scene_id': 3, 'map_id': 10, **source['party_position']},
+            'destination': {'scene_id': 3, 'map_id': 10, **source['party_position'], 'frame': 10},
+        }
+        write_state(debug, triggered)
+        debug.snapshot()
+        assert debug.pending_transition_observation is None
+        assert debug.read_exploration()['transitions'] == {}
 
 
 

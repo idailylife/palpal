@@ -31,12 +31,12 @@ def test_task_ledger_is_additive_and_survives_checkpoint_round_trip():
         state = make_checkpoint_state()
         write_state(debug, state)
         debug.save_slot_path().write_bytes(b"task-checkpoint")
-        debug.exploration_path.write_text('{"version":7,"rooms":{},"transitions":{}}', encoding="utf-8")
+        debug.exploration_path.write_text('{"version":9,"rooms":{},"transitions":{}}', encoding="utf-8")
         assert debug.read_exploration()["tasks"] == {}
         created = debug.run_agent_tool("upsert_task", {
             "description": "Reach the courtyard",
             "rationale": "It is the next stated destination.",
-            "room_id": "lr0:3:99:courtyard",
+            "room_id": "S3/M99:000000000001",
         })
         with mock.patch.object(debug, "run_slot_command", return_value={"result": {}}):
             debug.save_checkpoint("tasks", "Tasks")
@@ -64,6 +64,6 @@ def test_executable_task_overrides_unknown_transition_but_unmatched_task_does_no
 
         debug.write_exploration(debug.empty_exploration())
         debug.run_agent_tool("upsert_task", {
-            "description": "Later room", "rationale": "Not reachable from this room.", "room_id": "lr0:9:9:later",
+            "description": "Later room", "rationale": "Not reachable from this room.", "room_id": "S9/M9:000000000002",
         })
         assert debug.rules_decide_agent(state)["recommended_action"]["args"] == {"id": 10}
