@@ -353,6 +353,10 @@ def test_agent_messages_put_stable_policy_before_dynamic_context():
         assert '由非传送目标变为传送目标' in messages[1]['content']
         assert 'known_destination=false' in messages[1]['content']
         assert 'previously_tried 或 avoid_repeat 不应降低它的优先级' in messages[1]['content']
+        assert '0xFFFF' in messages[1]['content']
+        assert "use_item {item_id:<id>,target:'all'}" in messages[1]['content']
+        assert '不要因 target_object_id 被拒绝' in messages[1]['content']
+        assert '进程重启或载入存档不会恢复最近事件对象' in messages[1]['content']
         assert 'prefer the nearest reachable non-transition target' not in messages[1]['content']
         assert 'greet guests' not in messages[1]['content']
         assert 'secret passage' not in messages[1]['content']
@@ -500,7 +504,23 @@ def test_agent_get_inventory_returns_current_items():
         assert result['ok']
         assert result['total'] == 2
         assert result['returned'] == 2
-        assert result['inventory'][0] == {'slot': 0, 'item_id': 91, 'name': '十里香', 'amount': 1, 'amount_in_use': 0, 'equipped_count': 0, 'usable': True, 'apply_to_all': True, 'sellable': True, 'consuming': None, 'available_amount': 1, 'flags': ['usable', 'apply_to_all'], 'price': 640}
+        assert result['inventory'][0] == {'slot': 0, 'item_id': 91, 'name': '十里香', 'amount': 1, 'amount_in_use': 0, 'equipped_count': 0, 'usable': True, 'apply_to_all': True, 'target_mode': 'implicit_event_context', 'sellable': True, 'consuming': None, 'available_amount': 1, 'flags': ['usable', 'apply_to_all'], 'price': 640}
+        assert result['inventory'][1]['target_mode'] == 'party_role'
+
+
+def test_agent_tool_schema_explains_implicit_event_context_item_target():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        submit = next(
+            spec['function'] for spec in debug.agent_tool_specs()
+            if spec['function']['name'] == 'submit_decision'
+        )
+        action = submit['parameters']['properties']['recommended_action']
+        description = action['description'] + ' ' + action['properties']['args']['description']
+        assert 'implicit_event_context' in description
+        assert '0xFFFF' in description
+        assert 'most recent event object' in description
+        assert 'target_object_id is not supported' in description
 
 
 def test_agent_accepts_valid_single_target_item_recommendation():
@@ -544,8 +564,48 @@ def test_agent_rejects_item_target_that_disagrees_with_inventory_metadata():
         decision = result['decision']
         assert decision['recommended_intent'] == 'wait_runtime'
         assert decision['recommended_action']['tool'] == 'no_op'
-        assert decision['recommended_action']['args'] == {'reason': 'use_item_invalid', 'error': 'target_must_be_all'}
+        assert decision['recommended_action']['args'] == {'reason': 'use_item_invalid', 'error': 'target_must_use_implicit_context'}
         assert not debug.action_path.exists()
+
+
+def test_agent_accepts_implicit_event_context_item_recommendation():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state()
+        state['party'] = [{'role_id': 0}]
+        state['inventory'] = [{
+            'item_id': 272, 'name': '桂花酒', 'amount': 1, 'amount_in_use': 0,
+            'usable': True, 'apply_to_all': True, 'consuming': False,
+        }]
+        write_state(debug, state)
+        result = debug.run_agent_tool('submit_decision', {
+            'summary': 'Use the wine in the current NPC event context.',
+            'recommended_intent': 'use_inventory_item',
+            'recommended_action': {'tool': 'use_item', 'args': {'item_id': 272, 'target': 'all'}},
+            'evidence': {'item_id': 272, 'recent_npc_interaction': 63},
+            'risk': 'The all field means implicit event context here.',
+            'alternatives': [],
+        }, state)
+        assert result['ok']
+        assert result['decision']['recommended_action']['args'] == {'item_id': 272, 'target': 'all'}
+
+
+def test_agent_rejects_world_object_item_target_with_context_repair_guidance():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        error = debug.agent_decision_submission_error({
+            'summary': 'Give the wine to the NPC.',
+            'recommended_intent': 'use_inventory_item',
+            'recommended_action': {'tool': 'use_item', 'args': {'item_id': 272, 'target_object_id': 63}},
+            'evidence': {'target_id': 63},
+            'risk': 'Low.',
+            'alternatives': [],
+        })
+        issue = error['error']['issues'][0]
+        assert issue['code'] == 'unsupported_item_object_target'
+        assert "target='all'" in issue['message']
+        assert '0xFFFF' in issue['message']
+        assert 'most recent event object' in issue['message']
 
 
 

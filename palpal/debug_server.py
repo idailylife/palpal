@@ -5987,6 +5987,11 @@ class DebugState:
                     "equipped_count": item.get("equipped_count"),
                     "usable": item.get("usable"),
                     "apply_to_all": item.get("apply_to_all"),
+                    "target_mode": (
+                        "implicit_event_context"
+                        if item.get("apply_to_all") is True
+                        else "party_role"
+                    ),
                     "sellable": item.get("sellable"),
                     "consuming": item.get("consuming"),
                     "available_amount": max(
@@ -6043,12 +6048,24 @@ class DebugState:
             },
             "recommended_action": {
                 "type": "object",
+                "description": (
+                    "Dry-run action. For use_item, args must contain item_id and either role_id for "
+                    "target_mode=party_role or target='all' for target_mode=implicit_event_context. "
+                    "The compatibility name 'all' dispatches 0xFFFF and may reuse the most recent event object; "
+                    "it is not necessarily a whole-party effect. target_object_id is not supported."
+                ),
                 "properties": {
                     "tool": {
                         "type": "string",
                         "enum": ["no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"],
                     },
-                    "args": {"type": "object"},
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "use_item examples: {item_id:88,role_id:0} for a party member, or "
+                            "{item_id:272,target:'all'} for implicit event context after interacting with an NPC."
+                        ),
+                    },
                     "dry_run": {"type": "boolean"},
                 },
                 "required": ["tool", "args"],
@@ -6152,7 +6169,11 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "get_inventory",
-                    "description": "返回当前只读物品栏详情，包括可用数量、单体/全体和是否消耗；用途仍需根据名称与上下文谨慎推断。",
+                    "description": (
+                        "返回当前只读物品栏详情，包括可用数量、目标派发模式和是否消耗。"
+                        "target_mode=implicit_event_context 时用 target='all'，底层以 0xFFFF 沿用最近事件对象；"
+                        "兼容字段名 all 不一定表示全队效果。用途仍需根据名称与上下文谨慎推断。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 300, "default": 100}},
@@ -6284,6 +6305,8 @@ class DebugState:
                 "当 dialog.active 为 true 时，建议 advance_dialog，而不是原始按键。",
                 "只有针对明确对象目标时才使用 navigation_step(id)；否则建议 no_op 搭配 wait_runtime。",
                 "建议使用物品前调用 get_inventory；用途证据不足时不要仅因 usable=true 就建议使用。",
+                "target_mode=implicit_event_context 的物品使用 target='all'：它以 0xFFFF 沿用最近事件对象，字段名 all 不一定表示全队。",
+                "NPC 索要匹配物品且刚与该 NPC 交互后，应考虑 use_item target='all'；不要提交 target_object_id。",
             ],
         }
 
@@ -6561,8 +6584,11 @@ class DebugState:
             "当建议 inspect_target 或 enter_transition 时，把选中的对象 id 放入 evidence.target.id，"
             "并使用 recommended_action {tool:'navigation_step', args:{id:<target id>}, dry_run:true}。"
             "建议非战斗物品使用时，使用 intent use_inventory_item 和 action "
-            "{tool:'use_item', args:{item_id:<id>,role_id:<role id>}, dry_run:true}；全体物品将 args 改为 "
+            "{tool:'use_item', args:{item_id:<id>,role_id:<role id>}, dry_run:true}；"
+            "target_mode=implicit_event_context 的物品将 args 改为 "
             "{item_id:<id>,target:'all'}。"
+            "注意 target:'all' 是兼容字段名：对 target_mode=implicit_event_context 的物品，SDLPAL 实际以 0xFFFF "
+            "运行使用脚本并沿用最近事件对象，不一定表示对全体队员生效。use_item 不接受 target_object_id。"
             "没有明确安全目标时，建议 wait_runtime 搭配 no_op。"
             "不要调用工具，不要声称动作已经执行，也不要包含密钥或 prompts。"
         )
@@ -6595,6 +6621,10 @@ class DebugState:
             "只有在主游戏、非战斗、非对话状态下才可建议 use_inventory_item。先调用 get_inventory，确认物品 usable、"
             "available_amount 大于零，并严格匹配 apply_to_all 的目标形式。可结合物品名称、队伍 HP/MP、任务与剧情上下文"
             "保守推断用途；用途或收益证据不足时不要仅因 usable=true 就建议使用，并在 risk 中说明误用或浪费风险。"
+            "当 NPC 明确索要某物、背包存在匹配的 target_mode=implicit_event_context 物品、且刚与该 NPC 交互并结束对话时，"
+            "应优先考虑 use_item {item_id:<id>,target:'all'}；这会让 0xFFFF 使用脚本沿用最近 NPC/事件对象上下文。"
+            "不要因 target_object_id 被拒绝就推断剧情物品只能靠重复 NPC 交互自动使用。进程重启或载入存档不会恢复最近事件对象，"
+            "因此应先重新与目标 NPC 交互，再使用这种物品。普通全局效果脚本可能忽略事件上下文，不要把所有 apply_to_all 物品都视为剧情物品。"
             "对于任何明确的 search/touch 目标，使用 inspect_target 或 enter_transition，并搭配 navigation_step(id)。"
             "不要建议无目标的房间探索；如果没有明确目标，建议 wait_runtime 搭配 no_op。"
             "使用 get_navigation(full) 比较传送目的地；只对你认真考虑的一两个目标调用 get_route。"
@@ -6840,6 +6870,7 @@ class DebugState:
                 item_id = 0
             has_all_target = args.get("target") == "all"
             has_role_target = "role_id" in args and args.get("role_id") is not None
+            has_object_target = "target_object_id" in args
             try:
                 role_id = int(args.get("role_id")) if has_role_target else -1
             except (TypeError, ValueError):
@@ -6850,11 +6881,25 @@ class DebugState:
                     "code": "invalid_item_id",
                     "message": "use_item requires a positive item_id",
                 })
-            if has_all_target == has_role_target or (has_role_target and role_id < 0):
+            if has_object_target:
+                issues.append({
+                    "field": "recommended_action.args.target_object_id",
+                    "code": "unsupported_item_object_target",
+                    "message": (
+                        "use_item cannot directly select a world object. For an apply_to_all item, first interact "
+                        "with the NPC to establish the event context, then submit target='all'; SDLPAL dispatches "
+                        "0xFFFF to the most recent event object."
+                    ),
+                })
+            elif has_all_target == has_role_target or (has_role_target and role_id < 0):
                 issues.append({
                     "field": "recommended_action.args",
                     "code": "invalid_item_target",
-                    "message": "use_item requires exactly one target: target=all or a non-negative role_id",
+                    "message": (
+                        "use_item requires exactly one target: role_id for party_role, or target='all' for "
+                        "implicit_event_context. The compatibility name 'all' dispatches 0xFFFF to the most "
+                        "recent event object and is not necessarily a whole-party effect."
+                    ),
                 })
         elif intent == "wait_runtime" and tool != "no_op":
             issues.append({
@@ -6919,7 +6964,7 @@ class DebugState:
         apply_to_all = item.get("apply_to_all") is True
         if apply_to_all:
             if args.get("target") != "all" or "role_id" in args:
-                return "target_must_be_all"
+                return "target_must_use_implicit_context"
             return None
         if args.get("target") == "all" or "role_id" not in args:
             return "target_must_be_role"
