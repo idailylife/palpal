@@ -274,7 +274,11 @@ navigationEl.addEventListener("keydown", (event) => {
 inventoryEl.addEventListener("click", (event) => {
   const actionEl = event.target.closest("[data-use-item]");
   if (!actionEl || !inventoryEl.contains(actionEl)) return;
-  useInventoryItem(Number(actionEl.dataset.useItem), actionEl.dataset.useTarget);
+  useInventoryItem(Number(actionEl.dataset.useItem), actionEl.dataset.useTarget)
+    .catch((error) => {
+      agentActionStatus = `Action failed: ${error instanceof Error ? error.message : String(error)}`;
+      if (latestState) renderAgent(latestState);
+    });
 });
 
 agentEl.addEventListener("click", (event) => {
@@ -927,7 +931,7 @@ function agentDecisionContextMatches(decision, state) {
 }
 
 function agentActionExecutable(action) {
-  return ["press_buttons", "advance_dialog", "navigation_step"].includes(action?.tool);
+  return ["press_buttons", "advance_dialog", "navigation_step", "use_item"].includes(action?.tool);
 }
 
 function agentExecutionDisabledReason(decision, state, agentBusy) {
@@ -941,6 +945,7 @@ function agentExecutionDisabledReason(decision, state, agentBusy) {
   if (action.tool === "no_op") return "Recommendation has no executable action.";
   if (!agentActionExecutable(action)) return `Unsupported action tool: ${action.tool || "unknown"}.`;
   if (action.tool === "navigation_step" && !Number(action.args?.id)) return "Navigation target is missing.";
+  if (action.tool === "use_item" && !Number(action.args?.item_id)) return "Inventory item is missing.";
   if (action.tool === "navigation_step" && !navigationTargetActionable(state, Number(action.args.id))) {
     return "Navigation target is not actionable now.";
   }
@@ -1772,11 +1777,16 @@ async function useInventoryItem(itemId, target) {
   } else {
     payload.role_id = Number(target || 0);
   }
-  await fetch("/inventory/use", {
+  const response = await fetch("/inventory/use", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  const result = await response.json();
+  if (!response.ok || !result.ok) {
+    throw new Error(result.error || `item use failed: ${response.status}`);
+  }
+  return result;
 }
 
 async function selectNavigationTarget(targetId) {
@@ -2034,6 +2044,17 @@ async function executeAgentRecommendation() {
       if (!targetId) throw new Error("navigation target is missing");
       await navigateToTarget(targetId);
       agentActionStatus = `Executed navigation_step {"id":${targetId}}.`;
+      await refreshState();
+      return;
+    }
+
+    if (action.tool === "use_item") {
+      const args = action.args || {};
+      const itemId = Number(args.item_id || 0);
+      if (!itemId) throw new Error("inventory item is missing");
+      const target = args.target === "all" ? "all" : String(args.role_id);
+      await useInventoryItem(itemId, target);
+      agentActionStatus = `Queued ${actionText(action)}.`;
       await refreshState();
       return;
     }

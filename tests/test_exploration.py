@@ -230,18 +230,28 @@ def test_blocking_nodes_do_not_change_logical_exploration_component():
 def test_write_use_item_action_for_role():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
+        state = make_state()
+        state['party'] = [{'role_id': 0}]
+        state['inventory'] = [{'item_id': 88, 'amount': 2, 'amount_in_use': 0, 'usable': True, 'apply_to_all': False}]
+        write_state(debug, state)
+        debug.action_result_path.write_text('{"ok":true}', encoding='utf-8')
         result = debug.write_use_item_action(item_id=88, role_id=0)
         assert result['command'] == 'use_item'
         assert result['item_id'] == 88
         assert result['role_id'] == 0
         assert result['target'] == 'role'
         assert debug.action_path.read_text(encoding='ascii') == 'use_item 88 0\n'
+        assert not debug.action_result_path.exists()
 
 
 
 def test_write_use_item_action_for_all():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
+        state = make_state()
+        state['party'] = [{'role_id': 0}]
+        state['inventory'] = [{'item_id': 89, 'amount': 1, 'amount_in_use': 0, 'usable': True, 'apply_to_all': True}]
+        write_state(debug, state)
         result = debug.write_use_item_action(item_id=89, target='all')
         assert result['target'] == 'all'
         assert result['role_id'] is None

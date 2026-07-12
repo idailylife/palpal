@@ -5988,6 +5988,11 @@ class DebugState:
                     "usable": item.get("usable"),
                     "apply_to_all": item.get("apply_to_all"),
                     "sellable": item.get("sellable"),
+                    "consuming": item.get("consuming"),
+                    "available_amount": max(
+                        0,
+                        int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
+                    ),
                     "flags": item.get("flags"),
                     "price": item.get("price"),
                 }
@@ -6034,14 +6039,14 @@ class DebugState:
             "summary": {"type": "string"},
             "recommended_intent": {
                 "type": "string",
-                "enum": ["advance_dialog", "inspect_target", "enter_transition", "wait_runtime"],
+                "enum": ["advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"],
             },
             "recommended_action": {
                 "type": "object",
                 "properties": {
                     "tool": {
                         "type": "string",
-                        "enum": ["no_op", "press_buttons", "advance_dialog", "navigation_step"],
+                        "enum": ["no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"],
                     },
                     "args": {"type": "object"},
                     "dry_run": {"type": "boolean"},
@@ -6147,7 +6152,7 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "get_inventory",
-                    "description": "返回当前只读物品栏详情。",
+                    "description": "返回当前只读物品栏详情，包括可用数量、单体/全体和是否消耗；用途仍需根据名称与上下文谨慎推断。",
                     "parameters": {
                         "type": "object",
                         "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 300, "default": 100}},
@@ -6278,6 +6283,7 @@ class DebugState:
                 "针对特定对象使用 get_route，不要一开始就请求大体积路线 payload。",
                 "当 dialog.active 为 true 时，建议 advance_dialog，而不是原始按键。",
                 "只有针对明确对象目标时才使用 navigation_step(id)；否则建议 no_op 搭配 wait_runtime。",
+                "建议使用物品前调用 get_inventory；用途证据不足时不要仅因 usable=true 就建议使用。",
             ],
         }
 
@@ -6549,11 +6555,14 @@ class DebugState:
             "返回一个符合此 schema 的 JSON object："
             "{summary:string,recommended_intent:string,recommended_action:{tool:string,args:object,dry_run:true},"
             "evidence:object,risk:string,alternatives:[{intent:string,action:{tool:string,args:object,dry_run:true},reason:string}]}。"
-            "允许的 intents：advance_dialog、inspect_target、enter_transition、wait_runtime。"
-            "建议中允许的 tools：no_op、press_buttons、advance_dialog、navigation_step。"
+            "允许的 intents：advance_dialog、inspect_target、enter_transition、use_inventory_item、wait_runtime。"
+            "建议中允许的 tools：no_op、press_buttons、advance_dialog、navigation_step、use_item。"
             "当 dialog.active 为 true 时，使用 recommended_action {tool:'advance_dialog', args:{}, dry_run:true}。"
             "当建议 inspect_target 或 enter_transition 时，把选中的对象 id 放入 evidence.target.id，"
             "并使用 recommended_action {tool:'navigation_step', args:{id:<target id>}, dry_run:true}。"
+            "建议非战斗物品使用时，使用 intent use_inventory_item 和 action "
+            "{tool:'use_item', args:{item_id:<id>,role_id:<role id>}, dry_run:true}；全体物品将 args 改为 "
+            "{item_id:<id>,target:'all'}。"
             "没有明确安全目标时，建议 wait_runtime 搭配 no_op。"
             "不要调用工具，不要声称动作已经执行，也不要包含密钥或 prompts。"
         )
@@ -6570,6 +6579,9 @@ class DebugState:
             "将 agent_priority、interaction_state、recent_dialog_feedback、对象历史、目的地探索状态、路线成本和最近决策作为决策信号；不要把任何单一信号变成无条件优先规则。"
             "距离是成本信号，不是优先级规则；当近处目标重复陈旧或无效果行为时，它仍可能比更远目标或传送更差。"
             "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 get_object_history。"
+            "若当前目标 transition_candidate=true、最近对象历史显示它由非传送目标变为传送目标、且 known_destination=false，"
+            "应将它视为刚解锁的探索路线并优先建议 enter_transition；解锁动作本身产生的 previously_tried 或 avoid_repeat 不应降低它的优先级。"
+            "一旦该传送已有 known destination，则停止使用刚解锁优先级，恢复目的地探索价值、任务和回退风险的正常比较。"
             "当最近建议看起来反复访问同一房间、目标或传送循环时，使用 get_agent_history。"
             "传送目标包含 transition_key、to_semantic_room、confidence、destination_priority、destination_exploration 和 returns_to_recent_room。"
             "任务是 agent 从对话和事件推断的记忆，不是引擎事实。发现、调整、完成或作废任务时调用 upsert_task；不要自动关闭或过期任务。"
@@ -6580,6 +6592,9 @@ class DebugState:
             "将 returns_to_recent_room 和 agent_priority avoid_backtrack 视为回退风险信号；如果选择它们，需要明确说明理由。"
             "对话反馈可以创建或改变目标，但要从提供的对话和状态推断目标，不要匹配固定剧情短语。"
             "如果 dialog.active 为 true，优先选择 advance_dialog。如果 runtime stale、waiting 或 parse-error，建议 wait_runtime。"
+            "只有在主游戏、非战斗、非对话状态下才可建议 use_inventory_item。先调用 get_inventory，确认物品 usable、"
+            "available_amount 大于零，并严格匹配 apply_to_all 的目标形式。可结合物品名称、队伍 HP/MP、任务与剧情上下文"
+            "保守推断用途；用途或收益证据不足时不要仅因 usable=true 就建议使用，并在 risk 中说明误用或浪费风险。"
             "对于任何明确的 search/touch 目标，使用 inspect_target 或 enter_transition，并搭配 navigation_step(id)。"
             "不要建议无目标的房间探索；如果没有明确目标，建议 wait_runtime 搭配 no_op。"
             "使用 get_navigation(full) 比较传送目的地；只对你认真考虑的一两个目标调用 get_route。"
@@ -6614,8 +6629,8 @@ class DebugState:
         return {key: usage[key] for key in keys if key in usage}
 
     def normalize_agent_decision(self, raw: dict) -> dict:
-        allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "wait_runtime"}
-        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step"}
+        allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"}
+        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"}
 
         def positive_int(value) -> int:
             try:
@@ -6674,6 +6689,11 @@ class DebugState:
                 if tool != "advance_dialog":
                     warnings.append("normalized advance_dialog action to advance_dialog")
                 return intent, "advance_dialog", self.normalize_dialog_advance_args(raw_args), warnings
+            if intent == "use_inventory_item":
+                if tool != "use_item":
+                    warnings.append("normalized use_inventory_item action to wait_runtime")
+                    return "wait_runtime", "no_op", {"reason": "use_item_action_required"}, warnings
+                return intent, tool, args, warnings
             if tool not in allowed_tools:
                 warnings.append("normalized unknown action tool to no_op")
                 return "wait_runtime", "no_op", {"reason": "unsupported_tool", "tool": str(tool or "")}, warnings
@@ -6728,8 +6748,8 @@ class DebugState:
 
     def agent_decision_submission_error(self, raw: dict) -> dict | None:
         """Return a repairable contract error for an LLM decision submission."""
-        allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "wait_runtime"}
-        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step"}
+        allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"}
+        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"}
         issues: list[dict] = []
         intent = raw.get("recommended_intent")
         action = raw.get("recommended_action")
@@ -6739,7 +6759,7 @@ class DebugState:
             issues.append({
                 "field": "recommended_intent",
                 "code": "invalid_intent",
-                "message": "recommended_intent must be one of advance_dialog, inspect_target, enter_transition, wait_runtime",
+                "message": "recommended_intent must be one of advance_dialog, inspect_target, enter_transition, use_inventory_item, wait_runtime",
             })
         if not isinstance(action, dict):
             issues.append({
@@ -6764,7 +6784,7 @@ class DebugState:
             issues.append({
                 "field": "recommended_action.tool",
                 "code": "invalid_tool",
-                "message": "recommended_action.tool must be one of no_op, press_buttons, advance_dialog, navigation_step",
+                "message": "recommended_action.tool must be one of no_op, press_buttons, advance_dialog, navigation_step, use_item",
             })
         if not isinstance(args, dict):
             issues.append({
@@ -6807,6 +6827,35 @@ class DebugState:
                 "code": "intent_tool_mismatch",
                 "message": "advance_dialog requires recommended_action.tool to be advance_dialog",
             })
+        elif intent == "use_inventory_item":
+            if tool != "use_item":
+                issues.append({
+                    "field": "recommended_action.tool",
+                    "code": "intent_tool_mismatch",
+                    "message": "use_inventory_item requires recommended_action.tool to be use_item",
+                })
+            try:
+                item_id = int(args.get("item_id") or 0)
+            except (TypeError, ValueError):
+                item_id = 0
+            has_all_target = args.get("target") == "all"
+            has_role_target = "role_id" in args and args.get("role_id") is not None
+            try:
+                role_id = int(args.get("role_id")) if has_role_target else -1
+            except (TypeError, ValueError):
+                role_id = -1
+            if item_id <= 0:
+                issues.append({
+                    "field": "recommended_action.args.item_id",
+                    "code": "invalid_item_id",
+                    "message": "use_item requires a positive item_id",
+                })
+            if has_all_target == has_role_target or (has_role_target and role_id < 0):
+                issues.append({
+                    "field": "recommended_action.args",
+                    "code": "invalid_item_target",
+                    "message": "use_item requires exactly one target: target=all or a non-negative role_id",
+                })
         elif intent == "wait_runtime" and tool != "no_op":
             issues.append({
                 "field": "recommended_action.tool",
@@ -6825,8 +6874,102 @@ class DebugState:
             },
         }
 
+    def use_item_validation_error(self, state: dict, args: dict, check_pending: bool = True) -> str | None:
+        if state.get("status") not in {None, "ok"}:
+            return str(state.get("status"))
+        if not state.get("in_main_game"):
+            return "not_in_main_game"
+        if state.get("in_battle"):
+            return "in_battle"
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        if dialog.get("active"):
+            return "in_dialog"
+        if self.file_info(self.state_path).get("stale", True):
+            return "runtime_stale"
+        if check_pending and self.action_path.exists():
+            return "action_pending"
+
+        try:
+            item_id = int(args.get("item_id") or 0)
+        except (TypeError, ValueError):
+            item_id = 0
+        inventory = state.get("inventory") if isinstance(state.get("inventory"), list) else []
+        item = None
+        for entry in inventory:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                entry_item_id = int(entry.get("item_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if entry_item_id == item_id:
+                item = entry
+                break
+        if item_id <= 0 or item is None:
+            return "not_in_inventory"
+        try:
+            available = int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0)
+        except (TypeError, ValueError):
+            available = 0
+        if available <= 0:
+            return "not_available"
+        if item.get("usable") is not True:
+            return "not_usable"
+
+        apply_to_all = item.get("apply_to_all") is True
+        if apply_to_all:
+            if args.get("target") != "all" or "role_id" in args:
+                return "target_must_be_all"
+            return None
+        if args.get("target") == "all" or "role_id" not in args:
+            return "target_must_be_role"
+        try:
+            role_id = int(args.get("role_id"))
+        except (TypeError, ValueError):
+            return "invalid_role_id"
+        party = state.get("party") if isinstance(state.get("party"), list) else []
+        party_role_ids = set()
+        for role in party:
+            if not isinstance(role, dict) or "role_id" not in role:
+                continue
+            try:
+                party_role_ids.add(int(role.get("role_id")))
+            except (TypeError, ValueError):
+                continue
+        if role_id not in party_role_ids:
+            return "role_not_in_party"
+        return None
+
     def validate_agent_decision(self, decision: dict) -> dict:
         action = decision.get("recommended_action") if isinstance(decision.get("recommended_action"), dict) else {}
+        if action.get("tool") == "use_item":
+            latest_state = read_json(self.state_path)
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            error = self.use_item_validation_error(latest_state, args)
+            if error is None:
+                return decision
+            evidence = decision.setdefault("evidence", {})
+            if not isinstance(evidence, dict):
+                evidence = {}
+                decision["evidence"] = evidence
+            warnings = evidence.get("validation_warnings")
+            if not isinstance(warnings, list):
+                warnings = []
+                evidence["validation_warnings"] = warnings
+            warnings.append("use_item was not valid in the latest state; downgraded to wait_runtime")
+            evidence["validation_state_context"] = self.state_context(latest_state)
+            evidence["original_recommendation"] = {
+                "recommended_intent": decision.get("recommended_intent"),
+                "recommended_action": action,
+            }
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "use_item_invalid", "error": error}
+            )
+            decision["risk"] = (
+                f"{decision.get('risk') or ''} Latest-state validation rejected item use: {error}."
+            ).strip()
+            return decision
         if action.get("tool") != "navigation_step":
             return decision
         args = action.get("args") if isinstance(action.get("args"), dict) else {}
@@ -6907,6 +7050,18 @@ class DebugState:
                 return {"id": int(args.get("id") or args.get("target_id") or 0)}
             except (TypeError, ValueError):
                 return {"id": 0}
+        if tool == "use_item":
+            try:
+                item_id = int(args.get("item_id") or 0)
+            except (TypeError, ValueError):
+                item_id = 0
+            if args.get("target") == "all":
+                return {"item_id": item_id, "target": "all"}
+            try:
+                role_id = int(args.get("role_id"))
+            except (TypeError, ValueError):
+                role_id = -1
+            return {"item_id": item_id, "role_id": role_id}
         return dict(args)
 
     def parse_model_json(self, content: str) -> dict:
@@ -7259,14 +7414,26 @@ class DebugState:
             target_value = "all"
             role_value = None
         else:
-            role_value = 0 if role_id is None else int(role_id)
+            if role_id is None:
+                raise ValueError("role_id is required for a single-target item")
+            role_value = int(role_id)
             if role_value < 0:
                 raise ValueError("role_id must be non-negative")
             target_value = str(role_value)
 
         with self.action_lock:
-            if self.action_path.exists():
-                raise RuntimeError("action_pending")
+            state = read_json(self.state_path)
+            args = {"item_id": item_id, "target": "all"} if target_value == "all" else {
+                "item_id": item_id,
+                "role_id": role_value,
+            }
+            error = self.use_item_validation_error(state, args)
+            if error is not None:
+                raise RuntimeError(error)
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
 
             lines = [f"use_item {item_id} {target_value}"]
             self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")

@@ -350,6 +350,9 @@ def test_agent_messages_put_stable_policy_before_dynamic_context():
         assert 'JSON object' in messages[0]['content']
         assert '距离是成本信号，不是优先级规则' in messages[1]['content']
         assert '不要匹配固定剧情短语' in messages[1]['content']
+        assert '由非传送目标变为传送目标' in messages[1]['content']
+        assert 'known_destination=false' in messages[1]['content']
+        assert 'previously_tried 或 avoid_repeat 不应降低它的优先级' in messages[1]['content']
         assert 'prefer the nearest reachable non-transition target' not in messages[1]['content']
         assert 'greet guests' not in messages[1]['content']
         assert 'secret passage' not in messages[1]['content']
@@ -358,6 +361,34 @@ def test_agent_messages_put_stable_policy_before_dynamic_context():
         assert 'exploration' in dynamic
         assert 'last_route' in dynamic['exploration']
         assert 'rules' not in dynamic
+
+
+def test_agent_context_exposes_newly_unlocked_unknown_transition_signals():
+    opened = {'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4520, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[opened])
+        identity = debug.room_identity(state)
+        debug.event_log = [{
+            'type': 'interaction_effect',
+            'object_id': 10,
+            'target_id': 10,
+            'scene_id': identity['scene_id'],
+            'map_id': identity['map_id'],
+            'logical_room_id': identity['id'],
+            'room_id': identity['id'],
+            'started_object': {'state': 1, 'sprite_id': 0, 'trigger_mode': 2, 'trigger_script': 4510, 'interactable': True, 'blocking': False},
+            'finished_object': {'state': 1, 'sprite_id': 0, 'trigger_mode': 4, 'trigger_script': 4520, 'interactable': True, 'blocking': False},
+        }]
+        navigation = debug.navigation(state)
+        context = debug.agent_context(state, navigation, {'dialogs': []}, debug.event_log)
+        target = next(target for target in context['navigation']['targets'] if target['id'] == 10)
+        assert target['transition_candidate']
+        assert not target['known_destination']
+        assert target['interaction_state'] == 'previously_tried'
+        assert target['agent_priority'] == 'avoid_repeat'
+        assert target['previous_interaction_outcome']['started_object']['trigger_mode'] == 2
+        assert target['previous_interaction_outcome']['finished_object']['trigger_mode'] == 4
 
 
 
@@ -469,7 +500,52 @@ def test_agent_get_inventory_returns_current_items():
         assert result['ok']
         assert result['total'] == 2
         assert result['returned'] == 2
-        assert result['inventory'][0] == {'slot': 0, 'item_id': 91, 'name': '十里香', 'amount': 1, 'amount_in_use': 0, 'equipped_count': 0, 'usable': True, 'apply_to_all': True, 'sellable': True, 'flags': ['usable', 'apply_to_all'], 'price': 640}
+        assert result['inventory'][0] == {'slot': 0, 'item_id': 91, 'name': '十里香', 'amount': 1, 'amount_in_use': 0, 'equipped_count': 0, 'usable': True, 'apply_to_all': True, 'sellable': True, 'consuming': None, 'available_amount': 1, 'flags': ['usable', 'apply_to_all'], 'price': 640}
+
+
+def test_agent_accepts_valid_single_target_item_recommendation():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state()
+        state['party'] = [{'role_id': 0, 'hp': 12, 'max_hp': 100}]
+        state['inventory'] = [{'item_id': 88, 'name': '止血草', 'amount': 2, 'amount_in_use': 0, 'usable': True, 'apply_to_all': False, 'consuming': True}]
+        write_state(debug, state)
+        result = debug.run_agent_tool('submit_decision', {
+            'summary': 'Use a healing item on the injured party member.',
+            'recommended_intent': 'use_inventory_item',
+            'recommended_action': {'tool': 'use_item', 'args': {'item_id': 88, 'role_id': 0}},
+            'evidence': {'item_id': 88, 'hp': 12, 'max_hp': 100},
+            'risk': 'The item purpose is inferred from its name.',
+            'alternatives': [],
+        }, state)
+        assert result['ok']
+        assert result['decision']['recommended_intent'] == 'use_inventory_item'
+        assert result['decision']['recommended_action']['tool'] == 'use_item'
+        assert result['decision']['recommended_action']['args'] == {'item_id': 88, 'role_id': 0}
+        assert not debug.action_path.exists()
+
+
+def test_agent_rejects_item_target_that_disagrees_with_inventory_metadata():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state()
+        state['party'] = [{'role_id': 0}]
+        state['inventory'] = [{'item_id': 91, 'amount': 1, 'amount_in_use': 0, 'usable': True, 'apply_to_all': True}]
+        write_state(debug, state)
+        result = debug.run_agent_tool('submit_decision', {
+            'summary': 'Use the item.',
+            'recommended_intent': 'use_inventory_item',
+            'recommended_action': {'tool': 'use_item', 'args': {'item_id': 91, 'role_id': 0}},
+            'evidence': {'item_id': 91},
+            'risk': 'Unknown effect.',
+            'alternatives': [],
+        }, state)
+        assert result['ok']
+        decision = result['decision']
+        assert decision['recommended_intent'] == 'wait_runtime'
+        assert decision['recommended_action']['tool'] == 'no_op'
+        assert decision['recommended_action']['args'] == {'reason': 'use_item_invalid', 'error': 'target_must_be_all'}
+        assert not debug.action_path.exists()
 
 
 

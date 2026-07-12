@@ -87,6 +87,26 @@ def test_http_handler_serves_state_frame_action_and_404(http_server):
     assert payload["ok"] is False
     assert "invalid buttons" in payload["error"]
 
+    state = make_state(frame=8)
+    state["party"] = [{"role_id": 0}]
+    state["inventory"] = [{
+        "item_id": 88, "amount": 1, "amount_in_use": 0,
+        "usable": True, "apply_to_all": False,
+    }]
+    write_state(debug, state)
+    debug.action_result_path.write_text('{"ok":true,"action":"use_item"}', encoding="utf-8")
+    status, _, raw = http_request(
+        base_url,
+        "/inventory/use",
+        method="POST",
+        payload={"item_id": 88, "role_id": 0},
+    )
+    payload = json.loads(raw)
+    assert status == 200
+    assert payload["ok"] is True
+    assert debug.action_path.read_text(encoding="ascii") == "use_item 88 0\n"
+    assert not debug.action_result_path.exists()
+
 
 def test_http_handler_serves_only_confirmed_current_room_transitions(http_server):
     base_url, debug = http_server
