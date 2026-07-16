@@ -359,7 +359,7 @@ def test_navigation_step_does_not_discard_changed_room_observation_without_match
         assert debug.read_exploration()['transitions'] == {}
 
 
-def test_navigation_step_unknown_target_in_original_room_clears_pending_transition():
+def test_navigation_step_waits_for_pending_transition_when_target_is_unreachable_after_landing():
     target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -371,9 +371,79 @@ def test_navigation_step_unknown_target_in_original_room_clears_pending_transiti
         missing = make_state(objects=[])
         write_state(debug, missing)
         result = debug.navigation_step(missing, target_id=52)
+        assert result['ok']
+        assert result['status'] == 'transition_observing'
+        assert result['stable_snapshots'] == 0
+        assert debug.pending_transition_observation is not None
+
+
+def test_navigation_step_replans_after_pending_transition_times_out():
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target])
+        write_state(debug, state)
+        assert debug.navigation_step(state, target_id=52)['ok']
+        debug.action_path.unlink()
+        debug.pending_transition_observation['sent_at'] -= 5
+
+        missing = make_state(objects=[])
+        write_state(debug, missing)
+        result = debug.navigation_step(missing, target_id=52)
         assert not result['ok']
         assert result['status'] == 'unknown_target'
         assert debug.pending_transition_observation is None
+
+
+def test_navigation_step_confirms_delayed_intra_room_transition_after_landing():
+    target = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        source = make_state(width=6, height=4, start=(1, 1), objects=[target], frame=10)
+        write_state(debug, source)
+        started = debug.navigation_step(source, target_id=48)
+        assert started['status'] == 'stepping'
+        assert started['remaining_steps'] == 0
+        debug.action_path.unlink()
+
+        landed = make_state(width=6, height=4, start=(4, 2), objects=[], frame=11)
+        landed['_logical_room'] = debug.logical_room_identity(source)
+        write_state(debug, landed)
+        observing = debug.navigation_step(landed, target_id=48)
+        assert observing['ok']
+        assert observing['status'] == 'transition_observing'
+        assert observing['stable_snapshots'] == 0
+        assert debug.pending_transition_observation is not None
+
+        destination = dict(landed)
+        destination['frame'] = 12
+        destination['trigger_observation'] = {
+            'generation': 1,
+            'event_object_id': 48,
+            'trigger_script': 4631,
+            'completed': True,
+            'source': {'scene_id': 3, 'map_id': 10, **source['party_position']},
+            'destination': {'scene_id': 3, 'map_id': 10, **landed['party_position'], 'frame': 11},
+        }
+        write_state(debug, destination)
+        stabilizing = debug.navigation_step(destination, target_id=48)
+        assert stabilizing['ok']
+        assert stabilizing['status'] == 'transition_observing'
+        assert stabilizing['stable_snapshots'] == 1
+
+        destination['frame'] = 13
+        write_state(debug, destination)
+        transitioned = debug.navigation_step(destination, target_id=48)
+        assert transitioned['ok']
+        assert transitioned['status'] == 'transitioned'
+        assert transitioned['transition']['intra_room_transition'] is True
+        assert debug.pending_transition_observation is None
+
+        source_identity = debug.room_identity(source)
+        transition_key = debug.transition_observation_from_state(source, 48)['transition_key']
+        record = debug.read_exploration()['transitions'][source_identity['nav_room_id']][transition_key]
+        assert record['intra_room_transition'] is True
+        assert record['confirmation'] == 'native_trigger'
 
 
 def test_transition_observation_ignores_logical_room_change_without_native_trigger():
@@ -596,10 +666,10 @@ def test_navigation_and_route_include_known_transition_destination():
         room['explorable'] = 10
         room['complete'] = False
         debug.write_exploration(data)
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         target_status = {target['id']: target for target in navigation['targets']}
-        route = debug.run_agent_tool('get_route', {'id': 52}, state)['route']
-        known = debug.run_agent_tool('get_known_transitions', {}, state)
+        route = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']
+        known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
         assert target_status[52]['known_destination']
         assert target_status[52]['known_destination_room_id'] == to_identity['id']
         assert target_status[52]['destination_priority'] == 'partial'
@@ -628,8 +698,8 @@ def test_transition_destination_is_known_across_regions_in_same_room():
         to_state['region_key'] = '3:10:16:47'
         to_identity = debug.room_identity(to_state)
         debug.record_transition_destination(debug.room_identity(observed_from), 54, to_identity, from_object=target, from_state=observed_from, to_state=to_state)
-        route = debug.run_agent_tool('get_route', {'id': 54}, query_from)['route']
-        known = debug.run_agent_tool('get_known_transitions', {}, query_from)
+        route = debug.run_agent_tool('inspect_target', {'id': 54}, query_from)['route']
+        known = debug.run_agent_tool('get_room_memory', {}, query_from)['transitions']
         assert route['known_destination']
         assert route['known_destination_room_id'] == to_identity['id']
         assert known['from_nav_room_id'] == debug.room_identity(query_from)['nav_room_id']
@@ -650,8 +720,8 @@ def test_transition_destination_crosses_raw_room_key_when_logical_room_matches()
         to_state['map_id'] = 11
         to_state['room'] = {'key': 'next-room'}
         debug.record_transition_destination(debug.room_identity(observed_from), 54, debug.room_identity(to_state), from_object=target, from_state=observed_from, to_state=to_state)
-        route = debug.run_agent_tool('get_route', {'id': 54}, query_from)['route']
-        known = debug.run_agent_tool('get_known_transitions', {}, query_from)
+        route = debug.run_agent_tool('inspect_target', {'id': 54}, query_from)['route']
+        known = debug.run_agent_tool('get_room_memory', {}, query_from)['transitions']
         assert route['known_destination']
         assert known['known_transitions']
 
@@ -675,8 +745,8 @@ def test_transition_destination_requires_exact_position_and_script_key():
             from_state=observed_from,
             to_state=to_state,
         )
-        route = debug.run_agent_tool('get_route', {'id': 54}, query_from)['route']
-        known = debug.run_agent_tool('get_known_transitions', {}, query_from)
+        route = debug.run_agent_tool('inspect_target', {'id': 54}, query_from)['route']
+        known = debug.run_agent_tool('get_room_memory', {}, query_from)['transitions']
         assert not route['known_destination']
         assert known['known_transitions_by_object'] == {}
 
@@ -698,9 +768,9 @@ def test_transition_semantic_annotation_is_exposed_to_agent_navigation():
             to_state=to_state,
         )
         debug.annotate_transition(record['transition_key'], from_semantic_room='一楼大堂', to_semantic_room='厨房')
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
-        route = debug.run_agent_tool('get_route', {'id': 54}, state)['route']
-        known = debug.run_agent_tool('get_known_transitions', {}, state)
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
+        route = debug.run_agent_tool('inspect_target', {'id': 54}, state)['route']
+        known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
         target_status = {target['id']: target for target in navigation['targets']}
         assert target_status[54]['to_semantic_room'] == '厨房'
         assert target_status[54]['confidence'] == 'human_confirmed'
@@ -715,7 +785,7 @@ def test_unknown_transition_destination_is_explicit():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state(objects=[target])
-        route = debug.run_agent_tool('get_route', {'id': 52}, state)['route']
+        route = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']
         assert not route['known_destination']
         assert route['known_destination_room_id'] is None
         assert route['known_destination_observed_at'] is None
@@ -738,8 +808,8 @@ def test_legacy_transition_record_is_read_but_not_used_as_a_known_destination():
         data = debug.read_exploration()
         data['transitions'][debug.room_identity(state)['id']][record['transition_key']].pop('confirmation')
         debug.write_exploration(data)
-        route = debug.run_agent_tool('get_route', {'id': 52}, state)['route']
-        known = debug.run_agent_tool('get_known_transitions', {}, state)
+        route = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']
+        known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
         assert not route['known_destination']
         assert route['destination_priority'] == 'unknown'
         assert known['known_transitions'][record['transition_key']]['unconfirmed_destination']
@@ -760,9 +830,9 @@ def test_recent_transition_destination_is_marked_as_backtrack():
         transition_key = debug.transition_observation_from_state(state, 52)['transition_key']
         debug.record_transition_destination(debug.room_identity(state), 52, previous_identity, from_object=target, from_state=state, to_state=previous)
         debug.agent_log_path.write_text(json.dumps({'turn': 1, 'episode': previous_identity['id'], 'decision': {}}) + '\n', encoding='utf-8')
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         target_status = {target['id']: target for target in navigation['targets']}
-        known = debug.run_agent_tool('get_known_transitions', {}, state)
+        known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
         assert target_status[52]['returns_to_recent_room']
         assert target_status[52]['agent_priority'] == 'avoid_backtrack'
         assert known['known_transitions'][transition_key]['returns_to_recent_room']
@@ -836,13 +906,14 @@ def test_agent_decide_warns_on_transition_target():
 
 
 
-def test_agent_normalizes_target_intent_to_navigation_step():
+def test_agent_expands_navigation_submission_to_navigation_step():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
-        decision = debug.normalize_agent_decision({'summary': 'Target 10 should be inspected.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'exploration_step', 'args': {'max_steps': 4}}, 'evidence': {'target': {'id': 10}}, 'risk': 'Low.', 'alternatives': []})
+        state = make_state(objects=[{'id': 10, 'trigger_mode': 1, 'state': 1}])
+        decision = debug.normalize_agent_submission({'action': 'navigate', 'target_id': 10, 'reason': 'Inspect target.'}, state)
         assert decision['recommended_action']['tool'] == 'navigation_step'
         assert decision['recommended_action']['args'] == {'id': 10}
-        assert 'normalization_warnings' in decision['evidence']
+        assert decision['recommended_intent'] == 'inspect_target'
         assert not debug.action_path.exists()
 
 
@@ -854,7 +925,7 @@ def test_navigation_applies_dialog_feedback_across_regions_in_same_nav_room():
         state = make_state(objects=[target])
         state['region_key'] = '3:10:upper-region'
         debug.dialog_history = [{'frame': 50, 'room_id': '3/10/test-room/3:10:lower-region', 'room_key': 'test-room', 'region_key': '3:10:lower-region', 'nav_room_id': '3/10/test-room', 'scene_id': 3, 'map_id': 10, 'event_object_id': 25, 'message_id': 588, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         targets = {item['id']: item for item in navigation['targets']}
         assert targets[25]['interaction_state'] == 'recent_dialog'
         assert targets[25]['agent_priority'] == 'avoid_repeat'
@@ -871,7 +942,7 @@ def test_navigation_marks_same_full_room_object_with_recent_dialog():
         identity = debug.room_identity(state)
         debug.dialog_history = [{'frame': 50, 'room_id': identity['id'], 'room_key': identity['room_key'], 'region_key': identity['region_key'], 'nav_room_id': identity['nav_room_id'], 'scene_id': identity['scene_id'], 'map_id': identity['map_id'], 'event_object_id': 57, 'message_id': 588, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息', 'agent_turn': 1}]
         debug.agent_log_path.write_text(json.dumps({'turn': 1, 'episode': identity['id'], 'nav_room_id': identity['nav_room_id'], 'decision': {}}) + '\n', encoding='utf-8')
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         targets = {item['id']: item for item in navigation['targets']}
         assert targets[57]['interaction_state'] == 'recent_dialog'
         assert targets[57]['agent_priority'] == 'avoid_repeat'
@@ -887,7 +958,7 @@ def test_navigation_marks_same_object_in_different_nav_room_as_stale():
         state['room'] = {'key': 'upper-room'}
         identity = debug.room_identity(state)
         debug.dialog_history = [{'frame': 50, 'room_id': '3/10/lower-room/3:10:lower-region', 'room_key': 'lower-room', 'region_key': '3:10:lower-region', 'nav_room_id': '3/10/lower-room', 'scene_id': identity['scene_id'], 'map_id': identity['map_id'], 'event_object_id': 25, 'message_id': 588, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         targets = {item['id']: item for item in navigation['targets']}
         assert targets[25]['interaction_state'] == 'fresh'
         assert targets[25]['agent_priority'] == 'normal'
@@ -902,7 +973,7 @@ def test_navigation_does_not_apply_dialog_feedback_from_different_room():
         debug = make_debug_state(tmp)
         state = make_state(objects=[target])
         debug.dialog_history = [{'frame': 50, 'room_key': 'other-room', 'scene_id': 3, 'map_id': 10, 'event_object_id': 25, 'message_id': 588, 'speaker_hint': '李大娘', 'text': '呵～累了，想早點休息'}]
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         targets = {item['id']: item for item in navigation['targets']}
         assert targets[25]['interaction_state'] == 'fresh'
         assert targets[25]['agent_priority'] == 'normal'

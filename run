@@ -13,6 +13,7 @@ SAVE_SLOT="${PALPAL_SAVE_SLOT:-0}"
 CHECKPOINT_SLOT="${PALPAL_CHECKPOINT_SLOT:-99}"
 START_MODE="${PALPAL_START_MODE:-wait}"
 HEADLESS="${PALPAL_HEADLESS:-1}"
+GAME_INSTANCE_ID="${PALPAL_GAME_INSTANCE_ID:-}"
 
 usage() {
     printf '%s\n' \
@@ -33,7 +34,8 @@ usage() {
         'Useful environment variables:' \
         '  PYTHON, NODE, PALPAL_RUNTIME_DIR, PALPAL_ASSET_DIR, PALPAL_GAME_BIN' \
         '  PALPAL_HOST, PALPAL_PORT, PALPAL_SAVE_SLOT, PALPAL_CHECKPOINT_SLOT, PALPAL_START_MODE, PALPAL_HEADLESS' \
-        '  PALPAL_HEADLESS=0 starts a visible SDL window for video debugging.'
+        '  PALPAL_HEADLESS=0 starts a visible SDL window for video debugging.' \
+        '  PALPAL_GAME_INSTANCE_ID is normally generated automatically for each game process.'
 }
 
 need_cmake() {
@@ -100,6 +102,9 @@ run_debug() {
 run_game() {
     ensure_runtime
     check_game_inputs
+    if [ -z "$GAME_INSTANCE_ID" ]; then
+        GAME_INSTANCE_ID="$($PYTHON -c 'import uuid; print(uuid.uuid4().hex)')"
+    fi
     cd "$ASSET_DIR"
     if [ "$HEADLESS" = "1" ]; then
         exec env \
@@ -110,6 +115,7 @@ run_game() {
             PALPAL_SAVE_SLOT="$SAVE_SLOT" \
             PALPAL_CHECKPOINT_SLOT="$CHECKPOINT_SLOT" \
             PALPAL_START_MODE="$START_MODE" \
+            PALPAL_GAME_INSTANCE_ID="$GAME_INSTANCE_ID" \
             "$GAME_BIN"
     else
         exec env \
@@ -119,6 +125,7 @@ run_game() {
             PALPAL_SAVE_SLOT="$SAVE_SLOT" \
             PALPAL_CHECKPOINT_SLOT="$CHECKPOINT_SLOT" \
             PALPAL_START_MODE="$START_MODE" \
+            PALPAL_GAME_INSTANCE_ID="$GAME_INSTANCE_ID" \
             "$GAME_BIN"
     fi
 }
@@ -204,7 +211,7 @@ run_visual_smoke() {
     check_game_inputs
     mkdir -p "$RUNTIME_DIR/logs"
 
-    PALPAL_HEADLESS=1 run_game >"$RUNTIME_DIR/logs/game.log" 2>&1 &
+    HEADLESS=1 START_MODE=slot run_game >"$RUNTIME_DIR/logs/game.log" 2>&1 &
     game_pid=$!
 
     run_debug >"$RUNTIME_DIR/logs/debug.log" 2>&1 &

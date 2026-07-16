@@ -42,12 +42,12 @@ def test_animation_noise_does_not_displace_persistent_cleared_history():
         debug.write_events()
         returned = make_state(objects=[left, opened_right], frame=300)
         returned["region_key"] = "3:10:99:99"
-        navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, returned)["navigation"]
+        navigation = debug.run_agent_tool("get_navigation", {}, returned)["navigation"]
         targets = {target["id"]: target for target in navigation["targets"]}
         assert targets[74]["interaction_state"] == "previously_cleared"
         assert targets[75]["interaction_state"] == "previously_cleared"
 
-        history = debug.run_agent_tool("get_object_history", {"id": 75}, returned)
+        history = debug.run_agent_tool("inspect_target", {"id": 75}, returned)
         assert history["interaction_summary"]["cleared_blocker"] is True
         assert any(item["type"] == "object_changed" for item in history["history"])
 
@@ -199,7 +199,7 @@ def test_structured_tool_log_recovery_is_idempotent_and_ignores_model_text():
         assert debug.persistent_object_entry(state, 74)["attempt_count"] == 1
         assert debug.persistent_object_entry(state, 99) is None
 
-        navigation = debug.run_agent_tool("get_navigation", {"mode": "full"}, state)["navigation"]
+        navigation = debug.run_agent_tool("get_navigation", {}, state)["navigation"]
         targets = {target["id"]: target for target in navigation["targets"]}
         assert targets[74]["interaction_state"] == "previously_cleared"
         assert targets[75]["interaction_state"] == "previously_cleared"

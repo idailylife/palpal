@@ -22,7 +22,7 @@ only into gitignored local directories.
 
 - macOS or Linux shell environment.
 - `cmake`
-- `python3`
+- Python 3.10 or newer
 - `node` and Google Chrome for `./run visual-smoke`
 - `git`
 - C/C++ compiler toolchain.
@@ -33,6 +33,13 @@ On macOS with Homebrew, the native requirements can usually be installed with:
 
 ```sh
 brew install cmake pkg-config sdl3
+```
+
+Install the Python server, Agents SDK, and development dependencies in a
+Python 3.10+ virtual environment:
+
+```sh
+python3 -m pip install -e '.[dev]'
 ```
 
 ## Quick Start
@@ -169,6 +176,61 @@ Live raw frame stream:
 ```text
 ws://127.0.0.1:8765/frames
 ```
+
+### Persistent Agent Session
+
+The Web UI's Agent tab runs a persistent, server-side loop with the permanent
+goal `通关游戏`. Only one session can control the game at a time. DeepSeek uses
+the OpenAI Agents SDK over its OpenAI-compatible Chat Completions endpoint;
+without `DEEPSEEK_API_KEY`, the local rules backend remains available for
+development.
+
+```text
+GET  /agent/session
+POST /agent/session/run       {"model":"deepseek-v4-pro","max_turns":10}
+POST /agent/session/interrupt
+POST /agent/session/decide
+POST /agent/session/execute
+POST /agent/session/reset
+GET  /agent/session/events?after=0&limit=200
+WS   /agent/session/stream?after=0
+```
+
+Session control metadata, the SDK SQLite transcript, and replayable activity
+events live under gitignored `runtime/agent/`. A server restart pauses an
+unfinished run; it never resumes automatically. Manual game actions and
+checkpoint writes return `409 agent_session_running` while automatic play is
+active.
+
+Agent sessions follow the game lifecycle rather than the debug-server process.
+Each SDLPAL process exports a generated `game_instance_id`: restarting only the
+server preserves the current session, while restarting the game or choosing
+Start New Game creates a clean session. `PALPAL_GAME_INSTANCE_ID` is normally
+set by `./run` and is only needed when launching the native binary manually.
+
+Checkpoints include a local Agent bundle containing the saved session state,
+SDK transcript, and activity timeline. Loading one creates a new branch session
+from that exact save point, so decisions made after the checkpoint do not leak
+into the restored game. Older checkpoints still load, but begin with an empty
+Agent session and an explicit compatibility status.
+
+Set `PALPAL_AGENT_COMPACT_AT_TOKENS` to change the conservative context
+compression threshold (default `48000`). Compression uses a DeepSeek
+summarizer and keeps the two most recent full decision cycles. The UI reports
+cumulative billed tokens, the latest agent-run usage, and a conservative
+estimate of the currently persisted context separately.
+
+The persistent model sees seven tools: `upsert_task`, `get_navigation`,
+`inspect_target`, `get_observations`, `get_inventory`, `get_room_memory`, and
+`submit_decision`. Raw query outputs are compacted after a completed decision,
+and the permanent goal is held in agent instructions/session metadata
+instead of being repeated in every user message. After actions, the runtime
+requires a two-second quiet state before starting the next decision.
+
+`submit_decision` accepts only a minimal action plus a short reason. Depending
+on `action`, the model adds `target_id`, or `item_id` with exactly one of
+`role_id` and `target: "all"`. The server derives the internal intent, evidence,
+risk, and executable preview; the former nested decision payload is rejected.
 
 Reserved but not implemented yet:
 

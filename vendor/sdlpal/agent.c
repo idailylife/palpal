@@ -12,6 +12,7 @@
 #include "text.h"
 
 #include <errno.h>
+#include <time.h>
 
 static int g_agent_initialized = 0;
 static int g_agent_enabled = 0;
@@ -20,6 +21,7 @@ static BOOL g_agent_startup_waiting = FALSE;
 static BOOL g_agent_startup_ready = FALSE;
 static int g_agent_startup_slot = 0;
 static char g_agent_runtime_dir[PAL_MAX_PATH] = "runtime";
+static char g_agent_game_instance_id[65];
 static PALDIRECTION g_agent_injected_dir = kDirUnknown;
 static BOOL g_agent_action_pending = FALSE;
 static BOOL g_agent_dir_active = FALSE;
@@ -113,6 +115,8 @@ PALPAL_AgentInit(
    const char *enabled;
    const char *headless;
    const char *runtime_dir;
+   const char *game_instance_id;
+   int i;
 
    if (g_agent_initialized)
    {
@@ -131,6 +135,27 @@ PALPAL_AgentInit(
    {
       strncpy(g_agent_runtime_dir, runtime_dir, sizeof(g_agent_runtime_dir) - 1);
       g_agent_runtime_dir[sizeof(g_agent_runtime_dir) - 1] = '\0';
+   }
+
+   game_instance_id = getenv("PALPAL_GAME_INSTANCE_ID");
+   if (game_instance_id && game_instance_id[0])
+   {
+      strncpy(g_agent_game_instance_id, game_instance_id, sizeof(g_agent_game_instance_id) - 1);
+      g_agent_game_instance_id[sizeof(g_agent_game_instance_id) - 1] = '\0';
+      for (i = 0; g_agent_game_instance_id[i] != '\0'; i++)
+      {
+         char c = g_agent_game_instance_id[i];
+         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+         {
+            g_agent_game_instance_id[i] = '_';
+         }
+      }
+   }
+   else
+   {
+      snprintf(g_agent_game_instance_id, sizeof(g_agent_game_instance_id),
+         "%08lx-%08x", (unsigned long)time(NULL), (unsigned int)SDL_GetTicks());
    }
 }
 
@@ -2099,6 +2124,7 @@ PALPAL_AgentWriteStartupState(
 
    fprintf(fp, "{");
    fprintf(fp, "\"status\":\"startup_waiting\",");
+   fprintf(fp, "\"game_instance_id\":\"%s\",", g_agent_game_instance_id);
    fprintf(fp, "\"frame\":0,");
    fprintf(fp, "\"in_main_game\":false,");
    fprintf(fp, "\"in_battle\":false,");
@@ -2155,6 +2181,7 @@ PALPAL_AgentWriteState(
    }
 
    fprintf(fp, "{");
+   fprintf(fp, "\"game_instance_id\":\"%s\",", g_agent_game_instance_id);
    fprintf(fp, "\"frame\":%u,", (unsigned int)gpGlobals->dwFrameNum);
    fprintf(fp, "\"in_main_game\":%s,", gpGlobals->fInMainGame ? "true" : "false");
    fprintf(fp, "\"in_battle\":%s,", gpGlobals->fInBattle ? "true" : "false");

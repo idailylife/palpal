@@ -37,7 +37,7 @@ def test_legacy_dialog_feedback_requires_room_and_region_match():
         identity = debug.room_identity(state)
         debug.dialog_history = [{'frame': 50, 'room_key': identity['room_key'], 'region_key': identity['region_key'], 'scene_id': identity['scene_id'], 'map_id': identity['map_id'], 'event_object_id': 57, 'message_id': 588, 'speaker_hint': '李大娘', 'text': '還不快出來幫忙招呼客人', 'agent_turn': 1}, {'frame': 51, 'room_key': identity['room_key'], 'scene_id': identity['scene_id'], 'map_id': identity['map_id'], 'event_object_id': 58, 'message_id': 589, 'speaker_hint': '李大娘', 'text': 'weak legacy entry', 'agent_turn': 1}]
         debug.agent_log_path.write_text(json.dumps({'turn': 1, 'episode': identity['id'], 'nav_room_id': identity['nav_room_id'], 'decision': {}}) + '\n', encoding='utf-8')
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         targets = {item['id']: item for item in navigation['targets']}
         assert targets[57]['interaction_state'] == 'recent_dialog'
         assert targets[57]['agent_priority'] == 'avoid_repeat'

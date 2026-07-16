@@ -74,51 +74,63 @@
         </div>
       </section>
       <aside class="statePane">
-        <section>
-          <div id="checkpoints" class="checkpoints"></div>
-        </section>
-        <section>
-          <div class="sectionHeader">
-            <h2>Agent</h2>
-            <span class="agentMode">manual execute</span>
-          </div>
-          <div id="agent" class="agent"></div>
-        </section>
-        <section>
-          <h2>Dialog History</h2>
-          <div id="dialogs" class="dialogs"></div>
-        </section>
-        <section>
-          <h2>Events</h2>
-          <div id="events" class="events"></div>
-        </section>
-        <section>
-          <h2>Inventory</h2>
-          <div id="inventory" class="inventory"></div>
-        </section>
-        <section>
-          <h2>Equipment</h2>
-          <div id="equipment" class="equipment"></div>
-        </section>
-        <section>
-          <details class="objectsDetails">
-            <summary>Objects</summary>
-            <div id="objects" class="objects"></div>
-          </details>
-        </section>
-        <section class="jsonSection">
-          <details id="jsonDetails">
-            <summary>
-              <span class="jsonTitle">JSON</span>
-              <span id="jsonStatus"></span>
-            </summary>
-            <div class="jsonControls">
-              <label><input id="jsonLive" type="checkbox" /> live</label>
-              <button id="jsonRefresh" type="button">Refresh</button>
+        <div class="stateTabs" role="tablist" aria-label="Right sidebar mode">
+          <button id="normalTab" type="button" role="tab" aria-selected="true" aria-controls="normalPanel" tabindex="0">Normal</button>
+          <button id="agentTab" type="button" role="tab" aria-selected="false" aria-controls="agentPanel" tabindex="-1">Agent</button>
+        </div>
+        <div id="normalPanel" class="stateTabPanel" role="tabpanel" aria-labelledby="normalTab">
+          <section>
+            <div id="checkpoints" class="checkpoints"></div>
+          </section>
+          <section>
+            <div class="sectionHeader">
+              <h2>Agent</h2>
+              <span class="agentMode">single step</span>
             </div>
-            <pre id="json"></pre>
-          </details>
-        </section>
+            <div id="agent" class="agent"></div>
+          </section>
+          <section>
+            <h2>Dialog History</h2>
+            <div id="dialogs" class="dialogs"></div>
+          </section>
+          <section>
+            <h2>Events</h2>
+            <div id="events" class="events"></div>
+          </section>
+          <section>
+            <h2>Inventory</h2>
+            <div id="inventory" class="inventory"></div>
+          </section>
+          <section>
+            <h2>Equipment</h2>
+            <div id="equipment" class="equipment"></div>
+          </section>
+          <section>
+            <details class="objectsDetails">
+              <summary>Objects</summary>
+              <div id="objects" class="objects"></div>
+            </details>
+          </section>
+          <section class="jsonSection">
+            <details id="jsonDetails">
+              <summary>
+                <span class="jsonTitle">JSON</span>
+                <span id="jsonStatus"></span>
+              </summary>
+              <div class="jsonControls">
+                <label><input id="jsonLive" type="checkbox" /> live</label>
+                <button id="jsonRefresh" type="button">Refresh</button>
+              </div>
+              <pre id="json"></pre>
+            </details>
+          </section>
+        </div>
+        <div id="agentPanel" class="stateTabPanel agentPanel" role="tabpanel" aria-labelledby="agentTab" hidden>
+          <header id="agentSessionHeader" class="agentSessionHeader"></header>
+          <div id="agentSessionControls" class="agentSessionControls"></div>
+          <div id="agentTimeline" class="agentTimeline" role="log" aria-live="polite" aria-label="Agent activity"></div>
+          <button id="agentJumpLatest" class="agentJumpLatest" type="button" hidden>Jump to latest</button>
+        </div>
       </aside>
     </main>
     <dialog id="transitionsDialog" class="transitionsDialog" aria-labelledby="transitionsTitle">

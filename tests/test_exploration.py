@@ -259,15 +259,15 @@ def test_write_use_item_action_for_all():
 
 
 
-def test_get_room_exploration_returns_compact_known_and_unknown_status():
+def test_get_room_memory_returns_compact_known_and_unknown_status():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state()
         write_state(debug, state)
         debug.update_exploration(state)
         identity = debug.room_identity(state)
-        known = debug.run_agent_tool('get_room_exploration', {'room_id': identity['id']}, state)['exploration']
-        unknown = debug.run_agent_tool('get_room_exploration', {'room_id': '9/9/missing'}, state)['exploration']
+        known = debug.run_agent_tool('get_room_memory', {'room_id': identity['id']}, state)['exploration']
+        unknown = debug.run_agent_tool('get_room_memory', {'room_id': '9/9/missing'}, state)['exploration']
         assert known['known']
         assert known['room_id'] == identity['id']
         assert known['scene_id'] == 3

@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from palpal.agent_runtime import AgentRuntime
+
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
 VALID_BUTTONS = {
@@ -67,7 +69,9 @@ DIALOG_ADVANCE_BUTTON = "search"
 DIALOG_ADVANCE_ACTION_TIMEOUT = 2.5
 DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS = 3
 DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL = 0.25
-CHECKPOINT_MANIFEST_VERSION = 1
+DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL = 0.1
+DIALOG_ADVANCE_VISIBILITY_TIMEOUT = 2.0
+CHECKPOINT_MANIFEST_VERSION = 2
 DEFAULT_CHECKPOINT_SLOT = 99
 
 
@@ -397,6 +401,7 @@ class DebugState:
         self.agent_status_lock = threading.Lock()
         self.agent_status = self.empty_agent_status()
         self.recover_object_interactions_from_agent_llm_log()
+        self.agent_runtime = AgentRuntime(self, self.runtime_dir)
 
     def config_value(self, key: str, default: str | None = None) -> str | None:
         return os.environ.get(key) or self.env_file.get(key) or default
@@ -626,6 +631,7 @@ class DebugState:
         for relative_path in CHECKPOINT_COMPANION_FILES:
             key = f"companion/{relative_path.as_posix()}"
             files[key] = self.file_info(self.companion_checkpoint_path(checkpoint_dir, relative_path))
+        files["agent/session.json"] = self.file_info(checkpoint_dir / "agent" / "session.json")
         return files
 
     def checkpoint_context(self, state: dict) -> dict:
@@ -984,6 +990,7 @@ class DebugState:
             command_result = self.run_slot_command("save_slot", slot)
             self.copy_game_save_to_checkpoint(checkpoint_dir, slot)
             companion = self.copy_companion_to_checkpoint(checkpoint_dir)
+            agent_bundle = self.agent_runtime.export_checkpoint(checkpoint_dir)
             manifest = {
                 "version": CHECKPOINT_MANIFEST_VERSION,
                 "id": checkpoint_id,
@@ -994,6 +1001,7 @@ class DebugState:
                 "state": self.checkpoint_context(state),
                 "native_result": command_result["result"],
                 "companion": companion,
+                "agent_bundle": agent_bundle,
             }
             tmp = checkpoint_dir / "manifest.json.tmp"
             tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1022,12 +1030,18 @@ class DebugState:
             {"checkpoint_id": checkpoint_id, "restored": restored},
             state=state,
         )
-        return {
+        result = {
             "ok": True,
             "checkpoint": self.checkpoint_manifest(checkpoint_dir),
             "restored": restored,
             "native_result": command_result["result"],
         }
+        self.agent_runtime.restore_checkpoint(
+            checkpoint_dir,
+            checkpoint_id,
+            state.get("game_instance_id"),
+        )
+        return result
 
     def start_new_game(self) -> dict:
         state = read_json(self.state_path)
@@ -1039,10 +1053,12 @@ class DebugState:
         self.last_logical_frame = None
         self.last_snapshot_frame = None
         self.pending_checkpoint_frame_reset = None
-        return {
+        result = {
             "ok": True,
             "native_result": command_result["result"],
         }
+        self.agent_runtime.reset("start_new_game", game_instance_id=state.get("game_instance_id"))
+        return result
 
     def delete_checkpoint(self, checkpoint_id: str) -> dict:
         checkpoint_dir = self.checkpoint_dir(checkpoint_id)
@@ -1139,6 +1155,7 @@ class DebugState:
         )
         entry = {
             "time": time.time(),
+            "session_id": getattr(getattr(self, "agent_runtime", None), "state", {}).get("session_id"),
             "episode": episode,
             "turn": turn,
             "frame": state.get("frame"),
@@ -1166,6 +1183,7 @@ class DebugState:
     def append_agent_llm_log(self, state: dict, entry: dict) -> dict:
         payload = {
             "time": time.time(),
+            "session_id": getattr(getattr(self, "agent_runtime", None), "state", {}).get("session_id"),
             "state_context": self.state_context(state),
             **entry,
         }
@@ -1199,6 +1217,7 @@ class DebugState:
         )
         entry = {
             "time": time.time(),
+            "session_id": getattr(getattr(self, "agent_runtime", None), "state", {}).get("session_id"),
             "episode": episode,
             "turn": turn,
             "frame": state.get("frame"),
@@ -2879,7 +2898,7 @@ class DebugState:
                     continue
                 history_current = (
                     result.get("current")
-                    if message.get("name") == "get_object_history" and isinstance(result.get("current"), dict)
+                    if message.get("name") == "inspect_target" and isinstance(result.get("current"), dict)
                     else None
                 )
 
@@ -4387,16 +4406,13 @@ class DebugState:
                 }
             pending = self.pending_transition_observation
             if isinstance(pending, dict) and pending.get("object_id") == target_id:
-                from_room = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
-                current_room = self.room_identity(state)
-                if from_room is not None and current_room is not None and current_room["id"] != from_room.get("id"):
-                    return {
-                        "ok": True,
-                        "status": "transition_observing",
-                        "target_id": target_id,
-                        "stable_snapshots": int(pending.get("stable_snapshots") or 0),
-                        "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
-                    }
+                return {
+                    "ok": True,
+                    "status": "transition_observing",
+                    "target_id": target_id,
+                    "stable_snapshots": int(pending.get("stable_snapshots") or 0),
+                    "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
+                }
 
         route = self.route_to_object(state, target_id, avoid_transitions=True)
         if route.get("status") == "blocked_by_interactable":
@@ -4843,9 +4859,12 @@ class DebugState:
             },
             "recent_agent_decisions": self.read_agent_log(limit=20),
             "agent_status": self.agent_status_snapshot(),
+            "agent_session": self.agent_runtime.compact_snapshot(),
             "dialog_advance_status": self.dialog_advance_status_snapshot(),
             "timeline": timeline,
         }
+        self.agent_runtime.observe_game_instance(state.get("game_instance_id"))
+        state["_debug"]["agent_session"] = self.agent_runtime.compact_snapshot()
         return state
 
     def dialog_advance_int(self, value, default: int, lower: int, upper: int) -> int:
@@ -4891,20 +4910,47 @@ class DebugState:
             return "dialog_inactive"
         return None
 
-    def dialog_advance_confirm_stop_status(self, status: str | None) -> str | None:
-        if status != "dialog_inactive":
-            return status
-        for _ in range(DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS):
+    def dialog_advance_visible(self, state: dict) -> bool:
+        dialog = state.get("dialog") if isinstance(state, dict) else {}
+        if not isinstance(dialog, dict) or not dialog.get("active"):
+            return False
+        if "visible" in dialog:
+            return bool(dialog.get("visible"))
+        return not bool(dialog.get("held"))
+
+    def dialog_advance_wait_for_visible(self, state: dict) -> tuple[dict, str | None]:
+        visibility_polls = 0
+        max_visibility_polls = max(
+            1,
+            int(DIALOG_ADVANCE_VISIBILITY_TIMEOUT / DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL),
+        )
+        while True:
             if self.dialog_advance_cancel.is_set():
-                return "cancelled"
-            time.sleep(DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL)
+                return state, "cancelled"
+
+            stop_status = self.dialog_advance_stop_status(state)
+            if stop_status == "dialog_inactive":
+                for _ in range(DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS):
+                    if self.dialog_advance_cancel.is_set():
+                        return state, "cancelled"
+                    time.sleep(DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL)
+                    state = self.snapshot()
+                    stop_status = self.dialog_advance_stop_status(state)
+                    if stop_status != "dialog_inactive":
+                        break
+                else:
+                    return state, "dialog_inactive"
+
+            if stop_status and stop_status != "dialog_inactive":
+                return state, stop_status
+            if self.dialog_advance_visible(state):
+                return state, None
+            if visibility_polls >= max_visibility_polls:
+                return state, "dialog_visibility_timeout"
+
+            time.sleep(DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL)
+            visibility_polls += 1
             state = self.snapshot()
-            next_status = self.dialog_advance_stop_status(state)
-            if next_status is None:
-                return None
-            if next_status != "dialog_inactive":
-                return next_status
-        return status
 
     def advance_dialog(self, args: dict | None = None) -> dict:
         options = self.normalize_dialog_advance_args(args)
@@ -4927,6 +4973,10 @@ class DebugState:
                 }
 
             state = self.snapshot()
+            state, stop_status = self.dialog_advance_wait_for_visible(state)
+            if stop_status:
+                return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "cancelled"})
+
             previous_active_key = self.dialog_advance_active_event_key(state)
             repeated_active_presses = 0
             observed_event_keys: set[tuple] = set()
@@ -4938,14 +4988,35 @@ class DebugState:
                 detect_repeats=False,
             )
             has_dialog_event_info = bool(event_observation["has_event_info"])
-            stop_status = self.dialog_advance_stop_status(state)
-            stop_status = self.dialog_advance_confirm_stop_status(stop_status)
-            if stop_status:
-                return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "cancelled"})
 
-            while presses < options["max_presses"]:
+            while True:
                 if self.dialog_advance_cancel.is_set():
                     return finish_result("cancelled")
+                state, stop_status = self.dialog_advance_wait_for_visible(state)
+                if stop_status:
+                    return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "cancelled"})
+
+                event_observation = self.dialog_advance_observe_events(
+                    state,
+                    observed_event_keys,
+                    seen_opponent_keys,
+                    detect_repeats=presses > 0,
+                )
+                has_dialog_event_info = has_dialog_event_info or bool(event_observation["has_event_info"])
+                if options["stop_on_repeat"] and event_observation["repeated"]:
+                    return finish_result("repeated_dialog_opponent_line")
+                active_key = self.dialog_advance_active_event_key(state)
+                if presses > 0:
+                    if not has_dialog_event_info and active_key and active_key == previous_active_key:
+                        repeated_active_presses += 1
+                    else:
+                        repeated_active_presses = 0
+                        previous_active_key = active_key
+                    if options["stop_on_repeat"] and repeated_active_presses >= 2:
+                        return finish_result("repeated_dialog")
+
+                if presses >= options["max_presses"]:
+                    return finish_result("max_presses")
                 if self.action_path.exists():
                     return finish_result("action_pending_timeout", ok=False)
 
@@ -4959,29 +5030,6 @@ class DebugState:
                 if self.dialog_advance_cancel.is_set():
                     return finish_result("cancelled")
                 state = self.snapshot()
-                stop_status = self.dialog_advance_stop_status(state)
-                stop_status = self.dialog_advance_confirm_stop_status(stop_status)
-                if stop_status:
-                    return finish_result(stop_status)
-                event_observation = self.dialog_advance_observe_events(
-                    state,
-                    observed_event_keys,
-                    seen_opponent_keys,
-                    detect_repeats=True,
-                )
-                has_dialog_event_info = has_dialog_event_info or bool(event_observation["has_event_info"])
-                if options["stop_on_repeat"] and event_observation["repeated"]:
-                    return finish_result("repeated_dialog_opponent_line")
-                active_key = self.dialog_advance_active_event_key(state)
-                if not has_dialog_event_info and active_key and active_key == previous_active_key:
-                    repeated_active_presses += 1
-                else:
-                    repeated_active_presses = 0
-                    previous_active_key = active_key
-                if options["stop_on_repeat"] and repeated_active_presses >= 2:
-                    return finish_result("repeated_dialog")
-
-            return finish_result("max_presses")
         finally:
             self.dialog_advance_lock.release()
 
@@ -6040,66 +6088,7 @@ class DebugState:
         }
 
     def agent_tool_specs(self) -> list[dict]:
-        decision_properties = {
-            "summary": {"type": "string"},
-            "recommended_intent": {
-                "type": "string",
-                "enum": ["advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"],
-            },
-            "recommended_action": {
-                "type": "object",
-                "description": (
-                    "Dry-run action. For use_item, args must contain item_id and either role_id for "
-                    "target_mode=party_role or target='all' for target_mode=implicit_event_context. "
-                    "The compatibility name 'all' dispatches 0xFFFF and may reuse the most recent event object; "
-                    "it is not necessarily a whole-party effect. target_object_id is not supported."
-                ),
-                "properties": {
-                    "tool": {
-                        "type": "string",
-                        "enum": ["no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"],
-                    },
-                    "args": {
-                        "type": "object",
-                        "description": (
-                            "use_item examples: {item_id:88,role_id:0} for a party member, or "
-                            "{item_id:272,target:'all'} for implicit event context after interacting with an NPC."
-                        ),
-                    },
-                    "dry_run": {"type": "boolean"},
-                },
-                "required": ["tool", "args"],
-            },
-            "evidence": {"type": "object"},
-            "risk": {"type": "string"},
-            "alternatives": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "intent": {"type": "string"},
-                        "action": {"type": "object"},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["intent", "action", "reason"],
-                },
-            },
-        }
         return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_tasks",
-                    "description": "返回 agent 自行维护的任务账本。任务是推断记忆，不是引擎事实；默认仅返回 active 任务。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "include_closed": {"type": "boolean", "default": False},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
-                        },
-                    },
-                },
-            },
             {
                 "type": "function",
                 "function": {
@@ -6121,47 +6110,38 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
-                    "name": "get_state_summary",
-                    "description": "返回当前游戏状态的轻量级只读摘要。",
-                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
                     "name": "get_navigation",
-                    "description": "返回导航目标。full 模式包含路线状态、传送目的房间和目的地探索摘要；比较候选目标时优先使用 full 模式。",
+                    "description": "返回紧凑的可交互候选、路线成本、交互状态和已知传送目的地。",
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "mode": {"type": "string", "enum": ["lightweight", "full"], "default": "lightweight"},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
-                        },
+                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 40, "default": 20}},
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "get_dialogs",
-                    "description": "返回最近观察到的对话条目，可按 speaker_hint 过滤。",
+                    "name": "inspect_target",
+                    "description": "返回一个目标的当前状态、最近交互/对话证据和紧凑路线。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer", "minimum": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8}},
+                        "required": ["id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_observations",
+                    "description": "返回最近对话、状态事件或说话者摘要；默认返回对话和事件。",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+                            "kind": {"type": "string", "enum": ["both", "dialogs", "events", "speakers"], "default": "both"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
                             "speaker": {"type": "string"},
                         },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_dialog_speakers",
-                    "description": "返回已知的非系统对话说话者，以及其最近观察到的对话元数据。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 300, "default": 100}},
                     },
                 },
             },
@@ -6176,83 +6156,18 @@ class DebugState:
                     ),
                     "parameters": {
                         "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 300, "default": 100}},
+                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 40}},
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "get_events",
-                    "description": "返回最近观察到的状态变化事件。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}},
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_object_history",
-                    "description": "返回某个 object/event_object_id 的当前对象快照，以及最近的状态变化和对话历史。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "integer", "minimum": 1},
-                            "object_id": {"type": "integer", "minimum": 1},
-                            "event_object_id": {"type": "integer", "minimum": 1},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_agent_history",
-                    "description": "返回最近的 dry-run agent 决策历史。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5}},
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_route",
-                    "description": "返回某个对象 id 的路线和状态详情。用于检查已选候选目标，不要用它扫描所有目标。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "integer", "minimum": 1},
-                            "object_id": {"type": "integer", "minimum": 1},
-                            "avoid_transitions": {"type": "boolean", "default": True},
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_room_exploration",
-                    "description": "返回某个已知 room id 的简要持久化探索状态。",
+                    "name": "get_room_memory",
+                    "description": "返回当前或指定房间的探索摘要和已知传送目的地。",
                     "parameters": {
                         "type": "object",
                         "properties": {"room_id": {"type": "string"}},
-                        "required": ["room_id"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_known_transitions",
-                    "description": "返回某个房间已观察到的传送目的地和人工语义房间标签；默认使用当前房间。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"from_room_id": {"type": "string"}},
                     },
                 },
             },
@@ -6260,18 +6175,19 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "submit_decision",
-                    "description": "提交最终 dry-run 决策。这是结束本轮的唯一方式。",
+                    "description": "提交最小 dry-run 动作；仅填写当前 action 所需字段。",
                     "parameters": {
                         "type": "object",
-                        "properties": decision_properties,
-                        "required": [
-                            "summary",
-                            "recommended_intent",
-                            "recommended_action",
-                            "evidence",
-                            "risk",
-                            "alternatives",
-                        ],
+                        "properties": {
+                            "action": {"type": "string", "enum": ["wait", "advance_dialog", "navigate", "use_item"]},
+                            "target_id": {"type": "integer", "minimum": 1},
+                            "item_id": {"type": "integer", "minimum": 1},
+                            "role_id": {"type": "integer", "minimum": 0},
+                            "target": {"type": "string", "enum": ["all"]},
+                            "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+                        },
+                        "required": ["action", "reason"],
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -6280,34 +6196,7 @@ class DebugState:
     def agent_tool_initial_context(self, state: dict) -> dict:
         return {
             "state_summary": self.agent_state_summary(state),
-            "available_query_tools": [
-                "get_tasks",
-                "get_state_summary",
-                "get_navigation",
-                "get_dialogs",
-                "get_dialog_speakers",
-                "get_inventory",
-                "get_events",
-                "get_object_history",
-                "get_agent_history",
-                "get_route",
-                "get_room_exploration",
-                "get_known_transitions",
-            ],
             "active_tasks": self.active_task_summary(),
-            "completion_tool": "submit_decision",
-            "constraints": [
-                "所有建议都只能是 dry-run 预览。",
-                "任务是 agent 从对话和事件推断的记忆，不是游戏引擎事实；发现、调整、完成或作废任务时调用 upsert_task。",
-                "不要声称已经执行了动作。",
-                "不要编造工具结果之外的对象标签、剧情事实或房间身份。",
-                "针对特定对象使用 get_route，不要一开始就请求大体积路线 payload。",
-                "当 dialog.active 为 true 时，建议 advance_dialog，而不是原始按键。",
-                "只有针对明确对象目标时才使用 navigation_step(id)；否则建议 no_op 搭配 wait_runtime。",
-                "建议使用物品前调用 get_inventory；用途证据不足时不要仅因 usable=true 就建议使用。",
-                "target_mode=implicit_event_context 的物品使用 target='all'：它以 0xFFFF 沿用最近事件对象，字段名 all 不一定表示全队。",
-                "NPC 索要匹配物品且刚与该 NPC 交互后，应考虑 use_item target='all'；不要提交 target_object_id。",
-            ],
         }
 
     def agent_tool_messages(self, state: dict) -> list[dict]:
@@ -6335,87 +6224,98 @@ class DebugState:
             parsed = default
         return max(1, min(parsed, upper))
 
+    def compact_agent_navigation(self, state: dict, limit: int = 20) -> dict:
+        navigation = self.navigation(state)
+        target_keys = (
+            "id", "kind", "status", "steps", "remaining_steps", "segment_steps",
+            "required_direction", "transition_candidate", "known_destination",
+            "to_room_id", "to_semantic_room", "confidence", "destination_priority",
+            "destination_exploration", "returns_to_recent_room", "agent_priority",
+            "interaction_state", "previously_tried", "previously_cleared",
+            "soft_avoid", "deprioritize_reason", "blocker",
+            "transition_key", "to_room_key", "to_region_key", "to_nav_room_id",
+            "to_logical_room_id", "dialog_feedback_state", "recent_dialog_feedback",
+            "stale_dialog_feedback", "previous_interaction_outcome",
+            "known_destination_room_id", "known_destination_room_key",
+        )
+        targets = [
+            {key: target.get(key) for key in target_keys if target.get(key) is not None}
+            for target in (navigation.get("targets") or [])[:limit]
+            if isinstance(target, dict)
+        ]
+        return {
+            "status": navigation.get("status"),
+            "targets": targets,
+            "targets_returned": len(targets),
+            "targets_total": len(navigation.get("targets") or []),
+        }
+
     def run_agent_tool(self, name: str, arguments: dict | None = None, state: dict | None = None) -> dict:
         arguments = arguments if isinstance(arguments, dict) else {}
         state = state or read_json(self.state_path)
-        if name == "get_tasks":
-            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
-            return {"ok": True, "tasks": self.task_ledger(include_closed=arguments.get("include_closed") is True, limit=limit)}
         if name == "upsert_task":
             return self.upsert_agent_task(arguments)
-        if name == "get_state_summary":
-            return {"ok": True, "state": self.agent_state_summary(state)}
         if name == "get_navigation":
-            mode = arguments.get("mode") if arguments.get("mode") in {"lightweight", "full"} else "lightweight"
-            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
-            navigation = self.navigation(state) if mode == "full" else self.lightweight_navigation(state)
-            targets = navigation.get("targets") if isinstance(navigation.get("targets"), list) else []
-            return {
-                "ok": True,
-                "mode": mode,
-                "navigation": {
-                    **navigation,
-                    "targets": targets[:limit],
-                    "targets_returned": min(len(targets), limit),
-                    "targets_total": len(targets),
-                },
-            }
-        if name == "get_dialogs":
-            limit = self.agent_tool_limit(arguments.get("limit"), 10, 100)
-            speaker = arguments.get("speaker")
-            speaker = str(speaker).strip() if speaker is not None else None
-            return {"ok": True, **self.dialogs_view(limit=limit, speaker=speaker or None)}
-        if name == "get_dialog_speakers":
-            limit = self.agent_tool_limit(arguments.get("limit"), 100, 300)
-            return {"ok": True, **self.dialog_speakers_view(limit=limit)}
-        if name == "get_inventory":
-            limit = self.agent_tool_limit(arguments.get("limit"), 100, 300)
-            return {"ok": True, **self.agent_inventory(state, limit=limit)}
-        if name == "get_events":
-            limit = self.agent_tool_limit(arguments.get("limit"), 10, 100)
-            return {"ok": True, "events": self.event_log[-limit:], "total": len(self.event_log)}
-        if name == "get_object_history":
+            limit = self.agent_tool_limit(arguments.get("limit"), 20, 40)
+            return {"ok": True, "navigation": self.compact_agent_navigation(state, limit)}
+        if name == "inspect_target":
             try:
-                object_id = int(
-                    arguments.get("id")
-                    or arguments.get("object_id")
-                    or arguments.get("event_object_id")
-                    or 0
-                )
-            except (TypeError, ValueError):
-                object_id = 0
-            if object_id <= 0:
-                return {"ok": False, "error": "get_object_history requires a positive id, object_id, or event_object_id"}
-            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
-            return {"ok": True, **self.object_history_view(state, object_id, limit=limit)}
-        if name == "get_agent_history":
-            limit = self.agent_tool_limit(arguments.get("limit"), 5, 50)
-            history = self.agent_recent_decision_context(limit=limit)
-            return {"ok": True, "decisions": history, "total_returned": len(history)}
-        if name == "get_route":
-            try:
-                target_id = int(arguments.get("id") or arguments.get("object_id") or 0)
+                target_id = int(arguments.get("id") or 0)
             except (TypeError, ValueError):
                 target_id = 0
             if target_id <= 0:
-                return {"ok": False, "error": "get_route requires a positive id or object_id"}
-            avoid_transitions = arguments.get("avoid_transitions")
-            route = self.route_to_object(state, target_id, avoid_transitions=avoid_transitions is not False)
+                return {"ok": False, "error": "inspect_target requires a positive id"}
+            limit = self.agent_tool_limit(arguments.get("limit"), 8, 20)
+            history = self.object_history_view(state, target_id, limit=limit)
+            route = self.route_to_object(state, target_id, avoid_transitions=True)
             route.update(self.target_affordance(state, target_id))
-            return {"ok": True, "route": route}
-        if name == "get_room_exploration":
+            route_keys = (
+                "ok", "status", "steps", "remaining_steps", "segment_steps",
+                "required_direction", "move", "blocker", "agent_priority",
+                "interaction_state", "known_destination", "known_destination_room_id",
+                "known_destination_observed_at", "destination_priority",
+                "destination_exploration", "transition_key", "to_room_id",
+                "to_semantic_room", "confidence", "returns_to_recent_room",
+            )
+            return {
+                "ok": True,
+                "id": target_id,
+                "current": history.get("current"),
+                "history": (history.get("history") or [])[-limit:],
+                "history_total": history.get("total", len(history.get("history") or [])),
+                "interaction_summary": history.get("interaction_summary"),
+                "route": {key: route.get(key) for key in route_keys if key in route},
+            }
+        if name == "get_observations":
+            kind = arguments.get("kind") if arguments.get("kind") in {"both", "dialogs", "events", "speakers"} else "both"
+            limit = self.agent_tool_limit(arguments.get("limit"), 10, 30)
+            if kind == "speakers":
+                return {"ok": True, "kind": kind, **self.dialog_speakers_view(limit=limit)}
+            speaker = arguments.get("speaker")
+            speaker = str(speaker).strip() if speaker is not None else None
+            result = {"ok": True, "kind": kind}
+            if kind in {"both", "dialogs"}:
+                result.update(self.dialogs_view(limit=limit, speaker=speaker or None))
+            if kind in {"both", "events"}:
+                result["events"] = self.event_log[-limit:]
+                result["events_total"] = len(self.event_log)
+            return result
+        if name == "get_inventory":
+            limit = self.agent_tool_limit(arguments.get("limit"), 40, 100)
+            return {"ok": True, **self.agent_inventory(state, limit=limit)}
+        if name == "get_room_memory":
             room_id = arguments.get("room_id")
             room_id = str(room_id) if room_id is not None else None
-            return {"ok": True, "exploration": self.room_exploration_summary(room_id, state)}
-        if name == "get_known_transitions":
-            from_room_id = arguments.get("from_room_id")
-            from_room_id = str(from_room_id) if from_room_id is not None else None
-            return {"ok": True, **self.known_transitions_summary(from_room_id, state)}
+            return {
+                "ok": True,
+                "exploration": self.room_exploration_summary(room_id, state),
+                "transitions": self.known_transitions_summary(room_id, state),
+            }
         if name == "submit_decision":
             submission_error = self.agent_decision_submission_error(arguments)
             if submission_error is not None:
                 return submission_error
-            decision = self.normalize_agent_decision(arguments)
+            decision = self.normalize_agent_submission(arguments, state)
             self.attach_decision_context(state, decision)
             self.validate_agent_decision(decision)
             return {"ok": True, "decision": decision}
@@ -6449,14 +6349,7 @@ class DebugState:
 
     def compact_agent_tool_arguments(self, name: str, arguments: dict) -> dict:
         if name == "submit_decision":
-            action = arguments.get("recommended_action") if isinstance(arguments.get("recommended_action"), dict) else {}
-            return {
-                "recommended_intent": arguments.get("recommended_intent"),
-                "recommended_action": {
-                    "tool": action.get("tool"),
-                    "args": action.get("args") if isinstance(action.get("args"), dict) else {},
-                },
-            }
+            return {key: arguments.get(key) for key in ("action", "target_id", "item_id", "role_id", "target", "reason") if key in arguments}
         payload = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
         if len(payload.encode("utf-8")) <= 800:
             return arguments
@@ -6575,22 +6468,16 @@ class DebugState:
     def agent_system_prompt(self) -> str:
         return (
             "你是 PALPAL 的只读游戏自动化顾问。"
-            "返回一个符合此 schema 的 JSON object："
-            "{summary:string,recommended_intent:string,recommended_action:{tool:string,args:object,dry_run:true},"
-            "evidence:object,risk:string,alternatives:[{intent:string,action:{tool:string,args:object,dry_run:true},reason:string}]}。"
-            "允许的 intents：advance_dialog、inspect_target、enter_transition、use_inventory_item、wait_runtime。"
-            "建议中允许的 tools：no_op、press_buttons、advance_dialog、navigation_step、use_item。"
-            "当 dialog.active 为 true 时，使用 recommended_action {tool:'advance_dialog', args:{}, dry_run:true}。"
-            "当建议 inspect_target 或 enter_transition 时，把选中的对象 id 放入 evidence.target.id，"
-            "并使用 recommended_action {tool:'navigation_step', args:{id:<target id>}, dry_run:true}。"
-            "建议非战斗物品使用时，使用 intent use_inventory_item 和 action "
-            "{tool:'use_item', args:{item_id:<id>,role_id:<role id>}, dry_run:true}；"
-            "target_mode=implicit_event_context 的物品将 args 改为 "
-            "{item_id:<id>,target:'all'}。"
+            "必须调用 submit_decision 结束本轮，只提交最小动作和一句简短 reason。"
+            "dialog.active=true 时提交 {action:'advance_dialog',reason:'...'}。"
+            "检查对象或进入传送时提交 {action:'navigate',target_id:<id>,reason:'...'}；服务端根据目标推导语义。"
+            "等待时提交 {action:'wait',reason:'...'}。"
+            "使用普通队员物品时提交 {action:'use_item',item_id:<id>,role_id:<role>,reason:'...'}；"
+            "target_mode=implicit_event_context 时改为 {action:'use_item',item_id:<id>,target:'all',reason:'...'}。"
             "注意 target:'all' 是兼容字段名：对 target_mode=implicit_event_context 的物品，SDLPAL 实际以 0xFFFF "
-            "运行使用脚本并沿用最近事件对象，不一定表示对全体队员生效。use_item 不接受 target_object_id。"
-            "没有明确安全目标时，建议 wait_runtime 搭配 no_op。"
-            "不要调用工具，不要声称动作已经执行，也不要包含密钥或 prompts。"
+            "运行使用脚本并沿用最近事件对象，不一定表示对全体队员生效。"
+            "不要提交 intent、recommended_action、evidence、risk、alternatives、dry_run 或原始按键。"
+            "不要执行游戏控制，不要声称动作已经执行，也不要包含密钥或 prompts。"
         )
 
     def agent_policy_prompt(self) -> str:
@@ -6604,11 +6491,11 @@ class DebugState:
             "比较目标时，分别报告 recent_dialog、soft_avoid、previously_cleared 和 previously_tried。"
             "将 agent_priority、interaction_state、recent_dialog_feedback、对象历史、目的地探索状态、路线成本和最近决策作为决策信号；不要把任何单一信号变成无条件优先规则。"
             "距离是成本信号，不是优先级规则；当近处目标重复陈旧或无效果行为时，它仍可能比更远目标或传送更差。"
-            "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 get_object_history。"
+            "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 inspect_target。"
             "若当前目标 transition_candidate=true、最近对象历史显示它由非传送目标变为传送目标、且 known_destination=false，"
             "应将它视为刚解锁的探索路线并优先建议 enter_transition；解锁动作本身产生的 previously_tried 或 avoid_repeat 不应降低它的优先级。"
             "一旦该传送已有 known destination，则停止使用刚解锁优先级，恢复目的地探索价值、任务和回退风险的正常比较。"
-            "当最近建议看起来反复访问同一房间、目标或传送循环时，使用 get_agent_history。"
+            "当最近建议看起来反复访问同一房间、目标或传送循环时，依据持久 session 中的最近决策和 get_room_memory 判断。"
             "传送目标包含 transition_key、to_semantic_room、confidence、destination_priority、destination_exploration 和 returns_to_recent_room。"
             "任务是 agent 从对话和事件推断的记忆，不是引擎事实。发现、调整、完成或作废任务时调用 upsert_task；不要自动关闭或过期任务。"
             "只有 active 任务明确关联到当前可执行对象、当前可达传送，或可达且已知通往任务 room_id 的传送时，才可压过探索策略；不可执行任务不得阻塞探索。"
@@ -6620,14 +6507,14 @@ class DebugState:
             "如果 dialog.active 为 true，优先选择 advance_dialog。如果 runtime stale、waiting 或 parse-error，建议 wait_runtime。"
             "只有在主游戏、非战斗、非对话状态下才可建议 use_inventory_item。先调用 get_inventory，确认物品 usable、"
             "available_amount 大于零，并严格匹配 apply_to_all 的目标形式。可结合物品名称、队伍 HP/MP、任务与剧情上下文"
-            "保守推断用途；用途或收益证据不足时不要仅因 usable=true 就建议使用，并在 risk 中说明误用或浪费风险。"
+            "保守推断用途；用途或收益证据不足时不要仅因 usable=true 就建议使用，并在 reason 中说明关键权衡。"
             "当 NPC 明确索要某物、背包存在匹配的 target_mode=implicit_event_context 物品、且刚与该 NPC 交互并结束对话时，"
-            "应优先考虑 use_item {item_id:<id>,target:'all'}；这会让 0xFFFF 使用脚本沿用最近 NPC/事件对象上下文。"
+            "应优先考虑 submit_decision {action:'use_item',item_id:<id>,target:'all',reason:'...'}；这会让 0xFFFF 使用脚本沿用最近 NPC/事件对象上下文。"
             "不要因 target_object_id 被拒绝就推断剧情物品只能靠重复 NPC 交互自动使用。进程重启或载入存档不会恢复最近事件对象，"
             "因此应先重新与目标 NPC 交互，再使用这种物品。普通全局效果脚本可能忽略事件上下文，不要把所有 apply_to_all 物品都视为剧情物品。"
-            "对于任何明确的 search/touch 目标，使用 inspect_target 或 enter_transition，并搭配 navigation_step(id)。"
-            "不要建议无目标的房间探索；如果没有明确目标，建议 wait_runtime 搭配 no_op。"
-            "使用 get_navigation(full) 比较传送目的地；只对你认真考虑的一两个目标调用 get_route。"
+            "对于任何明确的 search/touch 或 transition 目标，提交 navigate 和 target_id。"
+            "不要建议无目标的房间探索；如果没有明确目标，提交 wait。"
+            "使用 get_navigation 比较传送目的地；只对你认真考虑的一两个目标调用 inspect_target。"
             "解释所选目标背后的权衡，包括相关的陈旧反馈、重复/无效果交互风险、离开房间风险和回退风险。"
         )
 
@@ -6658,266 +6545,88 @@ class DebugState:
         )
         return {key: usage[key] for key in keys if key in usage}
 
-    def normalize_agent_decision(self, raw: dict) -> dict:
-        allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"}
-        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"}
-
-        def positive_int(value) -> int:
-            try:
-                parsed = int(value or 0)
-            except (TypeError, ValueError):
-                return 0
-            return parsed if parsed > 0 else 0
-
-        def target_id_from_mapping(payload: dict) -> int:
-            for key in ("target_id", "object_id"):
-                target_id = positive_int(payload.get(key))
-                if target_id > 0:
-                    return target_id
-            target = payload.get("target")
-            if isinstance(target, dict):
-                target_id = positive_int(target.get("id"))
-                if target_id > 0:
-                    return target_id
-            return 0
-
-        def target_id_from_action(action: dict) -> int:
-            if not isinstance(action, dict):
-                return 0
-            args = action.get("args") if isinstance(action.get("args"), dict) else {}
-            return positive_int(args.get("id"))
-
-        def explicit_target_id(action: dict, evidence: dict, args: dict) -> int:
-            return (
-                target_id_from_mapping(evidence)
-                or target_id_from_action(action)
-                or positive_int(args.get("id"))
-            )
-
-        def normalize_recommended_action(
-            intent: str,
-            action: dict,
-            evidence: dict,
-        ) -> tuple[str, str, dict, list[str]]:
-            warnings: list[str] = []
-            if intent not in allowed_intents:
-                intent = "wait_runtime"
-                warnings.append("normalized unknown intent to wait_runtime")
-            tool = action.get("tool") if isinstance(action.get("tool"), str) else "no_op"
-            raw_args = action.get("args") if isinstance(action.get("args"), dict) else {}
-            args = self.normalize_action_args(tool, raw_args)
-
-            if intent in {"inspect_target", "enter_transition"}:
-                target_id = explicit_target_id(action, evidence, args)
-                if target_id > 0:
-                    if tool != "navigation_step" or args.get("id") != target_id:
-                        warnings.append(f"normalized {intent} action to navigation_step")
-                    return intent, "navigation_step", {"id": target_id}, warnings
-                warnings.append(f"normalized {intent} action to wait_runtime")
-                return "wait_runtime", "no_op", {"reason": f"missing target id for {intent}"}, warnings
-            if intent == "advance_dialog":
-                if tool != "advance_dialog":
-                    warnings.append("normalized advance_dialog action to advance_dialog")
-                return intent, "advance_dialog", self.normalize_dialog_advance_args(raw_args), warnings
-            if intent == "use_inventory_item":
-                if tool != "use_item":
-                    warnings.append("normalized use_inventory_item action to wait_runtime")
-                    return "wait_runtime", "no_op", {"reason": "use_item_action_required"}, warnings
-                return intent, tool, args, warnings
-            if tool not in allowed_tools:
-                warnings.append("normalized unknown action tool to no_op")
-                return "wait_runtime", "no_op", {"reason": "unsupported_tool", "tool": str(tool or "")}, warnings
-            if intent == "wait_runtime" and tool != "no_op":
-                warnings.append("normalized wait_runtime action to no_op")
-                return intent, "no_op", {"reason": "wait_runtime"}, warnings
-            return intent, tool, args, warnings
-
-        decision = {
-            "summary": str(raw.get("summary") or "No summary returned."),
-            "recommended_intent": str(raw.get("recommended_intent") or "wait_runtime"),
-            "recommended_action": raw.get("recommended_action") if isinstance(raw.get("recommended_action"), dict) else {},
-            "evidence": raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {},
-            "risk": str(raw.get("risk") or "No risk assessment returned."),
-            "alternatives": raw.get("alternatives") if isinstance(raw.get("alternatives"), list) else [],
+    def normalize_agent_submission(self, raw: dict, state: dict) -> dict:
+        """Expand the model's minimal action into the stable internal decision shape."""
+        action = raw["action"]
+        reason = str(raw["reason"]).strip()
+        evidence: dict = {"submitted_action": action}
+        risk = "Server validation will run again immediately before execution."
+        if action == "wait":
+            intent, preview = "wait_runtime", self.action_preview("no_op", {"reason": "agent_wait"})
+            risk = "No game action will be executed."
+        elif action == "advance_dialog":
+            intent, preview = "advance_dialog", self.action_preview("advance_dialog", self.normalize_dialog_advance_args({}))
+            risk = "Dialogue advancement uses the server safety limits and stable-state observer."
+        elif action == "navigate":
+            target_id = int(raw["target_id"])
+            target = next((item for item in state.get("objects") or [] if str(item.get("id")) == str(target_id)), None)
+            is_transition = bool(target and transition_candidate(target))
+            intent = "enter_transition" if is_transition else "inspect_target"
+            preview = self.action_preview("navigation_step", {"id": target_id})
+            evidence["target"] = {"id": target_id, "transition_candidate": is_transition}
+            risk = "May leave the current room." if is_transition else "The target and route will be revalidated before movement."
+        else:
+            args = {"item_id": int(raw["item_id"])}
+            if "role_id" in raw:
+                args["role_id"] = int(raw["role_id"])
+            else:
+                args["target"] = "all"
+            intent, preview = "use_inventory_item", self.action_preview("use_item", args)
+            evidence["item_id"] = args["item_id"]
+            risk = "Item availability, target mode, and consumption risk will be validated against the latest inventory."
+        return {
+            "summary": reason,
+            "recommended_intent": intent,
+            "recommended_action": preview,
+            "evidence": evidence,
+            "risk": risk,
+            "alternatives": [],
         }
-        evidence = decision["evidence"]
-        intent, tool, args, warnings = normalize_recommended_action(
-            decision["recommended_intent"],
-            decision["recommended_action"],
-            evidence,
-        )
-        decision["recommended_intent"] = intent
-        if warnings:
-            evidence["normalization_warnings"] = warnings
-        decision["recommended_action"] = self.action_preview(tool, args)
-
-        alternatives = []
-        for alternative in decision["alternatives"][:3]:
-            if not isinstance(alternative, dict):
-                continue
-            alt_intent = str(alternative.get("intent") or "wait_runtime")
-            alt_action = alternative.get("action") if isinstance(alternative.get("action"), dict) else {}
-            alt_evidence = alternative.get("evidence") if isinstance(alternative.get("evidence"), dict) else {}
-            reason = str(alternative.get("reason") or "")
-            alt_intent, alt_tool, alt_args, alt_warnings = normalize_recommended_action(
-                alt_intent,
-                alt_action,
-                alt_evidence,
-            )
-            if alt_warnings:
-                reason = (reason + " " if reason else "") + f"Normalization: {'; '.join(alt_warnings)}."
-            alternatives.append(
-                {
-                    "intent": alt_intent,
-                    "action": self.action_preview(alt_tool, alt_args),
-                    "reason": reason,
-                }
-            )
-        decision["alternatives"] = alternatives
-        return decision
 
     def agent_decision_submission_error(self, raw: dict) -> dict | None:
-        """Return a repairable contract error for an LLM decision submission."""
-        allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"}
-        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"}
+        """Return a repairable error for the minimal submit_decision contract."""
         issues: list[dict] = []
-        intent = raw.get("recommended_intent")
-        action = raw.get("recommended_action")
-        evidence = raw.get("evidence")
+        allowed_keys = {"action", "target_id", "item_id", "role_id", "target", "reason"}
+        for key in raw:
+            if key not in allowed_keys:
+                issues.append({"field": key, "code": "unsupported_field", "message": f"{key} is not part of the minimal decision contract"})
+        action = raw.get("action")
+        if action not in {"wait", "advance_dialog", "navigate", "use_item"}:
+            issues.append({"field": "action", "code": "invalid_action", "message": "action must be wait, advance_dialog, navigate, or use_item"})
+        if not isinstance(raw.get("reason"), str) or not raw.get("reason", "").strip():
+            issues.append({"field": "reason", "code": "invalid_reason", "message": "reason must be a non-empty string"})
+        elif len(raw["reason"]) > 300:
+            issues.append({"field": "reason", "code": "reason_too_long", "message": "reason must be at most 300 characters"})
 
-        if intent not in allowed_intents:
-            issues.append({
-                "field": "recommended_intent",
-                "code": "invalid_intent",
-                "message": "recommended_intent must be one of advance_dialog, inspect_target, enter_transition, use_inventory_item, wait_runtime",
-            })
-        if not isinstance(action, dict):
-            issues.append({
-                "field": "recommended_action",
-                "code": "missing_action",
-                "message": "recommended_action must be an object with tool and args",
-            })
-            action = {}
-        if not isinstance(raw.get("summary"), str):
-            issues.append({"field": "summary", "code": "invalid_summary", "message": "summary must be a string"})
-        if not isinstance(evidence, dict):
-            issues.append({"field": "evidence", "code": "invalid_evidence", "message": "evidence must be an object"})
-            evidence = {}
-        if not isinstance(raw.get("risk"), str):
-            issues.append({"field": "risk", "code": "invalid_risk", "message": "risk must be a string"})
-        if not isinstance(raw.get("alternatives"), list):
-            issues.append({"field": "alternatives", "code": "invalid_alternatives", "message": "alternatives must be an array"})
-
-        tool = action.get("tool")
-        args = action.get("args")
-        if tool not in allowed_tools:
-            issues.append({
-                "field": "recommended_action.tool",
-                "code": "invalid_tool",
-                "message": "recommended_action.tool must be one of no_op, press_buttons, advance_dialog, navigation_step, use_item",
-            })
-        if not isinstance(args, dict):
-            issues.append({
-                "field": "recommended_action.args",
-                "code": "invalid_args",
-                "message": "recommended_action.args must be an object",
-            })
-            args = {}
-
-        if intent in {"inspect_target", "enter_transition"}:
-            target_id = 0
-            for candidate in (args.get("id"), evidence.get("target_id")):
-                try:
-                    target_id = int(candidate or 0)
-                except (TypeError, ValueError):
-                    target_id = 0
-                if target_id > 0:
-                    break
-            if target_id <= 0:
-                evidence_target = evidence.get("target")
-                try:
-                    target_id = int(evidence_target.get("id") or 0) if isinstance(evidence_target, dict) else 0
-                except (TypeError, ValueError):
-                    target_id = 0
-            if tool != "navigation_step":
-                issues.append({
-                    "field": "recommended_action.tool",
-                    "code": "intent_tool_mismatch",
-                    "message": f"{intent} requires recommended_action.tool to be navigation_step",
-                })
-            if target_id <= 0:
-                issues.append({
-                    "field": "recommended_action.args.id",
-                    "code": "missing_target_id",
-                    "message": f"{intent} requires a positive target id in recommended_action.args.id or evidence.target.id",
-                })
-        elif intent == "advance_dialog" and tool != "advance_dialog":
-            issues.append({
-                "field": "recommended_action.tool",
-                "code": "intent_tool_mismatch",
-                "message": "advance_dialog requires recommended_action.tool to be advance_dialog",
-            })
-        elif intent == "use_inventory_item":
-            if tool != "use_item":
-                issues.append({
-                    "field": "recommended_action.tool",
-                    "code": "intent_tool_mismatch",
-                    "message": "use_inventory_item requires recommended_action.tool to be use_item",
-                })
+        def positive_int(field: str, *, allow_zero: bool = False) -> int | None:
             try:
-                item_id = int(args.get("item_id") or 0)
+                value = int(raw.get(field))
             except (TypeError, ValueError):
-                item_id = 0
-            has_all_target = args.get("target") == "all"
-            has_role_target = "role_id" in args and args.get("role_id") is not None
-            has_object_target = "target_object_id" in args
-            try:
-                role_id = int(args.get("role_id")) if has_role_target else -1
-            except (TypeError, ValueError):
-                role_id = -1
-            if item_id <= 0:
-                issues.append({
-                    "field": "recommended_action.args.item_id",
-                    "code": "invalid_item_id",
-                    "message": "use_item requires a positive item_id",
-                })
-            if has_object_target:
-                issues.append({
-                    "field": "recommended_action.args.target_object_id",
-                    "code": "unsupported_item_object_target",
-                    "message": (
-                        "use_item cannot directly select a world object. For an apply_to_all item, first interact "
-                        "with the NPC to establish the event context, then submit target='all'; SDLPAL dispatches "
-                        "0xFFFF to the most recent event object."
-                    ),
-                })
-            elif has_all_target == has_role_target or (has_role_target and role_id < 0):
-                issues.append({
-                    "field": "recommended_action.args",
-                    "code": "invalid_item_target",
-                    "message": (
-                        "use_item requires exactly one target: role_id for party_role, or target='all' for "
-                        "implicit_event_context. The compatibility name 'all' dispatches 0xFFFF to the most "
-                        "recent event object and is not necessarily a whole-party effect."
-                    ),
-                })
-        elif intent == "wait_runtime" and tool != "no_op":
-            issues.append({
-                "field": "recommended_action.tool",
-                "code": "intent_tool_mismatch",
-                "message": "wait_runtime requires recommended_action.tool to be no_op",
-            })
+                return None
+            return value if value >= (0 if allow_zero else 1) else None
 
+        if action == "navigate" and positive_int("target_id") is None:
+            issues.append({"field": "target_id", "code": "invalid_target_id", "message": "navigate requires a positive target_id"})
+        if action == "use_item":
+            if positive_int("item_id") is None:
+                issues.append({"field": "item_id", "code": "invalid_item_id", "message": "use_item requires a positive item_id"})
+            has_role = "role_id" in raw and positive_int("role_id", allow_zero=True) is not None
+            has_all = raw.get("target") == "all"
+            if has_role == has_all:
+                issues.append({"field": "role_id|target", "code": "invalid_item_target", "message": "use_item requires exactly one of role_id or target='all'"})
+        relevant_keys = {
+            "wait": {"action", "reason"},
+            "advance_dialog": {"action", "reason"},
+            "navigate": {"action", "target_id", "reason"},
+            "use_item": {"action", "item_id", "role_id", "target", "reason"},
+        }.get(action)
+        if relevant_keys:
+            for key in raw.keys() - relevant_keys:
+                if key in allowed_keys:
+                    issues.append({"field": key, "code": "irrelevant_field", "message": f"{key} is not used by action={action}"})
         if not issues:
             return None
-        return {
-            "ok": False,
-            "error": {
-                "code": "invalid_decision_submission",
-                "message": "submit_decision was not accepted. Correct the listed fields and call submit_decision again.",
-                "issues": issues,
-            },
-        }
+        return {"ok": False, "error": {"code": "invalid_decision_submission", "message": "submit_decision was not accepted. Correct the listed fields and call submit_decision again.", "issues": issues}}
 
     def use_item_validation_error(self, state: dict, args: dict, check_pending: bool = True) -> str | None:
         if state.get("status") not in {None, "ok"}:
@@ -7583,6 +7292,22 @@ class Handler(BaseHTTPRequestHandler):
                 limit = 100
             self.send_json({"requests": self.server.state.read_agent_llm_log(limit=limit)})
             return
+        if parsed.path == "/agent/session":
+            self.send_json({"ok": True, "session": self.server.state.agent_runtime.snapshot()})
+            return
+        if parsed.path == "/agent/session/events":
+            query = parse_qs(parsed.query)
+            try:
+                after = int((query.get("after") or ["0"])[0])
+                limit = int((query.get("limit") or ["200"])[0])
+            except ValueError:
+                self.send_json({"ok": False, "error": "after and limit must be integers"}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"ok": True, "events": self.server.state.agent_runtime.events(after, limit)})
+            return
+        if parsed.path == "/agent/session/stream":
+            self.handle_agent_events_websocket(parsed)
+            return
         if parsed.path == "/checkpoints":
             self.send_json(self.server.state.list_checkpoints())
             return
@@ -7608,6 +7333,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/action":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 buttons = payload.get("buttons", [])
@@ -7620,6 +7347,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/inventory/use":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 result = self.server.state.write_use_item_action(
@@ -7633,6 +7362,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/dialog/advance":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 result = self.server.state.advance_dialog(payload)
@@ -7643,6 +7374,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/dialog/advance/stop":
+            if self.reject_if_agent_running():
+                return
             result = self.server.state.cancel_dialog_advance()
             self.send_json(result)
             return
@@ -7657,7 +7390,49 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
 
+        if self.path == "/agent/session/run":
+            try:
+                payload = self.read_body_json()
+                session = self.server.state.agent_runtime.start(
+                    payload.get("model"), payload.get("max_turns", 10)
+                )
+                self.send_json({"ok": True, "session": session}, HTTPStatus.ACCEPTED)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
+        if self.path == "/agent/session/decide":
+            try:
+                payload = self.read_body_json()
+                session = self.server.state.agent_runtime.start(payload.get("model"), 1, decide_only=True)
+                self.send_json({"ok": True, "session": session}, HTTPStatus.ACCEPTED)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
+        if self.path == "/agent/session/interrupt":
+            self.send_json({"ok": True, "session": self.server.state.agent_runtime.interrupt()})
+            return
+
+        if self.path == "/agent/session/execute":
+            try:
+                result = self.server.state.agent_runtime.execute()
+                self.send_json({"ok": True, "execution": result, "session": self.server.state.agent_runtime.snapshot()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
+        if self.path == "/agent/session/reset":
+            try:
+                session = self.server.state.agent_runtime.reset("user_reset")
+                self.send_json({"ok": True, "session": session})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
         if self.path == "/navigation/step":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 target = int(payload.get("id") or 0)
@@ -7723,6 +7498,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/checkpoints/save":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 result = self.server.state.save_checkpoint(payload.get("id"), payload.get("label"))
@@ -7732,6 +7509,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/checkpoints/load":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 result = self.server.state.load_checkpoint(str(payload.get("id") or ""))
@@ -7741,6 +7520,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/startup/new":
+            if self.reject_if_agent_running():
+                return
             try:
                 result = self.server.state.start_new_game()
                 self.send_json(result)
@@ -7776,6 +7557,15 @@ class Handler(BaseHTTPRequestHandler):
         size = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(size) if size else b"{}"
         return json.loads(raw.decode("utf-8"))
+
+    def reject_if_agent_running(self) -> bool:
+        if not self.server.state.agent_runtime.is_running():
+            return False
+        self.send_json(
+            {"ok": False, "error": "agent_session_running", "code": "agent_session_running"},
+            HTTPStatus.CONFLICT,
+        )
+        return True
 
     def send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -7867,6 +7657,27 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 last_signature = signature
             time.sleep(0.02)
+
+    def handle_agent_events_websocket(self, parsed) -> None:
+        if not self.handle_websocket_upgrade():
+            return
+        query = parse_qs(parsed.query)
+        try:
+            after = int((query.get("after") or ["0"])[0])
+        except ValueError:
+            after = 0
+        self.connection.settimeout(1.0)
+        while True:
+            events = self.server.state.agent_runtime.events(after=after, limit=200)
+            for event in events:
+                try:
+                    self.connection.sendall(
+                        websocket_frame(json.dumps(event, ensure_ascii=False).encode("utf-8"), opcode=0x1)
+                    )
+                except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                    return
+                after = max(after, int(event.get("seq") or 0))
+            time.sleep(0.1)
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"{self.address_string()} - {fmt % args}")

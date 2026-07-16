@@ -30,7 +30,7 @@ def test_deepseek_tool_decision_records_usage_trace_and_no_action():
         write_state(debug, state)
         captured = []
         timeouts = []
-        responses = [{'choices': [{'message': {'tool_calls': [{'id': 'call_state', 'type': 'function', 'function': {'name': 'get_state_summary', 'arguments': '{}'}}]}}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'total_tokens': 12}}, {'choices': [{'message': {'tool_calls': [{'id': 'call_nav', 'type': 'function', 'function': {'name': 'get_navigation', 'arguments': '{"mode":"full","limit":5}'}}]}}], 'usage': {'prompt_tokens': 6, 'completion_tokens': 2, 'total_tokens': 8}}, {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Leave the room to greet guests.', 'recommended_intent': 'enter_transition', 'recommended_action': {'tool': 'navigation_step', 'args': {'id': 52}}, 'evidence': {'target': {'id': 52}}, 'risk': 'May leave the room.', 'alternatives': []})}}]}}], 'usage': {'prompt_tokens': 4, 'completion_tokens': 3, 'total_tokens': 7, 'prompt_cache_hit_tokens': 64, 'prompt_cache_miss_tokens': 56}}]
+        responses = [{'choices': [{'message': {'tool_calls': [{'id': 'call_obs', 'type': 'function', 'function': {'name': 'get_observations', 'arguments': '{"kind":"events","limit":1}'}}]}}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'total_tokens': 12}}, {'choices': [{'message': {'tool_calls': [{'id': 'call_nav', 'type': 'function', 'function': {'name': 'get_navigation', 'arguments': '{"limit":5}'}}]}}], 'usage': {'prompt_tokens': 6, 'completion_tokens': 2, 'total_tokens': 8}}, {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'navigate', 'target_id': 52, 'reason': 'Leave the room to greet guests.'})}}]}}], 'usage': {'prompt_tokens': 4, 'completion_tokens': 3, 'total_tokens': 7, 'prompt_cache_hit_tokens': 64, 'prompt_cache_miss_tokens': 56}}]
 
         def fake_urlopen(request, timeout):
             captured.append(json.loads(request.data.decode('utf-8')))
@@ -51,7 +51,7 @@ def test_deepseek_tool_decision_records_usage_trace_and_no_action():
         assert [message['role'] for message in captured[0]['messages']] == ['system', 'system', 'user']
         assert 'response_format' not in captured[0]
         assert 'tools' in captured[0]
-        assert [trace['name'] for trace in decision['tool_trace']] == ['get_state_summary', 'get_navigation', 'submit_decision']
+        assert [trace['name'] for trace in decision['tool_trace']] == ['get_observations', 'get_navigation', 'submit_decision']
         assert not debug.action_path.exists()
         log = debug.read_agent_log(limit=1)
         assert log[0]['backend'] == 'deepseek'
@@ -92,9 +92,9 @@ def test_deepseek_timeout_applies_to_each_model_round():
         state = make_state()
         timeouts = []
         responses = [
-            {'choices': [{'message': {'tool_calls': [{'id': 'call_state', 'type': 'function', 'function': {'name': 'get_state_summary', 'arguments': '{}'}}]}}]},
-            {'choices': [{'message': {'tool_calls': [{'id': 'call_nav', 'type': 'function', 'function': {'name': 'get_navigation', 'arguments': '{"mode":"full","limit":5}'}}]}}]},
-            {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_obs', 'type': 'function', 'function': {'name': 'get_observations', 'arguments': '{"kind":"events","limit":1}'}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_nav', 'type': 'function', 'function': {'name': 'get_navigation', 'arguments': '{"limit":5}'}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'wait', 'reason': 'Wait.'})}}]}}]},
         ]
         clock = [100.0]
 
@@ -123,7 +123,7 @@ def test_deepseek_decide_agent_accepts_whitelisted_model():
             return False
 
         def read(self):
-            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})}}]}}]}).encode('utf-8')
+            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'wait', 'reason': 'Wait.'})}}]}}]}).encode('utf-8')
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state()
@@ -151,7 +151,7 @@ def test_deepseek_decide_agent_rejects_unknown_model_name():
             return False
 
         def read(self):
-            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Wait.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})}}]}}]}).encode('utf-8')
+            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'wait', 'reason': 'Wait.'})}}]}}]}).encode('utf-8')
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state()
@@ -221,7 +221,7 @@ def test_deepseek_exceeding_tool_rounds_returns_clear_error():
             return False
 
         def read(self):
-            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_state', 'type': 'function', 'function': {'name': 'get_state_summary', 'arguments': '{}'}}]}}]}).encode('utf-8')
+            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': 'call_obs', 'type': 'function', 'function': {'name': 'get_observations', 'arguments': '{"kind":"events","limit":1}'}}]}}]}).encode('utf-8')
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state()
@@ -243,7 +243,7 @@ def test_deepseek_submit_decision_allowed_after_query_tool_budget():
             return False
 
         def read(self):
-            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': f'call_state_{index}', 'type': 'function', 'function': {'name': 'get_state_summary', 'arguments': '{}'}} for index in range(40)] + [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Wait after inspection.', 'recommended_intent': 'wait_runtime', 'recommended_action': {'tool': 'no_op', 'args': {}}, 'evidence': {}, 'risk': 'None.', 'alternatives': []})}}]}}]}).encode('utf-8')
+            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': f'call_obs_{index}', 'type': 'function', 'function': {'name': 'get_observations', 'arguments': '{"kind":"events","limit":1}'}} for index in range(40)] + [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'wait', 'reason': 'Wait after inspection.'})}}]}}]}).encode('utf-8')
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state(objects=[make_touch_object(10)])
@@ -268,7 +268,7 @@ def test_deepseek_exceeding_tool_calls_writes_failure_log():
             return False
 
         def read(self):
-            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': f'call_state_{index}', 'type': 'function', 'function': {'name': 'get_state_summary', 'arguments': '{}'}} for index in range(41)]}}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'total_tokens': 12}}).encode('utf-8')
+            return json.dumps({'choices': [{'message': {'tool_calls': [{'id': f'call_obs_{index}', 'type': 'function', 'function': {'name': 'get_observations', 'arguments': '{"kind":"events","limit":1}'}} for index in range(41)]}}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 2, 'total_tokens': 12}}).encode('utf-8')
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = make_state()
@@ -305,7 +305,7 @@ def test_deepseek_submit_decision_downgrades_stale_navigation_target():
         original_state = make_state(objects=[make_touch_object(52)])
         latest_state = make_state(objects=[])
         write_state(debug, original_state)
-        response = {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect object #52.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'navigation_step', 'args': {'id': 52}}, 'evidence': {'target': {'id': 52}}, 'risk': 'Low.', 'alternatives': []})}}]}}]}
+        response = {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'navigate', 'target_id': 52, 'reason': 'Inspect object #52.'})}}]}}]}
 
         def fake_urlopen(request, timeout):
             write_state(debug, latest_state)
@@ -340,8 +340,8 @@ def test_deepseek_submit_decision_repairs_illegal_action():
         state = make_state(objects=[make_touch_object(10)])
         write_state(debug, state)
         responses = [
-            {'choices': [{'message': {'tool_calls': [{'id': 'call_bad_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'write_action', 'args': {'id': 10}}, 'evidence': {'target': {'id': 10}}, 'risk': 'Low.', 'alternatives': []})}}]}}]},
-            {'choices': [{'message': {'tool_calls': [{'id': 'call_fixed_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'navigation_step', 'args': {'id': 10}}, 'evidence': {'target': {'id': 10}}, 'risk': 'Low.', 'alternatives': []})}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_bad_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'write_action', 'target_id': 10, 'reason': 'Inspect target.'})}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_fixed_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'navigate', 'target_id': 10, 'reason': 'Inspect target.'})}}]}}]},
         ]
         captured = []
 
@@ -377,7 +377,7 @@ def test_deepseek_submit_decision_fails_after_one_unsuccessful_repair():
         debug = make_debug_state(tmp)
         state = make_state(objects=[make_touch_object(74)])
         write_state(debug, state)
-        response = {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Explore one step.', 'recommended_intent': 'explore_room', 'recommended_action': {'tool': 'exploration_step', 'args': {'max_steps': 1}}, 'evidence': {'target': {'id': 74}}, 'risk': 'Low.', 'alternatives': []})}}]}}]}
+        response = {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'explore', 'target_id': 74, 'reason': 'Explore one step.'})}}]}}]}
         with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', lambda request, timeout: FakeResponse()):
             with pytest.raises(RuntimeError, match='remained invalid after 1 repair attempt'):
                 debug.deepseek_decide_agent(state)
@@ -405,8 +405,8 @@ def test_deepseek_submit_decision_repairs_missing_target_id():
         state = make_state(objects=[make_touch_object(10)])
         write_state(debug, state)
         responses = [
-            {'choices': [{'message': {'tool_calls': [{'id': 'call_bad_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': None, 'args': {}}, 'evidence': {}, 'risk': 'Low.', 'alternatives': []})}}]}}]},
-            {'choices': [{'message': {'tool_calls': [{'id': 'call_fixed_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'summary': 'Inspect target.', 'recommended_intent': 'inspect_target', 'recommended_action': {'tool': 'navigation_step', 'args': {'id': 10}}, 'evidence': {'target': {'id': 10}}, 'risk': 'Low.', 'alternatives': []})}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_bad_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'navigate', 'reason': 'Inspect target.'})}}]}}]},
+            {'choices': [{'message': {'tool_calls': [{'id': 'call_fixed_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'navigate', 'target_id': 10, 'reason': 'Inspect target.'})}}]}}]},
         ]
         with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', lambda request, timeout: FakeResponse()):
             decision = debug.deepseek_decide_agent(state)

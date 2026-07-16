@@ -330,14 +330,14 @@ def test_recent_dialog_feedback_decays_by_agent_turn():
         identity = debug.room_identity(state)
         debug.dialog_history = [{'frame': 50, 'room_id': identity['id'], 'room_key': identity['room_key'], 'region_key': identity['region_key'], 'nav_room_id': identity['nav_room_id'], 'scene_id': identity['scene_id'], 'map_id': identity['map_id'], 'event_object_id': 57, 'message_id': 588, 'speaker_hint': '苗人頭領', 'text': '你們跑不掉了', 'agent_turn': 1}]
         debug.agent_log_path.write_text('\n'.join((json.dumps({'turn': turn, 'episode': identity['id'], 'nav_room_id': identity['nav_room_id'], 'decision': {}}) for turn in (1, 2, 3))) + '\n', encoding='utf-8')
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         targets = {item['id']: item for item in navigation['targets']}
         assert targets[57]['agent_priority'] == 'soft_avoid'
         assert targets[57]['dialog_feedback_state'] == 'soft_avoid'
         decision = debug.rules_decide_agent(state)
         assert decision['recommended_action']['args'] == {'id': 58}
         debug.agent_log_path.write_text('\n'.join((json.dumps({'turn': turn, 'episode': identity['id'], 'nav_room_id': identity['nav_room_id'], 'decision': {}}) for turn in (1, 2, 3, 4))) + '\n', encoding='utf-8')
-        navigation = debug.run_agent_tool('get_navigation', {'mode': 'full'}, state)['navigation']
+        navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
         targets = {item['id']: item for item in navigation['targets']}
         assert targets[57]['interaction_state'] == 'recent_dialog'
         assert targets[57]['agent_priority'] == 'soft_avoid'

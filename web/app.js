@@ -4,6 +4,14 @@ const jsonLiveEl = document.getElementById("jsonLive");
 const jsonRefreshEl = document.getElementById("jsonRefresh");
 const jsonStatusEl = document.getElementById("jsonStatus");
 const agentEl = document.getElementById("agent");
+const normalTabEl = document.getElementById("normalTab");
+const agentTabEl = document.getElementById("agentTab");
+const normalPanelEl = document.getElementById("normalPanel");
+const agentPanelEl = document.getElementById("agentPanel");
+const agentSessionHeaderEl = document.getElementById("agentSessionHeader");
+const agentSessionControlsEl = document.getElementById("agentSessionControls");
+const agentTimelineEl = document.getElementById("agentTimeline");
+const agentJumpLatestEl = document.getElementById("agentJumpLatest");
 const summaryEl = document.getElementById("summary");
 const checkpointsEl = document.getElementById("checkpoints");
 const objectsEl = document.getElementById("objects");
@@ -52,6 +60,17 @@ let agentActionStatus = "";
 let agentResultTitlePending = false;
 let agentResultTitleTimer = null;
 let selectedAgentModel = null;
+let agentSession = null;
+let agentSessionEvents = [];
+let agentEventSeq = 0;
+let agentEventSocket = null;
+let agentUnread = 0;
+let agentSessionHeaderRenderKey = null;
+let agentSessionControlsRenderKey = null;
+let agentTimelineRenderKey = null;
+let agentRenderDeferred = false;
+let selectedStateTab = localStorage.getItem("palpal.stateTab") === "agent" ? "agent" : "normal";
+let agentMaxTurns = Math.max(1, Math.min(Number(localStorage.getItem("palpal.agentMaxTurns") || 10), 100));
 let checkpoints = [];
 let checkpointsLoaded = false;
 let checkpointBusy = null;
@@ -218,7 +237,7 @@ function navigationFullReady(state) {
 }
 
 function navigationTargetActionable(state, targetId) {
-  if (!navigationFullReady(state) || state?.dialog?.active || state?.in_battle || state?._debug?.runtime_stale) {
+  if (!navigationFullReady(state) || state?.dialog?.active || state?.in_battle || state?._debug?.runtime_stale || sessionRunning()) {
     return false;
   }
   const target = navigationTargets(state).get(targetId);
@@ -288,6 +307,8 @@ agentEl.addEventListener("click", (event) => {
     askAgent();
   } else if (actionEl.dataset.agentAction === "execute") {
     executeAgentRecommendation();
+  } else if (actionEl.dataset.agentAction === "open") {
+    selectStateTab("agent", true);
   }
 });
 
@@ -297,7 +318,22 @@ agentEl.addEventListener("change", (event) => {
   selectedAgentModel = modelEl.value;
 });
 
+agentEl.addEventListener("focusout", (event) => {
+  if (!event.target.closest("[data-agent-model]") || !agentRenderDeferred) return;
+  setTimeout(() => {
+    if (agentRenderDeferred && latestState && agentEl.querySelector("[data-agent-model]") !== document.activeElement) {
+      renderAgent(latestState);
+    }
+  }, 0);
+});
+
 checkpointsEl?.addEventListener("click", (event) => {
+  const dismissEl = event.target.closest("[data-checkpoint-dismiss]");
+  if (dismissEl && checkpointsEl.contains(dismissEl)) {
+    event.preventDefault();
+    closeCheckpointMenu();
+    return;
+  }
   const actionEl = event.target.closest("[data-checkpoint-action]");
   if (!actionEl || !checkpointsEl.contains(actionEl)) return;
   const action = actionEl.dataset.checkpointAction;
@@ -576,11 +612,15 @@ function renderCheckpoints(state) {
   const existingMenu = checkpointsEl.querySelector(".checkpointMenu");
   const menuOpen = Boolean(existingMenu?.open);
   const existingInput = document.getElementById("checkpointLabel");
+  const existingPanel = checkpointsEl.querySelector(".checkpointMenuPanel");
+  const existingList = checkpointsEl.querySelector(".checkpointList");
   const existingLabel = existingInput?.value || "";
+  const panelScrollTop = existingPanel?.scrollTop || 0;
+  const listScrollTop = existingList?.scrollTop || 0;
   const labelHadFocus = document.activeElement === existingInput;
   const labelSelectionStart = existingInput?.selectionStart ?? existingLabel.length;
   const labelSelectionEnd = existingInput?.selectionEnd ?? labelSelectionStart;
-  const stateBusy = Boolean(checkpointBusy);
+  const stateBusy = Boolean(checkpointBusy) || sessionRunning();
   const startupWaiting = state?.status === "startup_waiting";
   const stableMainGame = state?.in_main_game !== false && !state?._debug?.runtime_stale && !state?.dialog?.active && !state?.in_battle && !state?.entering_scene && !state?._debug?.action_pending;
   const canSave = !stateBusy && stableMainGame;
@@ -660,8 +700,13 @@ function renderCheckpoints(state) {
 
   checkpointsEl.innerHTML = `
     <details class="checkpointMenu" ${menuOpen ? "open" : ""}>
-      <summary>${escapeHtml(buttonText)}</summary>
-      <div class="checkpointMenuPanel">
+      <summary aria-haspopup="dialog">${escapeHtml(buttonText)}</summary>
+      <div class="checkpointBackdrop" data-checkpoint-dismiss aria-hidden="true"></div>
+      <div class="checkpointMenuPanel" role="dialog" aria-modal="true" aria-labelledby="checkpointDialogTitle">
+        <div class="checkpointDialogHeader">
+          <h2 id="checkpointDialogTitle">Checkpoints</h2>
+          <button class="miniButton" type="button" data-checkpoint-dismiss aria-label="Close checkpoints">Close</button>
+        </div>
         <div class="checkpointControls">
           <input id="checkpointLabel" type="text" maxlength="120" placeholder="short label" value="${escapeHtml(existingLabel)}" ${stateBusy ? "disabled" : ""} />
           <button id="checkpointSave" data-checkpoint-action="save" ${canSave ? "" : "disabled"}>${checkpointBusy === "saving" ? "Saving..." : "Save"}</button>
@@ -682,6 +727,10 @@ function renderCheckpoints(state) {
       nextInput.setSelectionRange(labelSelectionStart, labelSelectionEnd);
     }
   }
+  const nextPanel = checkpointsEl.querySelector(".checkpointMenuPanel");
+  const nextList = checkpointsEl.querySelector(".checkpointList");
+  if (nextPanel) nextPanel.scrollTop = panelScrollTop;
+  if (nextList) nextList.scrollTop = listScrollTop;
   checkpointRenderKey = renderKey;
 }
 
@@ -964,7 +1013,7 @@ function evidenceItems(evidence) {
     .join("");
 }
 
-function renderAgentDecision(decision) {
+function renderAgentDecision(decision, openState = {}) {
   if (!decision) return '<div class="navEmpty">No agent decisions yet.</div>';
   const alternatives = decision.alternatives || [];
   const toolsUsed = Array.isArray(decision.tool_trace) ? decision.tool_trace.length : 0;
@@ -982,11 +1031,11 @@ function renderAgentDecision(decision) {
       <span>Risk</span>
       <p>${escapeHtml(decision.risk || "-")}</p>
     </div>
-    <details>
+    <details class="agentEvidence" ${openState.evidence ? "open" : ""}>
       <summary>Evidence</summary>
       <ul>${evidenceItems(decision.evidence)}</ul>
     </details>
-    ${alternatives.length ? `<details>
+    ${alternatives.length ? `<details class="agentAlternatives" ${openState.alternatives ? "open" : ""}>
       <summary>Alternatives</summary>
       <div class="agentAlternatives">${alternatives.map((alternative) => `
         <div>
@@ -1064,11 +1113,15 @@ function currentAgentModel(state) {
 function renderAgent(state) {
   const log = state._debug?.recent_agent_decisions || [];
   const agentStatus = state._debug?.agent_status || {};
+  const persistentSession = state._debug?.agent_session || agentSession || {};
   const historyOpen = Boolean(agentEl.querySelector(".agentHistory")?.open);
+  const evidenceOpen = Boolean(agentEl.querySelector(".agentEvidence")?.open);
+  const alternativesOpen = Boolean(agentEl.querySelector(".agentAlternatives")?.open);
+  const modelFocused = agentEl.querySelector("[data-agent-model]") === document.activeElement;
   const decisionLog = log.filter((entry) => entry?.decision);
   const decision = agentVisibleDecision(state);
   const history = decisionLog.slice(-8).reverse();
-  const agentBusy = agentRequestInFlight || agentExecutionInFlight || Boolean(agentStatus.running);
+  const agentBusy = agentRequestInFlight || agentExecutionInFlight || Boolean(agentStatus.running) || ["running", "interrupting"].includes(persistentSession.status);
   const executeDisabledReason = agentExecutionDisabledReason(decision, state, agentBusy);
   const executeDisabled = Boolean(executeDisabledReason);
   const modelOptions = agentModelOptions(state);
@@ -1097,6 +1150,7 @@ function renderAgent(state) {
       agentStatus.error,
       agentStatus.updated_at,
     ],
+    persistentSession,
     decision,
     stateContext: agentRuntimeKey(state),
     history: history.map((entry) => [
@@ -1107,15 +1161,17 @@ function renderAgent(state) {
       entry.decision?.tool_trace?.length,
     ]),
   });
-  agentRenderKey = setPanelHtml(agentEl, `
+  const html = `
     <div class="agentControls">
       ${modelSelect}
-      <button data-agent-action="decide" ${agentBusy ? "disabled" : ""}>${escapeHtml(agentButtonText(agentStatus))}</button>
+      <button data-agent-action="decide" ${agentBusy ? "disabled" : ""}>Decide Once</button>
       <button data-agent-action="execute" ${executeDisabled ? "disabled" : ""}>${agentExecutionInFlight ? "Executing..." : "Execute Action"}</button>
+      <button data-agent-action="open">Open Agent Mode</button>
       <span class="agentStatusText">${escapeHtml(agentStatusText(agentStatus, executeDisabledReason, decision))}</span>
     </div>
+    <div class="agentProgress">Session ${escapeHtml(agentStatusLabel(persistentSession))} · turn ${Number(persistentSession.turn || 0)}</div>
     ${renderAgentProgress(agentStatus)}
-    ${agentError ? renderAgentError(agentError) : renderAgentDecision(decision)}
+    ${agentError ? renderAgentError(agentError) : renderAgentDecision(decision, { evidence: evidenceOpen, alternatives: alternativesOpen })}
     <details class="agentHistory" ${historyOpen ? "open" : ""}>
       <summary>Decision History <span>${history.length}</span></summary>
       ${history.length ? history.map((entry) => `
@@ -1125,7 +1181,13 @@ function renderAgent(state) {
         </div>
       `).join("") : '<div class="navEmpty">No agent decisions yet.</div>'}
     </details>
-  `, renderKey, agentRenderKey);
+  `;
+  if (agentRenderKey !== renderKey && modelFocused) {
+    agentRenderDeferred = true;
+    return;
+  }
+  agentRenderDeferred = false;
+  agentRenderKey = setPanelHtml(agentEl, html, renderKey, agentRenderKey);
 }
 
 function itemFlagLabels(item) {
@@ -1147,7 +1209,7 @@ function renderInventory(state) {
   }
 
   const firstRole = state.party?.[0]?.role_id ?? 0;
-  const disabled = Boolean(state.in_battle || state.dialog?.active || state._debug?.runtime_stale);
+  const disabled = Boolean(state.in_battle || state.dialog?.active || state._debug?.runtime_stale || sessionRunning());
   const renderKey = JSON.stringify(items.map((item) => [
     item.slot,
     item.item_id,
@@ -1758,6 +1820,8 @@ function render(state) {
   renderSummary(state);
   renderCheckpoints(state);
   renderAgent(state);
+  renderAgentSession();
+  updateExternalControls(state);
   renderFastDialogButton(state);
   renderDialogs(state);
   renderEvents(state);
@@ -1768,6 +1832,293 @@ function render(state) {
   renderObjects(state);
   drawOverlay(state);
   scheduleNavigationRefresh(state);
+}
+
+function selectStateTab(name, persist = false) {
+  selectedStateTab = name === "agent" ? "agent" : "normal";
+  const agentSelected = selectedStateTab === "agent";
+  normalTabEl?.setAttribute("aria-selected", String(!agentSelected));
+  agentTabEl?.setAttribute("aria-selected", String(agentSelected));
+  if (normalTabEl) normalTabEl.tabIndex = agentSelected ? -1 : 0;
+  if (agentTabEl) agentTabEl.tabIndex = agentSelected ? 0 : -1;
+  if (normalPanelEl) normalPanelEl.hidden = agentSelected;
+  if (agentPanelEl) agentPanelEl.hidden = !agentSelected;
+  if (persist) localStorage.setItem("palpal.stateTab", selectedStateTab);
+  if (agentSelected) {
+    agentUnread = 0;
+    renderAgentSession();
+    if (agentTimelineEl) agentTimelineEl.scrollTop = agentTimelineEl.scrollHeight;
+  }
+}
+
+function setupStateTabs() {
+  const tabs = [normalTabEl, agentTabEl].filter(Boolean);
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => selectStateTab(tab === agentTabEl ? "agent" : "normal", true));
+    tab.addEventListener("keydown", (event) => {
+      let index = tabs.indexOf(tab);
+      if (event.key === "ArrowRight") index = (index + 1) % tabs.length;
+      else if (event.key === "ArrowLeft") index = (index - 1 + tabs.length) % tabs.length;
+      else if (event.key === "Home") index = 0;
+      else if (event.key === "End") index = tabs.length - 1;
+      else return;
+      event.preventDefault();
+      tabs[index].focus();
+      selectStateTab(tabs[index] === agentTabEl ? "agent" : "normal", true);
+    });
+  });
+  selectStateTab(selectedStateTab);
+}
+
+function sessionRunning() {
+  const status = agentSession?.status || latestState?._debug?.agent_session?.status;
+  return status === "running" || status === "interrupting";
+}
+
+function setAgentSession(nextSession) {
+  if (!nextSession) return false;
+  const changed = Boolean(agentSession?.session_id && agentSession.session_id !== nextSession.session_id);
+  agentSession = nextSession;
+  if (changed) {
+    agentSessionEvents = [];
+    agentEventSeq = 0;
+    agentUnread = 0;
+  }
+  return changed;
+}
+
+function updateExternalControls(state) {
+  const running = sessionRunning();
+  document.querySelectorAll("[data-button], [data-use-item], [data-nav-go]").forEach((button) => {
+    if (running) {
+      button.dataset.agentDisabled = button.disabled ? "already" : "agent";
+      button.disabled = true;
+    } else if (button.dataset.agentDisabled === "agent") {
+      button.disabled = false;
+      delete button.dataset.agentDisabled;
+    }
+  });
+  if (fastDialogButton && running) fastDialogButton.disabled = true;
+}
+
+function agentStatusLabel(session) {
+  const status = session?.status || "loading";
+  const reason = session?.stop_reason ? ` · ${session.stop_reason}` : "";
+  return `${status}${reason}`;
+}
+
+function renderAgentSession() {
+  if (!agentSessionHeaderEl || !agentSessionControlsEl || !agentTimelineEl) return;
+  const session = agentSession || latestState?._debug?.agent_session || {};
+  const usage = session.usage || {};
+  const lastUsage = session.last_request_usage || {};
+  const running = ["running", "interrupting"].includes(session.status);
+  const pending = Boolean(session.pending_decision);
+  const headerRenderKey = JSON.stringify([
+    session.status,
+    session.stop_reason,
+    session.model,
+    session.turn,
+    session.run_turn,
+    session.max_turns,
+    usage.total_tokens,
+    lastUsage.total_tokens,
+    session.context_estimate_tokens,
+    session.compactions,
+    session.game_instance_id,
+    session.parent_session_id,
+    session.checkpoint_id,
+    session.restored_from_session_id,
+  ]);
+  if (agentSessionHeaderRenderKey !== headerRenderKey) {
+    agentSessionHeaderEl.innerHTML = `
+      <div><span>Permanent goal</span><strong>通关游戏</strong></div>
+      <span class="agentSessionStatus is-${escapeHtml(session.status || "loading")}">${escapeHtml(agentStatusLabel(session))}</span>
+      <dl>
+        <div><dt>Model</dt><dd>${escapeHtml(session.model || "-")}</dd></div>
+        <div><dt>Turn</dt><dd>${Number(session.turn || 0)}</dd></div>
+        <div><dt>Run</dt><dd>${Number(session.run_turn || 0)}/${Number(session.max_turns || agentMaxTurns)}</dd></div>
+        <div><dt>Billed</dt><dd>${Number(usage.total_tokens || 0).toLocaleString()}</dd></div>
+        <div><dt>Last run</dt><dd>${Number(lastUsage.total_tokens || 0).toLocaleString()}</dd></div>
+        <div><dt>Context est.</dt><dd>${Number(session.context_estimate_tokens || 0).toLocaleString()}</dd></div>
+        <div><dt>Compactions</dt><dd>${Number(session.compactions || 0)}</dd></div>
+        <div><dt>Lineage</dt><dd>${escapeHtml(session.checkpoint_id ? `checkpoint ${session.checkpoint_id}` : session.parent_session_id ? "session branch" : "game")}</dd></div>
+      </dl>`;
+    agentSessionHeaderRenderKey = headerRenderKey;
+  }
+  const model = selectedAgentModel || session.model || fallbackAgentModels[0];
+  // Keep native form controls mounted across high-frequency state updates.
+  // Replacing an open <select> closes its popup before the user can choose.
+  const controlsRenderKey = JSON.stringify([running, pending, Boolean(session.turn)]);
+  if (agentSessionControlsRenderKey !== controlsRenderKey) {
+    agentSessionControlsEl.innerHTML = `
+      <label>Model<select data-session-model ${running ? "disabled" : ""}>${fallbackAgentModels.map((item) => `<option ${item === model ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}</select></label>
+      <label>Max turns<input data-session-turns type="number" min="1" max="100" value="${agentMaxTurns}" ${running ? "disabled" : ""} /></label>
+      <div class="agentSessionButtons">
+        <button data-session-action="run" ${running ? "disabled" : ""}>${session.turn ? "Ask Agent / Resume" : "Ask Agent"}</button>
+        <button data-session-action="interrupt" ${running ? "" : "disabled"}>Interrupt</button>
+        <button data-session-action="decide" ${running ? "disabled" : ""}>Decide Once</button>
+        <button data-session-action="execute" ${running || !pending ? "disabled" : ""}>Execute</button>
+        <button data-session-action="reset" ${running ? "disabled" : ""}>Reset Session</button>
+      </div>`;
+    agentSessionControlsRenderKey = controlsRenderKey;
+  }
+  renderAgentTimeline();
+}
+
+function eventIcon(event) {
+  if (event.type === "error") return "×";
+  if (["pause", "interrupt"].includes(event.type)) return "Ⅱ";
+  if (["completed", "observed", "ready"].includes(event.phase)) return "✓";
+  if (["request", "progress", "validating", "executing", "deciding"].includes(event.phase)) return "●";
+  return "·";
+}
+
+function renderAgentTimeline() {
+  if (!agentTimelineEl) return;
+  const activePhases = new Set(["deciding", "request", "tool_called", "tool_output", "submitted", "validating", "executing", "progress"]);
+  const latestEvent = agentSessionEvents.at(-1);
+  const currentEventSeq = sessionRunning() && activePhases.has(latestEvent?.phase)
+    ? Number(latestEvent?.seq || 0)
+    : 0;
+  const wasNearBottom = agentTimelineEl.scrollHeight - agentTimelineEl.scrollTop - agentTimelineEl.clientHeight < 60;
+  const previousScrollTop = agentTimelineEl.scrollTop;
+  const openDetails = new Set(
+    [...agentTimelineEl.querySelectorAll(".agentActivity[data-event-seq] > div > details[open]")]
+      .map((details) => details.closest(".agentActivity")?.dataset.eventSeq)
+      .filter(Boolean)
+  );
+  const timelineRenderKey = `${agentSession?.session_id || ""}:${agentSession?.status || ""}:${agentSessionEvents.length}:${latestEvent?.seq || 0}`;
+  if (agentTimelineRenderKey === timelineRenderKey) {
+    if (agentJumpLatestEl) {
+      agentJumpLatestEl.hidden = agentUnread === 0;
+      agentJumpLatestEl.textContent = agentUnread ? `Jump to latest (${agentUnread})` : "Jump to latest";
+    }
+    return;
+  }
+  const groups = new Map();
+  agentSessionEvents.forEach((event) => {
+    const turn = Number(event.turn || 0);
+    if (!groups.has(turn)) groups.set(turn, []);
+    groups.get(turn).push(event);
+  });
+  agentTimelineEl.innerHTML = agentSessionEvents.length ? [...groups.entries()].map(([turn, events]) => `
+    <section class="agentTurn">
+      <h3>${turn ? `Turn ${turn}` : "Session"}</h3>
+      ${events.map((event) => `<article class="agentActivity is-${escapeHtml(event.type)} is-${escapeHtml(event.phase)}${Number(event.seq || 0) === currentEventSeq ? " is-current" : ""}" data-event-seq="${Number(event.seq || 0)}">
+        <span class="agentActivityIcon" aria-hidden="true">${eventIcon(event)}</span>
+        <div><div class="agentActivityTitle"><strong>${escapeHtml(event.summary || event.type)}</strong><time>${escapeHtml(event.time || "")}${event.elapsed != null ? ` · ${event.elapsed}s` : ""}</time></div>
+        ${event.details && Object.keys(event.details).length ? `<details ${openDetails.has(String(event.seq || 0)) ? "open" : ""}><summary>Details</summary><pre>${escapeHtml(JSON.stringify(event.details, null, 2))}</pre></details>` : ""}</div>
+      </article>`).join("")}
+    </section>`).join("") : '<div class="agentTimelineEmpty">No activity yet. Ask Agent to start.</div>';
+  agentTimelineRenderKey = timelineRenderKey;
+  if (selectedStateTab === "agent" && wasNearBottom) {
+    agentTimelineEl.scrollTop = agentTimelineEl.scrollHeight;
+    agentUnread = 0;
+  } else {
+    agentTimelineEl.scrollTop = previousScrollTop;
+  }
+  if (agentJumpLatestEl) {
+    agentJumpLatestEl.hidden = agentUnread === 0;
+    agentJumpLatestEl.textContent = agentUnread ? `Jump to latest (${agentUnread})` : "Jump to latest";
+  }
+}
+
+async function agentSessionRequest(action) {
+  const model = agentSessionControlsEl.querySelector("[data-session-model]")?.value || selectedAgentModel;
+  const turns = Math.max(1, Math.min(Number(agentSessionControlsEl.querySelector("[data-session-turns]")?.value || agentMaxTurns), 100));
+  agentMaxTurns = turns;
+  localStorage.setItem("palpal.agentMaxTurns", String(turns));
+  const options = { method: "POST", headers: { "Content-Type": "application/json" } };
+  if (["run", "decide"].includes(action)) options.body = JSON.stringify({ model, max_turns: turns });
+  const response = await fetch(`/agent/session/${action}`, options);
+  const result = await response.json();
+  if (!response.ok || !result.ok) throw new Error(result.error || `${action} failed: ${response.status}`);
+  const sessionChanged = setAgentSession(result.session);
+  if (sessionChanged) connectAgentEvents();
+  if (["run", "decide"].includes(action)) selectStateTab("agent", true);
+  renderAgentSession();
+}
+
+agentSessionControlsEl?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-session-action]");
+  if (!button) return;
+  button.disabled = true;
+  agentSessionRequest(button.dataset.sessionAction).catch((error) => {
+    button.disabled = false;
+    agentError = error instanceof Error ? error.message : String(error);
+    renderAgentSession();
+  });
+});
+
+agentSessionControlsEl?.addEventListener("change", (event) => {
+  const modelEl = event.target.closest("[data-session-model]");
+  if (modelEl) selectedAgentModel = modelEl.value;
+  const turnsEl = event.target.closest("[data-session-turns]");
+  if (turnsEl) {
+    agentMaxTurns = Math.max(1, Math.min(Number(turnsEl.value || 10), 100));
+    turnsEl.value = String(agentMaxTurns);
+    localStorage.setItem("palpal.agentMaxTurns", String(agentMaxTurns));
+  }
+});
+
+agentJumpLatestEl?.addEventListener("click", () => {
+  agentTimelineEl.scrollTop = agentTimelineEl.scrollHeight;
+  agentUnread = 0;
+  renderAgentTimeline();
+});
+
+async function refreshAgentSession() {
+  const response = await fetch("/agent/session");
+  const result = await response.json();
+  if (!response.ok || !result.ok) throw new Error(result.error || "session unavailable");
+  setAgentSession(result.session);
+  if (sessionRunning()) selectStateTab("agent", true);
+  const eventsResponse = await fetch(`/agent/session/events?after=0&limit=500`);
+  const eventsResult = await eventsResponse.json();
+  agentSessionEvents = eventsResult.events || [];
+  agentEventSeq = agentSessionEvents.reduce((value, event) => Math.max(value, Number(event.seq || 0)), 0);
+  renderAgentSession();
+  connectAgentEvents();
+}
+
+function connectAgentEvents() {
+  if (agentEventSocket) agentEventSocket.close();
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${protocol}//${location.host}/agent/session/stream?after=${agentEventSeq}`);
+  agentEventSocket = ws;
+  ws.onmessage = (message) => {
+    const event = JSON.parse(message.data);
+    if (event.session_id !== agentSession?.session_id || Number(event.seq || 0) <= agentEventSeq) return;
+    agentEventSeq = Number(event.seq || agentEventSeq);
+    agentSessionEvents.push(event);
+    if (agentSessionEvents.length > 500) agentSessionEvents.shift();
+    const nearBottom = agentTimelineEl.scrollHeight - agentTimelineEl.scrollTop - agentTimelineEl.clientHeight < 60;
+    if (selectedStateTab !== "agent" || !nearBottom) agentUnread += 1;
+    renderAgentTimeline();
+    refreshAgentSessionStateOnly();
+  };
+  ws.onclose = () => {
+    if (agentEventSocket === ws) setTimeout(connectAgentEvents, 1000);
+  };
+}
+
+async function refreshAgentSessionStateOnly() {
+  try {
+    const response = await fetch("/agent/session");
+    const result = await response.json();
+    const changed = result.ok ? setAgentSession(result.session) : false;
+    renderAgentSession();
+    if (changed) {
+      const eventsResponse = await fetch("/agent/session/events?after=0&limit=500");
+      const eventsResult = await eventsResponse.json();
+      agentSessionEvents = eventsResult.events || [];
+      agentEventSeq = agentSessionEvents.reduce((value, event) => Math.max(value, Number(event.seq || 0)), 0);
+      connectAgentEvents();
+    }
+  } catch (_) {
+    // The websocket reconnect path will retry.
+  }
 }
 
 async function useInventoryItem(itemId, target) {
@@ -1978,7 +2329,7 @@ async function askAgent() {
   if (latestState) renderAgent(latestState);
 
   try {
-    const response = await fetch("/agent/decide", {
+    const response = await fetch("/agent/session/decide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: currentAgentModel(latestState) }),
@@ -1987,9 +2338,9 @@ async function askAgent() {
     if (!response.ok || !result.ok) {
       throw new Error(result.error || `agent failed: ${response.status}`);
     }
-    agentLastDecision = result.decision;
-    await refreshState();
-    showAgentResultInTitle();
+    setAgentSession(result.session);
+    selectStateTab("agent", true);
+    renderAgentSession();
   } catch (error) {
     agentLastDecision = null;
     agentError = error instanceof Error ? error.message : String(error);
@@ -2001,65 +2352,17 @@ async function askAgent() {
 
 async function executeAgentRecommendation() {
   if (agentExecutionInFlight) return;
-  const decision = agentVisibleDecision(latestState);
-  const action = decision?.recommended_action;
-  const disabledReason = agentExecutionDisabledReason(
-    decision,
-    latestState,
-    agentRequestInFlight || Boolean(latestState?._debug?.agent_status?.running)
-  );
-  if (disabledReason) {
-    agentActionStatus = disabledReason;
-    if (latestState) renderAgent(latestState);
-    return;
-  }
-
   agentExecutionInFlight = true;
   agentActionStatus = "";
   if (latestState) renderAgent(latestState);
 
   try {
-    if (action.tool === "press_buttons") {
-      const args = action.args || {};
-      const rawButtons = Array.isArray(args.buttons) ? args.buttons : [args.buttons].filter(Boolean);
-      const buttons = rawButtons.map((button) => String(button).trim().toLowerCase()).filter(Boolean);
-      if (!buttons.length) throw new Error("press_buttons action has no buttons");
-      const parsedFrames = Number.isFinite(Number(args.frames)) ? Number(args.frames) : 1;
-      const frames = Math.max(1, Math.min(Math.trunc(parsedFrames), 300));
-      await sendAction(buttons, frames);
-      agentActionStatus = `Executed ${actionText(action)}.`;
-      await refreshState();
-      return;
-    }
-
-    if (action.tool === "advance_dialog") {
-      await advanceDialogRequest(action.args || {});
-      agentActionStatus = "Advanced dialog.";
-      await refreshState();
-      return;
-    }
-
-    if (action.tool === "navigation_step") {
-      const targetId = Number(action.args?.id || 0);
-      if (!targetId) throw new Error("navigation target is missing");
-      await navigateToTarget(targetId);
-      agentActionStatus = `Executed navigation_step {"id":${targetId}}.`;
-      await refreshState();
-      return;
-    }
-
-    if (action.tool === "use_item") {
-      const args = action.args || {};
-      const itemId = Number(args.item_id || 0);
-      if (!itemId) throw new Error("inventory item is missing");
-      const target = args.target === "all" ? "all" : String(args.role_id);
-      await useInventoryItem(itemId, target);
-      agentActionStatus = `Queued ${actionText(action)}.`;
-      await refreshState();
-      return;
-    }
-
-    agentActionStatus = "Recommendation has no executable action.";
+    const response = await fetch("/agent/session/execute", { method: "POST" });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || `execute failed: ${response.status}`);
+    setAgentSession(result.session);
+    agentActionStatus = "Executed pending recommendation.";
+    await refreshState();
   } catch (error) {
     agentActionStatus = `Action failed: ${error instanceof Error ? error.message : String(error)}`;
   } finally {
@@ -2411,6 +2714,7 @@ function flashButton(buttonName) {
 }
 
 function sendButton(buttonName) {
+  if (sessionRunning()) return;
   const now = performance.now();
   if (!repeatableButtons.has(buttonName)) {
     const last = lastActionAt.get(buttonName) || 0;
@@ -2482,6 +2786,14 @@ function checkpointMenuActive() {
   return Boolean(openMenu);
 }
 
+function closeCheckpointMenu() {
+  const openMenu = checkpointsEl?.querySelector(".checkpointMenu[open]");
+  if (!openMenu) return false;
+  openMenu.open = false;
+  openMenu.querySelector(":scope > summary")?.focus();
+  return true;
+}
+
 function shouldIgnoreGameKeydown(event) {
   const target = event.target instanceof Element ? event.target : null;
   if (event.defaultPrevented) return true;
@@ -2493,6 +2805,11 @@ function shouldIgnoreGameKeydown(event) {
 
 window.addEventListener("keydown", (event) => {
   const target = event.target instanceof Element ? event.target : null;
+  if (event.key === "Escape" && checkpointMenuActive()) {
+    event.preventDefault();
+    closeCheckpointMenu();
+    return;
+  }
   if (shouldIgnoreGameKeydown(event)) return;
 
   if (
@@ -2523,6 +2840,8 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+setupStateTabs();
+refreshAgentSession().catch((error) => console.warn("agent session unavailable", error));
 connectStream();
 connectFrames();
 refreshCheckpoints();

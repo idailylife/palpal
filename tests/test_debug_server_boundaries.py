@@ -159,6 +159,54 @@ def test_http_handler_deletes_checkpoints_and_reports_missing(http_server):
     assert payload == {"ok": True, "id": "cp1"}
     assert not checkpoint_dir.exists()
 
+
+def test_http_handler_agent_session_api_and_running_action_boundary(http_server):
+    base_url, debug = http_server
+    debug.agent_runtime.decision_provider = lambda state, model, feedback: {
+        "summary": "pause for test",
+        "recommended_intent": "wait_runtime",
+        "recommended_action": {"tool": "no_op", "args": {}, "dry_run": True},
+        "evidence": {},
+        "risk": "none",
+        "alternatives": [],
+    }
+
+    status, _, raw = http_request(base_url, "/agent/session")
+    payload = json.loads(raw)
+    assert status == 200
+    assert payload["session"]["goal"] == "通关游戏"
+
+    status, _, raw = http_request(
+        base_url,
+        "/agent/session/decide",
+        method="POST",
+        payload={"model": "deepseek-v4-flash"},
+    )
+    payload = json.loads(raw)
+    assert status == 202
+    deadline = time.monotonic() + 2
+    while debug.agent_runtime.is_running() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert debug.agent_runtime.snapshot()["stop_reason"] == "awaiting_manual_execute"
+
+    status, _, raw = http_request(base_url, "/agent/session/events?after=0&limit=20")
+    payload = json.loads(raw)
+    assert status == 200
+    assert any(event["type"] == "decision" for event in payload["events"])
+
+    debug.agent_runtime.state.update(status="running", phase="deciding")
+    status, _, raw = http_request(
+        base_url,
+        "/action",
+        method="POST",
+        payload={"buttons": ["search"], "frames": 1},
+    )
+    payload = json.loads(raw)
+    assert status == 409
+    assert payload["code"] == "agent_session_running"
+    assert not debug.action_path.exists()
+    debug.agent_runtime.state.update(status="paused", phase="paused")
+
     status, _, raw = http_request(base_url, "/checkpoints/missing", method="DELETE")
     payload = json.loads(raw)
     assert status == 404
@@ -243,6 +291,18 @@ def active_dialog_state(text="hello"):
     return state
 
 
+def visible_dialog_state(text="hello"):
+    state = active_dialog_state(text)
+    state["dialog"].update({"visible": True, "held": False})
+    return state
+
+
+def held_dialog_state(text="hello"):
+    state = active_dialog_state(text)
+    state["dialog"].update({"visible": False, "held": True})
+    return state
+
+
 def active_dialog_event_state(events, party=None):
     text = events[-1].get("text") if events else "hello"
     state = active_dialog_state(text)
@@ -292,6 +352,86 @@ def test_advance_dialog_continues_through_transient_inactive_gap(tmp_path, monke
     assert result["status"] == "dialog_inactive"
     assert result["presses"] == 2
     assert written == [(["search"], 1), (["search"], 1)]
+
+
+def test_advance_dialog_waits_through_held_state_until_inactive(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    snapshots = [
+        visible_dialog_state("苗人头领"),
+        held_dialog_state("苗人头领"),
+        make_state(),
+        make_state(),
+        make_state(),
+        make_state(),
+    ]
+    written = []
+
+    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
+    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
+    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    assert result["ok"] is True
+    assert result["status"] == "dialog_inactive"
+    assert result["presses"] == 1
+    assert written == [(["search"], 1)]
+
+
+def test_advance_dialog_waits_for_next_visible_page_before_pressing(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    snapshots = [
+        visible_dialog_state("first"),
+        held_dialog_state("first"),
+        visible_dialog_state("second"),
+        make_state(),
+        make_state(),
+        make_state(),
+        make_state(),
+    ]
+    written = []
+
+    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
+    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
+    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    assert result["ok"] is True
+    assert result["status"] == "dialog_inactive"
+    assert result["presses"] == 2
+    assert written == [(["search"], 1), (["search"], 1)]
+
+
+def test_advance_dialog_starting_held_waits_without_pressing(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    snapshots = [held_dialog_state(), make_state(), make_state(), make_state(), make_state()]
+    written = []
+
+    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
+    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    assert result["ok"] is True
+    assert result["status"] == "dialog_inactive"
+    assert result["presses"] == 0
+    assert written == []
+
+
+def test_advance_dialog_visibility_timeout_does_not_press(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    written = []
+
+    monkeypatch.setattr(debug, "snapshot", lambda: held_dialog_state())
+    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    assert result["ok"] is False
+    assert result["status"] == "dialog_visibility_timeout"
+    assert result["presses"] == 0
+    assert written == []
 
 
 def test_advance_dialog_reports_pending_timeout_and_cancel(tmp_path, monkeypatch):

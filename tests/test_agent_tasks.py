@@ -19,8 +19,8 @@ def test_task_ledger_create_update_close_and_filtering():
         updated = debug.run_agent_tool("upsert_task", {"id": task_id, "status": "completed"})
         assert updated["ok"]
         assert updated["task"]["history"][-1]["changes"]["status"]["to"] == "completed"
-        assert debug.run_agent_tool("get_tasks", {})["tasks"] == []
-        history = debug.run_agent_tool("get_tasks", {"include_closed": True})["tasks"]
+        assert debug.task_ledger() == []
+        history = debug.task_ledger(include_closed=True)
         assert history[0]["id"] == task_id
         assert not debug.run_agent_tool("upsert_task", {"description": "missing reason"})["ok"]
 
@@ -42,7 +42,7 @@ def test_task_ledger_is_additive_and_survives_checkpoint_round_trip():
             debug.save_checkpoint("tasks", "Tasks")
             debug.write_exploration(debug.empty_exploration())
             debug.load_checkpoint("tasks")
-        restored = debug.run_agent_tool("get_tasks", {})["tasks"]
+        restored = debug.task_ledger()
         assert restored[0]["id"] == created["task"]["id"]
 
 
