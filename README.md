@@ -193,8 +193,14 @@ POST /agent/session/decide
 POST /agent/session/execute
 POST /agent/session/reset
 GET  /agent/session/events?after=0&limit=200
+GET  /agent/session/events?turn_limit=5&before_turn=12
 WS   /agent/session/stream?after=0
 ```
+
+The Web UI initially loads the latest five complete turn groups. Scrolling to
+the top loads earlier groups in five-turn pages; the `before_turn` cursor is
+omitted for the newest page. The original `after`/`limit` event query remains
+available for forward event consumers and WebSocket catch-up.
 
 Session control metadata, the SDK SQLite transcript, and replayable activity
 events live under gitignored `runtime/agent/`. A server restart pauses an

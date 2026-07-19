@@ -64,6 +64,10 @@ let agentSession = null;
 let agentSessionEvents = [];
 let agentEventSeq = 0;
 let agentEventSocket = null;
+let agentHasOlderEvents = false;
+let agentOldestTurn = null;
+let agentOlderEventsLoading = false;
+let agentHistoryExpanded = false;
 let agentUnread = 0;
 let agentSessionHeaderRenderKey = null;
 let agentSessionControlsRenderKey = null;
@@ -95,6 +99,7 @@ const actionCooldownMs = 180;
 const dialogAdvanceDelayMs = 500;
 const dialogAdvanceMaxPresses = 100;
 const jsonUpdateIntervalMs = 1000;
+const agentTimelinePageTurns = 5;
 
 function showAgentResultInTitle() {
   clearAgentResultTitle();
@@ -1882,9 +1887,92 @@ function setAgentSession(nextSession) {
   if (changed) {
     agentSessionEvents = [];
     agentEventSeq = 0;
+    agentHasOlderEvents = false;
+    agentOldestTurn = null;
+    agentOlderEventsLoading = false;
+    agentHistoryExpanded = false;
     agentUnread = 0;
   }
   return changed;
+}
+
+function agentEventTurn(event) {
+  return Math.max(0, Number(event?.turn || 0));
+}
+
+function mergeAgentSessionEvents(events) {
+  const merged = new Map();
+  [...events, ...agentSessionEvents].forEach((event) => {
+    merged.set(Number(event.seq || 0), event);
+  });
+  return [...merged.values()].sort((left, right) => Number(left.seq || 0) - Number(right.seq || 0));
+}
+
+function trimAgentTimelineToLatestTurns() {
+  const turns = [...new Set(agentSessionEvents.map(agentEventTurn).filter((turn) => turn > 0))]
+    .sort((left, right) => left - right);
+  if (turns.length <= agentTimelinePageTurns) return;
+  const keptTurns = new Set(turns.slice(-agentTimelinePageTurns));
+  agentSessionEvents = agentSessionEvents.filter((event) => keptTurns.has(agentEventTurn(event)));
+  agentOldestTurn = Math.min(...keptTurns);
+  agentHasOlderEvents = true;
+}
+
+async function fetchAgentEventTurnPage(beforeTurn = null) {
+  const query = new URLSearchParams({ turn_limit: String(agentTimelinePageTurns) });
+  if (beforeTurn != null) query.set("before_turn", String(beforeTurn));
+  const response = await fetch(`/agent/session/events?${query}`);
+  const result = await response.json();
+  if (!response.ok || !result.ok) throw new Error(result.error || "session events unavailable");
+  return result;
+}
+
+async function loadLatestAgentEvents() {
+  const expectedSessionId = agentSession?.session_id;
+  const result = await fetchAgentEventTurnPage();
+  if (!expectedSessionId || expectedSessionId !== agentSession?.session_id || result.session_id !== expectedSessionId) return false;
+  agentSessionEvents = result.events || [];
+  agentHasOlderEvents = Boolean(result.has_more);
+  agentOldestTurn = result.oldest_turn == null ? null : Number(result.oldest_turn);
+  agentHistoryExpanded = false;
+  agentEventSeq = agentSessionEvents.reduce((value, event) => Math.max(value, Number(event.seq || 0)), 0);
+  agentTimelineRenderKey = null;
+  return true;
+}
+
+async function loadEarlierAgentEvents() {
+  if (!agentHasOlderEvents || agentOldestTurn == null || agentOlderEventsLoading) return;
+  const expectedSessionId = agentSession?.session_id;
+  const beforeTurn = agentOldestTurn;
+  agentOlderEventsLoading = true;
+  const loadingButton = agentTimelineEl?.querySelector("[data-agent-load-earlier]");
+  if (loadingButton) {
+    loadingButton.disabled = true;
+    loadingButton.textContent = "Loading earlier turns…";
+  }
+  try {
+    const result = await fetchAgentEventTurnPage(beforeTurn);
+    if (!expectedSessionId || expectedSessionId !== agentSession?.session_id || result.session_id !== expectedSessionId) return;
+    const anchorScrollHeight = agentTimelineEl.scrollHeight;
+    const anchorScrollTop = agentTimelineEl.scrollTop;
+    agentSessionEvents = mergeAgentSessionEvents(result.events || []);
+    agentHasOlderEvents = Boolean(result.has_more);
+    agentOldestTurn = result.oldest_turn == null ? agentOldestTurn : Number(result.oldest_turn);
+    agentHistoryExpanded = true;
+    agentTimelineRenderKey = null;
+    renderAgentTimeline({ anchorScrollHeight, anchorScrollTop });
+  } catch (error) {
+    console.warn("earlier agent turns unavailable", error);
+    const retryButton = agentTimelineEl?.querySelector("[data-agent-load-earlier]");
+    if (retryButton) retryButton.textContent = "Retry loading earlier turns";
+  } finally {
+    agentOlderEventsLoading = false;
+    const button = agentTimelineEl?.querySelector("[data-agent-load-earlier]");
+    if (button) {
+      button.disabled = false;
+      if (button.textContent === "Loading earlier turns…") button.textContent = "Load earlier turns";
+    }
+  }
 }
 
 function updateExternalControls(state) {
@@ -1974,7 +2062,7 @@ function eventIcon(event) {
   return "·";
 }
 
-function renderAgentTimeline() {
+function renderAgentTimeline({ anchorScrollHeight = null, anchorScrollTop = 0 } = {}) {
   if (!agentTimelineEl) return;
   const activePhases = new Set(["deciding", "request", "tool_called", "tool_output", "submitted", "validating", "executing", "progress"]);
   const latestEvent = agentSessionEvents.at(-1);
@@ -1988,7 +2076,7 @@ function renderAgentTimeline() {
       .map((details) => details.closest(".agentActivity")?.dataset.eventSeq)
       .filter(Boolean)
   );
-  const timelineRenderKey = `${agentSession?.session_id || ""}:${agentSession?.status || ""}:${agentSessionEvents.length}:${latestEvent?.seq || 0}`;
+  const timelineRenderKey = `${agentSession?.session_id || ""}:${agentSession?.status || ""}:${agentSessionEvents.length}:${agentSessionEvents[0]?.seq || 0}:${latestEvent?.seq || 0}:${agentHasOlderEvents}`;
   if (agentTimelineRenderKey === timelineRenderKey) {
     if (agentJumpLatestEl) {
       agentJumpLatestEl.hidden = agentUnread === 0;
@@ -2002,7 +2090,10 @@ function renderAgentTimeline() {
     if (!groups.has(turn)) groups.set(turn, []);
     groups.get(turn).push(event);
   });
-  agentTimelineEl.innerHTML = agentSessionEvents.length ? [...groups.entries()].map(([turn, events]) => `
+  const earlierButton = agentHasOlderEvents
+    ? `<button class="agentLoadEarlier" type="button" data-agent-load-earlier>Load earlier turns</button>`
+    : "";
+  agentTimelineEl.innerHTML = agentSessionEvents.length ? earlierButton + [...groups.entries()].map(([turn, events]) => `
     <section class="agentTurn">
       <h3>${turn ? `Turn ${turn}` : "Session"}</h3>
       ${events.map((event) => `<article class="agentActivity is-${escapeHtml(event.type)} is-${escapeHtml(event.phase)}${Number(event.seq || 0) === currentEventSeq ? " is-current" : ""}" data-event-seq="${Number(event.seq || 0)}">
@@ -2012,7 +2103,9 @@ function renderAgentTimeline() {
       </article>`).join("")}
     </section>`).join("") : '<div class="agentTimelineEmpty">No activity yet. Ask Agent to start.</div>';
   agentTimelineRenderKey = timelineRenderKey;
-  if (selectedStateTab === "agent" && wasNearBottom) {
+  if (anchorScrollHeight != null) {
+    agentTimelineEl.scrollTop = anchorScrollTop + agentTimelineEl.scrollHeight - anchorScrollHeight;
+  } else if (selectedStateTab === "agent" && wasNearBottom) {
     agentTimelineEl.scrollTop = agentTimelineEl.scrollHeight;
     agentUnread = 0;
   } else {
@@ -2035,7 +2128,10 @@ async function agentSessionRequest(action) {
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error(result.error || `${action} failed: ${response.status}`);
   const sessionChanged = setAgentSession(result.session);
-  if (sessionChanged) connectAgentEvents();
+  if (sessionChanged) {
+    await loadLatestAgentEvents();
+    connectAgentEvents();
+  }
   if (["run", "decide"].includes(action)) selectStateTab("agent", true);
   renderAgentSession();
 }
@@ -2068,16 +2164,22 @@ agentJumpLatestEl?.addEventListener("click", () => {
   renderAgentTimeline();
 });
 
+agentTimelineEl?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-agent-load-earlier]")) loadEarlierAgentEvents();
+});
+
+agentTimelineEl?.addEventListener("scroll", () => {
+  const scrollable = agentTimelineEl.scrollHeight > agentTimelineEl.clientHeight + 1;
+  if (scrollable && agentTimelineEl.scrollTop <= 48) loadEarlierAgentEvents();
+});
+
 async function refreshAgentSession() {
   const response = await fetch("/agent/session");
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error(result.error || "session unavailable");
   setAgentSession(result.session);
   if (sessionRunning()) selectStateTab("agent", true);
-  const eventsResponse = await fetch(`/agent/session/events?after=0&limit=500`);
-  const eventsResult = await eventsResponse.json();
-  agentSessionEvents = eventsResult.events || [];
-  agentEventSeq = agentSessionEvents.reduce((value, event) => Math.max(value, Number(event.seq || 0)), 0);
+  await loadLatestAgentEvents();
   renderAgentSession();
   connectAgentEvents();
 }
@@ -2092,7 +2194,7 @@ function connectAgentEvents() {
     if (event.session_id !== agentSession?.session_id || Number(event.seq || 0) <= agentEventSeq) return;
     agentEventSeq = Number(event.seq || agentEventSeq);
     agentSessionEvents.push(event);
-    if (agentSessionEvents.length > 500) agentSessionEvents.shift();
+    if (!agentHistoryExpanded) trimAgentTimelineToLatestTurns();
     const nearBottom = agentTimelineEl.scrollHeight - agentTimelineEl.scrollTop - agentTimelineEl.clientHeight < 60;
     if (selectedStateTab !== "agent" || !nearBottom) agentUnread += 1;
     renderAgentTimeline();
@@ -2110,10 +2212,7 @@ async function refreshAgentSessionStateOnly() {
     const changed = result.ok ? setAgentSession(result.session) : false;
     renderAgentSession();
     if (changed) {
-      const eventsResponse = await fetch("/agent/session/events?after=0&limit=500");
-      const eventsResult = await eventsResponse.json();
-      agentSessionEvents = eventsResult.events || [];
-      agentEventSeq = agentSessionEvents.reduce((value, event) => Math.max(value, Number(event.seq || 0)), 0);
+      await loadLatestAgentEvents();
       connectAgentEvents();
     }
   } catch (_) {
@@ -2263,6 +2362,7 @@ async function loadCheckpoint(id) {
     resetLocalAfterCheckpointLoad();
     await refreshCheckpoints();
     await refreshState();
+    await refreshAgentSession();
   } catch (error) {
     checkpointError = error instanceof Error ? error.message : String(error);
   } finally {
@@ -2289,6 +2389,7 @@ async function startNewGame() {
     checkpointStatus = "Started.";
     resetLocalAfterCheckpointLoad();
     await refreshState();
+    await refreshAgentSession();
   } catch (error) {
     checkpointError = error instanceof Error ? error.message : String(error);
   } finally {

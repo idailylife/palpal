@@ -7538,6 +7538,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/agent/session/events":
             query = parse_qs(parsed.query)
+            if "turn_limit" in query or "before_turn" in query:
+                try:
+                    turn_limit = int((query.get("turn_limit") or ["5"])[0])
+                    before_raw = (query.get("before_turn") or [None])[0]
+                    before_turn = int(before_raw) if before_raw is not None else None
+                except ValueError:
+                    self.send_json({"ok": False, "error": "before_turn and turn_limit must be integers"}, HTTPStatus.BAD_REQUEST)
+                    return
+                self.send_json({
+                    "ok": True,
+                    **self.server.state.agent_runtime.event_turn_page(before_turn, turn_limit),
+                })
+                return
             try:
                 after = int((query.get("after") or ["0"])[0])
                 limit = int((query.get("limit") or ["200"])[0])

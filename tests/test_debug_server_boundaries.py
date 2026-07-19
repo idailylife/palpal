@@ -194,6 +194,14 @@ def test_http_handler_agent_session_api_and_running_action_boundary(http_server)
     assert status == 200
     assert any(event["type"] == "decision" for event in payload["events"])
 
+    status, _, raw = http_request(base_url, "/agent/session/events?turn_limit=5")
+    payload = json.loads(raw)
+    assert status == 200
+    assert payload["session_id"] == debug.agent_runtime.snapshot()["session_id"]
+    assert payload["oldest_turn"] == 1
+    assert payload["has_more"] is False
+    assert {event["turn"] for event in payload["events"]} == {0, 1}
+
     debug.agent_runtime.state.update(status="running", phase="deciding")
     status, _, raw = http_request(
         base_url,

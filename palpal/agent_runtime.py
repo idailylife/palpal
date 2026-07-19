@@ -295,6 +295,52 @@ class AgentRuntime:
                 result.append(event)
         return result[:limit]
 
+    def event_turn_page(
+        self,
+        before_turn: int | None = None,
+        turn_limit: int = 5,
+        session_id: str | None = None,
+    ) -> dict:
+        """Return complete timeline turn groups, newest page first by cursor."""
+        turn_limit = max(1, min(int(turn_limit), 50))
+        wanted = session_id or self.state.get("session_id")
+        events = self._all_session_events(str(wanted or ""))
+        turns: dict[int, list[dict]] = {}
+        normalized_events: list[tuple[int, dict]] = []
+        for event in events:
+            try:
+                turn = max(0, int(event.get("turn") or 0))
+            except (TypeError, ValueError):
+                turn = 0
+            turns.setdefault(turn, []).append(event)
+            normalized_events.append((turn, event))
+
+        numbered_turns = sorted(turn for turn in turns if turn > 0)
+        candidates = numbered_turns
+        if before_turn is not None:
+            candidates = [turn for turn in candidates if turn < int(before_turn)]
+        selected_turns = candidates[-turn_limit:]
+        reached_oldest_turn = not numbered_turns or (
+            bool(selected_turns) and selected_turns[0] == numbered_turns[0]
+        )
+        include_session = 0 in turns and reached_oldest_turn
+        selected = set(selected_turns)
+        page_events = [
+            event for turn, event in normalized_events
+            if turn in selected or (include_session and turn == 0)
+        ]
+        has_more = bool(
+            (selected_turns and any(turn < selected_turns[0] for turn in numbered_turns))
+            or (0 in turns and not include_session)
+        )
+        return {
+            "session_id": wanted,
+            "events": page_events,
+            "has_more": has_more,
+            "oldest_turn": selected_turns[0] if selected_turns else None,
+            "turn_limit": turn_limit,
+        }
+
     def _all_session_events(self, session_id: str) -> list[dict]:
         result: list[dict] = []
         try:

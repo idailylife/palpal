@@ -482,6 +482,13 @@ button.is-active {
 .agentActivity pre { background: #0b0e11; border-radius: 5px; font-size: 10px; margin: 5px 0 0; max-height: 300px; padding: 7px; }
 .agentTimelineEmpty { color: #8fa0af; padding: 30px 10px; text-align: center; }
 
+.agentLoadEarlier {
+  justify-self: center;
+  margin: 0 0 4px;
+  min-height: 30px;
+  padding: 4px 12px;
+}
+
 .agentJumpLatest {
   bottom: 16px;
   box-shadow: 0 5px 20px rgba(0, 0, 0, .45);

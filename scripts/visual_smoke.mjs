@@ -303,6 +303,61 @@ async function main() {
       throw new Error(`agent timeline stability smoke failed (${JSON.stringify(timelineResult)})`);
     }
 
+    const timelinePagingState = await cdp.send(
+      "Runtime.evaluate",
+      {
+        returnByValue: true,
+        expression: `(() => {
+          agentSessionEvents = Array.from({ length: 24 }, (_, index) => ({
+            seq: index + 1,
+            turn: Math.floor(index / 4) + 1,
+            type: "tool",
+            phase: "completed",
+            summary: "Paged event " + (index + 1),
+            details: {},
+          }));
+          agentHasOlderEvents = false;
+          agentHistoryExpanded = false;
+          trimAgentTimelineToLatestTurns();
+          agentTimelineRenderKey = null;
+          renderAgentTimeline();
+          const timeline = document.getElementById("agentTimeline");
+          const trimmedHeadings = [...timeline.querySelectorAll(".agentTurn h3")].map((node) => node.textContent);
+          const hasLoadButton = Boolean(timeline.querySelector("[data-agent-load-earlier]"));
+          const anchorScrollHeight = timeline.scrollHeight;
+          agentSessionEvents = mergeAgentSessionEvents(Array.from({ length: 4 }, (_, index) => ({
+            seq: index + 1,
+            turn: 1,
+            type: "tool",
+            phase: "completed",
+            summary: "Earlier event " + (index + 1),
+            details: {},
+          })));
+          agentHasOlderEvents = false;
+          agentHistoryExpanded = true;
+          agentTimelineRenderKey = null;
+          renderAgentTimeline({ anchorScrollHeight, anchorScrollTop: 0 });
+          const loadedHeadings = [...timeline.querySelectorAll(".agentTurn h3")].map((node) => node.textContent);
+          return {
+            trimmedHeadings,
+            hasLoadButton,
+            loadedHeadings,
+            scrollAnchored: Math.abs(timeline.scrollTop - (timeline.scrollHeight - anchorScrollHeight)) <= 1,
+          };
+        })()`,
+      },
+      sessionId
+    );
+    const timelinePagingResult = timelinePagingState.result?.value;
+    if (
+      JSON.stringify(timelinePagingResult?.trimmedHeadings) !== JSON.stringify(["Turn 2", "Turn 3", "Turn 4", "Turn 5", "Turn 6"])
+      || !timelinePagingResult.hasLoadButton
+      || JSON.stringify(timelinePagingResult.loadedHeadings) !== JSON.stringify(["Turn 1", "Turn 2", "Turn 3", "Turn 4", "Turn 5", "Turn 6"])
+      || !timelinePagingResult.scrollAnchored
+    ) {
+      throw new Error(`agent timeline paging smoke failed (${JSON.stringify(timelinePagingResult)})`);
+    }
+
     const normalAgentState = await cdp.send(
       "Runtime.evaluate",
       {
@@ -408,6 +463,57 @@ async function main() {
       throw new Error(`checkpoint modal smoke failed (${JSON.stringify(checkpointModal)})`);
     }
 
+    const checkpointSessionSync = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const calls = [];
+          const originalFetch = window.fetch;
+          const originalConfirm = window.confirm;
+          const originalRefreshCheckpoints = refreshCheckpoints;
+          const originalRefreshState = refreshState;
+          const originalRefreshAgentSession = refreshAgentSession;
+          try {
+            window.confirm = () => true;
+            window.fetch = async (url) => {
+              calls.push("fetch:" + url);
+              return { ok: true, json: async () => ({ ok: true }) };
+            };
+            refreshCheckpoints = async () => calls.push("refreshCheckpoints");
+            refreshState = async () => calls.push("refreshState");
+            refreshAgentSession = async () => calls.push("refreshAgentSession");
+            checkpointBusy = null;
+            await loadCheckpoint("session-sync-smoke");
+            return { calls, checkpointStatus, checkpointError };
+          } finally {
+            window.fetch = originalFetch;
+            window.confirm = originalConfirm;
+            refreshCheckpoints = originalRefreshCheckpoints;
+            refreshState = originalRefreshState;
+            refreshAgentSession = originalRefreshAgentSession;
+            checkpointBusy = null;
+            checkpointError = null;
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const checkpointSessionSyncResult = checkpointSessionSync.result?.value;
+    if (
+      JSON.stringify(checkpointSessionSyncResult?.calls) !== JSON.stringify([
+        "fetch:/checkpoints/load",
+        "refreshCheckpoints",
+        "refreshState",
+        "refreshAgentSession",
+      ])
+      || checkpointSessionSyncResult.checkpointStatus !== "Loaded."
+      || checkpointSessionSyncResult.checkpointError !== null
+    ) {
+      throw new Error(`checkpoint session sync smoke failed (${JSON.stringify(checkpointSessionSyncResult)})`);
+    }
+
     const smoke = await waitFor(async () => {
       const result = await cdp.send(
         "Runtime.evaluate",
@@ -450,7 +556,7 @@ async function main() {
     }, "Timed out waiting for visual smoke pass");
 
     console.log(
-      `visual smoke ok: ${smoke.width}x${smoke.height}, non-black pixels=${smoke.nonBlack}, tabs/model controls/timeline/checkpoint state preservation ok, ${smoke.connection}`
+      `visual smoke ok: ${smoke.width}x${smoke.height}, non-black pixels=${smoke.nonBlack}, tabs/model controls/timeline paging/checkpoint state preservation ok, ${smoke.connection}`
     );
     if (cdp.exceptions.length) {
       throw new Error(`console exceptions: ${cdp.exceptions.join("; ")}`);

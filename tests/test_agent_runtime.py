@@ -212,6 +212,31 @@ def test_events_are_session_isolated_after_reset(tmp_path):
     assert not any(event["summary"] == "old" for event in runtime.events())
 
 
+def test_event_turn_pages_keep_complete_turns_and_include_session_at_the_start(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    runtime.emit("session", "paused", "session created")
+    for turn in range(1, 13):
+        runtime.state["turn"] = turn
+        runtime.emit("model", "request", f"turn {turn} request")
+        runtime.emit("decision", "ready", f"turn {turn} ready")
+
+    latest = runtime.event_turn_page(turn_limit=5)
+    assert {event["turn"] for event in latest["events"]} == {8, 9, 10, 11, 12}
+    assert len(latest["events"]) == 10
+    assert latest["oldest_turn"] == 8
+    assert latest["has_more"] is True
+
+    middle = runtime.event_turn_page(before_turn=latest["oldest_turn"], turn_limit=5)
+    assert {event["turn"] for event in middle["events"]} == {3, 4, 5, 6, 7}
+    assert middle["oldest_turn"] == 3
+    assert middle["has_more"] is True
+
+    oldest = runtime.event_turn_page(before_turn=middle["oldest_turn"], turn_limit=5)
+    assert {event["turn"] for event in oldest["events"]} == {0, 1, 2}
+    assert oldest["oldest_turn"] == 1
+    assert oldest["has_more"] is False
+
+
 def test_interrupt_discards_late_decision(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
