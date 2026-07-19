@@ -410,6 +410,8 @@ class AgentRuntime:
         checkpoint_id: str | None = None,
         restored_from_session_id: str | None = None,
     ) -> dict:
+        self.debug.observations.cancel_all("agent_reset", owner="navigation")
+        self.debug.observations.cancel_all("agent_reset", owner="dialog_advance")
         with self.lock:
             if self.is_running():
                 raise RuntimeError("agent_session_running")
@@ -493,6 +495,7 @@ class AgentRuntime:
             stream = self.active_stream
             loop = self.loop
         self.debug.cancel_dialog_advance()
+        self.debug.observations.cancel_all("agent_interrupt", owner="navigation")
         if stream is not None and loop is not None:
             loop.call_soon_threadsafe(stream.cancel, "immediate")
         self.emit("interrupt", "interrupting", "Immediate interrupt requested.")
@@ -1007,6 +1010,10 @@ finish the game.
         else:
             action_result = self._navigate(int(args.get("id") or 0))
             after = self._wait_state_quiet()
+        observation_id = action_result.get("observation_id") if isinstance(action_result, dict) else None
+        observation = self.debug.observations.consume(observation_id, owner="navigation")
+        if isinstance(action_result, dict) and observation is not None:
+            action_result = {**action_result, "observation": observation}
         delta = self.state_delta(before, after)
         result = {"ok": True, "tool": tool, "args": args, "result": self._compact_action_result(action_result), "delta": delta, "state": self._compact_state(after)}
         self.emit("action", "completed", f"Executed {tool}.", {"result": action_result}, started=started)
@@ -1053,7 +1060,7 @@ finish the game.
                 raise RuntimeError("interrupted")
             state = self.debug.snapshot()
             result = self.debug.navigation_step(state, target_id)
-            progress.append({key: result.get(key) for key in ("status", "move", "segment_steps", "remaining_steps", "required_direction")})
+            progress.append({key: result.get(key) for key in ("status", "move", "segment_steps", "remaining_steps", "required_direction", "observation_id")})
             self.emit("navigation", "progress", f"Navigation step {step}: {result.get('status')}.", {"step": step, "target_id": target_id, "result": progress[-1]})
             status = result.get("status")
             if status == "entering_scene":
@@ -1072,9 +1079,26 @@ finish the game.
             if result.get("action"):
                 self._wait_action_and_stable(quiet_window=0.2)
             if status in terminal:
-                return {"ok": True, "status": status, "steps": step, "target_id": target_id, "progress": progress[-20:]}
+                terminal_result = {
+                    "ok": True,
+                    "status": status,
+                    "steps": step,
+                    "target_id": target_id,
+                    "progress": progress[-20:],
+                }
+                if result.get("observation_id"):
+                    terminal_result["observation_id"] = result["observation_id"]
+                return terminal_result
             if status in observing:
-                time.sleep(0.12)
+                observation_id = result.get("observation_id")
+                if observation_id:
+                    self.debug.observations.wait(
+                        observation_id,
+                        timeout=0.12,
+                        cancel_event=self.cancel_event,
+                    )
+                else:
+                    time.sleep(0.12)
                 continue
         raise RuntimeError("navigation_step_limit")
 
@@ -1133,7 +1157,18 @@ finish the game.
     def _compact_action_result(result: Any) -> Any:
         if not isinstance(result, dict):
             return result
-        compact = {key: result.get(key) for key in ("ok", "status", "presses", "steps", "target_id", "frames", "buttons") if key in result}
+        compact = {
+            key: result.get(key)
+            for key in ("ok", "status", "presses", "steps", "target_id", "frames", "buttons", "observation_id")
+            if key in result
+        }
+        observation = result.get("observation")
+        if isinstance(observation, dict):
+            compact["observation"] = {
+                key: observation.get(key)
+                for key in ("id", "kind", "status", "reason", "result")
+                if observation.get(key) is not None
+            }
         dialogs = result.get("dialogs")
         if isinstance(dialogs, list):
             compact["dialogs"] = [

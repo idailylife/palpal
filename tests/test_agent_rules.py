@@ -35,6 +35,28 @@ def test_agent_decide_reports_stale_runtime():
 
 
 
+def test_agent_decide_allows_fresh_state_when_frame_is_stale():
+    target = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 21, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target])
+        write_state(debug, state)
+        debug.frame_path.write_bytes(b'frame')
+        old = time.time() - 10
+        os.utime(debug.frame_path, (old, old))
+
+        snapshot = debug.snapshot()
+        assert snapshot['_debug']['state_stale'] is False
+        assert snapshot['_debug']['frame_stale'] is True
+        assert snapshot['_debug']['runtime_stale'] is False
+
+        decision = debug.rules_decide_agent(snapshot)
+        assert decision['recommended_intent'] == 'inspect_target'
+        assert decision['recommended_action']['args'] == {'id': 48}
+        assert not debug.action_path.exists()
+
+
+
 def test_agent_decide_prioritizes_active_dialog():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -185,7 +207,7 @@ def test_interaction_no_effect_is_recorded_and_deprioritizes_target():
         debug = make_debug_state(tmp)
         state = make_state(objects=[target], frame=20)
         write_state(debug, state)
-        debug.mark_pending_interaction_observation(
+        observation_id = debug.mark_pending_interaction_observation(
             state,
             75,
             action={'buttons': ['search'], 'frames': 1},
@@ -201,6 +223,8 @@ def test_interaction_no_effect_is_recorded_and_deprioritizes_target():
         assert targets[75]['interaction_state'] == 'previously_tried'
         assert targets[75]['agent_priority'] == 'avoid_repeat'
         assert history['history'][-1]['type'] == 'interaction_no_effect'
+        completed = debug.observations.consume(observation_id, owner='navigation')
+        assert completed['result']['type'] == 'interaction_no_effect'
 
 
 def test_interaction_effect_attributes_inventory_change_to_target():
@@ -209,7 +233,7 @@ def test_interaction_effect_attributes_inventory_change_to_target():
         debug = make_debug_state(tmp)
         state = make_state(objects=[target], frame=20)
         state['inventory'] = []
-        debug.mark_pending_interaction_observation(
+        observation_id = debug.mark_pending_interaction_observation(
             state,
             75,
             action={'buttons': ['search'], 'frames': 1},
@@ -221,9 +245,34 @@ def test_interaction_effect_attributes_inventory_change_to_target():
         assert debug.event_log[-1]['type'] == 'interaction_effect'
         assert debug.event_log[-1]['object_id'] == 75
         assert debug.event_log[-1]['inventory_changes'] == [{'item_id': 201, 'delta': 1, 'amount': 1}]
+        completed = debug.observations.consume(observation_id, owner='navigation')
+        assert completed['status'] == 'completed'
+        assert completed['result']['type'] == 'interaction_effect'
         route = debug.run_agent_tool('inspect_target', {'id': 75}, next_state)['route']
         assert route['interaction_state'] == 'previously_tried'
         assert route['agent_priority'] == 'avoid_repeat'
+
+
+def test_interaction_observation_does_not_finish_before_action_is_armed():
+    target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target], frame=20)
+        observation_id = debug.mark_pending_interaction_observation(state, 75)
+        later = make_state(objects=[target], frame=40)
+
+        assert debug.observe_pending_interaction_outcome(later) is None
+        assert debug.event_log == []
+
+        debug.observations.update_payload(
+            observation_id,
+            action={'buttons': ['search'], 'frames': 1},
+            armed=True,
+        )
+        debug.pending_interaction_observation['action'] = {'buttons': ['search'], 'frames': 1}
+        debug.pending_interaction_observation['armed'] = True
+        debug.observe_pending_interaction_outcome(later)
+        assert debug.event_log[-1]['type'] == 'interaction_no_effect'
 
 
 

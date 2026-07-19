@@ -483,6 +483,51 @@ def test_navigation_waits_for_pending_transition_observation(tmp_path, monkeypat
     assert runtime.snapshot()["stop_reason"] != "execution_failed"
 
 
+def test_navigation_receives_transition_confirmed_during_action_wait(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    target = {
+        "id": 48,
+        "x": 32,
+        "y": 0,
+        "sprite_id": 0,
+        "state": 1,
+        "trigger_mode": 4,
+        "trigger_script": 60,
+        "auto_script": 0,
+        "blocking": False,
+        "interactable": True,
+    }
+    source = make_state(width=6, height=4, start=(1, 1), objects=[target], frame=10)
+    write_state(debug, source)
+    destination = make_state(width=6, height=4, start=(4, 2), objects=[], frame=11)
+    destination["_logical_room"] = debug.logical_room_identity(source)
+    destination["trigger_observation"] = {
+        "generation": 1,
+        "event_object_id": 48,
+        "trigger_script": 60,
+        "completed": True,
+        "source": {"scene_id": 3, "map_id": 10, **source["party_position"]},
+        "destination": {"scene_id": 3, "map_id": 10, **destination["party_position"], "frame": 10},
+    }
+
+    def complete_during_wait(**_kwargs):
+        debug.action_path.unlink()
+        write_state(debug, destination)
+        debug.snapshot()
+        destination["frame"] = 12
+        write_state(debug, destination)
+        return debug.snapshot()
+
+    monkeypatch.setattr(runtime, "_wait_action_and_stable", complete_during_wait)
+    monkeypatch.setattr("palpal.agent_runtime.time.sleep", lambda _seconds: None)
+
+    result = runtime._navigate(48)
+    assert result["ok"]
+    assert result["status"] == "transitioned"
+    assert [entry["status"] for entry in result["progress"]] == ["stepping", "transitioned"]
+
+
 def test_navigation_treats_dialog_started_during_navigation_as_success(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime

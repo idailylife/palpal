@@ -434,6 +434,27 @@ def test_advance_dialog_visibility_timeout_does_not_press(tmp_path, monkeypatch)
     assert written == []
 
 
+def test_background_snapshots_do_not_confirm_dialog_inactive_for_owner(tmp_path):
+    debug = make_debug_state(tmp_path)
+    observation_id = debug.observations.register(
+        "dialog_gate",
+        owner="dialog_advance",
+        timeout=2,
+        payload={"inactive_started": False, "inactive_polls": 0},
+    )
+    inactive = make_state()
+
+    for _ in range(10):
+        debug.observe_dialog_gates(inactive)
+    assert debug.observations.get(observation_id)["status"] == "pending"
+
+    for _ in range(4):
+        debug.observe_dialog_gates(inactive, confirm_inactive=True)
+    assert debug.observations.get(observation_id)["status"] == "completed"
+    completed = debug.observations.consume(observation_id, owner="dialog_advance")
+    assert completed["result"]["status"] == "dialog_inactive"
+
+
 def test_advance_dialog_reports_pending_timeout_and_cancel(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     monkeypatch.setattr(debug, "snapshot", lambda: active_dialog_state())

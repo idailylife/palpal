@@ -446,6 +446,58 @@ def test_navigation_step_confirms_delayed_intra_room_transition_after_landing():
         assert record['confirmation'] == 'native_trigger'
 
 
+def test_navigation_step_receives_transition_already_confirmed_by_background_snapshot():
+    target = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        source = make_state(width=6, height=4, start=(1, 1), objects=[target], frame=10)
+        write_state(debug, source)
+        started = debug.navigation_step(source, target_id=48)
+        observation_id = started['observation_id']
+        debug.action_path.unlink()
+
+        destination = make_state(width=6, height=4, start=(4, 2), objects=[], frame=11)
+        destination['_logical_room'] = debug.logical_room_identity(source)
+        destination['trigger_observation'] = {
+            'generation': 1,
+            'event_object_id': 48,
+            'trigger_script': 60,
+            'completed': True,
+            'source': {'scene_id': 3, 'map_id': 10, **source['party_position']},
+            'destination': {'scene_id': 3, 'map_id': 10, **destination['party_position'], 'frame': 10},
+        }
+        write_state(debug, destination)
+        debug.snapshot()
+        destination['frame'] = 12
+        write_state(debug, destination)
+        debug.snapshot()
+
+        assert debug.pending_transition_observation is None
+        assert debug.observations.get(observation_id)['status'] == 'completed'
+        transitioned = debug.navigation_step(destination, target_id=48)
+        assert transitioned['ok']
+        assert transitioned['status'] == 'transitioned'
+        assert transitioned['observation_id'] == observation_id
+        assert transitioned['transition']['intra_room_transition'] is True
+        assert debug.observations.get(observation_id) is None
+
+
+def test_runtime_history_reset_clears_transition_handoffs():
+    target = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(objects=[target])
+        write_state(debug, state)
+        started = debug.navigation_step(state, target_id=48)
+        observation_id = started['observation_id']
+
+        debug.clear_runtime_history('test_reset', state)
+
+        assert debug.pending_transition_observation is None
+        assert debug.navigation_transition_requests == {}
+        assert debug.observations.get(observation_id) is None
+
+
 def test_transition_observation_ignores_logical_room_change_without_native_trigger():
     target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
     with tempfile.TemporaryDirectory() as tmp:

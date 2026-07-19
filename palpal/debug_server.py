@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from palpal.agent_runtime import AgentRuntime
+from palpal.observations import ObservationCoordinator
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
@@ -386,6 +387,9 @@ class DebugState:
         self.last_stable_room_state: dict | None = None
         self.pending_transition_observation: dict | None = None
         self.pending_interaction_observation: dict | None = None
+        self.observations = ObservationCoordinator()
+        self.navigation_transition_requests: dict[int, str] = {}
+        self.dialog_advance_observation_id: str | None = None
         self.last_snapshot_frame: int | None = None
         self.logical_frame_offset = 0
         self.last_raw_frame: int | None = None
@@ -716,12 +720,21 @@ class DebugState:
             raise RuntimeError("action_pending")
 
     def refresh_companion_caches(self) -> None:
+        self.cancel_runtime_observations("checkpoint_restored")
         self.event_log = self.read_events()
         self.dialog_history = self.read_dialog_history()
         self.dialog_source_keys = self.dialog_history_source_keys(self.dialog_history)
         self.last_observed_state = None
         self.last_stable_room_state = None
         self.pending_transition_observation = None
+        self.pending_interaction_observation = None
+
+    def cancel_runtime_observations(self, reason: str) -> None:
+        self.observations.clear_all(reason)
+        self.navigation_transition_requests.clear()
+        self.dialog_advance_observation_id = None
+        self.pending_transition_observation = None
+        self.pending_interaction_observation = None
 
     def int_frame(self, value) -> int | None:
         try:
@@ -1251,13 +1264,13 @@ class DebugState:
 
     def clear_runtime_history(self, reason: str = "reset", state: dict | None = None) -> None:
         with self.state_lock:
+            self.cancel_runtime_observations(reason)
             self.action_log = []
             self.event_log = []
             self.dialog_history = []
             self.dialog_source_keys = set()
             self.last_observed_state = None
             self.last_stable_room_state = None
-            self.pending_transition_observation = None
             for path in (
                 self.action_result_path,
                 self.agent_log_path,
@@ -2092,9 +2105,14 @@ class DebugState:
         via_target_id: int | None = None,
         action: dict | None = None,
         status: str = "interacting",
-    ) -> None:
+    ) -> str:
+        if isinstance(self.pending_interaction_observation, dict):
+            self.observations.cancel(
+                self.pending_interaction_observation.get("observation_id"),
+                "superseded",
+            )
         identity = self.room_identity(state)
-        self.pending_interaction_observation = {
+        payload = {
             "object_id": int(object_id),
             "via_target_id": int(via_target_id or object_id),
             "status": status,
@@ -2113,7 +2131,17 @@ class DebugState:
             "inventory": self.observed_inventory(state),
             "object": self.object_snapshot_for_interaction(state, int(object_id)),
             "action": action,
+            "armed": action is not None,
         }
+        observation_id = self.observations.register(
+            "interaction",
+            owner="navigation",
+            timeout=60.0,
+            payload=payload,
+        )
+        payload["observation_id"] = observation_id
+        self.pending_interaction_observation = payload
+        return observation_id
 
     def observe_pending_interaction_outcome(self, state: dict) -> dict | None:
         pending = self.pending_interaction_observation
@@ -2122,10 +2150,14 @@ class DebugState:
         try:
             object_id = int(pending.get("object_id") or 0)
         except (TypeError, ValueError):
+            self.observations.cancel(pending.get("observation_id"), "invalid_interaction_observation")
             self.pending_interaction_observation = None
             return None
         if object_id <= 0:
+            self.observations.cancel(pending.get("observation_id"), "invalid_interaction_observation")
             self.pending_interaction_observation = None
+            return None
+        if not pending.get("armed"):
             return None
 
         if self.action_path.exists():
@@ -2173,6 +2205,10 @@ class DebugState:
                 "room_changed": room_changed,
             }
             self.append_event(state, "interaction_effect", payload)
+            self.observations.complete(
+                pending.get("observation_id"),
+                {"type": "interaction_effect", "event": payload},
+            )
             self.pending_interaction_observation = None
             return payload
 
@@ -2186,6 +2222,10 @@ class DebugState:
                 "reason": "no_state_change",
             }
             self.append_event(state, "interaction_no_effect", payload)
+            self.observations.complete(
+                pending.get("observation_id"),
+                {"type": "interaction_no_effect", "event": payload},
+            )
             self.pending_interaction_observation = None
             return payload
         return None
@@ -3432,18 +3472,28 @@ class DebugState:
     def clear_pending_transition_observation(self, object_id: int | None = None) -> None:
         pending = self.pending_transition_observation
         if object_id is None or (isinstance(pending, dict) and pending.get("object_id") == object_id):
+            if isinstance(pending, dict):
+                self.observations.cancel(pending.get("observation_id"), "transition_cleared")
             self.pending_transition_observation = None
 
-    def mark_pending_transition_observation(self, state: dict, object_id: int) -> None:
+    def mark_pending_transition_observation(
+        self,
+        state: dict,
+        object_id: int,
+        *,
+        owner: str = "navigation",
+    ) -> str | None:
         observation = self.transition_observation_from_state(state, object_id)
         if observation is None:
-            return
+            return None
+        if isinstance(self.pending_transition_observation, dict):
+            self.clear_pending_transition_observation()
         native = self.native_trigger_observation(state)
         try:
             baseline_generation = int(native.get("generation") or 0) if native else 0
         except (TypeError, ValueError):
             baseline_generation = 0
-        self.pending_transition_observation = {
+        payload = {
             **observation,
             "frozen_source_state": state,
             "object_id": int(object_id),
@@ -3454,6 +3504,21 @@ class DebugState:
             "stable_snapshots": 0,
             "last_frame": None,
         }
+        observation_id = self.observations.register(
+            "transition",
+            owner=owner,
+            timeout=TRANSITION_OBSERVATION_TIMEOUT_SECONDS,
+            payload=payload,
+        )
+        payload["observation_id"] = observation_id
+        payload["owner"] = owner
+        self.pending_transition_observation = payload
+        if owner == "navigation":
+            previous_id = self.navigation_transition_requests.get(int(object_id))
+            if previous_id and previous_id != observation_id:
+                self.observations.cancel(previous_id, "superseded")
+            self.navigation_transition_requests[int(object_id)] = observation_id
+        return observation_id
 
     def discover_native_transition_observation(self, state: dict) -> None:
         if isinstance(self.pending_transition_observation, dict):
@@ -3510,7 +3575,7 @@ class DebugState:
         from_identity = self.room_identity(previous)
         if from_identity is None:
             return
-        self.mark_pending_transition_observation(previous, object_id)
+        self.mark_pending_transition_observation(previous, object_id, owner="background")
         pending = self.pending_transition_observation
         if not isinstance(pending, dict):
             return
@@ -3589,10 +3654,12 @@ class DebugState:
                 {"reason": "destination_unstable_timeout", "object_id": object_id},
                 state,
             )
+            self.observations.cancel(pending.get("observation_id"), "destination_unstable_timeout")
             self.pending_transition_observation = None
             return None
         from_identity = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
         if object_id <= 0 or from_identity is None:
+            self.observations.cancel(pending.get("observation_id"), "invalid_transition_observation")
             self.pending_transition_observation = None
             return None
         native = self.native_trigger_observation(state)
@@ -3644,6 +3711,7 @@ class DebugState:
         position_changed = (from_pos.get("x"), from_pos.get("y")) != (to_pos.get("x"), to_pos.get("y"))
         same_room = to_identity["id"] == from_identity.get("id")
         if same_room and not position_changed:
+            self.observations.cancel(pending.get("observation_id"), "no_position_change")
             self.pending_transition_observation = None
             return None
         frame = self.int_frame(state.get("logical_frame", state.get("frame")))
@@ -3657,7 +3725,6 @@ class DebugState:
             pending["stable_snapshots"] = 1
         if pending["stable_snapshots"] < TRANSITION_STABLE_SNAPSHOTS:
             return None
-        self.pending_transition_observation = None
         record = self.record_transition_destination(
             from_identity,
             object_id,
@@ -3682,6 +3749,11 @@ class DebugState:
             },
             state,
         )
+        observation_id = pending.get("observation_id")
+        self.observations.complete(observation_id, {"transition": record})
+        if pending.get("owner") == "background":
+            self.observations.consume(observation_id, owner="background")
+        self.pending_transition_observation = None
         return record
 
     def exploration_room(self, data: dict, identity: dict) -> dict:
@@ -4394,25 +4466,59 @@ class DebugState:
         if self.action_path.exists():
             return {"ok": False, "status": "action_pending", "target_id": target_id}
 
-        pending = self.pending_transition_observation
-        if isinstance(pending, dict) and pending.get("object_id") == target_id:
-            transition = self.observe_pending_transition_destination(state)
-            if transition is not None:
-                return {
-                    "ok": True,
-                    "status": "transitioned",
-                    "target_id": target_id,
-                    "transition": transition,
-                }
+        with self.state_lock:
+            observation_id = self.navigation_transition_requests.get(target_id)
+            request = self.observations.get(observation_id)
+            if request is not None and request.get("status") == "completed":
+                completed = self.observations.consume(observation_id, owner="navigation")
+                self.navigation_transition_requests.pop(target_id, None)
+                transition = (completed or {}).get("result", {}).get("transition")
+                if isinstance(transition, dict):
+                    return {
+                        "ok": True,
+                        "status": "transitioned",
+                        "target_id": target_id,
+                        "transition": transition,
+                        "observation_id": observation_id,
+                    }
+            if request is not None and request.get("status") in {"cancelled", "timed_out"}:
+                self.observations.consume(observation_id, owner="navigation")
+                self.navigation_transition_requests.pop(target_id, None)
+                pending = self.pending_transition_observation
+                if isinstance(pending, dict) and pending.get("observation_id") == observation_id:
+                    self.pending_transition_observation = None
+                request = None
+
             pending = self.pending_transition_observation
-            if isinstance(pending, dict) and pending.get("object_id") == target_id:
-                return {
-                    "ok": True,
-                    "status": "transition_observing",
-                    "target_id": target_id,
-                    "stable_snapshots": int(pending.get("stable_snapshots") or 0),
-                    "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
-                }
+            if (
+                request is not None
+                and request.get("status") == "pending"
+                and isinstance(pending, dict)
+                and pending.get("object_id") == target_id
+            ):
+                self.observe_pending_transition_destination(state)
+                request = self.observations.get(observation_id)
+                if request is not None and request.get("status") == "completed":
+                    completed = self.observations.consume(observation_id, owner="navigation")
+                    self.navigation_transition_requests.pop(target_id, None)
+                    transition = (completed or {}).get("result", {}).get("transition")
+                    return {
+                        "ok": True,
+                        "status": "transitioned",
+                        "target_id": target_id,
+                        "transition": transition,
+                        "observation_id": observation_id,
+                    }
+                pending = self.pending_transition_observation
+                if request is not None and request.get("status") == "pending":
+                    return {
+                        "ok": True,
+                        "status": "transition_observing",
+                        "target_id": target_id,
+                        "observation_id": observation_id,
+                        "stable_snapshots": int((pending or {}).get("stable_snapshots") or 0),
+                        "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
+                    }
 
         route = self.route_to_object(state, target_id, avoid_transitions=True)
         if route.get("status") == "blocked_by_interactable":
@@ -4458,20 +4564,34 @@ class DebugState:
 
             direction = interaction.get("required_direction")
             buttons = [button for button in (direction, "search") if button]
-            action = self.write_action(buttons, 1)
             blocker = route.get("blocker") or {}
             blocker_id = int(blocker.get("id") or target_id)
-            self.mark_pending_interaction_observation(
-                state,
-                blocker_id,
-                via_target_id=target_id,
-                action=action,
-                status="interacting",
-            )
+            with self.state_lock:
+                observation_id = self.mark_pending_interaction_observation(
+                    state,
+                    blocker_id,
+                    via_target_id=target_id,
+                    status="interacting",
+                )
+            try:
+                action = self.write_action(buttons, 1)
+            except Exception:
+                self.observations.cancel(observation_id, "action_write_failed")
+                if (
+                    isinstance(self.pending_interaction_observation, dict)
+                    and self.pending_interaction_observation.get("observation_id") == observation_id
+                ):
+                    self.pending_interaction_observation = None
+                raise
+            self.observations.update_payload(observation_id, action=action, armed=True)
+            if isinstance(self.pending_interaction_observation, dict):
+                self.pending_interaction_observation["action"] = action
+                self.pending_interaction_observation["armed"] = True
             return {
                 "ok": True,
                 "status": "interacting",
                 "target_id": target_id,
+                "observation_id": observation_id,
                 "action": action,
                 "route": route.get("blocked_route"),
                 "blocker": route.get("blocker"),
@@ -4496,18 +4616,32 @@ class DebugState:
                 current_pos = (int(pos.get("x") or 0), int(pos.get("y") or 0))
                 current_direction = int(state.get("party_direction") or 0)
                 if target is not None and search_hits(current_pos, current_direction, target):
-                    action = self.write_action(["search"], 1)
-                    self.mark_pending_interaction_observation(
-                        state,
-                        target_id,
-                        via_target_id=target_id,
-                        action=action,
-                        status="interacting",
-                    )
+                    with self.state_lock:
+                        observation_id = self.mark_pending_interaction_observation(
+                            state,
+                            target_id,
+                            via_target_id=target_id,
+                            status="interacting",
+                        )
+                    try:
+                        action = self.write_action(["search"], 1)
+                    except Exception:
+                        self.observations.cancel(observation_id, "action_write_failed")
+                        if (
+                            isinstance(self.pending_interaction_observation, dict)
+                            and self.pending_interaction_observation.get("observation_id") == observation_id
+                        ):
+                            self.pending_interaction_observation = None
+                        raise
+                    self.observations.update_payload(observation_id, action=action, armed=True)
+                    if isinstance(self.pending_interaction_observation, dict):
+                        self.pending_interaction_observation["action"] = action
+                        self.pending_interaction_observation["armed"] = True
                     return {
                         "ok": True,
                         "status": "interacting",
                         "target_id": target_id,
+                        "observation_id": observation_id,
                         "action": action,
                         "route": route.get("route"),
                         "required_direction": DIR_TO_BUTTON.get(current_direction, "down"),
@@ -4542,10 +4676,24 @@ class DebugState:
                 break
             segment_steps += 1
         segment_moves = moves[:segment_steps]
-        action = self.write_action(segment_moves, 1)
         route_nodes = route.get("route", {}).get("nodes") or []
         expected_node = route_nodes[segment_steps] if len(route_nodes) > segment_steps else None
         remaining_steps = max(0, len(moves) - segment_steps)
+        observation_id = None
+        if route.get("status") == "transition" and segment_steps >= len(moves):
+            with self.state_lock:
+                observation_id = self.mark_pending_transition_observation(state, target_id)
+        try:
+            action = self.write_action(segment_moves, 1)
+        except Exception:
+            if observation_id:
+                with self.state_lock:
+                    self.observations.cancel(observation_id, "action_write_failed")
+                    self.navigation_transition_requests.pop(target_id, None)
+                    pending = self.pending_transition_observation
+                    if isinstance(pending, dict) and pending.get("observation_id") == observation_id:
+                        self.pending_transition_observation = None
+            raise
         self.remember_navigation_route(
             state,
             target_id,
@@ -4554,9 +4702,7 @@ class DebugState:
             remaining_steps,
             route.get("status") or "reachable",
         )
-        if route.get("status") == "transition" and segment_steps >= len(moves):
-            self.mark_pending_transition_observation(state, target_id)
-        return {
+        result = {
             "ok": True,
             "status": "stepping",
             "target_id": target_id,
@@ -4568,6 +4714,9 @@ class DebugState:
             "remaining_steps": remaining_steps,
             "route": route.get("route"),
         }
+        if observation_id:
+            result["observation_id"] = observation_id
+        return result
 
     def reachable_nodes(
         self,
@@ -4819,6 +4968,7 @@ class DebugState:
                     self.append_navigation_diagnostic("unstable_room_state_ignored", {"reason": "entering_scene"}, state)
                 self.record_state_events(state)
                 self.record_dialog_event(state)
+                self.observe_dialog_gates(state)
                 self.observe_pending_interaction_outcome(state)
             if state_info.get("available") and stable_room_state:
                 state["_navigation"] = self.lightweight_navigation(state)
@@ -4845,7 +4995,14 @@ class DebugState:
             "state_file": state_info,
             "frame_file": frame_info,
             "frame_available": frame_info["available"],
-            "runtime_stale": state_info.get("stale", True) or frame_info.get("stale", True),
+            # Agent actions are driven by the native state bridge. The frame
+            # exporter can legitimately stop advancing while SDLPAL is inside
+            # a dialog/wait loop, even though state and action polling remain
+            # live. Keep that visible for diagnostics without treating it as
+            # an unsafe runtime.
+            "state_stale": state_info.get("stale", True),
+            "frame_stale": frame_info.get("stale", True),
+            "runtime_stale": state_info.get("stale", True),
             "action_pending": self.action_path.exists(),
             "stale_after_seconds": STALE_AFTER_SECONDS,
             "recent_actions": recent_actions,
@@ -4918,39 +5075,99 @@ class DebugState:
             return bool(dialog.get("visible"))
         return not bool(dialog.get("held"))
 
-    def dialog_advance_wait_for_visible(self, state: dict) -> tuple[dict, str | None]:
-        visibility_polls = 0
-        max_visibility_polls = max(
-            1,
-            int(DIALOG_ADVANCE_VISIBILITY_TIMEOUT / DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL),
-        )
-        while True:
+    def observe_dialog_gates(self, state: dict, *, confirm_inactive: bool = False) -> None:
+        for request in self.observations.active(kind="dialog_gate"):
+            observation_id = request["id"]
             if self.dialog_advance_cancel.is_set():
-                return state, "cancelled"
-
+                self.observations.cancel(observation_id, "cancelled")
+                continue
             stop_status = self.dialog_advance_stop_status(state)
             if stop_status == "dialog_inactive":
-                for _ in range(DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS):
-                    if self.dialog_advance_cancel.is_set():
-                        return state, "cancelled"
-                    time.sleep(DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL)
-                    state = self.snapshot()
-                    stop_status = self.dialog_advance_stop_status(state)
-                    if stop_status != "dialog_inactive":
-                        break
+                if not confirm_inactive:
+                    continue
+                payload = request.get("payload", {})
+                if not payload.get("inactive_started"):
+                    self.observations.update_payload(
+                        observation_id,
+                        inactive_started=True,
+                        inactive_polls=0,
+                    )
+                    continue
+                inactive_polls = int(payload.get("inactive_polls") or 0) + 1
+                if inactive_polls >= DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS:
+                    self.observations.complete(
+                        observation_id,
+                        {"status": "dialog_inactive", "state": state},
+                    )
                 else:
-                    return state, "dialog_inactive"
-
-            if stop_status and stop_status != "dialog_inactive":
-                return state, stop_status
+                    self.observations.update_payload(
+                        observation_id,
+                        inactive_polls=inactive_polls,
+                    )
+                continue
+            if stop_status:
+                self.observations.complete(
+                    observation_id,
+                    {"status": stop_status, "state": state},
+                )
+                continue
+            if request.get("payload", {}).get("inactive_started"):
+                self.observations.update_payload(
+                    observation_id,
+                    inactive_started=False,
+                    inactive_polls=0,
+                )
             if self.dialog_advance_visible(state):
-                return state, None
-            if visibility_polls >= max_visibility_polls:
-                return state, "dialog_visibility_timeout"
+                self.observations.complete(
+                    observation_id,
+                    {"status": "ready", "state": state},
+                )
 
-            time.sleep(DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL)
-            visibility_polls += 1
-            state = self.snapshot()
+    def dialog_advance_wait_for_visible(self, state: dict) -> tuple[dict, str | None]:
+        observation_id = self.observations.register(
+            "dialog_gate",
+            owner="dialog_advance",
+            timeout=DIALOG_ADVANCE_VISIBILITY_TIMEOUT,
+            payload={"inactive_started": False, "inactive_polls": 0},
+        )
+        self.dialog_advance_observation_id = observation_id
+        try:
+            self.observe_dialog_gates(state, confirm_inactive=True)
+            while True:
+                request = self.observations.get(observation_id)
+                if request is None:
+                    return state, "cancelled"
+                status = request.get("status")
+                if status == "completed":
+                    completed = self.observations.consume(observation_id, owner="dialog_advance")
+                    result = (completed or {}).get("result") or {}
+                    observed_state = result.get("state") if isinstance(result.get("state"), dict) else state
+                    observed_status = result.get("status")
+                    return observed_state, None if observed_status == "ready" else observed_status
+                if status == "timed_out":
+                    self.observations.consume(observation_id, owner="dialog_advance")
+                    return state, "dialog_visibility_timeout"
+                if status == "cancelled":
+                    self.observations.consume(observation_id, owner="dialog_advance")
+                    return state, "cancelled"
+
+                wait_interval = (
+                    DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL
+                    if request.get("payload", {}).get("inactive_started")
+                    else DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL
+                )
+                self.observations.wait(
+                    observation_id,
+                    timeout=wait_interval,
+                    cancel_event=self.dialog_advance_cancel,
+                )
+                request = self.observations.get(observation_id)
+                if request is not None and request.get("status") == "pending":
+                    state = self.snapshot()
+                    self.observe_dialog_gates(state, confirm_inactive=True)
+        finally:
+            if self.dialog_advance_observation_id == observation_id:
+                self.dialog_advance_observation_id = None
 
     def advance_dialog(self, args: dict | None = None) -> dict:
         options = self.normalize_dialog_advance_args(args)
@@ -5037,6 +5254,7 @@ class DebugState:
         running = self.dialog_advance_lock.locked()
         if running:
             self.dialog_advance_cancel.set()
+            self.observations.cancel(self.dialog_advance_observation_id, "cancelled")
             self.update_dialog_advance_status(status="cancelling")
         return {"ok": True, "status": "cancelling" if running else "idle", "running": running}
 
@@ -5173,7 +5391,7 @@ class DebugState:
             self.append_agent_decision(state, decision)
             return decision
 
-        if not state_info.get("available") or state_info.get("stale") or (frame_info.get("available") and frame_info.get("stale")):
+        if not state_info.get("available") or state_info.get("stale"):
             decision["evidence"]["state_file"] = state_info
             decision["evidence"]["frame_file"] = frame_info
             decision.update(
@@ -6014,7 +6232,9 @@ class DebugState:
             },
             "state_file": state_info,
             "frame_file": frame_info,
-            "runtime_stale": state_info.get("stale", True) or frame_info.get("stale", True),
+            "state_stale": state_info.get("stale", True),
+            "frame_stale": frame_info.get("stale", True),
+            "runtime_stale": state_info.get("stale", True),
             "action_pending": self.action_path.exists(),
             "exploration": self.agent_exploration_summary(self.agent_current_exploration(state)),
         }
@@ -7685,6 +7905,12 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     state: DebugState
+
+    def server_close(self) -> None:
+        state = getattr(self, "state", None)
+        if state is not None:
+            state.cancel_runtime_observations("server_closed")
+        super().server_close()
 
 
 def main() -> int:
