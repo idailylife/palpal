@@ -1358,6 +1358,9 @@ finish the game.
     def _state_signature(state: dict) -> tuple:
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
+        latest_dialog_event = dialog.get("latest_event")
+        if not isinstance(latest_dialog_event, dict):
+            latest_dialog_event = {}
         debug = state.get("_debug") or {}
         recent_events = debug.get("recent_events") or []
         latest_event = recent_events[-1] if recent_events and isinstance(recent_events[-1], dict) else {}
@@ -1373,7 +1376,7 @@ finish the game.
             state.get("scene_id"), state.get("map_id"), state.get("room_key"),
             pos.get("x"), pos.get("y"), state.get("party_direction"),
             bool(dialog.get("active")), dialog.get("message_id"), state.get("in_battle"),
-            state.get("entering_scene"), dialog.get("latest_event", {}).get("sequence"),
+            state.get("entering_scene"), latest_dialog_event.get("sequence"),
             latest_event.get("time"), latest_event.get("type"), latest_event.get("object_id"),
             inventory, objects,
         )

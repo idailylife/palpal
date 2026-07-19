@@ -479,6 +479,19 @@ def test_quiet_window_restarts_when_dialog_reappears(tmp_path):
     assert time.monotonic() - started >= 0.3
 
 
+def test_quiet_window_accepts_checkpoint_state_without_latest_dialog_event(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    restored = make_state()
+    restored["dialog"] = {"active": False, "latest_event": None, "events": []}
+    debug.snapshot = lambda: restored
+
+    signature = runtime._state_signature(restored)
+    assert signature[10] is None
+    observed = runtime._wait_state_quiet(timeout=0.5, quiet_window=0.05)
+    assert observed is restored
+
+
 def test_navigation_waits_for_scene_transition_instead_of_failing(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
