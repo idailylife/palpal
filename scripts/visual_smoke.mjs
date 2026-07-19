@@ -218,6 +218,105 @@ async function main() {
       throw new Error(`agent model control stability smoke failed (${JSON.stringify(modelControlState)})`);
     }
 
+    const goalsModal = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalFetch = window.fetch;
+          const originalSession = agentSession;
+          try {
+            window.fetch = async (url, options) => {
+              if (url === "/agent/tasks") {
+                return {
+                  ok: true,
+                  json: async () => ({
+                    ok: true,
+                    counts: { active: 2, completed: 1, abandoned: 1, total: 4 },
+                    tasks: [
+                      { id: "active-1", description: "Reach the courtyard", priority: 8, status: "active" },
+                      { id: "active-2", description: "Inspect the cabinet", priority: 2, status: "active" },
+                      { id: "completed-1", description: "Speak to the innkeeper", priority: 5, status: "completed" },
+                      { id: "abandoned-1", description: "Retry the inert door", priority: 1, status: "abandoned" },
+                    ],
+                  }),
+                };
+              }
+              return originalFetch(url, options);
+            };
+            agentSession = { ...agentSession, status: "running", phase: "deciding" };
+            agentSessionControlsRenderKey = null;
+            renderAgentSession();
+            const buttons = [...document.querySelectorAll(".agentSessionButtons button")];
+            const decide = buttons.find((button) => button.textContent.includes("Decide Once"));
+            const reset = buttons.find((button) => button.textContent.includes("Reset Session"));
+            const goals = buttons.find((button) => button.textContent.includes("Goals"));
+            const goalsRect = goals?.getBoundingClientRect();
+            const resetRect = reset?.getBoundingClientRect();
+            const decideRect = decide?.getBoundingClientRect();
+            const sixthButton = buttons.indexOf(goals) === 5;
+            const expectedPosition = goalsRect && resetRect && decideRect
+              && goalsRect.left > resetRect.left && goalsRect.top > decideRect.top;
+            const enabledWhileRunning = goals?.disabled === false;
+            const permanentGoalRemoved = !document.getElementById("agentSessionHeader")?.textContent.includes("Permanent goal")
+              && !document.getElementById("agentSessionHeader")?.textContent.includes("通关游戏");
+            goals?.focus();
+            goals?.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const dialog = document.getElementById("goalsDialog");
+            const opened = dialog.open;
+            const groupHeadings = [...dialog.querySelectorAll(".goalsGroupHeader h3")].map((node) => node.textContent);
+            const cardStatuses = [...dialog.querySelectorAll(".goalStatus")].map((node) => node.textContent);
+            const summary = document.getElementById("goalsSummary")?.textContent;
+            const countLabel = goals?.textContent;
+            const ignoresGameKeys = shouldIgnoreGameKeydown(new KeyboardEvent("keydown", { key: "ArrowUp" }));
+            dialog.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const closedFromBackdrop = !dialog.open;
+            const restoredFocus = document.activeElement === goals;
+            return {
+              sixthButton,
+              expectedPosition,
+              enabledWhileRunning,
+              permanentGoalRemoved,
+              opened,
+              closedFromBackdrop,
+              groupHeadings,
+              cardStatuses,
+              summary,
+              countLabel,
+              ignoresGameKeys,
+              restoredFocus,
+            };
+          } finally {
+            window.fetch = originalFetch;
+            agentSession = originalSession;
+            agentSessionControlsRenderKey = null;
+            renderAgentSession();
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const goalsModalResult = goalsModal.result?.value;
+    if (
+      !goalsModalResult?.sixthButton
+      || !goalsModalResult.expectedPosition
+      || !goalsModalResult.enabledWhileRunning
+      || !goalsModalResult.permanentGoalRemoved
+      || !goalsModalResult.opened
+      || !goalsModalResult.closedFromBackdrop
+      || JSON.stringify(goalsModalResult.groupHeadings) !== JSON.stringify(["Active", "Completed", "Abandoned"])
+      || JSON.stringify(goalsModalResult.cardStatuses) !== JSON.stringify(["Active", "Active", "Completed", "Abandoned"])
+      || goalsModalResult.summary !== "2 active · 1 completed · 1 abandoned"
+      || !goalsModalResult.countLabel?.includes("Goals (2)")
+      || !goalsModalResult.ignoresGameKeys
+      || !goalsModalResult.restoredFocus
+    ) {
+      throw new Error(`agent goals modal smoke failed (${JSON.stringify(goalsModalResult)})`);
+    }
+
     const timelineState = await cdp.send(
       "Runtime.evaluate",
       {
@@ -358,31 +457,34 @@ async function main() {
       throw new Error(`agent timeline paging smoke failed (${JSON.stringify(timelinePagingResult)})`);
     }
 
-    const normalAgentState = await cdp.send(
-      "Runtime.evaluate",
-      {
-        returnByValue: true,
-        expression: `(() => {
-          document.getElementById("normalTab")?.click();
-          const select = document.querySelector("[data-agent-model]");
-          if (!select) return { ready: false };
-          select.focus();
-          agentError = "synthetic deferred render";
-          renderAgent(latestState);
-          const retained = document.querySelector("[data-agent-model]") === select
-            && document.activeElement === select
-            && agentRenderDeferred;
-          select.blur();
-          agentError = null;
-          agentRenderDeferred = false;
-          agentRenderKey = null;
-          renderAgent(latestState);
-          return { ready: true, retained };
-        })()`,
-      },
-      sessionId
-    );
-    const normalAgentResult = normalAgentState.result?.value;
+    const normalAgentResult = await waitFor(async () => {
+      const result = await cdp.send(
+        "Runtime.evaluate",
+        {
+          returnByValue: true,
+          expression: `(() => {
+            document.getElementById("normalTab")?.click();
+            const select = document.querySelector("[data-agent-model]");
+            if (!select) return { ready: false };
+            select.focus();
+            agentError = "synthetic deferred render";
+            renderAgent(latestState);
+            const retained = document.querySelector("[data-agent-model]") === select
+              && document.activeElement === select
+              && agentRenderDeferred;
+            select.blur();
+            agentError = null;
+            agentRenderDeferred = false;
+            agentRenderKey = null;
+            renderAgent(latestState);
+            return { ready: true, retained };
+          })()`,
+        },
+        sessionId
+      );
+      const value = result.result?.value;
+      return value?.ready ? value : null;
+    }, "Timed out waiting for normal Agent controls");
     if (!normalAgentResult?.ready || !normalAgentResult.retained) {
       throw new Error(`normal agent model stability smoke failed (${JSON.stringify(normalAgentResult)})`);
     }
@@ -475,6 +577,7 @@ async function main() {
           const originalRefreshCheckpoints = refreshCheckpoints;
           const originalRefreshState = refreshState;
           const originalRefreshAgentSession = refreshAgentSession;
+          const originalRefreshAgentTasks = refreshAgentTasks;
           try {
             window.confirm = () => true;
             window.fetch = async (url) => {
@@ -484,6 +587,7 @@ async function main() {
             refreshCheckpoints = async () => calls.push("refreshCheckpoints");
             refreshState = async () => calls.push("refreshState");
             refreshAgentSession = async () => calls.push("refreshAgentSession");
+            refreshAgentTasks = async () => calls.push("refreshAgentTasks");
             checkpointBusy = null;
             await loadCheckpoint("session-sync-smoke");
             return { calls, checkpointStatus, checkpointError };
@@ -493,6 +597,7 @@ async function main() {
             refreshCheckpoints = originalRefreshCheckpoints;
             refreshState = originalRefreshState;
             refreshAgentSession = originalRefreshAgentSession;
+            refreshAgentTasks = originalRefreshAgentTasks;
             checkpointBusy = null;
             checkpointError = null;
           }
@@ -507,6 +612,7 @@ async function main() {
         "refreshCheckpoints",
         "refreshState",
         "refreshAgentSession",
+        "refreshAgentTasks",
       ])
       || checkpointSessionSyncResult.checkpointStatus !== "Loaded."
       || checkpointSessionSyncResult.checkpointError !== null
@@ -556,7 +662,7 @@ async function main() {
     }, "Timed out waiting for visual smoke pass");
 
     console.log(
-      `visual smoke ok: ${smoke.width}x${smoke.height}, non-black pixels=${smoke.nonBlack}, tabs/model controls/timeline paging/checkpoint state preservation ok, ${smoke.connection}`
+      `visual smoke ok: ${smoke.width}x${smoke.height}, non-black pixels=${smoke.nonBlack}, tabs/model controls/goals/timeline paging/checkpoint state preservation ok, ${smoke.connection}`
     );
     if (cdp.exceptions.length) {
       throw new Error(`console exceptions: ${cdp.exceptions.join("; ")}`);

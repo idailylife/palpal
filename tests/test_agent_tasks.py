@@ -25,6 +25,37 @@ def test_task_ledger_create_update_close_and_filtering():
         assert not debug.run_agent_tool("upsert_task", {"description": "missing reason"})["ok"]
 
 
+def test_agent_tasks_view_groups_all_statuses_and_returns_compact_records():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        active = debug.run_agent_tool("upsert_task", {
+            "description": "Active high priority", "rationale": "Current evidence.", "priority": 8,
+        })["task"]
+        debug.run_agent_tool("upsert_task", {
+            "description": "Active low priority", "rationale": "Current evidence.", "priority": 2,
+        })
+        completed = debug.run_agent_tool("upsert_task", {
+            "description": "Completed task", "rationale": "Already handled.", "priority": 9,
+        })["task"]
+        debug.run_agent_tool("upsert_task", {"id": completed["id"], "status": "completed"})
+        abandoned = debug.run_agent_tool("upsert_task", {
+            "description": "Abandoned task", "rationale": "No longer useful.", "priority": 7,
+        })["task"]
+        debug.run_agent_tool("upsert_task", {"id": abandoned["id"], "status": "abandoned"})
+
+        view = debug.agent_tasks_view()
+
+        assert view["counts"] == {"active": 2, "completed": 1, "abandoned": 1, "total": 4}
+        assert [task["status"] for task in view["tasks"]] == ["active", "active", "completed", "abandoned"]
+        assert [task["description"] for task in view["tasks"][:2]] == ["Active high priority", "Active low priority"]
+        assert view["tasks"][0] == {
+            "id": active["id"],
+            "description": "Active high priority",
+            "priority": 8,
+            "status": "active",
+        }
+
+
 def test_task_ledger_is_additive_and_survives_checkpoint_round_trip():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -44,6 +75,20 @@ def test_task_ledger_is_additive_and_survives_checkpoint_round_trip():
             debug.load_checkpoint("tasks")
         restored = debug.task_ledger()
         assert restored[0]["id"] == created["task"]["id"]
+        assert debug.agent_tasks_view()["tasks"][0]["description"] == "Reach the courtyard"
+
+
+def test_agent_session_reset_keeps_tool_tasks():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        created = debug.run_agent_tool("upsert_task", {
+            "description": "Keep this across session reset",
+            "rationale": "It belongs to companion memory.",
+        })["task"]
+
+        debug.agent_runtime.reset("manual_reset")
+
+        assert debug.agent_tasks_view()["tasks"][0]["id"] == created["id"]
 
 
 def test_executable_task_overrides_unknown_transition_but_unmatched_task_does_not():

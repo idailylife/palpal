@@ -222,6 +222,28 @@ def test_http_handler_agent_session_api_and_running_action_boundary(http_server)
     assert "checkpoint not found" in payload["error"]
 
 
+def test_http_handler_exposes_agent_tasks(http_server):
+    base_url, debug = http_server
+    task = debug.run_agent_tool("upsert_task", {
+        "description": "Inspect the courtyard",
+        "rationale": "The latest dialog points there.",
+        "priority": 6,
+    })["task"]
+
+    status, _, raw = http_request(base_url, "/agent/tasks")
+    payload = json.loads(raw)
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["counts"] == {"active": 1, "completed": 0, "abandoned": 0, "total": 1}
+    assert payload["tasks"] == [{
+        "id": task["id"],
+        "description": "Inspect the courtyard",
+        "priority": 6,
+        "status": "active",
+    }]
+
+
 def test_action_file_writers_validate_and_replace_results(tmp_path):
     debug = make_debug_state(tmp_path)
 

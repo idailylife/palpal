@@ -28,6 +28,10 @@ const transitionsDialog = document.getElementById("transitionsDialog");
 const transitionsClose = document.getElementById("transitionsClose");
 const transitionsRoom = document.getElementById("transitionsRoom");
 const transitionsContent = document.getElementById("transitionsContent");
+const goalsDialog = document.getElementById("goalsDialog");
+const goalsClose = document.getElementById("goalsClose");
+const goalsSummary = document.getElementById("goalsSummary");
+const goalsContent = document.getElementById("goalsContent");
 const connectionEl = document.getElementById("connection");
 const runtimeStatusEl = document.getElementById("runtimeStatus");
 const overlay = document.getElementById("overlay");
@@ -73,6 +77,13 @@ let agentSessionHeaderRenderKey = null;
 let agentSessionControlsRenderKey = null;
 let agentTimelineRenderKey = null;
 let agentRenderDeferred = false;
+let agentTasks = [];
+let agentTaskCounts = { active: 0, completed: 0, abandoned: 0, total: 0 };
+let agentTasksLoaded = false;
+let agentTasksLoading = false;
+let agentTasksError = null;
+let agentTasksRequestId = 0;
+let goalsDialogTrigger = null;
 let selectedStateTab = localStorage.getItem("palpal.stateTab") === "agent" ? "agent" : "normal";
 let agentMaxTurns = Math.max(1, Math.min(Number(localStorage.getItem("palpal.agentMaxTurns") || 10), 100));
 let checkpoints = [];
@@ -2020,7 +2031,6 @@ function renderAgentSession() {
   ]);
   if (agentSessionHeaderRenderKey !== headerRenderKey) {
     agentSessionHeaderEl.innerHTML = `
-      <div><span>Permanent goal</span><strong>通关游戏</strong></div>
       <span class="agentSessionStatus is-${escapeHtml(session.status || "loading")}">${escapeHtml(agentStatusLabel(session))}</span>
       <dl>
         <div><dt>Model</dt><dd>${escapeHtml(session.model || "-")}</dd></div>
@@ -2048,10 +2058,84 @@ function renderAgentSession() {
         <button data-session-action="decide" ${running ? "disabled" : ""}>Decide Once</button>
         <button data-session-action="execute" ${running || !pending ? "disabled" : ""}>Execute</button>
         <button data-session-action="reset" ${running ? "disabled" : ""}>Reset Session</button>
+        <button data-goals-open>Goals (<span data-goals-count>…</span>)</button>
       </div>`;
     agentSessionControlsRenderKey = controlsRenderKey;
   }
+  renderGoalsButtonCount();
   renderAgentTimeline();
+}
+
+function renderGoalsButtonCount() {
+  const countEl = agentSessionControlsEl?.querySelector("[data-goals-count]");
+  if (!countEl) return;
+  countEl.textContent = agentTasksLoaded ? String(Number(agentTaskCounts.active || 0)) : "…";
+}
+
+function renderGoalsDialog() {
+  if (!goalsSummary || !goalsContent) return;
+  if (agentTasksLoading && !agentTasksLoaded) {
+    goalsSummary.textContent = "Loading current tool tasks…";
+    goalsContent.innerHTML = '<div class="goalsMessage">Loading goals…</div>';
+    return;
+  }
+  if (agentTasksError) {
+    goalsSummary.textContent = "Goals unavailable";
+    goalsContent.innerHTML = `<div class="goalsError">${escapeHtml(agentTasksError)}<br><button class="goalsRetry" type="button" data-goals-retry>Retry</button></div>`;
+    return;
+  }
+  const counts = agentTaskCounts;
+  goalsSummary.textContent = `${Number(counts.active || 0)} active · ${Number(counts.completed || 0)} completed · ${Number(counts.abandoned || 0)} abandoned`;
+  if (!agentTasks.length) {
+    goalsContent.innerHTML = '<div class="goalsEmpty">The Agent has not created any tool tasks yet.</div>';
+    return;
+  }
+  const labels = { active: "Active", completed: "Completed", abandoned: "Abandoned" };
+  goalsContent.innerHTML = ["active", "completed", "abandoned"].map((status) => {
+    const tasks = agentTasks.filter((task) => task.status === status);
+    return `<section class="goalsGroup is-${status}">
+      <div class="goalsGroupHeader"><h3>${labels[status]}</h3><span>${tasks.length}</span></div>
+      ${tasks.length ? tasks.map((task) => `<article class="goalCard">
+        <strong>${escapeHtml(task.description || task.id || "Untitled goal")}</strong>
+        <span class="goalStatus is-${status}">${labels[status]}</span>
+        <span class="goalPriority">Priority ${Number(task.priority || 0)}</span>
+      </article>`).join("") : '<div class="goalsEmpty">None</div>'}
+    </section>`;
+  }).join("");
+}
+
+async function refreshAgentTasks() {
+  const requestId = ++agentTasksRequestId;
+  agentTasksLoading = true;
+  agentTasksError = null;
+  if (goalsDialog?.open) renderGoalsDialog();
+  try {
+    const response = await fetch("/agent/tasks");
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) throw new Error(result.error || `goals unavailable: ${response.status}`);
+    if (requestId !== agentTasksRequestId) return;
+    agentTasks = Array.isArray(result.tasks) ? result.tasks : [];
+    agentTaskCounts = { active: 0, completed: 0, abandoned: 0, total: 0, ...(result.counts || {}) };
+    agentTasksLoaded = true;
+  } catch (error) {
+    if (requestId !== agentTasksRequestId) return;
+    agentTasksError = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (requestId !== agentTasksRequestId) return;
+    agentTasksLoading = false;
+    renderGoalsButtonCount();
+    if (goalsDialog?.open) renderGoalsDialog();
+  }
+}
+
+function openGoalsDialog(trigger) {
+  goalsDialogTrigger = trigger || document.activeElement;
+  if (!goalsDialog?.open) goalsDialog?.showModal();
+  refreshAgentTasks();
+}
+
+function closeGoalsDialog() {
+  if (goalsDialog?.open) goalsDialog.close();
 }
 
 function eventIcon(event) {
@@ -2137,6 +2221,11 @@ async function agentSessionRequest(action) {
 }
 
 agentSessionControlsEl?.addEventListener("click", (event) => {
+  const goalsButton = event.target.closest("[data-goals-open]");
+  if (goalsButton) {
+    openGoalsDialog(goalsButton);
+    return;
+  }
   const button = event.target.closest("[data-session-action]");
   if (!button) return;
   button.disabled = true;
@@ -2145,6 +2234,19 @@ agentSessionControlsEl?.addEventListener("click", (event) => {
     agentError = error instanceof Error ? error.message : String(error);
     renderAgentSession();
   });
+});
+
+goalsClose?.addEventListener("click", closeGoalsDialog);
+goalsContent?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-goals-retry]")) refreshAgentTasks();
+});
+goalsDialog?.addEventListener("click", (event) => {
+  if (event.target === goalsDialog) closeGoalsDialog();
+});
+goalsDialog?.addEventListener("close", () => {
+  const trigger = goalsDialogTrigger;
+  goalsDialogTrigger = null;
+  trigger?.focus?.();
 });
 
 agentSessionControlsEl?.addEventListener("change", (event) => {
@@ -2198,6 +2300,9 @@ function connectAgentEvents() {
     const nearBottom = agentTimelineEl.scrollHeight - agentTimelineEl.scrollTop - agentTimelineEl.clientHeight < 60;
     if (selectedStateTab !== "agent" || !nearBottom) agentUnread += 1;
     renderAgentTimeline();
+    if (event.type === "tool" && event.phase === "completed" && event.details?.name === "upsert_task") {
+      refreshAgentTasks();
+    }
     refreshAgentSessionStateOnly();
   };
   ws.onclose = () => {
@@ -2363,6 +2468,7 @@ async function loadCheckpoint(id) {
     await refreshCheckpoints();
     await refreshState();
     await refreshAgentSession();
+    await refreshAgentTasks();
   } catch (error) {
     checkpointError = error instanceof Error ? error.message : String(error);
   } finally {
@@ -2390,6 +2496,7 @@ async function startNewGame() {
     resetLocalAfterCheckpointLoad();
     await refreshState();
     await refreshAgentSession();
+    await refreshAgentTasks();
   } catch (error) {
     checkpointError = error instanceof Error ? error.message : String(error);
   } finally {
@@ -2901,6 +3008,7 @@ function shouldIgnoreGameKeydown(event) {
   if (isEditableKeyTarget(target)) return true;
   if (checkpointMenuActive()) return true;
   if (transitionsDialog?.open) return true;
+  if (goalsDialog?.open) return true;
   return false;
 }
 
@@ -2943,6 +3051,7 @@ window.addEventListener("keydown", (event) => {
 
 setupStateTabs();
 refreshAgentSession().catch((error) => console.warn("agent session unavailable", error));
+refreshAgentTasks();
 connectStream();
 connectFrames();
 refreshCheckpoints();

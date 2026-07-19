@@ -2653,7 +2653,7 @@ class DebugState:
             result["history"] = list(task.get("history") or [])[-MAX_TASK_HISTORY:]
         return result
 
-    def task_ledger(self, *, include_closed: bool = False, limit: int = 20) -> list[dict]:
+    def task_ledger(self, *, include_closed: bool = False, limit: int | None = 20) -> list[dict]:
         with self.exploration_lock:
             data = self.read_exploration()
             tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
@@ -2671,7 +2671,27 @@ class DebugState:
                 updated_at = 0
             return (-priority, -updated_at, str(task.get("id") or ""))
         records.sort(key=sort_key)
-        return [self.task_view(task) for task in records[:limit]]
+        selected = records if limit is None else records[:max(0, int(limit))]
+        return [self.task_view(task) for task in selected]
+
+    def agent_tasks_view(self) -> dict:
+        grouped = {status: [] for status in ("active", "completed", "abandoned")}
+        for task in self.task_ledger(include_closed=True, limit=None):
+            status = task.get("status")
+            if status not in grouped:
+                continue
+            grouped[status].append({
+                key: task.get(key)
+                for key in ("id", "description", "priority", "status")
+            })
+        tasks = [
+            task
+            for status in ("active", "completed", "abandoned")
+            for task in grouped[status]
+        ]
+        counts = {status: len(records) for status, records in grouped.items()}
+        counts["total"] = len(tasks)
+        return {"ok": True, "counts": counts, "tasks": tasks}
 
     def upsert_agent_task(self, arguments: dict) -> dict:
         task_id = str(arguments.get("id") or "").strip()
@@ -7523,6 +7543,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 100
             self.send_json({"decisions": self.server.state.read_agent_log(limit=limit)})
+            return
+        if parsed.path == "/agent/tasks":
+            self.send_json(self.server.state.agent_tasks_view())
             return
         if parsed.path == "/agent/llm-log":
             query = parse_qs(parsed.query)

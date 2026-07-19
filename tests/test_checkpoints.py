@@ -60,6 +60,10 @@ def test_start_new_game_allowed_while_game_is_running():
         debug.events_path.write_text('[{"type":"old"}]', encoding='utf-8')
         debug.agent_log_path.write_text('{"turn":9}\n', encoding='utf-8')
         debug.exploration_path.write_text('{"version":9,"rooms":{},"transitions":{},"object_interactions":{"room":{"75":{"attempt_count":1}}}}', encoding='utf-8')
+        debug.run_agent_tool('upsert_task', {
+            'description': 'Old game task',
+            'rationale': 'This must not survive a new game.',
+        })
         debug.snapshot()
 
         def run(command, slot):
@@ -74,6 +78,7 @@ def test_start_new_game_allowed_while_game_is_running():
         assert not debug.events_path.exists()
         assert not debug.agent_log_path.exists()
         assert not debug.exploration_path.exists()
+        assert debug.agent_tasks_view()['counts']['total'] == 0
         assert debug.last_raw_frame is None
         assert debug.logical_frame_offset == 0
 
