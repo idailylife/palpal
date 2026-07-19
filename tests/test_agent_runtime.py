@@ -8,7 +8,26 @@ import types
 import pytest
 
 from conftest import make_debug_state, make_state, write_state
-from palpal.agent_runtime import AgentRuntime, ReplanRequired
+from palpal.agent_runtime import (
+    DEFAULT_COMPACT_AT_TOKENS,
+    TOOL_OUTPUT_PRESSURE_TARGET_TOKENS,
+    AgentRuntime,
+    ReplanRequired,
+)
+
+
+class MemorySession:
+    def __init__(self, items):
+        self.items = list(items)
+
+    async def get_items(self):
+        return list(self.items)
+
+    async def clear_session(self):
+        self.items = []
+
+    async def add_items(self, items):
+        self.items.extend(items)
 
 
 def decision(tool="no_op", args=None, intent="wait_runtime"):
@@ -247,6 +266,23 @@ def test_context_compression_replaces_history_and_keeps_recent_items(tmp_path, m
     assert session.items[-2:] == original[-2:]
     assert runtime.snapshot()["compactions"] == 1
     assert any(event["type"] == "compression" and event["phase"] == "completed" for event in runtime.events())
+
+
+def test_context_compaction_threshold_defaults_and_invalid_values(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.delenv("PALPAL_AGENT_COMPACT_AT_TOKENS", raising=False)
+    assert runtime._compact_at_tokens() == DEFAULT_COMPACT_AT_TOKENS == 128_000
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "invalid")
+    assert runtime._compact_at_tokens() == DEFAULT_COMPACT_AT_TOKENS
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "0")
+    assert runtime._compact_at_tokens() == DEFAULT_COMPACT_AT_TOKENS
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "64000")
+    assert runtime._compact_at_tokens() == 64_000
+
+
+def test_context_estimate_counts_utf8_bytes_for_chinese():
+    assert AgentRuntime._estimate_text_tokens("中" * 100) == 100
+    assert AgentRuntime._estimate_text_tokens("x" * 300) == 100
 
 
 def test_sdk_adapter_uses_streaming_tools_sqlite_and_buffering(tmp_path, monkeypatch):
@@ -595,19 +631,106 @@ def test_navigation_in_dialog_before_execution_still_requests_replan(tmp_path):
         runtime._execute_decision(recommendation)
 
 
-def test_large_tool_outputs_are_compacted_after_a_completed_run(tmp_path):
+def test_sub_limit_query_tool_outputs_remain_verbatim(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
-
-    class Session:
-        def __init__(self):
-            self.items = [{"type": "function_call_output", "output": json.dumps({"ok": True, "events": [{"text": "x" * 900}, {"text": "y" * 900}]})}]
-        async def get_items(self): return list(self.items)
-        async def clear_session(self): self.items = []
-        async def add_items(self, items): self.items.extend(items)
-
-    session = Session()
+    outputs = [
+        json.dumps({"ok": True, "navigation": {"targets": [{"id": 1}] * 20}}),
+        json.dumps({"ok": True, "dialogs": [{"text": "观察" * 100}]} , ensure_ascii=False),
+        json.dumps({"ok": True, "inventory": [{"item_id": index} for index in range(100)]}),
+    ]
+    session = MemorySession([
+        {"type": "function_call_output", "output": output} for output in outputs
+    ])
     asyncio.run(runtime._sanitize_sdk_session(session))
-    compacted = json.loads(session.items[0]["output"])
-    assert compacted["compacted"] is True
-    assert len(session.items[0]["output"]) < 1600
+    assert [item["output"] for item in session.items] == outputs
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_format"),
+    [
+        (json.dumps({"ok": True, "status": "complete", "events": [{"text": "中" * 9000}]}, ensure_ascii=False), "json"),
+        ("HEAD-" + ("x" * 25000) + "-TAIL", "text"),
+    ],
+)
+def test_large_tool_outputs_archive_preview_and_page_exact_content(tmp_path, raw, expected_format):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    session = MemorySession([{"type": "function_call_output", "output": raw}])
+    asyncio.run(runtime._sanitize_sdk_session(session))
+
+    preview = json.loads(session.items[0]["output"])
+    assert preview["truncated"] is True
+    assert preview["archived"] is True
+    assert preview["ok"] is True
+    assert preview["format"] == expected_format
+    assert preview["head"] == raw[:2000]
+    assert preview["tail"] == raw[-2000:]
+    if expected_format == "json":
+        assert preview["key_fields"]["status"] == "complete"
+        assert preview["key_fields"]["events_count"] == 1
+
+    parts = []
+    offset = 0
+    while True:
+        page = runtime.get_tool_output(preview["output_ref"], offset)
+        assert page["ok"]
+        assert len(page["content"]) <= 6000
+        parts.append(page["content"])
+        if page["complete"]:
+            assert page["next_offset"] is None
+            break
+        offset = page["next_offset"]
+    assert "".join(parts) == raw
+
+
+def test_tool_output_refs_reject_paths_missing_and_cross_session_access(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    output_ref = runtime._archive_tool_output("saved output")
+    assert runtime.get_tool_output(output_ref)["content"] == "saved output"
+    assert runtime.get_tool_output("../" + output_ref)["error"] == "invalid_output_ref"
+    assert runtime.get_tool_output("tool-" + ("0" * 32) + ".txt")["error"] == "tool_output_not_found"
+    assert runtime.get_tool_output(output_ref, -1)["error"] == "invalid_offset"
+
+    runtime.reset("new_session")
+    assert runtime.get_tool_output(output_ref)["error"] == "tool_output_not_found"
+
+
+def test_tool_output_pressure_cleanup_has_hysteresis_and_keeps_recent_six(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    monkeypatch.setattr(debug, "agent_system_prompt", lambda: "")
+    monkeypatch.setattr(debug, "agent_policy_prompt", lambda: "")
+    monkeypatch.setattr(debug, "agent_tool_specs", lambda: [])
+    raw_outputs = [json.dumps({"ok": True, "index": index, "data": "x" * 19900}) for index in range(18)]
+    session = MemorySession([
+        {"type": "function_call_output", "output": output} for output in raw_outputs
+    ])
+
+    asyncio.run(runtime._sanitize_sdk_session(session))
+    parsed = [json.loads(item["output"]) for item in session.items]
+    assert any(value.get("archived") is True for value in parsed[:-6])
+    assert [item["output"] for item in session.items[-6:]] == raw_outputs[-6:]
+    assert runtime.snapshot()["context_estimate_tokens"] <= TOOL_OUTPUT_PRESSURE_TARGET_TOKENS
+    refs = [value["output_ref"] for value in parsed[:-6] if value.get("archived") is True]
+    files_before = sorted(path.name for path in runtime._session_tool_outputs_dir().iterdir())
+
+    asyncio.run(runtime._sanitize_sdk_session(session))
+    parsed_again = [json.loads(item["output"]) for item in session.items]
+    assert [value["output_ref"] for value in parsed_again[:-6] if value.get("archived") is True] == refs
+    assert sorted(path.name for path in runtime._session_tool_outputs_dir().iterdir()) == files_before
+
+
+def test_tool_output_pressure_cleanup_waits_until_96k(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    monkeypatch.setattr(debug, "agent_system_prompt", lambda: "")
+    monkeypatch.setattr(debug, "agent_policy_prompt", lambda: "")
+    monkeypatch.setattr(debug, "agent_tool_specs", lambda: [])
+    raw_outputs = [json.dumps({"ok": True, "data": "x" * 19900}) for _ in range(13)]
+    session = MemorySession([
+        {"type": "function_call_output", "output": output} for output in raw_outputs
+    ])
+
+    asyncio.run(runtime._sanitize_sdk_session(session))
+    assert [item["output"] for item in session.items] == raw_outputs
+    assert not runtime._session_tool_outputs_dir().exists()

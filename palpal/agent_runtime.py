@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -15,7 +16,15 @@ from typing import Any, Callable
 GOAL = "通关游戏"
 RUNNING_PHASES = {"running", "interrupting"}
 EXECUTABLE_TOOLS = {"press_buttons", "advance_dialog", "navigation_step", "use_item"}
-CHECKPOINT_BUNDLE_VERSION = 1
+CHECKPOINT_BUNDLE_VERSION = 2
+SUPPORTED_CHECKPOINT_BUNDLE_VERSIONS = {1, CHECKPOINT_BUNDLE_VERSION}
+DEFAULT_COMPACT_AT_TOKENS = 128_000
+TOOL_OUTPUT_FULL_TOKENS = 8_000
+TOOL_OUTPUT_PRESSURE_TOKENS = 96_000
+TOOL_OUTPUT_PRESSURE_TARGET_TOKENS = 80_000
+TOOL_OUTPUT_RECENT_FULL = 6
+TOOL_OUTPUT_PAGE_CHARS = 6_000
+TOOL_OUTPUT_REF_RE = re.compile(r"tool-[0-9a-f]{32}\.txt")
 
 
 class ReplanRequired(RuntimeError):
@@ -44,6 +53,8 @@ class AgentRuntime:
         self.control_path = self.root / "control.json"
         self.events_path = self.root / "events.jsonl"
         self.sqlite_path = self.root / "session.sqlite3"
+        self.tool_outputs_root = self.root / "tool_outputs"
+        self.tool_outputs_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.cancel_event = threading.Event()
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -133,6 +144,63 @@ class AgentRuntime:
                 tmp.unlink()
             except FileNotFoundError:
                 pass
+
+    def _atomic_text(self, path: Path, value: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(value, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _valid_output_ref(output_ref: Any) -> bool:
+        return isinstance(output_ref, str) and TOOL_OUTPUT_REF_RE.fullmatch(output_ref) is not None
+
+    def _session_tool_outputs_dir(self, session_id: str | None = None) -> Path:
+        wanted = str(session_id or self.state.get("session_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", wanted):
+            raise ValueError("invalid session id")
+        return self.tool_outputs_root / wanted
+
+    def _archive_tool_output(self, raw_output: str) -> str:
+        output_ref = f"tool-{uuid.uuid4().hex}.txt"
+        self._atomic_text(self._session_tool_outputs_dir() / output_ref, raw_output)
+        return output_ref
+
+    def get_tool_output(self, output_ref: Any, offset: Any = 0) -> dict:
+        if not self._valid_output_ref(output_ref):
+            return {"ok": False, "error": "invalid_output_ref"}
+        try:
+            offset = int(offset or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "invalid_offset"}
+        if offset < 0:
+            return {"ok": False, "error": "invalid_offset"}
+        path = self._session_tool_outputs_dir() / output_ref
+        try:
+            content = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {"ok": False, "error": "tool_output_not_found", "output_ref": output_ref}
+        except (OSError, UnicodeError):
+            return {"ok": False, "error": "tool_output_unreadable", "output_ref": output_ref}
+        total_chars = len(content)
+        start = min(offset, total_chars)
+        end = min(total_chars, start + TOOL_OUTPUT_PAGE_CHARS)
+        complete = end >= total_chars
+        return {
+            "ok": True,
+            "output_ref": output_ref,
+            "offset": start,
+            "content": content[start:end],
+            "next_offset": None if complete else end,
+            "total_chars": total_chars,
+            "complete": complete,
+        }
 
     def _persist(self, value: dict | None = None) -> None:
         value = value or self.state
@@ -262,6 +330,58 @@ class AgentRuntime:
         if items:
             await session.add_items(items)
 
+    def _checkpoint_tool_outputs(self, checkpoint_dir: Path, session_id: str) -> list[dict]:
+        source_dir = self._session_tool_outputs_dir(session_id)
+        if not source_dir.is_dir():
+            return []
+        target_dir = checkpoint_dir / "agent" / "tool_outputs"
+        archived: list[dict] = []
+        for source in sorted(source_dir.iterdir(), key=lambda item: item.name):
+            if source.is_symlink() or not source.is_file() or not self._valid_output_ref(source.name):
+                continue
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / source.name
+            tmp = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            try:
+                shutil.copyfile(source, tmp)
+                os.replace(tmp, target)
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+            archived.append({"output_ref": source.name, "bytes": source.stat().st_size})
+        return archived
+
+    def _restore_checkpoint_tool_outputs(
+        self,
+        checkpoint_dir: Path,
+        entries: list[dict],
+        session_id: str,
+    ) -> None:
+        if not entries:
+            return
+        source_dir = checkpoint_dir / "agent" / "tool_outputs"
+        target_dir = self._session_tool_outputs_dir(session_id)
+        for entry in entries:
+            output_ref = entry.get("output_ref") if isinstance(entry, dict) else None
+            if not self._valid_output_ref(output_ref):
+                raise ValueError("invalid checkpoint tool output reference")
+            source = source_dir / output_ref
+            if not source.is_file():
+                raise ValueError("checkpoint tool output is missing")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / output_ref
+            tmp = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            try:
+                shutil.copyfile(source, tmp)
+                os.replace(tmp, target)
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+
     def export_checkpoint(self, checkpoint_dir: Path) -> dict:
         with self.lock:
             if self.is_running():
@@ -269,6 +389,7 @@ class AgentRuntime:
             control = self.snapshot()
         transcript = self._submit(self._sdk_session_items(control["session_id"])).result(timeout=30)
         events = self._all_session_events(control["session_id"])
+        tool_outputs = self._checkpoint_tool_outputs(checkpoint_dir, control["session_id"])
         bundle = {
             "version": CHECKPOINT_BUNDLE_VERSION,
             "saved_at": _stamp(),
@@ -276,6 +397,7 @@ class AgentRuntime:
             "control": control,
             "transcript": transcript,
             "events": events,
+            "tool_outputs": tool_outputs,
         }
         path = checkpoint_dir / "agent" / "session.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -286,6 +408,7 @@ class AgentRuntime:
             "turn": int(control.get("turn") or 0),
             "transcript_items": len(transcript),
             "events": len(events),
+            "tool_outputs": len(tool_outputs),
         }
 
     def _append_restored_events(self, events: list[dict], session_id: str) -> None:
@@ -315,13 +438,25 @@ class AgentRuntime:
         path = checkpoint_dir / "agent" / "session.json"
         try:
             bundle = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(bundle, dict) or int(bundle.get("version") or 0) != CHECKPOINT_BUNDLE_VERSION:
+            if not isinstance(bundle, dict) or int(bundle.get("version") or 0) not in SUPPORTED_CHECKPOINT_BUNDLE_VERSIONS:
                 raise ValueError("unsupported agent checkpoint bundle")
             control = bundle.get("control")
             transcript = bundle.get("transcript")
             events = bundle.get("events")
-            if not isinstance(control, dict) or not isinstance(transcript, list) or not isinstance(events, list):
+            tool_outputs = bundle.get("tool_outputs", [])
+            if (
+                not isinstance(control, dict)
+                or not isinstance(transcript, list)
+                or not isinstance(events, list)
+                or not isinstance(tool_outputs, list)
+            ):
                 raise ValueError("invalid agent checkpoint bundle")
+            checkpoint_outputs_dir = checkpoint_dir / "agent" / "tool_outputs"
+            for entry in tool_outputs:
+                output_ref = entry.get("output_ref") if isinstance(entry, dict) else None
+                source = checkpoint_outputs_dir / output_ref if self._valid_output_ref(output_ref) else None
+                if source is None or source.is_symlink() or not source.is_file():
+                    raise ValueError("invalid agent checkpoint tool output")
         except FileNotFoundError:
             return self.reset(
                 "checkpoint_loaded_without_agent_bundle",
@@ -358,6 +493,7 @@ class AgentRuntime:
             self.state = restored
             self._persist()
         try:
+            self._restore_checkpoint_tool_outputs(checkpoint_dir, tool_outputs, restored["session_id"])
             self._submit(self._replace_sdk_session_items(restored["session_id"], transcript)).result(timeout=30)
         except Exception:
             return self.reset(
@@ -751,10 +887,8 @@ finish the game.
         return output
 
     async def _maybe_compact_sdk(self, session: Any, client: Any, next_prompt: str) -> None:
-        try:
-            threshold = int(self.debug.config_value("PALPAL_AGENT_COMPACT_AT_TOKENS", "48000") or 48000)
-        except ValueError:
-            threshold = 48000
+        await self._sanitize_sdk_session(session, next_prompt=next_prompt)
+        threshold = self._compact_at_tokens()
         items = await session.get_items()
         fixed_overhead = self.debug.agent_system_prompt() + self.debug.agent_policy_prompt() + json.dumps(self.debug.agent_tool_specs(), ensure_ascii=False)
         estimate = self._estimate_context_tokens(items, next_prompt + fixed_overhead)
@@ -809,6 +943,17 @@ finish the game.
         self._persist()
         self.emit("compression", "completed", "Context compression completed.", {"kept_recent_items": len(items) - recent_start, "kept_recent_cycles": 2})
 
+    def _compact_at_tokens(self) -> int:
+        raw = self.debug.config_value(
+            "PALPAL_AGENT_COMPACT_AT_TOKENS",
+            str(DEFAULT_COMPACT_AT_TOKENS),
+        )
+        try:
+            threshold = int(raw or DEFAULT_COMPACT_AT_TOKENS)
+        except (TypeError, ValueError):
+            return DEFAULT_COMPACT_AT_TOKENS
+        return threshold if threshold > 0 else DEFAULT_COMPACT_AT_TOKENS
+
     def _merge_usage(self, usage: dict) -> None:
         normalized: dict[str, int] = {}
         target = self.state.setdefault("usage", {})
@@ -824,7 +969,14 @@ finish the game.
     @staticmethod
     def _estimate_context_tokens(items: list[dict], next_prompt: str) -> int:
         serialized = json.dumps(items, ensure_ascii=False, separators=(",", ":")) + next_prompt
-        return max(1, len(serialized) // 3)
+        return AgentRuntime._estimate_text_tokens(serialized)
+
+    @staticmethod
+    def _estimate_text_tokens(value: str) -> int:
+        # UTF-8 bytes avoid treating CJK text as if every character were a fraction
+        # of one token. Three bytes per token is intentionally dependency-free and
+        # conservative for the mixed Chinese/JSON transcripts PALPAL produces.
+        return max(1, (len(value.encode("utf-8")) + 2) // 3)
 
     @staticmethod
     def _recent_cycle_start(items: list[dict], cycles: int = 2) -> int:
@@ -871,8 +1023,8 @@ finish the game.
             raise ValueError("tool arguments must be a JSON object")
         return value
 
-    async def _sanitize_sdk_session(self, session: Any) -> None:
-        """Keep tool evidence useful without replaying large raw results next turn."""
+    async def _sanitize_sdk_session(self, session: Any, next_prompt: str = "") -> None:
+        """Archive oversized/old tool evidence while retaining reloadable previews."""
         items = await session.get_items()
         changed = False
         replacement: list[dict] = []
@@ -880,18 +1032,34 @@ finish the game.
             current = dict(item)
             if current.get("type") == "function_call_output":
                 output = current.get("output")
-                if isinstance(output, str) and len(output) > 1600:
-                    try:
-                        parsed = json.loads(output)
-                    except json.JSONDecodeError:
-                        parsed = None
-                    summary = self._compact_tool_output(parsed, len(output))
-                    current["output"] = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(output, str) and self._tool_output_needs_archive(output):
+                    current["output"] = self._archived_tool_output_preview(output, reason="output_limit")
                     changed = True
             replacement.append(current)
+
+        fixed_overhead = self.debug.agent_system_prompt() + self.debug.agent_policy_prompt() + json.dumps(self.debug.agent_tool_specs(), ensure_ascii=False)
+        estimate = self._estimate_context_tokens(replacement, next_prompt + fixed_overhead)
+        if estimate >= TOOL_OUTPUT_PRESSURE_TOKENS:
+            output_indices = [
+                index for index, item in enumerate(replacement)
+                if item.get("type") == "function_call_output" and isinstance(item.get("output"), str)
+            ]
+            protected = set(output_indices[-TOOL_OUTPUT_RECENT_FULL:])
+            for index in output_indices:
+                if estimate <= TOOL_OUTPUT_PRESSURE_TARGET_TOKENS:
+                    break
+                if index in protected:
+                    continue
+                output = replacement[index].get("output")
+                if not isinstance(output, str) or self._is_archived_tool_preview(output):
+                    continue
+                replacement[index] = dict(replacement[index])
+                replacement[index]["output"] = self._archived_tool_output_preview(output, reason="context_pressure")
+                changed = True
+                estimate = self._estimate_context_tokens(replacement, next_prompt + fixed_overhead)
+
         if not changed:
-            fixed_overhead = self.debug.agent_system_prompt() + self.debug.agent_policy_prompt() + json.dumps(self.debug.agent_tool_specs(), ensure_ascii=False)
-            self.state["context_estimate_tokens"] = self._estimate_context_tokens(items, fixed_overhead)
+            self.state["context_estimate_tokens"] = estimate
             self._persist()
             return
         try:
@@ -901,45 +1069,70 @@ finish the game.
             await session.clear_session()
             await session.add_items(items)
             raise
-        fixed_overhead = self.debug.agent_system_prompt() + self.debug.agent_policy_prompt() + json.dumps(self.debug.agent_tool_specs(), ensure_ascii=False)
-        self.state["context_estimate_tokens"] = self._estimate_context_tokens(replacement, fixed_overhead)
+        self.state["context_estimate_tokens"] = self._estimate_context_tokens(
+            replacement,
+            next_prompt + fixed_overhead,
+        )
         self._persist()
 
-    @staticmethod
-    def _compact_tool_output(value: Any, original_chars: int) -> dict:
-        if not isinstance(value, dict):
-            return {"ok": False, "summary": "Large non-JSON tool output omitted.", "original_chars": original_chars}
-        result: dict[str, Any] = {"ok": value.get("ok", True), "original_chars": original_chars, "compacted": True}
-        for key in ("mode", "total", "returned", "object_id", "room_id", "status"):
-            if key in value:
-                result[key] = value[key]
-        if isinstance(value.get("navigation"), dict):
-            nav = value["navigation"]
-            result["navigation"] = {
-                "status": nav.get("status"),
-                "targets_total": nav.get("targets_total", len(nav.get("targets") or [])),
-                "target_ids": [item.get("id") for item in (nav.get("targets") or [])[:20] if isinstance(item, dict)],
-            }
-        for key in ("dialogs", "events", "history", "observations", "inventory", "speakers"):
-            if isinstance(value.get(key), list):
-                result[f"{key}_count"] = len(value[key])
-                result[f"{key}_latest"] = [
-                    AgentRuntime._compact_tool_entry(item) for item in value[key][-3:]
-                    if isinstance(item, dict)
-                ]
-        return result
+    def _tool_output_needs_archive(self, output: str) -> bool:
+        return (
+            self._estimate_text_tokens(output) > TOOL_OUTPUT_FULL_TOKENS
+            and not self._is_archived_tool_preview(output)
+        )
 
     @staticmethod
-    def _compact_tool_entry(item: dict) -> dict:
-        keys = (
-            "id", "item_id", "object_id", "event_object_id", "type", "status",
-            "sequence", "end_sequence", "message_id", "speaker_hint", "amount",
-            "available_amount", "usable", "target_mode", "text", "changes",
+    def _is_archived_tool_preview(output: str) -> bool:
+        try:
+            value = json.loads(output)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(value, dict)
+            and value.get("truncated") is True
+            and value.get("archived") is True
+            and AgentRuntime._valid_output_ref(value.get("output_ref"))
         )
-        compact = {key: item.get(key) for key in keys if item.get(key) is not None}
-        if isinstance(compact.get("text"), str) and len(compact["text"]) > 240:
-            compact["text"] = compact["text"][:240] + "…"
-        return compact
+
+    def _archived_tool_output_preview(self, output: str, *, reason: str) -> str:
+        output_ref = self._archive_tool_output(output)
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = None
+        is_json = parsed is not None
+        preview: dict[str, Any] = {
+            "ok": parsed.get("ok", True) if isinstance(parsed, dict) else True,
+            "truncated": True,
+            "archived": True,
+            "reason": reason,
+            "format": "json" if is_json else "text",
+            "output_ref": output_ref,
+            "original_chars": len(output),
+            "original_bytes": len(output.encode("utf-8")),
+            "estimated_tokens": self._estimate_text_tokens(output),
+            "head": output[:2000],
+            "tail": output[-2000:] if len(output) > 2000 else "",
+        }
+        if isinstance(parsed, dict):
+            preview["keys"] = sorted(str(key) for key in parsed.keys())[:40]
+            key_fields: dict[str, Any] = {}
+            for key in (
+                "ok", "error", "mode", "kind", "id", "object_id", "room_id",
+                "status", "total", "returned", "events_total", "history_total",
+            ):
+                value = parsed.get(key)
+                if value is None or isinstance(value, (bool, int, float)):
+                    if key in parsed:
+                        key_fields[key] = value
+                elif isinstance(value, str) and len(value) <= 300:
+                    key_fields[key] = value
+            for key, value in parsed.items():
+                if isinstance(value, list):
+                    key_fields.setdefault(f"{key}_count", len(value))
+            if key_fields:
+                preview["key_fields"] = key_fields
+        return json.dumps(preview, ensure_ascii=False, separators=(",", ":"))
 
     def _decision_event_details(self, decision: dict) -> dict:
         return {key: decision.get(key) for key in (

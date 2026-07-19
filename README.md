@@ -209,23 +209,35 @@ Start New Game creates a clean session. `PALPAL_GAME_INSTANCE_ID` is normally
 set by `./run` and is only needed when launching the native binary manually.
 
 Checkpoints include a local Agent bundle containing the saved session state,
-SDK transcript, and activity timeline. Loading one creates a new branch session
-from that exact save point, so decisions made after the checkpoint do not leak
-into the restored game. Older checkpoints still load, but begin with an empty
-Agent session and an explicit compatibility status.
+SDK transcript, activity timeline, and any archived tool outputs. Loading one
+creates a new branch session from that exact save point, so decisions made after
+the checkpoint do not leak into the restored game. Version 1 Agent bundles still
+load without archived outputs. Older checkpoints with no Agent bundle still
+begin with an empty Agent session and an explicit compatibility status.
 
 Set `PALPAL_AGENT_COMPACT_AT_TOKENS` to change the conservative context
-compression threshold (default `48000`). Compression uses a DeepSeek
+compression threshold (default `128000` estimated tokens). Compression uses a DeepSeek
 summarizer and keeps the two most recent full decision cycles. The UI reports
 cumulative billed tokens, the latest agent-run usage, and a conservative
-estimate of the currently persisted context separately.
+estimate of the currently persisted context separately. Token estimates use
+UTF-8 byte size so Chinese output is not severely undercounted.
 
-The persistent model sees seven tools: `upsert_task`, `get_navigation`,
+The persistent model sees eight tools: `upsert_task`, `get_navigation`,
 `inspect_target`, `get_observations`, `get_inventory`, `get_room_memory`, and
-`submit_decision`. Raw query outputs are compacted after a completed decision,
-and the permanent goal is held in agent instructions/session metadata
-instead of being repeated in every user message. After actions, the runtime
-requires a two-second quiet state before starting the next decision.
+`get_tool_output`, followed by `submit_decision`. Query outputs up to about 8000
+estimated tokens stay verbatim. Larger JSON or text outputs are atomically
+archived under the current session's `runtime/agent/tool_outputs/` directory;
+the transcript keeps a valid JSON preview with key fields, head/tail excerpts,
+original size, and a reloadable `output_ref`. `get_tool_output` reads only the
+current session's archive in pages of at most 6000 characters.
+
+At 96000 estimated context tokens, older tool results are archived until the
+estimate is near 80000 while the six most recent complete tool results remain
+inline. This hysteresis happens before the 128k whole-session summary and avoids
+rewriting the transcript on every turn. The permanent goal is held in agent
+instructions/session metadata instead of being repeated in every user message.
+After actions, the runtime requires a two-second quiet state before starting the
+next decision.
 
 `submit_decision` accepts only a minimal action plus a short reason. Depending
 on `action`, the model adds `target_id`, or `item_id` with exactly one of

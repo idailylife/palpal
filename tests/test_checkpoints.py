@@ -129,7 +129,7 @@ def test_save_checkpoint_writes_manifest_game_and_existing_companion_files():
         assert (checkpoint_dir / 'companion' / 'exploration.json').exists()
         assert (checkpoint_dir / 'companion' / 'logs' / 'navigation.log').exists()
         assert (checkpoint_dir / 'agent' / 'session.json').exists()
-        assert checkpoint['agent_bundle']['version'] == 1
+        assert checkpoint['agent_bundle']['version'] == 2
         assert not (checkpoint_dir / 'state.json').exists()
         assert not (checkpoint_dir / 'screen.bmp').exists()
 
@@ -266,10 +266,13 @@ def test_checkpoint_restores_agent_as_an_isolated_branch():
             {'role': 'user', 'content': 'checkpoint context'},
             {'role': 'assistant', 'content': 'checkpoint response'},
         ])).result(timeout=5)
+        archived_output = json.dumps({'ok': True, 'events': [{'text': 'checkpoint evidence'}]})
+        output_ref = runtime._archive_tool_output(archived_output)
         runtime.emit('decision', 'ready', 'Saved activity.')
 
         with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
-            debug.save_checkpoint('agent-branch', 'Agent Branch')
+            saved = debug.save_checkpoint('agent-branch', 'Agent Branch')
+        assert saved['checkpoint']['agent_bundle']['tool_outputs'] == 1
 
         runtime.reset('later_manual_reset')
         later_session_id = runtime.snapshot()['session_id']
@@ -293,6 +296,7 @@ def test_checkpoint_restores_agent_as_an_isolated_branch():
         assert restored['compactions'] == 1
         transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)
         assert [item['content'] for item in transcript] == ['checkpoint context', 'checkpoint response']
+        assert runtime.get_tool_output(output_ref)['content'] == archived_output
         summaries = [event['summary'] for event in runtime.events(limit=500)]
         assert 'Saved activity.' in summaries
         assert 'Post-checkpoint activity.' not in summaries
@@ -305,6 +309,41 @@ def test_checkpoint_restores_agent_as_an_isolated_branch():
         assert second_branch['session_id'] != first_branch_id
         assert second_branch['restored_from_session_id'] == source_session_id
         assert second_branch['turn'] == 4
+        assert runtime.get_tool_output(output_ref)['content'] == archived_output
+
+
+def test_version_one_agent_bundle_without_tool_outputs_remains_compatible():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = {**make_state(), 'game_instance_id': 'game-a'}
+        write_state(debug, state)
+        debug.snapshot()
+        runtime = debug.agent_runtime
+        checkpoint_dir = debug.checkpoint_dir('agent-v1')
+        checkpoint_dir.mkdir(parents=True)
+        (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
+        (checkpoint_dir / 'manifest.json').write_text(json.dumps({
+            'version': 2,
+            'label': 'Agent v1',
+            'created_at': '2026-01-01T00:00:00Z',
+        }), encoding='utf-8')
+        (checkpoint_dir / 'agent').mkdir()
+        (checkpoint_dir / 'agent' / 'session.json').write_text(json.dumps({
+            'version': 1,
+            'source_session_id': 'a' * 32,
+            'control': {'session_id': 'a' * 32, 'turn': 3},
+            'transcript': [{'role': 'user', 'content': 'legacy transcript'}],
+            'events': [],
+        }), encoding='utf-8')
+
+        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+            debug.load_checkpoint('agent-v1')
+
+        restored = runtime.snapshot()
+        assert restored['stop_reason'] == 'checkpoint_restored'
+        assert restored['turn'] == 3
+        transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)
+        assert transcript == [{'role': 'user', 'content': 'legacy transcript'}]
 
 
 def test_old_checkpoint_loads_with_a_new_empty_agent_session():

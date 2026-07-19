@@ -416,7 +416,7 @@ def test_agent_tool_specs_include_queries_and_submit():
         tools = debug.agent_tool_specs()
         names = [tool['function']['name'] for tool in tools]
         by_name = {tool['function']['name']: tool for tool in tools}
-        assert set(names) == {'upsert_task', 'get_navigation', 'inspect_target', 'get_observations', 'get_inventory', 'get_room_memory', 'submit_decision'}
+        assert set(names) == {'upsert_task', 'get_navigation', 'inspect_target', 'get_observations', 'get_inventory', 'get_room_memory', 'get_tool_output', 'submit_decision'}
         dialog_properties = by_name['get_observations']['function']['parameters']['properties']
         assert 'speaker' in dialog_properties
         assert dialog_properties['speaker']['type'] == 'string'
@@ -424,6 +424,8 @@ def test_agent_tool_specs_include_queries_and_submit():
         assert set(object_history_properties) == {'id', 'limit'}
         assert '紧凑' in by_name['get_navigation']['function']['description']
         assert '最小 dry-run 动作' in by_name['submit_decision']['function']['description']
+        output_properties = by_name['get_tool_output']['function']['parameters']['properties']
+        assert set(output_properties) == {'output_ref', 'offset'}
         context = debug.agent_tool_initial_context(make_state())
         assert context['active_tasks'] == []
         assert set(context) == {'state_summary', 'active_tasks'}
@@ -647,7 +649,7 @@ def test_agent_tools_return_json_serializable_dicts():
         write_state(debug, state)
         debug.event_log = [{'type': 'inventory_changed'}]
         debug.dialog_history = [{'text': 'hello'}]
-        calls = [('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('get_navigation', {'limit': 5}), ('inspect_target', {'id': 48, 'limit': 1}), ('get_observations', {'kind': 'both', 'limit': 1}), ('get_observations', {'kind': 'speakers', 'limit': 1}), ('get_inventory', {'limit': 1}), ('get_room_memory', {'room_id': debug.room_identity(state)['id']}), ('submit_decision', {'action': 'wait', 'reason': 'Wait.'})]
+        calls = [('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('get_navigation', {'limit': 5}), ('inspect_target', {'id': 48, 'limit': 1}), ('get_observations', {'kind': 'both', 'limit': 1}), ('get_observations', {'kind': 'speakers', 'limit': 1}), ('get_inventory', {'limit': 1}), ('get_room_memory', {'room_id': debug.room_identity(state)['id']}), ('get_tool_output', {'output_ref': 'tool-' + ('0' * 32) + '.txt'}), ('submit_decision', {'action': 'wait', 'reason': 'Wait.'})]
         for (name, arguments) in calls:
             result = debug.run_agent_tool(name, arguments, state)
             assert isinstance(result, dict)

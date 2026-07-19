@@ -6394,6 +6394,22 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_tool_output",
+                    "description": "分页读取当前 Agent session 中已归档的完整工具输出；每次最多返回 6000 个字符。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "output_ref": {"type": "string"},
+                            "offset": {"type": "integer", "minimum": 0, "default": 0},
+                        },
+                        "required": ["output_ref"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "submit_decision",
                     "description": "提交最小 dry-run 动作；仅填写当前 action 所需字段。",
                     "parameters": {
@@ -6531,6 +6547,11 @@ class DebugState:
                 "exploration": self.room_exploration_summary(room_id, state),
                 "transitions": self.known_transitions_summary(room_id, state),
             }
+        if name == "get_tool_output":
+            return self.agent_runtime.get_tool_output(
+                arguments.get("output_ref"),
+                arguments.get("offset", 0),
+            )
         if name == "submit_decision":
             submission_error = self.agent_decision_submission_error(arguments)
             if submission_error is not None:
