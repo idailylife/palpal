@@ -66,7 +66,7 @@ def test_runtime_counts_recommendations_and_can_resume(tmp_path):
     paused = wait_for_pause(runtime)
     assert paused["turn"] == 1
     assert paused["run_turn"] == 1
-    assert paused["stop_reason"] == "no_op"
+    assert paused["stop_reason"] == "agent_wait"
     assert paused["usage"]["total_tokens"] == 15
 
     runtime.start(None, 1)
@@ -74,6 +74,113 @@ def test_runtime_counts_recommendations_and_can_resume(tmp_path):
     assert resumed["turn"] == 2
     assert resumed["usage"]["total_tokens"] == 30
     assert any(event["type"] == "decision" for event in runtime.events())
+
+
+def test_runtime_replans_rejected_recommendation_without_counting_turn(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime._unsafe_state_reason = lambda state: None
+    rejected = decision(
+        "no_op",
+        {"reason": "navigation_target_invalid", "target_id": 52, "route_status": "unreachable_static"},
+        "wait_runtime",
+    )
+    rejected["validation"] = {
+        "status": "rejected",
+        "reason": "navigation_target_invalid",
+        "target_id": 52,
+        "route_status": "unreachable_static",
+        "route_ok": True,
+    }
+    accepted = decision("press_buttons", {"buttons": ["search"]}, "inspect_target")
+    recommendations = [rejected, accepted]
+    feedback = []
+
+    def provide(state, model, current_feedback):
+        feedback.append(current_feedback)
+        return recommendations.pop(0)
+
+    runtime.decision_provider = provide
+    runtime._execute_decision = lambda value: {"ok": True, "delta": {"stable": True}}
+    runtime.start(None, 1)
+    paused = wait_for_pause(runtime)
+
+    assert paused["stop_reason"] == "turn_limit"
+    assert paused["turn"] == 1
+    assert paused["run_turn"] == 1
+    assert paused["usage"]["total_tokens"] == 30
+    assert "navigation_target_invalid" in feedback[1]
+    discarded = [event for event in runtime.events() if event["phase"] == "discarded"]
+    assert len(discarded) == 1
+    assert discarded[0]["details"]["validation"]["target_id"] == 52
+
+
+def test_runtime_pauses_with_details_after_replan_rejections_are_exhausted(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime._unsafe_state_reason = lambda state: None
+
+    def provide(state, model, feedback):
+        value = decision(
+            "no_op",
+            {"reason": "navigation_target_invalid", "target_id": 63, "route_status": "unreachable_static"},
+            "wait_runtime",
+        )
+        value["validation"] = {
+            "status": "rejected",
+            "reason": "navigation_target_invalid",
+            "target_id": 63,
+            "route_status": "unreachable_static",
+            "route_ok": True,
+        }
+        return value
+
+    runtime.decision_provider = provide
+    runtime.start(None, 1)
+    paused = wait_for_pause(runtime)
+
+    assert paused["stop_reason"] == "replan_exhausted"
+    assert paused["turn"] == 0
+    assert paused["run_turn"] == 0
+    assert paused["usage"]["total_tokens"] == 45
+    pause = [event for event in runtime.events() if event["type"] == "pause"][-1]
+    assert pause["summary"] == "Agent paused: no executable recommendation after 3 replans."
+    assert pause["details"]["validation"]["target_id"] == 63
+    assert len([event for event in runtime.events() if event["phase"] == "discarded"]) == 3
+
+
+def test_successful_execution_resets_consecutive_replan_budget(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime._unsafe_state_reason = lambda state: None
+
+    def rejected(target_id):
+        value = decision(
+            "no_op",
+            {"reason": "navigation_target_invalid", "target_id": target_id},
+            "wait_runtime",
+        )
+        value["validation"] = {
+            "status": "rejected",
+            "reason": "navigation_target_invalid",
+            "target_id": target_id,
+            "route_status": "unreachable_static",
+        }
+        return value
+
+    def accepted():
+        return decision("press_buttons", {"buttons": ["search"]}, "inspect_target")
+
+    recommendations = [rejected(48), accepted(), rejected(52), rejected(63), accepted()]
+    runtime.decision_provider = lambda state, model, feedback: recommendations.pop(0)
+    runtime._execute_decision = lambda value: {"ok": True, "delta": {"stable": True}}
+
+    runtime.start(None, 2)
+    paused = wait_for_pause(runtime)
+    assert paused["stop_reason"] == "turn_limit"
+    assert paused["turn"] == 2
+    assert paused["run_turn"] == 2
+    assert paused["usage"]["total_tokens"] == 75
 
 
 def test_runtime_executes_exact_turn_budget_in_same_session(tmp_path):
@@ -427,7 +534,7 @@ def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeyp
 
     asyncio.run(runtime._sdk_decide(make_state(), "compact feedback"))
     assert set(captured["prompt"]) == {"feedback", "context"}
-    assert set(captured["prompt"]["context"]) == {"state_summary", "active_tasks"}
+    assert set(captured["prompt"]["context"]) == {"state_summary", "active_tasks", "active_tasks_total"}
 
 
 def test_tool_argument_parser_repairs_one_truncated_json_ending():

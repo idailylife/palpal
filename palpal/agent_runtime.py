@@ -707,11 +707,17 @@ class AgentRuntime:
         future = self._submit(self.execute_pending())
         return future.result(timeout=300)
 
-    def _pause(self, reason: str) -> None:
+    def _pause(
+        self,
+        reason: str,
+        *,
+        details: dict | None = None,
+        summary: str | None = None,
+    ) -> None:
         with self.lock:
             self.state.update(status="paused", phase="paused", stop_reason=reason, ended_at=_stamp())
             self._persist()
-        self.emit("pause", "paused", f"Agent paused: {reason}.")
+        self.emit("pause", "paused", summary or f"Agent paused: {reason}.", details)
         with self.lock:
             pending_instance = self.state.get("pending_game_instance_id")
             if pending_instance:
@@ -742,6 +748,32 @@ class AgentRuntime:
                     self._pause("interrupted")
                     return
                 latest = await asyncio.to_thread(self.debug.snapshot)
+                validation_rejection = self._decision_validation_rejection(decision)
+                if validation_rejection:
+                    replans += 1
+                    self._merge_usage(decision.get("usage") or {})
+                    self.emit(
+                        "decision",
+                        "discarded",
+                        "Recommendation rejected by latest-state validation.",
+                        {
+                            "validation": validation_rejection,
+                            "recommended_action": decision.get("recommended_action"),
+                        },
+                        started=started,
+                    )
+                    if replans >= 3:
+                        self._pause(
+                            "replan_exhausted",
+                            details={"validation": validation_rejection, "replans": replans},
+                            summary=(
+                                "Agent paused: no executable recommendation after "
+                                f"{replans} replans."
+                            ),
+                        )
+                        return
+                    feedback = self._validation_replan_feedback(validation_rejection, latest)
+                    continue
                 replan_reason = self._decision_replan_reason(decision, latest)
                 if replan_reason:
                     replans += 1
@@ -769,7 +801,12 @@ class AgentRuntime:
                     return
                 action = decision.get("recommended_action") or {}
                 if action.get("tool") in {None, "no_op"} or decision.get("recommended_intent") == "wait_runtime":
-                    self._pause("no_op")
+                    wait_reason = (action.get("args") or {}).get("reason") or "agent_wait"
+                    self._pause(
+                        "agent_wait",
+                        details={"reason": wait_reason, "recommended_action": action},
+                        summary="Agent paused: agent requested wait.",
+                    )
                     return
                 self.state["phase"] = "executing"
                 self._persist()
@@ -795,6 +832,7 @@ class AgentRuntime:
                 with self.lock:
                     self.state.update(last_execution=result, pending_decision=None)
                     self._persist()
+                replans = 0
                 feedback = "Execution result and stable state delta:\n" + json.dumps(result, ensure_ascii=False, separators=(",", ":"))
             self._pause("turn_limit")
         except asyncio.CancelledError:
@@ -1207,9 +1245,22 @@ finish the game.
             return "dialog_inactive"
         return None
 
+    @staticmethod
+    def _decision_validation_rejection(decision: dict) -> dict | None:
+        validation = decision.get("validation")
+        if not isinstance(validation, dict) or validation.get("status") != "rejected":
+            return None
+        return dict(validation)
+
     def _replan_feedback(self, reason: str, state: dict) -> str:
         return "Recommendation invalidated by live state; replan without executing:\n" + json.dumps({
             "reason": reason,
+            "state": self._compact_state(state),
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    def _validation_replan_feedback(self, validation: dict, state: dict) -> str:
+        return "Recommendation rejected by server validation; inspect the latest navigation or inventory and choose a currently executable action:\n" + json.dumps({
+            "validation": validation,
             "state": self._compact_state(state),
         }, ensure_ascii=False, separators=(",", ":"))
 

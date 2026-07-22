@@ -2002,7 +2002,12 @@ function updateExternalControls(state) {
 
 function agentStatusLabel(session) {
   const status = session?.status || "loading";
-  const reason = session?.stop_reason ? ` · ${session.stop_reason}` : "";
+  const stopReasonLabels = {
+    agent_wait: "agent requested wait",
+    replan_exhausted: "no executable recommendation",
+  };
+  const stopReason = session?.stop_reason;
+  const reason = stopReason ? ` · ${stopReasonLabels[stopReason] || stopReason}` : "";
   return `${status}${reason}`;
 }
 

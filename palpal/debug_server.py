@@ -51,6 +51,8 @@ EXPLORATION_VERSION = 11
 LOGICAL_ROOM_ID_RE = re.compile(r"^S\d+/M\d+:[0-9A-F]{12}$")
 MAX_OBJECT_INTERACTION_HISTORY = 20
 MAX_TASK_HISTORY = 20
+MAX_ACTIVE_TASK_CONTEXT = 8
+MAX_ACTIVE_TASK_DESCRIPTION = 160
 TRANSITION_OBSERVATION_TIMEOUT_SECONDS = 4.0
 TRANSITION_STABLE_SNAPSHOTS = 2
 MAX_NAVIGATION_SEGMENT_STEPS = 8
@@ -2704,21 +2706,41 @@ class DebugState:
             data = self.read_exploration()
             tasks = data.setdefault("tasks", {})
             existing = tasks.get(task_id) if task_id else None
-            if task_id and not isinstance(existing, dict):
-                return {"ok": False, "error": "task id was not found"}
+            if not isinstance(existing, dict):
+                existing = None
             if existing is None:
                 description = arguments.get("description")
                 rationale = arguments.get("rationale")
-                if not isinstance(description, str) or not description.strip():
-                    return {"ok": False, "error": "creating a task requires a non-empty description"}
-                if not isinstance(rationale, str) or not rationale.strip():
-                    return {"ok": False, "error": "creating a task requires a non-empty rationale"}
-                task_id = "task-" + hashlib.sha256(f"{now}:{turn}:{description}".encode("utf-8")).hexdigest()[:16]
+                if (
+                    not isinstance(description, str)
+                    or not description.strip()
+                    or not isinstance(rationale, str)
+                    or not rationale.strip()
+                ):
+                    if task_id:
+                        return {
+                            "ok": False,
+                            "error": (
+                                "unknown task id; creating it requires non-empty description and rationale; "
+                                "call get_tasks to verify existing ids"
+                            ),
+                        }
+                    return {
+                        "ok": False,
+                        "error": "creating a task requires non-empty description and rationale",
+                    }
+                if not task_id:
+                    task_id = "task-" + hashlib.sha256(
+                        f"{now}:{turn}:{description}".encode("utf-8")
+                    ).hexdigest()[:16]
                 existing = {
                     "id": task_id, "description": description.strip(), "rationale": rationale.strip(),
                     "priority": 0, "status": status or "active", "created_at": now,
                     "created_agent_turn": turn, "history": [],
                 }
+                operation = "created"
+            else:
+                operation = "updated"
             changed = {}
             for key in ("description", "rationale", "status", "transition_key", "room_id"):
                 if key not in arguments:
@@ -2760,13 +2782,28 @@ class DebugState:
             existing["history"] = existing["history"][-MAX_TASK_HISTORY:]
             tasks[task_id] = existing
             self.write_exploration(data)
-            return {"ok": True, "task": self.task_view(existing)}
+            return {"ok": True, "operation": operation, "task": self.task_view(existing)}
 
-    def active_task_summary(self, limit: int = 20) -> list[dict]:
+    def active_task_summary(self, limit: int = MAX_ACTIVE_TASK_CONTEXT) -> list[dict]:
+        limit = max(0, min(int(limit), MAX_ACTIVE_TASK_CONTEXT))
+        def compact_description(value) -> str:
+            description = str(value or "")
+            if len(description) <= MAX_ACTIVE_TASK_DESCRIPTION:
+                return description
+            return description[:MAX_ACTIVE_TASK_DESCRIPTION - 1] + "…"
         return [
-            {key: task.get(key) for key in ("id", "description", "priority", "object_id", "transition_key", "room_id", "rationale", "updated_agent_turn")}
+            {
+                **{key: task.get(key) for key in ("id", "priority", "object_id", "transition_key", "room_id")},
+                "description": compact_description(task.get("description")),
+            }
             for task in self.task_ledger(limit=limit)
         ]
+
+    def active_task_context(self) -> dict:
+        return {
+            "active_tasks": self.active_task_summary(),
+            "active_tasks_total": len(self.task_ledger(limit=None)),
+        }
 
     def object_event_key(self, event: dict) -> str:
         payload = {
@@ -3494,6 +3531,11 @@ class DebugState:
         if object_id is None or (isinstance(pending, dict) and pending.get("object_id") == object_id):
             if isinstance(pending, dict):
                 self.observations.cancel(pending.get("observation_id"), "transition_cleared")
+                self.finish_navigation_route(
+                    pending.get("from_room"),
+                    pending.get("object_id"),
+                    "transition_cleared",
+                )
             self.pending_transition_observation = None
 
     def mark_pending_transition_observation(
@@ -3675,11 +3717,17 @@ class DebugState:
                 state,
             )
             self.observations.cancel(pending.get("observation_id"), "destination_unstable_timeout")
+            self.finish_navigation_route(
+                pending.get("from_room"),
+                object_id,
+                "transition_timeout",
+            )
             self.pending_transition_observation = None
             return None
         from_identity = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
         if object_id <= 0 or from_identity is None:
             self.observations.cancel(pending.get("observation_id"), "invalid_transition_observation")
+            self.finish_navigation_route(from_identity, object_id, "transition_invalid")
             self.pending_transition_observation = None
             return None
         native = self.native_trigger_observation(state)
@@ -3773,6 +3821,7 @@ class DebugState:
         self.observations.complete(observation_id, {"transition": record})
         if pending.get("owner") == "background":
             self.observations.consume(observation_id, owner="background")
+        self.finish_navigation_route(from_identity, object_id, "transitioned")
         self.pending_transition_observation = None
         return record
 
@@ -3918,6 +3967,42 @@ class DebugState:
             }
             self.write_exploration(data)
 
+    def finish_navigation_route(
+        self,
+        from_identity: dict | None,
+        target_id,
+        outcome: str,
+    ) -> None:
+        if not isinstance(from_identity, dict) or not from_identity.get("id"):
+            return
+        try:
+            target_id = int(target_id or 0)
+        except (TypeError, ValueError):
+            return
+        if target_id <= 0:
+            return
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = (data.get("rooms") or {}).get(from_identity["id"])
+            if not isinstance(room, dict):
+                return
+            last_route = room.get("last_route")
+            try:
+                remembered_target_id = int(last_route.get("target_id") or 0) if isinstance(last_route, dict) else 0
+            except (TypeError, ValueError):
+                remembered_target_id = 0
+            if (
+                not isinstance(last_route, dict)
+                or not last_route.get("pending")
+                or remembered_target_id != target_id
+            ):
+                return
+            last_route["pending"] = False
+            last_route["outcome"] = outcome
+            last_route["completed_at"] = time.time()
+            room["updated_at"] = last_route["completed_at"]
+            self.write_exploration(data)
+
     def exploration_safe_and_reachable(
         self,
         state: dict,
@@ -3962,6 +4047,38 @@ class DebugState:
             if current == expected_node:
                 explored.update(node for node in self.route_nodes_through(last_route, current) if node in reachable_safe)
                 last_route["pending"] = False
+                last_route["outcome"] = "expected_node_reached"
+                last_route["completed_at"] = time.time()
+            else:
+                pending_transition = self.pending_transition_observation
+                try:
+                    pending_object_id = (
+                        int(pending_transition.get("object_id") or 0)
+                        if isinstance(pending_transition, dict)
+                        else 0
+                    )
+                    remembered_target_id = int(last_route.get("target_id") or 0)
+                except (TypeError, ValueError):
+                    pending_object_id = 0
+                    remembered_target_id = -1
+                same_live_transition = (
+                    isinstance(pending_transition, dict)
+                    and pending_object_id == remembered_target_id
+                    and isinstance(pending_transition.get("from_room"), dict)
+                    and pending_transition["from_room"].get("id") == room.get("logical_room_id")
+                )
+                try:
+                    route_age = time.time() - float(last_route.get("updated_at") or 0)
+                except (TypeError, ValueError):
+                    route_age = TRANSITION_OBSERVATION_TIMEOUT_SECONDS + 1
+                if (
+                    not self.action_path.exists()
+                    and not same_live_transition
+                    and route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS
+                ):
+                    last_route["pending"] = False
+                    last_route["outcome"] = "confirmation_expired"
+                    last_route["completed_at"] = time.time()
 
         frontier: set[tuple[int, int]] = set()
         blocked_edges: set[str] = set()
@@ -6323,7 +6440,6 @@ class DebugState:
                 "segment_steps": last_route.get("segment_steps"),
                 "remaining_steps": last_route.get("remaining_steps"),
                 "target_selection": target_selection,
-                "pending": last_route.get("pending"),
             },
         }
 
@@ -6333,17 +6449,36 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "upsert_task",
-                    "description": "创建或更新本地 agent 任务记忆，不执行游戏动作。新任务必须提供 description 和 rationale；用 status 标记 completed 或 abandoned，记录会保留历史。",
+                    "description": (
+                        "创建或更新本地 agent 任务记忆，不执行游戏动作。已有 id 会更新；未知自选 id 在同时提供 "
+                        "description 和 rationale 时按该 id 创建；省略 id 创建时自动生成 task-* id。更新前优先用 get_tasks 核对账本。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"}, "description": {"type": "string"},
+                            "id": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1},
                             "priority": {"type": "integer"},
                             "status": {"type": "string", "enum": ["active", "completed", "abandoned"]},
                             "object_id": {"type": "integer", "minimum": 1},
                             "transition_key": {"type": "string"}, "room_id": {"type": "string"},
-                            "rationale": {"type": "string"},
+                            "rationale": {"type": "string", "minLength": 1},
                         },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_tasks",
+                    "description": "查询任务账本的完整记录。默认只返回 active；include_closed=true 返回 completed 和 abandoned；写入前用它核对已有 id。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "include_closed": {"type": "boolean", "default": False},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                        },
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -6452,7 +6587,7 @@ class DebugState:
     def agent_tool_initial_context(self, state: dict) -> dict:
         return {
             "state_summary": self.agent_state_summary(state),
-            "active_tasks": self.active_task_summary(),
+            **self.active_task_context(),
         }
 
     def agent_tool_messages(self, state: dict) -> list[dict]:
@@ -6511,6 +6646,18 @@ class DebugState:
         state = state or read_json(self.state_path)
         if name == "upsert_task":
             return self.upsert_agent_task(arguments)
+        if name == "get_tasks":
+            include_closed = arguments.get("include_closed") is True
+            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
+            all_tasks = self.task_ledger(include_closed=include_closed, limit=None)
+            tasks = all_tasks[:limit]
+            return {
+                "ok": True,
+                "include_closed": include_closed,
+                "tasks": tasks,
+                "returned": len(tasks),
+                "total": len(all_tasks),
+            }
         if name == "get_navigation":
             limit = self.agent_tool_limit(arguments.get("limit"), 20, 40)
             return {"ok": True, "navigation": self.compact_agent_navigation(state, limit)}
@@ -6719,7 +6866,7 @@ class DebugState:
                 "targets": targets,
             },
             "exploration": self.agent_exploration_summary(self.agent_current_exploration(state)),
-            "active_tasks": self.active_task_summary(),
+            **self.active_task_context(),
             "dialogs": recent_dialogs,
             "dialog_feedback_by_object": {str(obj_id): entries for obj_id, entries in feedback_by_object.items()},
             "events": events[-10:],
@@ -6758,7 +6905,9 @@ class DebugState:
             "一旦该传送已有 known destination，则停止使用刚解锁优先级，恢复目的地探索价值、任务和回退风险的正常比较。"
             "当最近建议看起来反复访问同一房间、目标或传送循环时，依据持久 session 中的最近决策和 get_room_memory 判断。"
             "传送目标包含 transition_key、to_semantic_room、confidence、destination_priority、destination_exploration 和 returns_to_recent_room。"
-            "任务是 agent 从对话和事件推断的记忆，不是引擎事实。发现、调整、完成或作废任务时调用 upsert_task；不要自动关闭或过期任务。"
+            "任务是 agent 从对话和事件推断的记忆，不是引擎事实。自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
+            "发现、调整、完成或作废任务时调用 upsert_task；更新前先用 get_tasks 核对已有 id，不要自动关闭或过期任务。"
+            "upsert_task 可用稳定自选 id：未知 id 需同时给出完整 description 和 rationale 才会按该 id 创建；省略 id 则自动生成 task-* id。"
             "只有 active 任务明确关联到当前可执行对象、当前可达传送，或可达且已知通往任务 room_id 的传送时，才可压过探索策略；不可执行任务不得阻塞探索。"
             "没有可执行 active 任务时，非回退的 unknown 目的地具有最高探索价值，其后是 unexplored、partial、complete；unknown 不代表独立风险。"
             "比较传送时，要在这些目的地探索价值、循环风险、当前房间剩余有用目标之间权衡。"
@@ -6955,6 +7104,14 @@ class DebugState:
             return "role_not_in_party"
         return None
 
+    @staticmethod
+    def reject_agent_decision(decision: dict, reason: str, **details) -> None:
+        decision["validation"] = {
+            "status": "rejected",
+            "reason": reason,
+            **details,
+        }
+
     def validate_agent_decision(self, decision: dict) -> dict:
         action = decision.get("recommended_action") if isinstance(decision.get("recommended_action"), dict) else {}
         if action.get("tool") == "use_item":
@@ -6980,6 +7137,12 @@ class DebugState:
             decision["recommended_intent"] = "wait_runtime"
             decision["recommended_action"] = self.action_preview(
                 "no_op", {"reason": "use_item_invalid", "error": error}
+            )
+            self.reject_agent_decision(
+                decision,
+                "use_item_invalid",
+                item_id=args.get("item_id"),
+                error=error,
             )
             decision["risk"] = (
                 f"{decision.get('risk') or ''} Latest-state validation rejected item use: {error}."
@@ -7026,6 +7189,13 @@ class DebugState:
                 "target_id": target_id,
                 "route_status": route_status,
             },
+        )
+        self.reject_agent_decision(
+            decision,
+            "navigation_target_invalid",
+            target_id=target_id,
+            route_status=route_status,
+            route_ok=route.get("ok"),
         )
         if decision.get("risk"):
             decision["risk"] = f"{decision['risk']} Latest-state validation rejected the navigation target."

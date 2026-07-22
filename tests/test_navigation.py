@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 
 from conftest import make_debug_state, make_state, make_touch_object, write_state
 from palpal.debug_server import decode_nav_grid, nav_bit, pal_distance, trigger_radius, world_pos
@@ -52,6 +53,42 @@ def test_navigation_step_sends_straight_transition_segment():
         assert result['segment_moves'] == ['up', 'up', 'up', 'up']
         assert result['expected_node'] == {'x': 64, 'y': 0}
         assert result['remaining_steps'] == 0
+
+
+def test_transition_completion_finalizes_remembered_navigation_route():
+    target = {'id': 52, 'x': 64, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(width=5, height=5, start=(0, 4), objects=[target])
+        route = debug.route_to_object(state, target_id=52)
+        identity = debug.room_identity(state)
+        debug.remember_navigation_route(state, 52, route['route'], 1, route['route']['steps'] - 1, 'transition')
+
+        before = debug.read_exploration()['rooms'][identity['id']]['last_route']
+        assert before['pending'] is True
+        debug.finish_navigation_route(identity, 52, 'transitioned')
+        after = debug.read_exploration()['rooms'][identity['id']]['last_route']
+        assert after['pending'] is False
+        assert after['outcome'] == 'transitioned'
+        assert after['completed_at'] >= after['updated_at']
+
+
+def test_expired_navigation_confirmation_is_not_left_pending():
+    target = {'id': 52, 'x': 64, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = make_state(width=5, height=5, start=(0, 4), objects=[target])
+        route = debug.route_to_object(state, target_id=52)
+        identity = debug.room_identity(state)
+        debug.remember_navigation_route(state, 52, route['route'], 1, route['route']['steps'] - 1, 'transition')
+        data = debug.read_exploration()
+        data['rooms'][identity['id']]['last_route']['updated_at'] = time.time() - 10
+        debug.write_exploration(data)
+
+        debug.update_exploration(state)
+        last_route = debug.read_exploration()['rooms'][identity['id']]['last_route']
+        assert last_route['pending'] is False
+        assert last_route['outcome'] == 'confirmation_expired'
 
 
 

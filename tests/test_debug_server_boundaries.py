@@ -225,6 +225,7 @@ def test_http_handler_agent_session_api_and_running_action_boundary(http_server)
 def test_http_handler_exposes_agent_tasks(http_server):
     base_url, debug = http_server
     task = debug.run_agent_tool("upsert_task", {
+        "id": "inspect-courtyard",
         "description": "Inspect the courtyard",
         "rationale": "The latest dialog points there.",
         "priority": 6,
@@ -237,7 +238,7 @@ def test_http_handler_exposes_agent_tasks(http_server):
     assert payload["ok"] is True
     assert payload["counts"] == {"active": 1, "completed": 0, "abandoned": 0, "total": 1}
     assert payload["tasks"] == [{
-        "id": task["id"],
+        "id": "inspect-courtyard",
         "description": "Inspect the courtyard",
         "priority": 6,
         "status": "active",
@@ -674,3 +675,10 @@ def test_validate_agent_decision_ignores_non_navigation_and_rejects_stale_target
     assert result["recommended_action"]["args"]["reason"] == "navigation_target_invalid"
     assert result["evidence"]["validation_target_id"] == 99
     assert result["evidence"]["validation_route_status"] == "unknown_target"
+    assert result["validation"] == {
+        "status": "rejected",
+        "reason": "navigation_target_invalid",
+        "target_id": 99,
+        "route_status": "unknown_target",
+        "route_ok": False,
+    }
