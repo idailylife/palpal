@@ -6,6 +6,47 @@ import pytest
 
 from tests.support import make_debug_state, make_state, write_state
 
+
+def equipment_item(
+    item_id,
+    name,
+    *,
+    slot_id=0,
+    modifiers=None,
+    traits=None,
+    usable=False,
+    amount=1,
+    eligible=(0,),
+):
+    return {
+        'item_id': item_id,
+        'name': name,
+        'amount': amount,
+        'amount_in_use': 0,
+        'equipped_count': 0,
+        'total_count': amount,
+        'usable': usable,
+        'equipable': True,
+        'equipable_role_ids': list(eligible),
+        'equipment_effect': {
+            'preview_complete': True,
+            'slot_id': slot_id,
+            'slot_key': 'head',
+            'stat_modifiers': {
+                'attack_strength': 0,
+                'magic_strength': 0,
+                'defense': 0,
+                'dexterity': 0,
+                'flee_rate': 0,
+                'poison_resistance': 0,
+                **(modifiers or {}),
+            },
+            'elemental_resistance': [0, 0, 0, 0, 0],
+            'traits': traits or [],
+            'unparsed_effects': [],
+        },
+    }
+
 def test_agent_decide_reports_stale_runtime(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state()
@@ -381,7 +422,7 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     tools = debug.agent_tool_specs()
     names = [tool['function']['name'] for tool in tools]
     by_name = {tool['function']['name']: tool for tool in tools}
-    assert set(names) == {'upsert_task', 'get_tasks', 'get_navigation', 'inspect_target', 'get_observations', 'get_inventory', 'get_room_memory', 'get_tool_output', 'submit_decision'}
+    assert set(names) == {'upsert_task', 'get_tasks', 'get_navigation', 'inspect_target', 'get_observations', 'get_inventory', 'get_equipment', 'get_room_memory', 'get_tool_output', 'submit_decision'}
     dialog_properties = by_name['get_observations']['function']['parameters']['properties']
     assert 'speaker' in dialog_properties
     assert dialog_properties['speaker']['type'] == 'string'
@@ -498,6 +539,146 @@ def test_agent_get_inventory_returns_current_items(tmp_path):
     assert result['inventory'][1]['target_mode'] == 'party_role'
 
 
+def test_agent_get_equipment_compares_candidate_for_eligible_roles(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    current = equipment_item(
+        196, '头巾', modifiers={'defense': 2}, traits=[{'kind': 'attack_all', 'value': False}]
+    )
+    current.update({'slot_id': 0, 'slot_key': 'head'})
+    candidate = equipment_item(
+        201,
+        '皮帽',
+        modifiers={'defense': 5, 'dexterity': -1},
+        traits=[
+            {'kind': 'attack_all', 'value': True},
+            {'kind': 'persistent_poison', 'poison_id': 563, 'name': 'HP回补'},
+            {'kind': 'persistent_poison', 'poison_id': 564, 'name': 'MP回补'},
+        ],
+        usable=True,
+        eligible=(0, 1),
+    )
+    state['party'] = [
+        {
+            'role_id': 0,
+            'name': '李逍遥',
+            'attack_strength': 35,
+            'magic_strength': 20,
+            'defense': 41,
+            'dexterity': 31,
+            'flee_rate': 32,
+            'poison_resistance': 0,
+            'equipment': [current],
+        },
+        {
+            'role_id': 2,
+            'name': '赵灵儿',
+            'attack_strength': 20,
+            'magic_strength': 40,
+            'defense': 30,
+            'dexterity': 28,
+            'flee_rate': 25,
+            'poison_resistance': 0,
+            'equipment': [],
+        },
+    ]
+    state['inventory'] = [candidate]
+
+    result = debug.run_agent_tool('get_equipment', {'item_id': 201}, state)
+
+    assert result['ok']
+    assert result['candidate']['usable'] is True
+    assert result['candidate']['equipable'] is True
+    assert result['available_count'] == 1
+    assert [entry['role_id'] for entry in result['comparisons']] == [0]
+    comparison = result['comparisons'][0]
+    assert comparison['current_item']['item_id'] == 196
+    assert comparison['stat_delta']['defense'] == 3
+    assert comparison['stat_delta']['dexterity'] == -1
+    assert comparison['resulting_stats']['defense'] == 44
+    assert [effect['poison_id'] for effect in comparison['gained_effects']] == [563, 564]
+    assert comparison['changed_effects'][0]['kind'] == 'attack_all'
+
+
+def test_equipment_validation_uses_equipable_flag_independently_from_usable(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state['party'] = [{'role_id': 0, 'equipment': []}]
+    pearl = equipment_item(260, '圣灵珠', usable=True)
+    medicine = {
+        'item_id': 105,
+        'name': '还神丹',
+        'amount': 1,
+        'amount_in_use': 0,
+        'usable': True,
+        'equipable': False,
+    }
+    state['inventory'] = [pearl, medicine]
+    write_state(debug, state)
+
+    assert debug.equip_item_validation_error(state, {'item_id': 260, 'role_id': 0}) is None
+    assert debug.equip_item_validation_error(state, {'item_id': 105, 'role_id': 0}) == 'not_equipable'
+
+
+def test_agent_accepts_equip_item_decision_with_compared_slot_fingerprint(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    current = equipment_item(196, '头巾', modifiers={'defense': 2})
+    current.update({'slot_id': 0, 'slot_key': 'head'})
+    state['party'] = [{'role_id': 0, 'name': '李逍遥', 'equipment': [current]}]
+    state['inventory'] = [equipment_item(201, '皮帽', modifiers={'defense': 5})]
+    write_state(debug, state)
+
+    result = debug.run_agent_tool(
+        'submit_decision',
+        {'action': 'equip_item', 'item_id': 201, 'role_id': 0, 'reason': 'Higher defense.'},
+        state,
+    )
+
+    assert result['ok']
+    decision = result['decision']
+    assert decision['recommended_intent'] == 'equip_inventory_item'
+    assert decision['recommended_action']['tool'] == 'equip_item'
+    assert decision['recommended_action']['args'] == {
+        'item_id': 201,
+        'role_id': 0,
+        'expected_slot_item_id': 196,
+    }
+
+
+def test_pending_equipment_review_is_compact_and_get_equipment_uses_it(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state['party'] = [{'role_id': 0, 'name': '李逍遥', 'equipment': []}]
+    state['inventory'] = [equipment_item(201, '皮帽', modifiers={'defense': 5})]
+    write_state(debug, state)
+    debug.agent_runtime.state['equipment_review'] = {
+        'ownership_counts': {'201': 1},
+        'pending': [{
+            'item_id': 201,
+            'name': '皮帽',
+            'new_count': 1,
+            'first_seen_at': '2026-07-25T00:00:00Z',
+        }],
+    }
+
+    context = debug.agent_tool_initial_context(state)
+    result = debug.run_agent_tool(
+        'get_equipment',
+        {},
+        state,
+        tool_cycle=debug.new_agent_tool_cycle(state),
+    )
+
+    assert context['equipment_review'] == {
+        'pending': True,
+        'item_id': 201,
+        'name': '皮帽',
+        'new_count': 1,
+    }
+    assert result['candidate']['item_id'] == 201
+
+
 def test_agent_tool_schema_explains_implicit_event_context_item_target(tmp_path):
     debug = make_debug_state(tmp_path)
     submit = next(
@@ -505,7 +686,7 @@ def test_agent_tool_schema_explains_implicit_event_context_item_target(tmp_path)
         if spec['function']['name'] == 'submit_decision'
     )
     properties = submit['parameters']['properties']
-    assert properties['action']['enum'] == ['wait', 'advance_dialog', 'navigate', 'use_item']
+    assert properties['action']['enum'] == ['wait', 'advance_dialog', 'navigate', 'use_item', 'equip_item']
     assert properties['target']['enum'] == ['all']
     assert submit['parameters']['required'] == ['action', 'reason']
     assert submit['parameters']['additionalProperties'] is False

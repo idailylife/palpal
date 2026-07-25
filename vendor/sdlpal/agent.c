@@ -86,6 +86,41 @@ static const char * const g_agent_equipment_slot_keys[MAX_PLAYER_EQUIPMENTS] = {
    "wear"
 };
 
+#define PALPAL_AGENT_EQUIP_SCRIPT_LIMIT 64
+#define PALPAL_AGENT_EQUIP_SPECIAL_LIMIT 8
+#define PALPAL_AGENT_EQUIP_UNKNOWN_LIMIT 8
+
+typedef struct tagPALPALEQUIPMENTSPECIAL
+{
+   WORD operation;
+   WORD operand0;
+   WORD operand1;
+   WORD operand2;
+} PALPALEQUIPMENTSPECIAL;
+
+typedef struct tagPALPALEQUIPMENTPREVIEW
+{
+   BOOL complete;
+   int slot_id;
+   SHORT attack_strength;
+   SHORT magic_strength;
+   SHORT defense;
+   SHORT dexterity;
+   SHORT flee_rate;
+   SHORT poison_resistance;
+   SHORT elemental_resistance[NUM_MAGIC_ELEMENTAL];
+   BOOL has_battle_sprite;
+   WORD battle_sprite;
+   BOOL has_attack_all;
+   WORD attack_all;
+   BOOL has_cooperative_magic;
+   WORD cooperative_magic;
+   PALPALEQUIPMENTSPECIAL specials[PALPAL_AGENT_EQUIP_SPECIAL_LIMIT];
+   int special_count;
+   PALPALEQUIPMENTSPECIAL unknown[PALPAL_AGENT_EQUIP_UNKNOWN_LIMIT];
+   int unknown_count;
+} PALPALEQUIPMENTPREVIEW;
+
 typedef struct tagPALPALDIALOGEVENT
 {
    BOOL valid;
@@ -445,6 +480,278 @@ PALPAL_AgentEquipmentSlotKey(
    return "unknown";
 }
 
+static const char *
+PALPAL_AgentStatusKey(
+   WORD status
+)
+{
+   switch (status)
+   {
+   case kStatusConfused: return "confused";
+#ifdef PAL_CLASSIC
+   case kStatusParalyzed: return "paralyzed";
+#else
+   case kStatusSlow: return "slow";
+#endif
+   case kStatusSleep: return "sleep";
+   case kStatusSilence: return "silence";
+   case kStatusPuppet: return "puppet";
+   case kStatusBravery: return "bravery";
+   case kStatusProtect: return "protect";
+   case kStatusHaste: return "haste";
+   case kStatusDualAttack: return "dual_attack";
+   default: return "unknown";
+   }
+}
+
+static VOID
+PALPAL_AgentRememberEquipmentEffect(
+   PALPALEQUIPMENTSPECIAL *effects,
+   int *count,
+   int capacity,
+   LPSCRIPTENTRY entry
+)
+{
+   PALPALEQUIPMENTSPECIAL *effect;
+
+   if (*count >= capacity)
+   {
+      return;
+   }
+   effect = &effects[*count];
+   effect->operation = entry->wOperation;
+   effect->operand0 = entry->rgwOperand[0];
+   effect->operand1 = entry->rgwOperand[1];
+   effect->operand2 = entry->rgwOperand[2];
+   (*count)++;
+}
+
+static PALPALEQUIPMENTPREVIEW
+PALPAL_AgentPreviewEquipment(
+   WORD item_id
+)
+{
+   PALPALEQUIPMENTPREVIEW preview;
+   WORD script_entry;
+   int steps;
+
+   memset(&preview, 0, sizeof(preview));
+   preview.complete = TRUE;
+   preview.slot_id = -1;
+   if (item_id == 0 || item_id >= MAX_OBJECTS ||
+      !(gpGlobals->g.rgObject[item_id].item.wFlags & kItemFlagEquipable))
+   {
+      preview.complete = FALSE;
+      return preview;
+   }
+
+   script_entry = gpGlobals->g.rgObject[item_id].item.wScriptOnEquip;
+   for (steps = 0; script_entry != 0 && steps < PALPAL_AGENT_EQUIP_SCRIPT_LIMIT; steps++, script_entry++)
+   {
+      LPSCRIPTENTRY entry;
+      int field;
+
+      if (script_entry >= gpGlobals->g.nScriptEntry)
+      {
+         preview.complete = FALSE;
+         break;
+      }
+      entry = &gpGlobals->g.lprgScriptEntry[script_entry];
+      if (entry->wOperation == 0x0000)
+      {
+         break;
+      }
+      switch (entry->wOperation)
+      {
+      case 0x0018:
+         preview.slot_id = (int)entry->rgwOperand[0] - 0x0B;
+         if (preview.slot_id < 0 || preview.slot_id >= MAX_PLAYER_EQUIPMENTS ||
+            entry->rgwOperand[1] != item_id)
+         {
+            preview.complete = FALSE;
+         }
+         break;
+
+      case 0x0017:
+         field = entry->rgwOperand[1];
+         if ((int)entry->rgwOperand[0] - 0x0B != preview.slot_id && preview.slot_id >= 0)
+         {
+            preview.complete = FALSE;
+         }
+         switch (field)
+         {
+         case 17: preview.attack_strength = (SHORT)entry->rgwOperand[2]; break;
+         case 18: preview.magic_strength = (SHORT)entry->rgwOperand[2]; break;
+         case 19: preview.defense = (SHORT)entry->rgwOperand[2]; break;
+         case 20: preview.dexterity = (SHORT)entry->rgwOperand[2]; break;
+         case 21: preview.flee_rate = (SHORT)entry->rgwOperand[2]; break;
+         case 22: preview.poison_resistance = (SHORT)entry->rgwOperand[2]; break;
+         default:
+            if (field >= 23 && field < 23 + NUM_MAGIC_ELEMENTAL)
+            {
+               preview.elemental_resistance[field - 23] = (SHORT)entry->rgwOperand[2];
+            }
+            else
+            {
+               preview.complete = FALSE;
+               PALPAL_AgentRememberEquipmentEffect(
+                  preview.unknown, &preview.unknown_count,
+                  PALPAL_AGENT_EQUIP_UNKNOWN_LIMIT, entry);
+            }
+            break;
+         }
+         break;
+
+      case 0x001A:
+         switch (entry->rgwOperand[0])
+         {
+         case 1:
+            preview.has_battle_sprite = TRUE;
+            preview.battle_sprite = entry->rgwOperand[1];
+            break;
+         case 4:
+            preview.has_attack_all = TRUE;
+            preview.attack_all = entry->rgwOperand[1];
+            break;
+         case 65:
+            preview.has_cooperative_magic = TRUE;
+            preview.cooperative_magic = entry->rgwOperand[1];
+            break;
+         default:
+            preview.complete = FALSE;
+            PALPAL_AgentRememberEquipmentEffect(
+               preview.unknown, &preview.unknown_count,
+               PALPAL_AGENT_EQUIP_UNKNOWN_LIMIT, entry);
+            break;
+         }
+         break;
+
+      case 0x0029:
+      case 0x002D:
+         PALPAL_AgentRememberEquipmentEffect(
+            preview.specials, &preview.special_count,
+            PALPAL_AGENT_EQUIP_SPECIAL_LIMIT, entry);
+         break;
+
+      default:
+         preview.complete = FALSE;
+         PALPAL_AgentRememberEquipmentEffect(
+            preview.unknown, &preview.unknown_count,
+            PALPAL_AGENT_EQUIP_UNKNOWN_LIMIT, entry);
+         break;
+      }
+   }
+   if (script_entry != 0 &&
+      (steps >= PALPAL_AGENT_EQUIP_SCRIPT_LIMIT || script_entry >= gpGlobals->g.nScriptEntry))
+   {
+      preview.complete = FALSE;
+   }
+   if (preview.slot_id < 0)
+   {
+      preview.complete = FALSE;
+   }
+   return preview;
+}
+
+static VOID
+PALPAL_AgentWriteEquipmentPreview(
+   FILE *fp,
+   WORD item_id
+)
+{
+   PALPALEQUIPMENTPREVIEW preview;
+   int i;
+   int first;
+
+   preview = PALPAL_AgentPreviewEquipment(item_id);
+   fprintf(fp,
+      ",\"equipment_effect\":{"
+      "\"preview_complete\":%s,"
+      "\"slot_id\":%d,"
+      "\"slot_key\":\"%s\","
+      "\"stat_modifiers\":{"
+      "\"attack_strength\":%d,"
+      "\"magic_strength\":%d,"
+      "\"defense\":%d,"
+      "\"dexterity\":%d,"
+      "\"flee_rate\":%d,"
+      "\"poison_resistance\":%d},"
+      "\"elemental_resistance\":[",
+      preview.complete ? "true" : "false",
+      preview.slot_id,
+      PALPAL_AgentEquipmentSlotKey(preview.slot_id),
+      preview.attack_strength,
+      preview.magic_strength,
+      preview.defense,
+      preview.dexterity,
+      preview.flee_rate,
+      preview.poison_resistance);
+   for (i = 0; i < NUM_MAGIC_ELEMENTAL; i++)
+   {
+      if (i > 0) fprintf(fp, ",");
+      fprintf(fp, "%d", preview.elemental_resistance[i]);
+   }
+   fprintf(fp, "],\"traits\":[");
+   first = 1;
+   if (preview.has_battle_sprite)
+   {
+      fprintf(fp, "{\"kind\":\"battle_sprite\",\"value\":%u}", preview.battle_sprite);
+      first = 0;
+   }
+   if (preview.has_attack_all)
+   {
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"kind\":\"attack_all\",\"value\":%s}",
+         preview.attack_all ? "true" : "false");
+      first = 0;
+   }
+   if (preview.has_cooperative_magic)
+   {
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"kind\":\"cooperative_magic\",\"value\":%u}",
+         preview.cooperative_magic);
+      first = 0;
+   }
+   for (i = 0; i < preview.special_count; i++)
+   {
+      PALPALEQUIPMENTSPECIAL *effect = &preview.specials[i];
+      if (!first) fprintf(fp, ",");
+      if (effect->operation == 0x002D)
+      {
+         fprintf(fp,
+            "{\"kind\":\"status\",\"status_id\":%u,\"status\":\"%s\",\"duration\":%u}",
+            effect->operand0,
+            PALPAL_AgentStatusKey(effect->operand0),
+            effect->operand1);
+      }
+      else
+      {
+         fprintf(fp,
+            "{\"kind\":\"persistent_poison\",\"apply_to_all\":%s,\"poison_id\":%u,\"name\":",
+            effect->operand0 ? "true" : "false",
+            effect->operand1);
+         PALPAL_AgentWriteJsonWideString(
+            fp,
+            effect->operand1 < MAX_OBJECTS ? PAL_GetWord(effect->operand1) : L"");
+         fprintf(fp, "}");
+      }
+      first = 0;
+   }
+   fprintf(fp, "],\"unparsed_effects\":[");
+   for (i = 0; i < preview.unknown_count; i++)
+   {
+      PALPALEQUIPMENTSPECIAL *effect = &preview.unknown[i];
+      if (i > 0) fprintf(fp, ",");
+      fprintf(fp,
+         "{\"operation\":%u,\"operands\":[%u,%u,%u]}",
+         effect->operation,
+         effect->operand0,
+         effect->operand1,
+         effect->operand2);
+   }
+   fprintf(fp, "]}");
+}
+
 static VOID
 PALPAL_AgentWriteItemFlags(
    FILE *fp,
@@ -522,6 +829,23 @@ PALPAL_AgentWriteItemMetadata(
       (unsigned int)item.item.wScriptOnEquip,
       (unsigned int)item.item.wScriptOnThrow);
    PALPAL_AgentWriteItemFlags(fp, item.item.wFlags);
+   if (item.item.wFlags & kItemFlagEquipable)
+   {
+      int i;
+      int first = 1;
+      fprintf(fp, ",\"equipable_role_ids\":[");
+      for (i = 0; i < MAX_PLAYER_ROLES; i++)
+      {
+         if (item.item.wFlags & (kItemFlagEquipableByPlayerRole_First << i))
+         {
+            if (!first) fprintf(fp, ",");
+            fprintf(fp, "%d", i);
+            first = 0;
+         }
+      }
+      fprintf(fp, "]");
+      PALPAL_AgentWriteEquipmentPreview(fp, item_id);
+   }
 }
 
 static VOID
@@ -567,6 +891,61 @@ PALPAL_AgentWriteActionResult(
       target_all ? "all" : "role",
       consumed ? "true" : "false",
       script_success ? "true" : "false");
+   if (error && error[0])
+   {
+      fprintf(fp, "\"%s\"", error);
+   }
+   else
+   {
+      fputs("null", fp);
+   }
+   fputs("}\n", fp);
+   fclose(fp);
+   rename(tmp_path, result_path);
+}
+
+static VOID
+PALPAL_AgentWriteEquipResult(
+   BOOL ok,
+   const char *status,
+   WORD item_id,
+   WORD role_id,
+   int slot_id,
+   WORD previous_item_id,
+   const char *error
+)
+{
+   char result_path[PAL_MAX_PATH];
+   char tmp_path[PAL_MAX_PATH];
+   FILE *fp;
+
+   PALPAL_AgentPath(result_path, sizeof(result_path), "action_result.json");
+   PALPAL_AgentPath(tmp_path, sizeof(tmp_path), "action_result.json.tmp");
+   fp = fopen(tmp_path, "w");
+   if (!fp)
+   {
+      return;
+   }
+
+   fprintf(fp,
+      "{\"time_ms\":%u,"
+      "\"ok\":%s,"
+      "\"status\":\"%s\","
+      "\"action\":\"equip_item\","
+      "\"item_id\":%u,"
+      "\"role_id\":%u,"
+      "\"slot_id\":%d,"
+      "\"slot_key\":\"%s\","
+      "\"previous_item_id\":%u,"
+      "\"error\":",
+      (unsigned int)SDL_GetTicks(),
+      ok ? "true" : "false",
+      status ? status : "unknown",
+      (unsigned int)item_id,
+      (unsigned int)role_id,
+      slot_id,
+      PALPAL_AgentEquipmentSlotKey(slot_id),
+      (unsigned int)previous_item_id);
    if (error && error[0])
    {
       fprintf(fp, "\"%s\"", error);
@@ -945,6 +1324,82 @@ PALPAL_AgentUseItem(
    PALPAL_AgentWriteActionResult(TRUE, "used", item_id, role_id, target_all, consumed, g_fScriptSuccess, NULL);
 }
 
+static VOID
+PALPAL_AgentEquipItem(
+   WORD item_id,
+   WORD role_id
+)
+{
+   WORD flags;
+   WORD previous_item_id;
+   int inventory_index;
+   PALPALEQUIPMENTPREVIEW preview;
+
+   if (gpGlobals == NULL || !gpGlobals->fInMainGame)
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "not_in_main_game", item_id, role_id, -1, 0, "not_in_main_game");
+      return;
+   }
+   if (gpGlobals->fInBattle)
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "in_battle", item_id, role_id, -1, 0, "in_battle");
+      return;
+   }
+   if (PAL_IsInDialog())
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "in_dialog", item_id, role_id, -1, 0, "in_dialog");
+      return;
+   }
+   if (item_id == 0 || item_id >= MAX_OBJECTS)
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "invalid_item", item_id, role_id, -1, 0, "invalid_item");
+      return;
+   }
+   if (!PALPAL_AgentPartyHasRole(role_id))
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "role_not_in_party", item_id, role_id, -1, 0, "role_not_in_party");
+      return;
+   }
+   flags = gpGlobals->g.rgObject[item_id].item.wFlags;
+   if (!(flags & kItemFlagEquipable))
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "not_equipable", item_id, role_id, -1, 0, "not_equipable");
+      return;
+   }
+   if (!(flags & (kItemFlagEquipableByPlayerRole_First << role_id)))
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "role_not_eligible", item_id, role_id, -1, 0, "role_not_eligible");
+      return;
+   }
+   if (!PAL_GetItemIndexToInventory(item_id, &inventory_index) ||
+      inventory_index >= MAX_INVENTORY ||
+      gpGlobals->rgInventory[inventory_index].nAmount <=
+         gpGlobals->rgInventory[inventory_index].nAmountInUse)
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "not_in_inventory", item_id, role_id, -1, 0, "not_in_inventory");
+      return;
+   }
+
+   preview = PALPAL_AgentPreviewEquipment(item_id);
+   if (preview.slot_id < 0 || preview.slot_id >= MAX_PLAYER_EQUIPMENTS)
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "invalid_equip_script", item_id, role_id, preview.slot_id, 0, "invalid_equip_script");
+      return;
+   }
+   previous_item_id = gpGlobals->g.PlayerRoles.rgwEquipment[preview.slot_id][role_id];
+   gpGlobals->wLastUnequippedItem = item_id;
+   gpGlobals->g.rgObject[item_id].item.wScriptOnEquip =
+      PAL_RunTriggerScript(gpGlobals->g.rgObject[item_id].item.wScriptOnEquip, role_id);
+   if (gpGlobals->g.PlayerRoles.rgwEquipment[preview.slot_id][role_id] != item_id)
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "equip_not_applied", item_id, role_id,
+         preview.slot_id, previous_item_id, "equip_not_applied");
+      return;
+   }
+   PALPAL_AgentWriteEquipResult(TRUE, "equipped", item_id, role_id,
+      preview.slot_id, previous_item_id, NULL);
+}
+
 static DWORD
 PALPAL_AgentButtonForName(
    const char *name
@@ -1031,9 +1486,12 @@ PALPAL_AgentLoadActionFile(
    FILE *fp;
    char line[128];
    BOOL pending_use_item = FALSE;
+   BOOL pending_equip_item = FALSE;
    BOOL pending_target_all = FALSE;
    WORD pending_item_id = 0;
    WORD pending_role_id = 0;
+   WORD pending_equip_item_id = 0;
+   WORD pending_equip_role_id = 0;
    PALPALAGENTSLOTCOMMAND pending_slot_command = kPalpalAgentSlotCommandNone;
    int pending_slot = 0;
 
@@ -1088,6 +1546,17 @@ PALPAL_AgentLoadActionFile(
          pending_role_id = role_id;
          pending_target_all = target_all;
       }
+      else if (strcmp(key, "equip_item") == 0)
+      {
+         WORD item_id = (WORD)atoi(value);
+         target[0] = '\0';
+         if (sscanf(line, "%31s %63s %63s", key, value, target) == 3)
+         {
+            pending_equip_item = TRUE;
+            pending_equip_item_id = item_id;
+            pending_equip_role_id = (WORD)atoi(target);
+         }
+      }
       else if (strcmp(key, "save_slot") == 0)
       {
          pending_slot_command = kPalpalAgentSlotCommandSave;
@@ -1123,6 +1592,10 @@ PALPAL_AgentLoadActionFile(
    if (pending_use_item)
    {
       PALPAL_AgentUseItem(pending_item_id, pending_role_id, pending_target_all);
+   }
+   else if (pending_equip_item)
+   {
+      PALPAL_AgentEquipItem(pending_equip_item_id, pending_equip_role_id);
    }
 }
 
@@ -1590,6 +2063,8 @@ PALPAL_AgentWriteParty(
          "\"defense\":%u,"
          "\"dexterity\":%u,"
          "\"flee_rate\":%u,"
+         "\"poison_resistance\":%u,"
+         "\"elemental_resistance\":[%u,%u,%u,%u,%u],"
          "\"x\":%d,\"y\":%d,\"frame\":%u,",
          gpGlobals->g.PlayerRoles.rgwLevel[role],
          gpGlobals->g.PlayerRoles.rgwHP[role],
@@ -1601,6 +2076,12 @@ PALPAL_AgentWriteParty(
          PAL_GetPlayerDefense(role),
          PAL_GetPlayerDexterity(role),
          PAL_GetPlayerFleeRate(role),
+         PAL_GetPlayerPoisonResistance(role),
+         PAL_GetPlayerElementalResistance(role, 0),
+         PAL_GetPlayerElementalResistance(role, 1),
+         PAL_GetPlayerElementalResistance(role, 2),
+         PAL_GetPlayerElementalResistance(role, 3),
+         PAL_GetPlayerElementalResistance(role, 4),
          gpGlobals->rgParty[i].x,
          gpGlobals->rgParty[i].y,
          gpGlobals->rgParty[i].wFrame);

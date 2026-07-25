@@ -105,6 +105,82 @@ def test_runtime_start_feedback_has_no_permanent_macro_goal(tmp_path):
     assert "finish the game" not in feedback_seen[0].lower()
 
 
+def test_equipment_review_tracks_total_ownership_and_ignores_consumables(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    base = make_state()
+    base['party'] = [{'role_id': 0, 'equipment': []}]
+    base['inventory'] = []
+    runtime.observe_equipment_state(base)
+    assert runtime.pending_equipment_review() is None
+
+    acquired = json.loads(json.dumps(base))
+    acquired['inventory'] = [{
+        'item_id': 105, 'name': '还神丹', 'amount': 1, 'amount_in_use': 0,
+        'usable': True, 'equipable': False,
+    }, {
+        'item_id': 260, 'name': '圣灵珠', 'amount': 1, 'amount_in_use': 0,
+        'usable': True, 'equipable': True,
+    }]
+    runtime.observe_equipment_state(acquired)
+
+    assert runtime.pending_equipment_review() == {
+        'item_id': 260,
+        'name': '圣灵珠',
+        'new_count': 1,
+        'first_seen_at': runtime.pending_equipment_review()['first_seen_at'],
+    }
+
+
+def test_equipment_review_does_not_treat_swapped_old_item_as_new(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    old = {'item_id': 196, 'name': '头巾', 'equipable': True, 'slot_id': 0}
+    candidate = {
+        'item_id': 201, 'name': '皮帽', 'amount': 1, 'amount_in_use': 0,
+        'equipable': True,
+    }
+    before = make_state()
+    before['party'] = [{'role_id': 0, 'equipment': [old]}]
+    before['inventory'] = [candidate]
+    runtime.observe_equipment_state(before)
+
+    after = make_state()
+    after['party'] = [{'role_id': 0, 'equipment': [{**candidate, 'slot_id': 0}]}]
+    after['inventory'] = [{
+        'item_id': 196, 'name': '头巾', 'amount': 1, 'amount_in_use': 0,
+        'equipable': True,
+    }]
+    runtime.observe_equipment_state(after)
+
+    assert runtime.pending_equipment_review() is None
+
+
+def test_equipment_review_multiple_copies_clamps_after_one_is_equipped(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    base = make_state()
+    base['party'] = [{'role_id': 0, 'equipment': []}]
+    base['inventory'] = []
+    runtime.observe_equipment_state(base)
+    acquired = json.loads(json.dumps(base))
+    acquired['inventory'] = [{
+        'item_id': 201, 'name': '皮帽', 'amount': 2, 'amount_in_use': 0,
+        'equipable': True,
+    }]
+    runtime.observe_equipment_state(acquired)
+    assert runtime.pending_equipment_review()['new_count'] == 2
+
+    equipped = json.loads(json.dumps(acquired))
+    equipped['inventory'][0]['amount'] = 1
+    equipped['party'][0]['equipment'] = [{
+        'item_id': 201, 'name': '皮帽', 'equipable': True, 'slot_id': 0,
+    }]
+    runtime.observe_equipment_state(equipped)
+
+    assert runtime.pending_equipment_review()['new_count'] == 1
+
+
 def test_runtime_replans_rejected_recommendation_without_counting_turn(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -700,6 +776,22 @@ def test_state_delta_only_emits_changed_object_and_compact_dialog():
     delta = AgentRuntime.state_delta(before, after)
     assert delta["object_changes"] == [{"id": 1, "before": (1, None, True, False), "after": (0, None, True, False)}]
     assert "events" not in delta["dialog"]["before"]
+
+
+def test_state_delta_reports_equipment_slot_change():
+    before = make_state()
+    before['party'] = [{'role_id': 0, 'equipment': [{'slot_id': 0, 'item_id': 196}]}]
+    after = json.loads(json.dumps(before))
+    after['party'][0]['equipment'][0]['item_id'] = 201
+
+    delta = AgentRuntime.state_delta(before, after)
+
+    assert delta['equipment_changes'] == [{
+        'role_id': 0,
+        'slot_id': 0,
+        'before': 196,
+        'after': 201,
+    }]
 
 
 def test_live_dialog_invalidates_navigation_and_requests_replan(tmp_path):

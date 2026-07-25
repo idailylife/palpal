@@ -2885,6 +2885,7 @@ class DebugState:
             "tasks_queried": False,
             "required_task_ids": [str(item.get("id")) for item in review.get("tasks") or []],
             "reviewed_task_ids": [],
+            "equipment_review_item_id": None,
         }
 
     def upsert_agent_task(self, arguments: dict) -> dict:
@@ -5300,6 +5301,7 @@ class DebugState:
                 elif state.get("entering_scene"):
                     self.append_navigation_diagnostic("unstable_room_state_ignored", {"reason": "entering_scene"}, state)
                 self.record_state_events(state)
+                self.agent_runtime.observe_equipment_state(state)
                 self.record_dialog_event(state)
                 self.observe_dialog_gates(state)
                 self.observe_pending_interaction_outcome(state)
@@ -6613,6 +6615,220 @@ class DebugState:
             )
         return {"inventory": items, "total": len(inventory), "returned": len(items)}
 
+    @staticmethod
+    def compact_equipment_item(item: dict | None) -> dict | None:
+        if not isinstance(item, dict):
+            return None
+        return {
+            key: item.get(key)
+            for key in (
+                "item_id", "name", "price", "amount", "amount_in_use",
+                "equipped_count", "total_count", "usable", "equipable",
+                "equipable_role_ids", "equipment_effect",
+            )
+            if key in item
+        }
+
+    @staticmethod
+    def equipment_item_by_id(state: dict, item_id: int) -> dict | None:
+        for item in state.get("inventory") or []:
+            if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id:
+                return item
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            for item in role.get("equipment") or []:
+                if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id:
+                    return item
+        return None
+
+    @staticmethod
+    def equipment_trait_map(effect: dict | None) -> dict[str, dict]:
+        if not isinstance(effect, dict):
+            return {}
+        result = {}
+        for trait in effect.get("traits") or []:
+            if not isinstance(trait, dict):
+                continue
+            kind = str(trait.get("kind") or "")
+            if kind:
+                key = kind
+                if kind == "status":
+                    key = f"{kind}:{trait.get('status_id')}"
+                elif kind == "persistent_poison":
+                    key = f"{kind}:{trait.get('poison_id')}"
+                result[key] = trait
+        return result
+
+    def equipment_comparisons(self, state: dict, candidate: dict) -> list[dict]:
+        effect = candidate.get("equipment_effect") if isinstance(candidate.get("equipment_effect"), dict) else {}
+        try:
+            slot_id = int(effect.get("slot_id"))
+        except (TypeError, ValueError):
+            slot_id = -1
+        eligible_ids = set()
+        for value in candidate.get("equipable_role_ids") or []:
+            try:
+                eligible_ids.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        stat_keys = (
+            "attack_strength", "magic_strength", "defense",
+            "dexterity", "flee_rate", "poison_resistance",
+        )
+        candidate_modifiers = effect.get("stat_modifiers") if isinstance(effect.get("stat_modifiers"), dict) else {}
+        candidate_elements = effect.get("elemental_resistance") if isinstance(effect.get("elemental_resistance"), list) else []
+        candidate_traits = self.equipment_trait_map(effect)
+        comparisons = []
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            try:
+                role_id = int(role.get("role_id"))
+            except (TypeError, ValueError):
+                continue
+            if role_id not in eligible_ids:
+                continue
+            current_item = None
+            for item in role.get("equipment") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    current_slot = int(item.get("slot_id"))
+                except (TypeError, ValueError):
+                    current_slot = -1
+                if current_slot == slot_id:
+                    current_item = item
+                    break
+            current_effect = (
+                current_item.get("equipment_effect")
+                if isinstance(current_item, dict) and isinstance(current_item.get("equipment_effect"), dict)
+                else {}
+            )
+            current_modifiers = (
+                current_effect.get("stat_modifiers")
+                if isinstance(current_effect.get("stat_modifiers"), dict)
+                else {}
+            )
+            stat_delta = {
+                key: int(candidate_modifiers.get(key) or 0) - int(current_modifiers.get(key) or 0)
+                for key in stat_keys
+            }
+            current_elements = (
+                current_effect.get("elemental_resistance")
+                if isinstance(current_effect.get("elemental_resistance"), list)
+                else []
+            )
+            elemental_delta = [
+                int(candidate_elements[index] if index < len(candidate_elements) else 0)
+                - int(current_elements[index] if index < len(current_elements) else 0)
+                for index in range(5)
+            ]
+            current_stats = {
+                key: role.get(key)
+                for key in stat_keys
+                if role.get(key) is not None
+            }
+            resulting_stats = {
+                key: int(current_stats[key]) + stat_delta[key]
+                for key in ("attack_strength", "magic_strength", "defense", "dexterity", "flee_rate")
+                if key in current_stats
+            }
+            old_traits = self.equipment_trait_map(current_effect)
+            gained_effects = [
+                trait for kind, trait in candidate_traits.items()
+                if kind not in old_traits
+            ]
+            lost_effects = [
+                trait for kind, trait in old_traits.items()
+                if kind not in candidate_traits
+            ]
+            changed_effects = [
+                {
+                    "kind": candidate_traits[kind].get("kind") or old_traits[kind].get("kind"),
+                    "from": old_traits[kind],
+                    "to": candidate_traits[kind],
+                }
+                for kind in sorted(set(old_traits) & set(candidate_traits))
+                if old_traits[kind] != candidate_traits[kind]
+            ]
+            comparisons.append(
+                {
+                    "role_id": role_id,
+                    "role_name": role.get("name"),
+                    "current_item": self.compact_equipment_item(current_item),
+                    "current_stats": current_stats,
+                    "stat_delta": stat_delta,
+                    "elemental_resistance_delta": elemental_delta,
+                    "resulting_stats": resulting_stats,
+                    "gained_effects": gained_effects,
+                    "lost_effects": lost_effects,
+                    "changed_effects": changed_effects,
+                }
+            )
+        return comparisons
+
+    def agent_equipment(self, state: dict, item_id: int | None = None) -> dict:
+        pending = self.agent_runtime.pending_equipment_review()
+        if item_id is None and isinstance(pending, dict):
+            try:
+                item_id = int(pending.get("item_id") or 0)
+            except (TypeError, ValueError):
+                item_id = 0
+        if item_id is not None:
+            try:
+                item_id = int(item_id)
+            except (TypeError, ValueError):
+                item_id = 0
+            candidate = self.equipment_item_by_id(state, item_id)
+            if item_id <= 0 or not isinstance(candidate, dict):
+                return {"ok": False, "error": "equipment item was not found"}
+            if candidate.get("equipable") is not True:
+                return {"ok": False, "error": "item is not equipable", "item_id": item_id}
+            available = 0
+            for item in state.get("inventory") or []:
+                if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id:
+                    available = max(
+                        0,
+                        int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
+                    )
+                    break
+            return {
+                "ok": True,
+                "pending_review": pending if isinstance(pending, dict) and int(pending.get("item_id") or 0) == item_id else None,
+                "candidate": self.compact_equipment_item(candidate),
+                "available_count": available,
+                "comparisons": self.equipment_comparisons(state, candidate),
+            }
+
+        current = []
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            current.append(
+                {
+                    "role_id": role.get("role_id"),
+                    "role_name": role.get("name"),
+                    "equipment": [
+                        self.compact_equipment_item(item)
+                        for item in role.get("equipment") or []
+                        if isinstance(item, dict)
+                    ],
+                }
+            )
+        candidates = [
+            self.compact_equipment_item(item)
+            for item in state.get("inventory") or []
+            if isinstance(item, dict) and item.get("equipable") is True
+        ]
+        return {
+            "ok": True,
+            "pending_review": None,
+            "current_equipment": current,
+            "candidates": candidates[:40],
+            "candidates_total": len(candidates),
+        }
+
     def agent_current_exploration(self, state: dict) -> dict:
         existing = state.get("_exploration")
         if isinstance(existing, dict):
@@ -6728,6 +6944,24 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_equipment",
+                    "description": (
+                        "比较装备。无参数时优先返回最早待审查的新装备；也可指定背包中的 item_id。"
+                        "返回每个可装备角色的当前同槽装备、属性差值、换装后属性和特殊效果变化。"
+                        "装备与普通使用是独立能力；usable=true 不排除 equipable=true。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": "integer", "minimum": 1},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_inventory",
                     "description": (
                         "返回当前只读物品栏详情，包括可用数量、目标派发模式和是否消耗。"
@@ -6775,7 +7009,7 @@ class DebugState:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["wait", "advance_dialog", "navigate", "use_item"]},
+                            "action": {"type": "string", "enum": ["wait", "advance_dialog", "navigate", "use_item", "equip_item"]},
                             "target_id": {"type": "integer", "minimum": 1},
                             "item_id": {"type": "integer", "minimum": 1},
                             "role_id": {"type": "integer", "minimum": 0},
@@ -6790,10 +7024,26 @@ class DebugState:
         ]
 
     def agent_tool_initial_context(self, state: dict) -> dict:
-        return {
+        context = {
             "state_summary": self.agent_state_summary(state),
             **self.active_task_context(state),
         }
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        review = self.agent_runtime.pending_equipment_review()
+        if (
+            isinstance(review, dict)
+            and state.get("in_main_game")
+            and not state.get("in_battle")
+            and not dialog.get("active")
+            and not self.file_info(self.state_path).get("stale", True)
+        ):
+            context["equipment_review"] = {
+                "pending": True,
+                "item_id": review.get("item_id"),
+                "name": review.get("name"),
+                "new_count": review.get("new_count"),
+            }
+        return context
 
     def agent_tool_messages(self, state: dict) -> list[dict]:
         return [
@@ -6927,6 +7177,12 @@ class DebugState:
         if name == "get_inventory":
             limit = self.agent_tool_limit(arguments.get("limit"), 40, 100)
             return {"ok": True, **self.agent_inventory(state, limit=limit)}
+        if name == "get_equipment":
+            result = self.agent_equipment(state, arguments.get("item_id"))
+            candidate = result.get("candidate") if isinstance(result.get("candidate"), dict) else {}
+            if result.get("ok") and isinstance(tool_cycle, dict) and candidate.get("item_id"):
+                tool_cycle["equipment_review_item_id"] = int(candidate["item_id"])
+            return result
         if name == "get_room_memory":
             room_id = arguments.get("room_id")
             room_id = str(room_id) if room_id is not None else None
@@ -6966,6 +7222,14 @@ class DebugState:
             decision = self.normalize_agent_submission(arguments, state)
             self.attach_decision_context(state, decision)
             self.validate_agent_decision(decision)
+            validation = decision.get("validation") if isinstance(decision.get("validation"), dict) else {}
+            reviewed_item_id = tool_cycle.get("equipment_review_item_id") if isinstance(tool_cycle, dict) else None
+            if (
+                reviewed_item_id
+                and validation.get("status") != "rejected"
+                and action != "equip_item"
+            ):
+                self.agent_runtime.resolve_equipment_review(reviewed_item_id)
             return {"ok": True, "decision": decision}
         raise RuntimeError(f"unsupported agent tool: {name}")
 
@@ -7122,6 +7386,8 @@ class DebugState:
             "等待时提交 {action:'wait',reason:'...'}。"
             "使用普通队员物品时提交 {action:'use_item',item_id:<id>,role_id:<role>,reason:'...'}；"
             "target_mode=implicit_event_context 时改为 {action:'use_item',item_id:<id>,target:'all',reason:'...'}。"
+            "equipment_review.pending=true 时先调用 get_equipment；综合角色定位、属性差值和特殊效果决定是否提交 "
+            "{action:'equip_item',item_id:<id>,role_id:<role>,reason:'...'}，不要仅按价格判断。"
             "注意 target:'all' 是兼容字段名：对 target_mode=implicit_event_context 的物品，SDLPAL 实际以 0xFFFF "
             "运行使用脚本并沿用最近事件对象，不一定表示对全体队员生效。"
             "不要提交 intent、recommended_action、evidence、risk、alternatives、dry_run 或原始按键。"
@@ -7220,7 +7486,7 @@ class DebugState:
             preview = self.action_preview("navigation_step", {"id": target_id})
             evidence["target"] = {"id": target_id, "transition_candidate": is_transition}
             risk = "May leave the current room." if is_transition else "The target and route will be revalidated before movement."
-        else:
+        elif action == "use_item":
             args = {"item_id": int(raw["item_id"])}
             if "role_id" in raw:
                 args["role_id"] = int(raw["role_id"])
@@ -7229,6 +7495,26 @@ class DebugState:
             intent, preview = "use_inventory_item", self.action_preview("use_item", args)
             evidence["item_id"] = args["item_id"]
             risk = "Item availability, target mode, and consumption risk will be validated against the latest inventory."
+        else:
+            item_id = int(raw["item_id"])
+            role_id = int(raw["role_id"])
+            args = {"item_id": item_id, "role_id": role_id}
+            equipment = self.agent_equipment(state, item_id)
+            comparison = next(
+                (
+                    entry for entry in equipment.get("comparisons") or []
+                    if isinstance(entry, dict) and int(entry.get("role_id", -1)) == role_id
+                ),
+                None,
+            )
+            current_item = comparison.get("current_item") if isinstance(comparison, dict) else None
+            if isinstance(current_item, dict):
+                args["expected_slot_item_id"] = int(current_item.get("item_id") or 0)
+            intent, preview = "equip_inventory_item", self.action_preview("equip_item", args)
+            evidence["item_id"] = item_id
+            evidence["role_id"] = role_id
+            evidence["equipment_comparison"] = comparison
+            risk = "Inventory, role eligibility, and the compared equipment slot will be revalidated immediately before equipping."
         return {
             "summary": reason,
             "recommended_intent": intent,
@@ -7246,8 +7532,8 @@ class DebugState:
             if key not in allowed_keys:
                 issues.append({"field": key, "code": "unsupported_field", "message": f"{key} is not part of the minimal decision contract"})
         action = raw.get("action")
-        if action not in {"wait", "advance_dialog", "navigate", "use_item"}:
-            issues.append({"field": "action", "code": "invalid_action", "message": "action must be wait, advance_dialog, navigate, or use_item"})
+        if action not in {"wait", "advance_dialog", "navigate", "use_item", "equip_item"}:
+            issues.append({"field": "action", "code": "invalid_action", "message": "action must be wait, advance_dialog, navigate, use_item, or equip_item"})
         if not isinstance(raw.get("reason"), str) or not raw.get("reason", "").strip():
             issues.append({"field": "reason", "code": "invalid_reason", "message": "reason must be a non-empty string"})
         elif len(raw["reason"]) > 300:
@@ -7269,11 +7555,17 @@ class DebugState:
             has_all = raw.get("target") == "all"
             if has_role == has_all:
                 issues.append({"field": "role_id|target", "code": "invalid_item_target", "message": "use_item requires exactly one of role_id or target='all'"})
+        if action == "equip_item":
+            if positive_int("item_id") is None:
+                issues.append({"field": "item_id", "code": "invalid_item_id", "message": "equip_item requires a positive item_id"})
+            if positive_int("role_id", allow_zero=True) is None:
+                issues.append({"field": "role_id", "code": "invalid_role_id", "message": "equip_item requires a non-negative role_id"})
         relevant_keys = {
             "wait": {"action", "reason"},
             "advance_dialog": {"action", "reason"},
             "navigate": {"action", "target_id", "reason"},
             "use_item": {"action", "item_id", "role_id", "target", "reason"},
+            "equip_item": {"action", "item_id", "role_id", "reason"},
         }.get(action)
         if relevant_keys:
             for key in raw.keys() - relevant_keys:
@@ -7349,6 +7641,83 @@ class DebugState:
             return "role_not_in_party"
         return None
 
+    def equip_item_validation_error(self, state: dict, args: dict, check_pending: bool = True) -> str | None:
+        if state.get("status") not in {None, "ok"}:
+            return str(state.get("status"))
+        if not state.get("in_main_game"):
+            return "not_in_main_game"
+        if state.get("in_battle"):
+            return "in_battle"
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        if dialog.get("active"):
+            return "in_dialog"
+        if self.file_info(self.state_path).get("stale", True):
+            return "runtime_stale"
+        if check_pending and self.action_path.exists():
+            return "action_pending"
+        try:
+            item_id = int(args.get("item_id") or 0)
+            role_id = int(args.get("role_id"))
+        except (TypeError, ValueError):
+            return "invalid_equipment_target"
+        candidate = next(
+            (
+                item for item in state.get("inventory") or []
+                if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+            ),
+            None,
+        )
+        if item_id <= 0 or not isinstance(candidate, dict):
+            return "not_in_inventory"
+        try:
+            available = int(candidate.get("amount") or 0) - int(candidate.get("amount_in_use") or 0)
+        except (TypeError, ValueError):
+            available = 0
+        if available <= 0:
+            return "not_available"
+        if candidate.get("equipable") is not True:
+            return "not_equipable"
+        eligible = set()
+        for value in candidate.get("equipable_role_ids") or []:
+            try:
+                eligible.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        if role_id not in eligible:
+            return "role_not_eligible"
+        role = next(
+            (
+                entry for entry in state.get("party") or []
+                if isinstance(entry, dict) and int(entry.get("role_id", -1)) == role_id
+            ),
+            None,
+        )
+        if not isinstance(role, dict):
+            return "role_not_in_party"
+        effect = candidate.get("equipment_effect") if isinstance(candidate.get("equipment_effect"), dict) else {}
+        try:
+            slot_id = int(effect.get("slot_id"))
+        except (TypeError, ValueError):
+            slot_id = -1
+        if slot_id < 0:
+            return "invalid_equip_script"
+        if "expected_slot_item_id" in args:
+            current = next(
+                (
+                    item for item in role.get("equipment") or []
+                    if isinstance(item, dict) and int(item.get("slot_id", -1)) == slot_id
+                ),
+                None,
+            )
+            try:
+                current_item_id = int((current or {}).get("item_id") or 0)
+                expected_item_id = int(args.get("expected_slot_item_id") or 0)
+            except (TypeError, ValueError):
+                return "equipment_context_stale"
+            if current_item_id != expected_item_id:
+                return "equipment_context_stale"
+        return None
+
     @staticmethod
     def reject_agent_decision(decision: dict, reason: str, **details) -> None:
         decision["validation"] = {
@@ -7359,6 +7728,28 @@ class DebugState:
 
     def validate_agent_decision(self, decision: dict) -> dict:
         action = decision.get("recommended_action") if isinstance(decision.get("recommended_action"), dict) else {}
+        if action.get("tool") == "equip_item":
+            latest_state = read_json(self.state_path)
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            error = self.equip_item_validation_error(latest_state, args)
+            if error is None:
+                return decision
+            self.reject_agent_decision(
+                decision,
+                "equip_item_invalid",
+                item_id=args.get("item_id"),
+                role_id=args.get("role_id"),
+                error=error,
+            )
+            decision.setdefault("evidence", {})["validation_state_context"] = self.state_context(latest_state)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "equip_item_invalid", "error": error}
+            )
+            decision["risk"] = (
+                f"{decision.get('risk') or ''} Latest-state validation rejected equipment change: {error}."
+            ).strip()
+            return decision
         if action.get("tool") == "use_item":
             latest_state = read_json(self.state_path)
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
@@ -7492,6 +7883,19 @@ class DebugState:
             except (TypeError, ValueError):
                 role_id = -1
             return {"item_id": item_id, "role_id": role_id}
+        if tool == "equip_item":
+            try:
+                item_id = int(args.get("item_id") or 0)
+                role_id = int(args.get("role_id"))
+            except (TypeError, ValueError):
+                item_id, role_id = 0, -1
+            result = {"item_id": item_id, "role_id": role_id}
+            if "expected_slot_item_id" in args:
+                try:
+                    result["expected_slot_item_id"] = int(args.get("expected_slot_item_id") or 0)
+                except (TypeError, ValueError):
+                    pass
+            return result
         return dict(args)
 
     def parse_model_json(self, content: str) -> dict:
@@ -7880,6 +8284,77 @@ class DebugState:
             self.append_navigation_diagnostic("action_written", {"action": entry})
             return entry
 
+    def wait_for_item_action_result(
+        self,
+        action: str,
+        item_id: int,
+        role_id: int,
+        start_time: float,
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = self.file_info(self.action_result_path)
+            if info.get("available") and float(info.get("mtime") or 0) >= start_time:
+                result = read_optional_json(self.action_result_path)
+                try:
+                    result_item_id = int(result.get("item_id"))
+                    result_role_id = int(result.get("role_id"))
+                except (TypeError, ValueError):
+                    result_item_id = result_role_id = -1
+                if (
+                    result.get("action") == action
+                    and result_item_id == item_id
+                    and result_role_id == role_id
+                ):
+                    return result
+            time.sleep(0.03)
+        raise TimeoutError(f"{action} {item_id} {role_id} did not complete")
+
+    def write_equip_item_action(
+        self,
+        item_id: int,
+        role_id: int,
+        expected_slot_item_id: int | None = None,
+    ) -> dict:
+        try:
+            item_id = int(item_id)
+            role_id = int(role_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("item_id and role_id must be integers") from exc
+        args = {"item_id": item_id, "role_id": role_id}
+        if expected_slot_item_id is not None:
+            args["expected_slot_item_id"] = int(expected_slot_item_id)
+        start_time = time.time()
+        with self.action_lock:
+            state = read_json(self.state_path)
+            error = self.equip_item_validation_error(state, args)
+            if error is not None:
+                raise RuntimeError(error)
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            self.atomic_write_text(
+                self.action_path,
+                f"equip_item {item_id} {role_id}\n",
+                encoding="ascii",
+            )
+            entry = {
+                "time": start_time,
+                "command": "equip_item",
+                "item_id": item_id,
+                "role_id": role_id,
+            }
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+        result = self.wait_for_item_action_result(
+            "equip_item", item_id, role_id, start_time
+        )
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or result.get("status") or "equip_item_failed"))
+        return {**entry, "result": result}
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "PALPALDebug/0.1"
@@ -8048,6 +8523,20 @@ class Handler(BaseHTTPRequestHandler):
                     payload.get("item_id"),
                     payload.get("role_id"),
                     payload.get("target"),
+                )
+                self.send_json({"ok": True, "action": result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/inventory/equip":
+            if self.reject_if_agent_running():
+                return
+            try:
+                payload = self.read_body_json()
+                result = self.server.state.write_equip_item_action(
+                    payload.get("item_id"),
+                    payload.get("role_id"),
                 )
                 self.send_json({"ok": True, "action": result})
             except Exception as exc:

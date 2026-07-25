@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 
 RUNNING_PHASES = {"running", "interrupting"}
-EXECUTABLE_TOOLS = {"press_buttons", "advance_dialog", "navigation_step", "use_item"}
+EXECUTABLE_TOOLS = {"press_buttons", "advance_dialog", "navigation_step", "use_item", "equip_item"}
 CHECKPOINT_BUNDLE_VERSION = 2
 DEFAULT_COMPACT_AT_TOKENS = 128_000
 TOOL_OUTPUT_FULL_TOKENS = 8_000
@@ -100,6 +100,10 @@ class AgentRuntime:
             "last_event_seq": self._last_event_seq(),
             "generation": 0,
             "pending_game_instance_id": None,
+            "equipment_review": {
+                "ownership_counts": None,
+                "pending": [],
+            },
         }
 
     def _load_or_create(self) -> dict:
@@ -122,6 +126,16 @@ class AgentRuntime:
         value.setdefault("checkpoint_id", None)
         value.setdefault("restored_from_session_id", None)
         value.setdefault("pending_game_instance_id", None)
+        review = value.setdefault("equipment_review", {})
+        if not isinstance(review, dict):
+            review = {}
+            value["equipment_review"] = review
+        if review.get("ownership_counts") is not None and not isinstance(review.get("ownership_counts"), dict):
+            review["ownership_counts"] = None
+        review.setdefault("ownership_counts", None)
+        if not isinstance(review.get("pending"), list):
+            review["pending"] = []
+        review.setdefault("pending", [])
         # Older control files carried a permanent macro goal. It is no longer
         # part of runtime state; silently discard it for in-place compatibility.
         value.pop("goal", None)
@@ -215,12 +229,140 @@ class AgentRuntime:
 
     def compact_snapshot(self) -> dict:
         state = self.snapshot()
-        return {key: state.get(key) for key in (
+        compact = {key: state.get(key) for key in (
             "session_id", "model", "status", "phase", "turn", "run_turn",
             "max_turns", "stop_reason", "usage", "compactions", "last_event_seq",
             "last_request_usage", "context_estimate_tokens", "game_instance_id",
             "parent_session_id", "checkpoint_id", "restored_from_session_id",
         )}
+        compact["equipment_review"] = {
+            "pending": len((state.get("equipment_review") or {}).get("pending") or []),
+        }
+        return compact
+
+    @staticmethod
+    def _equipment_ownership(state: dict) -> tuple[dict[str, int], dict[str, int], dict[str, str]]:
+        ownership: dict[str, int] = {}
+        available: dict[str, int] = {}
+        names: dict[str, str] = {}
+        for item in state.get("inventory") or []:
+            if not isinstance(item, dict) or item.get("equipable") is not True:
+                continue
+            try:
+                item_id = int(item.get("item_id") or 0)
+                amount = max(0, int(item.get("amount") or 0))
+                in_use = max(0, int(item.get("amount_in_use") or 0))
+            except (TypeError, ValueError):
+                continue
+            if item_id <= 0:
+                continue
+            key = str(item_id)
+            ownership[key] = ownership.get(key, 0) + amount
+            available[key] = max(0, amount - in_use)
+            names[key] = str(item.get("name") or "")
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            for item in role.get("equipment") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    item_id = int(item.get("item_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if item_id <= 0:
+                    continue
+                key = str(item_id)
+                ownership[key] = ownership.get(key, 0) + 1
+                names[key] = str(item.get("name") or names.get(key) or "")
+        return ownership, available, names
+
+    def observe_equipment_state(self, state: dict) -> None:
+        if state.get("status") in {"waiting_for_game", "state_parse_error"} or not state.get("in_main_game"):
+            return
+        ownership, available, names = self._equipment_ownership(state)
+        with self.lock:
+            review = self.state.setdefault("equipment_review", {"ownership_counts": None, "pending": []})
+            previous = review.get("ownership_counts")
+            if not isinstance(previous, dict):
+                review["ownership_counts"] = ownership
+                review["pending"] = []
+                self._persist()
+                return
+
+            pending_by_id = {
+                str(entry.get("item_id")): dict(entry)
+                for entry in review.get("pending") or []
+                if isinstance(entry, dict) and int(entry.get("item_id") or 0) > 0
+            }
+            changed = previous != ownership
+            for key in sorted(set(previous) | set(ownership), key=lambda value: int(value)):
+                delta = int(ownership.get(key) or 0) - int(previous.get(key) or 0)
+                if delta > 0:
+                    entry = pending_by_id.get(key) or {
+                        "item_id": int(key),
+                        "name": names.get(key) or "",
+                        "new_count": 0,
+                        "first_seen_at": _stamp(),
+                    }
+                    entry["name"] = names.get(key) or entry.get("name") or ""
+                    entry["new_count"] = int(entry.get("new_count") or 0) + delta
+                    pending_by_id[key] = entry
+                elif delta < 0 and key in pending_by_id:
+                    entry = pending_by_id[key]
+                    entry["new_count"] = max(0, int(entry.get("new_count") or 0) + delta)
+
+            for key, entry in list(pending_by_id.items()):
+                remaining = min(
+                    max(0, int(entry.get("new_count") or 0)),
+                    max(0, int(available.get(key) or 0)),
+                )
+                if remaining <= 0:
+                    pending_by_id.pop(key, None)
+                else:
+                    entry["new_count"] = remaining
+                    entry["name"] = names.get(key) or entry.get("name") or ""
+
+            pending = sorted(
+                pending_by_id.values(),
+                key=lambda entry: (str(entry.get("first_seen_at") or ""), int(entry.get("item_id") or 0)),
+            )
+            if pending != review.get("pending"):
+                changed = True
+            review["ownership_counts"] = ownership
+            review["pending"] = pending
+            if changed:
+                self._persist()
+
+    def pending_equipment_review(self) -> dict | None:
+        with self.lock:
+            pending = (self.state.get("equipment_review") or {}).get("pending") or []
+            return json.loads(json.dumps(pending[0], ensure_ascii=False)) if pending else None
+
+    def resolve_equipment_review(self, item_id: Any, *, count: int | None = None) -> None:
+        try:
+            wanted = int(item_id)
+        except (TypeError, ValueError):
+            return
+        with self.lock:
+            review = self.state.get("equipment_review") or {}
+            pending = []
+            changed = False
+            for entry in review.get("pending") or []:
+                if not isinstance(entry, dict) or int(entry.get("item_id") or 0) != wanted:
+                    pending.append(entry)
+                    continue
+                changed = True
+                if count is not None:
+                    remaining = max(0, int(entry.get("new_count") or 0) - max(0, int(count)))
+                    if remaining:
+                        entry = dict(entry)
+                        entry["new_count"] = remaining
+                        pending.append(entry)
+            if changed:
+                review["pending"] = pending
+                self.state["equipment_review"] = review
+                self._persist()
 
     def _event_for(
         self,
@@ -533,6 +675,7 @@ class AgentRuntime:
             for key in (
                 "model", "turn", "max_turns", "pending_decision", "last_execution",
                 "usage", "last_request_usage", "context_estimate_tokens", "compactions",
+                "equipment_review",
             ):
                 if key in control:
                     restored[key] = control[key]
@@ -1317,6 +1460,13 @@ exploration value, and maintained local tasks to choose the next action.
         elif tool == "use_item":
             action_result = self.debug.write_use_item_action(args.get("item_id"), args.get("role_id"), args.get("target"))
             after = self._wait_action_and_stable()
+        elif tool == "equip_item":
+            action_result = self.debug.write_equip_item_action(
+                args.get("item_id"),
+                args.get("role_id"),
+                args.get("expected_slot_item_id"),
+            )
+            after = self._wait_action_and_stable()
         else:
             action_result = self._navigate(int(args.get("id") or 0))
             after = self._wait_state_quiet()
@@ -1472,9 +1622,23 @@ exploration value, and maintained local tasks to choose the next action.
             return result
         compact = {
             key: result.get(key)
-            for key in ("ok", "status", "presses", "steps", "target_id", "frames", "buttons", "observation_id")
+            for key in (
+                "ok", "status", "presses", "steps", "target_id", "frames",
+                "buttons", "observation_id", "command", "item_id", "role_id",
+                "slot_id", "slot_key", "previous_item_id",
+            )
             if key in result
         }
+        native_result = result.get("result")
+        if isinstance(native_result, dict):
+            compact["native_result"] = {
+                key: native_result.get(key)
+                for key in (
+                    "ok", "status", "action", "item_id", "role_id",
+                    "slot_id", "slot_key", "previous_item_id", "error",
+                )
+                if key in native_result
+            }
         observation = result.get("observation")
         if isinstance(observation, dict):
             compact["observation"] = {
@@ -1503,6 +1667,26 @@ exploration value, and maintained local tasks to choose the next action.
         def objects(value: dict) -> dict[int, tuple]:
             return {int(item.get("id") or 0): (item.get("state"), item.get("vanish_time"), item.get("interactable"), item.get("blocking")) for item in value.get("objects") or []}
 
+        def equipment(value: dict) -> dict[tuple[int, int], int]:
+            result = {}
+            for role in value.get("party") or []:
+                if not isinstance(role, dict):
+                    continue
+                try:
+                    role_id = int(role.get("role_id"))
+                except (TypeError, ValueError):
+                    continue
+                for item in role.get("equipment") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        slot_id = int(item.get("slot_id"))
+                        item_id = int(item.get("item_id") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    result[(role_id, slot_id)] = item_id
+            return result
+
         delta: dict[str, Any] = {}
         fields = {
             "position": (position(before), position(after)),
@@ -1520,6 +1704,19 @@ exploration value, and maintained local tasks to choose the next action.
         ]
         if inventory_changes:
             delta["inventory_changes"] = inventory_changes
+        before_equipment, after_equipment = equipment(before), equipment(after)
+        equipment_changes = [
+            {
+                "role_id": role_id,
+                "slot_id": slot_id,
+                "before": before_equipment.get((role_id, slot_id), 0),
+                "after": after_equipment.get((role_id, slot_id), 0),
+            }
+            for role_id, slot_id in sorted(set(before_equipment) | set(after_equipment))
+            if before_equipment.get((role_id, slot_id), 0) != after_equipment.get((role_id, slot_id), 0)
+        ]
+        if equipment_changes:
+            delta["equipment_changes"] = equipment_changes
         before_objects, after_objects = objects(before), objects(after)
         object_changes = [
             {"id": object_id, "before": before_objects.get(object_id), "after": after_objects.get(object_id)}

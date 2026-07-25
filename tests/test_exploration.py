@@ -243,6 +243,53 @@ def test_write_use_item_action_for_all(tmp_path):
     assert debug.action_path.read_text(encoding='ascii') == 'use_item 89 all\n'
 
 
+def test_write_equip_item_action_uses_independent_equip_command(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state['party'] = [{'role_id': 0, 'equipment': [{'slot_id': 0, 'item_id': 196}]}]
+    state['inventory'] = [{
+        'item_id': 260,
+        'name': '圣灵珠',
+        'amount': 1,
+        'amount_in_use': 0,
+        'usable': True,
+        'equipable': True,
+        'equipable_role_ids': [0],
+        'equipment_effect': {
+            'preview_complete': True,
+            'slot_id': 0,
+            'slot_key': 'head',
+            'stat_modifiers': {},
+            'elemental_resistance': [0, 0, 0, 0, 0],
+            'traits': [],
+            'unparsed_effects': [],
+        },
+    }]
+    write_state(debug, state)
+    monkeypatch.setattr(
+        debug,
+        'wait_for_item_action_result',
+        lambda action, item_id, role_id, start_time: {
+            'ok': True,
+            'action': action,
+            'item_id': item_id,
+            'role_id': role_id,
+            'slot_id': 0,
+            'previous_item_id': 196,
+        },
+    )
+
+    result = debug.write_equip_item_action(
+        item_id=260,
+        role_id=0,
+        expected_slot_item_id=196,
+    )
+
+    assert result['command'] == 'equip_item'
+    assert result['result']['ok']
+    assert debug.action_path.read_text(encoding='ascii') == 'equip_item 260 0\n'
+
+
 
 def test_get_room_memory_returns_compact_known_and_unknown_status(tmp_path):
     debug = make_debug_state(tmp_path)

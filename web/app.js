@@ -1287,7 +1287,7 @@ function agentDecisionContextMatches(decision, state) {
 }
 
 function agentActionExecutable(action) {
-  return ["press_buttons", "advance_dialog", "navigation_step", "use_item"].includes(action?.tool);
+  return ["press_buttons", "advance_dialog", "navigation_step", "use_item", "equip_item"].includes(action?.tool);
 }
 
 function agentExecutionDisabledReason(decision, state, agentBusy) {
@@ -1302,6 +1302,10 @@ function agentExecutionDisabledReason(decision, state, agentBusy) {
   if (!agentActionExecutable(action)) return `Unsupported action tool: ${action.tool || "unknown"}.`;
   if (action.tool === "navigation_step" && !Number(action.args?.id)) return "Navigation target is missing.";
   if (action.tool === "use_item" && !Number(action.args?.item_id)) return "Inventory item is missing.";
+  if (
+    action.tool === "equip_item"
+    && (!Number(action.args?.item_id) || !Number.isInteger(Number(action.args?.role_id)) || Number(action.args.role_id) < 0)
+  ) return "Equipment item or role is missing.";
   if (action.tool === "navigation_step" && !navigationTargetActionable(state, Number(action.args.id))) {
     return "Navigation target is not actionable now.";
   }

@@ -240,6 +240,13 @@ def test_load_checkpoint_discards_incompatible_companion_files(tmp_path):
 def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
     debug = make_debug_state(tmp_path)
     state = {**make_state(), 'game_instance_id': 'game-a'}
+    state['inventory'] = [{
+        'item_id': 201,
+        'name': '皮帽',
+        'amount': 1,
+        'amount_in_use': 0,
+        'equipable': True,
+    }]
     write_state(debug, state)
     debug.snapshot()
     runtime = debug.agent_runtime
@@ -254,6 +261,15 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
         pending_decision=saved_decision,
         usage={'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110},
         compactions=1,
+        equipment_review={
+            'ownership_counts': {'201': 1},
+            'pending': [{
+                'item_id': 201,
+                'name': '皮帽',
+                'new_count': 1,
+                'first_seen_at': '2026-07-25T00:00:00Z',
+            }],
+        },
     )
     runtime._persist()
     runtime._submit(runtime._replace_sdk_session_items(source_session_id, [
@@ -288,6 +304,7 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
     assert restored['pending_decision'] == saved_decision
     assert restored['usage']['total_tokens'] == 110
     assert restored['compactions'] == 1
+    assert restored['equipment_review']['pending'][0]['item_id'] == 201
     transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)
     assert [item['content'] for item in transcript] == ['checkpoint context', 'checkpoint response']
     assert runtime.get_tool_output(output_ref)['content'] == archived_output
