@@ -433,7 +433,8 @@ def test_agent_tool_specs_include_queries_and_submit():
         context = debug.agent_tool_initial_context(make_state())
         assert context['active_tasks'] == []
         assert context['active_tasks_total'] == 0
-        assert set(context) == {'state_summary', 'active_tasks', 'active_tasks_total'}
+        assert set(context) == {'state_summary', 'active_tasks', 'active_tasks_total', 'task_review'}
+        assert context['task_review'] == {'required': False, 'tasks': []}
         assert names[-1] == 'submit_decision'
 
 

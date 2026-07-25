@@ -55,6 +55,20 @@ def wait_for_pause(runtime, timeout=3):
     raise AssertionError("agent runtime did not pause")
 
 
+def test_old_control_goal_is_silently_removed(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    legacy = runtime.snapshot()
+    legacy["goal"] = "通关游戏"
+    runtime._atomic_json(runtime.control_path, legacy)
+
+    runtime.state = runtime._load_or_create()
+
+    assert "goal" not in runtime.snapshot()
+    assert "goal" not in json.loads(runtime.control_path.read_text(encoding="utf-8"))
+    assert "goal" not in runtime.compact_snapshot()
+
+
 def test_runtime_counts_recommendations_and_can_resume(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -74,6 +88,21 @@ def test_runtime_counts_recommendations_and_can_resume(tmp_path):
     assert resumed["turn"] == 2
     assert resumed["usage"]["total_tokens"] == 30
     assert any(event["type"] == "decision" for event in runtime.events())
+
+
+def test_runtime_start_feedback_has_no_permanent_macro_goal(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime._unsafe_state_reason = lambda state: None
+    feedback_seen = []
+    runtime.decision_provider = lambda state, model, feedback: feedback_seen.append(feedback) or decision()
+
+    runtime.start(None, 1)
+    wait_for_pause(runtime)
+
+    assert feedback_seen
+    assert "permanent goal" not in feedback_seen[0].lower()
+    assert "finish the game" not in feedback_seen[0].lower()
 
 
 def test_runtime_replans_rejected_recommendation_without_counting_turn(tmp_path):
@@ -387,6 +416,7 @@ def test_context_compression_replaces_history_and_keeps_recent_items(tmp_path, m
 
     class Completions:
         async def create(self, **kwargs):
+            self.messages = kwargs["messages"]
             message = type("Message", (), {"content": "compact summary"})()
             choice = type("Choice", (), {"message": message})()
             return type("Response", (), {"choices": [choice]})()
@@ -397,6 +427,9 @@ def test_context_compression_replaces_history_and_keeps_recent_items(tmp_path, m
     assert session.items[0]["content"].startswith("Persistent context summary:")
     assert session.items[-2:] == original[-2:]
     assert runtime.snapshot()["compactions"] == 1
+    compact_text = json.dumps(client.chat.completions.messages)
+    assert "permanent goal" not in compact_text.lower()
+    assert "finish the game" not in compact_text.lower()
     assert any(event["type"] == "compression" and event["phase"] == "completed" for event in runtime.events())
 
 
@@ -478,7 +511,7 @@ def test_sdk_adapter_uses_streaming_tools_sqlite_and_buffering(tmp_path, monkeyp
     fake_agents.SQLiteSession = SQLiteSession
     fake_agents.set_tracing_disabled = lambda **kwargs: captured.setdefault("tracing", kwargs)
     fake_agent_module = types.ModuleType("agents.agent")
-    fake_agent_module.StopAtTools = lambda **kwargs: kwargs
+    fake_agent_module.ToolsToFinalOutputResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
     monkeypatch.setitem(sys.modules, "agents", fake_agents)
     monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
     monkeypatch.setattr(runtime, "_maybe_compact_sdk", lambda *args: asyncio.sleep(0))
@@ -487,12 +520,124 @@ def test_sdk_adapter_uses_streaming_tools_sqlite_and_buffering(tmp_path, monkeyp
     expected_tools = [spec["function"]["name"] for spec in debug.agent_tool_specs()]
     assert captured["model"]["buffer_streamed_tool_calls"] is True
     assert [tool.name for tool in captured["agent"]["tools"]] == expected_tools
-    assert captured["agent"]["tool_use_behavior"] == {"stop_at_tool_names": ["submit_decision"]}
+    behavior = captured["agent"]["tool_use_behavior"]
+    query = types.SimpleNamespace(tool=types.SimpleNamespace(name="get_tasks"), output='{"ok":true}')
+    rejected = types.SimpleNamespace(
+        tool=types.SimpleNamespace(name="submit_decision"),
+        output='{"ok":false,"error":{"code":"task_review_required"}}',
+    )
+    accepted = types.SimpleNamespace(
+        tool=types.SimpleNamespace(name="submit_decision"),
+        output='{"ok":true,"accepted":true}',
+    )
+    assert behavior(None, [query]).is_final_output is False
+    assert behavior(None, [rejected]).is_final_output is False
+    finished = behavior(None, [accepted])
+    assert finished.is_final_output is True
+    assert json.loads(finished.final_output) == {"ok": True, "accepted": True}
+    assert "permanent goal" not in captured["agent"]["instructions"].lower()
+    assert "finish the game" not in captured["agent"]["instructions"].lower()
     assert captured["sqlite"] == (runtime.snapshot()["session_id"], runtime.sqlite_path)
     assert captured["run"]["session"].__class__ is SQLiteSession
     assert captured["run"]["max_turns"] == 8
     assert captured["tracing"] == {"disabled": True}
     assert result["usage"]["total_tokens"] == 15
+
+
+def test_sdk_rejected_submit_returns_to_model_and_recovers_in_same_tool_cycle(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    captured = {"calls": [], "cycles": []}
+
+    class FunctionTool:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.kwargs = kwargs
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self.tools = kwargs["tools"]
+            self.tool_use_behavior = kwargs["tool_use_behavior"]
+
+    class Session:
+        def __init__(self, *_args):
+            self.items = []
+
+        async def get_items(self): return list(self.items)
+        async def clear_session(self): self.items = []
+        async def add_items(self, items): self.items.extend(items)
+
+    accepted_decision = decision("navigation_step", {"id": 63}, "inspect_target")
+
+    def run_agent_tool(name, arguments, state, *, tool_cycle=None):
+        captured["calls"].append(name)
+        captured["cycles"].append(tool_cycle)
+        if name == "submit_decision" and captured["calls"].count("submit_decision") == 1:
+            return {
+                "ok": False,
+                "error": {"code": "task_review_required", "message": "Review tasks first."},
+            }
+        if name == "submit_decision":
+            return {"ok": True, "decision": accepted_decision}
+        return {"ok": True}
+
+    monkeypatch.setattr(debug, "run_agent_tool", run_agent_tool)
+
+    class Stream:
+        context_wrapper = None
+        final_output = None
+
+        def __init__(self, agent):
+            self.agent = agent
+
+        async def stream_events(self):
+            by_name = {tool.name: tool for tool in self.agent.tools}
+            submit = by_name["submit_decision"]
+            rejected_output = await submit.kwargs["on_invoke_tool"](None, json.dumps(submission("navigate", target_id=63)))
+            assert json.loads(rejected_output)["error"]["code"] == "task_review_required"
+            rejected = types.SimpleNamespace(tool=submit, output=rejected_output)
+            assert self.agent.tool_use_behavior(None, [rejected]).is_final_output is False
+
+            outputs = []
+            for name, arguments in (
+                ("get_tasks", {}),
+                ("upsert_task", {"id": "review-me"}),
+                ("submit_decision", submission("navigate", target_id=63)),
+            ):
+                tool = by_name[name]
+                output = await tool.kwargs["on_invoke_tool"](None, json.dumps(arguments))
+                outputs.append(types.SimpleNamespace(tool=tool, output=output))
+            finished = self.agent.tool_use_behavior(None, outputs)
+            assert finished.is_final_output is True
+            self.final_output = finished.final_output
+            if False:
+                yield None
+
+    class Runner:
+        @classmethod
+        def run_streamed(cls, agent, _prompt, **_kwargs):
+            return Stream(agent)
+
+    fake_agents = types.ModuleType("agents")
+    fake_agents.Agent = Agent
+    fake_agents.AsyncOpenAI = lambda **kwargs: object()
+    fake_agents.FunctionTool = FunctionTool
+    fake_agents.ModelSettings = lambda **kwargs: kwargs
+    fake_agents.OpenAIChatCompletionsModel = lambda **kwargs: object()
+    fake_agents.Runner = Runner
+    fake_agents.SQLiteSession = Session
+    fake_agents.set_tracing_disabled = lambda **kwargs: None
+    fake_agent_module = types.ModuleType("agents.agent")
+    fake_agent_module.ToolsToFinalOutputResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "agents", fake_agents)
+    monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
+    monkeypatch.setattr(runtime, "_maybe_compact_sdk", lambda *args: asyncio.sleep(0))
+
+    result = asyncio.run(runtime._sdk_decide(make_state(), "feedback"))
+
+    assert captured["calls"] == ["submit_decision", "get_tasks", "upsert_task", "submit_decision"]
+    assert len({id(cycle) for cycle in captured["cycles"]}) == 1
+    assert result["recommended_action"] == accepted_decision["recommended_action"]
 
 
 def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeypatch):
@@ -527,14 +672,16 @@ def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeyp
     fake_agents.SQLiteSession = lambda *args: Session()
     fake_agents.set_tracing_disabled = lambda **kwargs: None
     fake_agent_module = types.ModuleType("agents.agent")
-    fake_agent_module.StopAtTools = lambda **kwargs: kwargs
+    fake_agent_module.ToolsToFinalOutputResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
     monkeypatch.setitem(sys.modules, "agents", fake_agents)
     monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
     monkeypatch.setattr(runtime, "_maybe_compact_sdk", lambda *args: asyncio.sleep(0))
 
     asyncio.run(runtime._sdk_decide(make_state(), "compact feedback"))
     assert set(captured["prompt"]) == {"feedback", "context"}
-    assert set(captured["prompt"]["context"]) == {"state_summary", "active_tasks", "active_tasks_total"}
+    assert set(captured["prompt"]["context"]) == {
+        "state_summary", "active_tasks", "active_tasks_total", "task_review",
+    }
 
 
 def test_tool_argument_parser_repairs_one_truncated_json_ending():

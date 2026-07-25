@@ -179,8 +179,9 @@ ws://127.0.0.1:8765/frames
 
 ### Persistent Agent Session
 
-The Web UI's Agent tab runs a persistent, server-side loop with the permanent
-goal `通关游戏`. Only one session can control the game at a time. DeepSeek uses
+The Web UI's Agent tab runs a persistent, server-side loop that chooses useful
+local actions from current state, exploration value, and maintained tasks. Only
+one session can control the game at a time. DeepSeek uses
 the OpenAI Agents SDK over its OpenAI-compatible Chat Completions endpoint;
 without `DEEPSEEK_API_KEY`, the local rules backend remains available for
 development.
@@ -217,9 +218,8 @@ set by `./run` and is only needed when launching the native binary manually.
 Checkpoints include a local Agent bundle containing the saved session state,
 SDK transcript, activity timeline, and any archived tool outputs. Loading one
 creates a new branch session from that exact save point, so decisions made after
-the checkpoint do not leak into the restored game. Version 1 Agent bundles still
-load without archived outputs. Older checkpoints with no Agent bundle still
-begin with an empty Agent session and an explicit compatibility status.
+the checkpoint do not leak into the restored game. Only the current Agent bundle
+format is supported.
 
 Set `PALPAL_AGENT_COMPACT_AT_TOKENS` to change the conservative context
 compression threshold (default `128000` estimated tokens). Compression uses a DeepSeek
@@ -228,7 +228,7 @@ cumulative billed tokens, the latest agent-run usage, and a conservative
 estimate of the currently persisted context separately. Token estimates use
 UTF-8 byte size so Chinese output is not severely undercounted.
 
-The persistent model sees eight tools: `upsert_task`, `get_navigation`,
+The persistent model sees nine tools: `upsert_task`, `get_tasks`, `get_navigation`,
 `inspect_target`, `get_observations`, `get_inventory`, `get_room_memory`, and
 `get_tool_output`, followed by `submit_decision`. Query outputs up to about 8000
 estimated tokens stay verbatim. Larger JSON or text outputs are atomically
@@ -240,8 +240,8 @@ current session's archive in pages of at most 6000 characters.
 At 96000 estimated context tokens, older tool results are archived until the
 estimate is near 80000 while the six most recent complete tool results remain
 inline. This hysteresis happens before the 128k whole-session summary and avoids
-rewriting the transcript on every turn. The permanent goal is held in agent
-instructions/session metadata instead of being repeated in every user message.
+rewriting the transcript on every turn. There is no permanent macro goal in
+agent instructions or session metadata; an empty task ledger still permits normal exploration.
 After actions, the runtime requires a two-second quiet state before starting the
 next decision.
 

@@ -4,6 +4,18 @@ from unittest import mock
 from conftest import make_checkpoint_state, make_debug_state, write_state
 
 
+def review_state(*, sprite=2, cash=10, inventory=None):
+    state = make_checkpoint_state()
+    state.update({
+        "cash": cash,
+        "inventory": inventory or [],
+        "party": [{"role_id": 0, "name": "李逍遙", "scene_sprite_id": sprite}],
+        "objects": [],
+        "dialog": {"active": False},
+    })
+    return state
+
+
 def test_task_ledger_create_update_close_and_filtering():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
@@ -51,6 +63,27 @@ def test_task_upsert_accepts_stable_custom_id_and_does_not_duplicate_on_update()
         assert updated["operation"] == "updated"
         assert updated["task"]["priority"] == 8
         assert list(debug.read_exploration()["tasks"]) == ["buy_shrimp"]
+
+
+def test_unchanged_upsert_explicitly_reviews_task_and_refreshes_snapshot():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = review_state()
+        write_state(debug, state)
+        created = debug.run_agent_tool("upsert_task", {
+            "id": "keep-going", "description": "Keep going", "rationale": "Current evidence.",
+        })["task"]
+
+        state["cash"] = 15
+        write_state(debug, state)
+        assert debug.task_review_context(state)["required"] is True
+        reviewed = debug.run_agent_tool("upsert_task", {"id": "keep-going"})
+
+        assert reviewed["operation"] == "updated"
+        assert reviewed["task"]["last_reviewed_at"] >= created["last_reviewed_at"]
+        assert reviewed["task"]["last_reviewed_agent_turn"] == 0
+        assert reviewed["task"]["history"][-1]["changes"] == {}
+        assert debug.task_review_context(state) == {"required": False, "tasks": []}
 
 
 def test_unknown_custom_task_id_requires_complete_creation_fields_without_writing():
@@ -122,6 +155,7 @@ def test_active_task_context_is_sorted_bounded_and_compact():
         context = debug.active_task_context()
 
         assert context["active_tasks_total"] == 10
+        assert context["task_review"] == {"required": False, "tasks": []}
         assert len(context["active_tasks"]) == 8
         assert [task["priority"] for task in context["active_tasks"]] == list(range(9, 1, -1))
         assert len(context["active_tasks"][0]["description"]) == 160
@@ -132,6 +166,141 @@ def test_active_task_context_is_sorted_bounded_and_compact():
         assert "rationale" not in context["active_tasks"][0]
         assert "history" not in context["active_tasks"][0]
         assert "updated_at" not in context["active_tasks"][0]
+
+
+def test_task_review_matches_object_dialog_and_events_but_not_unrelated_objects():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = review_state()
+        write_state(debug, state)
+        task = debug.run_agent_tool("upsert_task", {
+            "id": "object-task", "description": "Talk to object", "rationale": "NPC request.", "object_id": 63,
+        })["task"]
+        reviewed_at = task["last_reviewed_at"]
+        debug.dialog_history = [{"time": reviewed_at + 1, "event_object_id": 99, "text": "unrelated"}]
+        debug.event_log = [{"time": reviewed_at + 1, "type": "object_changed", "object_id": 99}]
+        assert debug.task_review_context(state)["required"] is False
+
+        debug.dialog_history.append({"time": reviewed_at + 2, "event_object_id": 63, "text": "new evidence"})
+        review = debug.task_review_context(state)
+        assert review["required"] is True
+        assert review["tasks"][0]["id"] == "object-task"
+        assert {reason["kind"] for reason in review["tasks"][0]["reasons"]} == {"dialog"}
+
+        debug.run_agent_tool("upsert_task", {"id": "object-task"})
+        new_reviewed_at = debug.task_ledger()[0]["last_reviewed_at"]
+        debug.dialog_history = []
+        debug.event_log.append({
+            "time": new_reviewed_at + 1, "type": "interaction_no_effect", "target_id": 63,
+        })
+        kinds = {reason["kind"] for reason in debug.task_review_context(state)["tasks"][0]["reasons"]}
+        assert kinds == {"interaction_no_effect"}
+
+
+def test_task_review_detects_transition_and_stable_net_resource_changes():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = review_state(inventory=[{"item_id": 7, "amount": 1, "amount_in_use": 0}])
+        write_state(debug, state)
+        task = debug.run_agent_tool("upsert_task", {
+            "id": "travel-task", "description": "Reach upstairs", "rationale": "Known delivery.",
+            "transition_key": "stairs", "room_id": "room-upstairs",
+        })["task"]
+        data = debug.read_exploration()
+        data["transitions"] = {"room-lobby": {"stairs": {
+            "transition_key": "stairs", "from_room_id": "room-lobby", "to_room_id": "room-upstairs",
+            "observed_at": task["last_reviewed_at"] + 1,
+        }}}
+        debug.write_exploration(data)
+        state["cash"] = 15
+        state["inventory"][0]["amount"] = 2
+        write_state(debug, state)
+
+        reasons = debug.task_review_context(state)["tasks"][0]["reasons"]
+        assert {reason["kind"] for reason in reasons} == {
+            "transition", "cash_net_changed", "inventory_net_changed",
+        }
+
+
+def test_task_review_uses_net_sprite_state_and_ignores_recovered_animation():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = review_state(sprite=2)
+        write_state(debug, state)
+        debug.run_agent_tool("upsert_task", {
+            "id": "delivery", "description": "Carry the delivery", "rationale": "Dialog established it.",
+        })
+
+        transient = review_state(sprite=193)
+        debug.record_state_events(transient)
+        recovered = review_state(sprite=2)
+        debug.record_state_events(recovered)
+        assert debug.task_review_context(recovered)["required"] is False
+
+        persistent = review_state(sprite=208)
+        write_state(debug, persistent)
+        review = debug.task_review_context(persistent)
+        sprite_reason = next(reason for reason in review["tasks"][0]["reasons"] if reason["kind"] == "party_sprite_net_changed")
+        assert sprite_reason["roles"] == [{"role_id": "0", "from": 2, "to": 208}]
+
+
+def test_pre_snapshot_task_reconstructs_stable_sprite_net_from_events():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = review_state(sprite=208)
+        write_state(debug, state)
+        reviewed_at = 100.0
+        data = debug.empty_exploration()
+        data["tasks"]["legacy-task"] = {
+            "id": "legacy-task", "description": "Old task", "rationale": "Old evidence.",
+            "priority": 1, "status": "active", "created_at": reviewed_at,
+            "updated_at": reviewed_at, "updated_agent_turn": 2, "history": [],
+        }
+        debug.write_exploration(data)
+        debug.event_log = [{
+            "time": 101.0, "type": "party_sprite_changed", "role_id": 0,
+            "from_scene_sprite_id": 2, "to_scene_sprite_id": 208,
+        }]
+
+        task = debug.task_ledger()[0]
+        assert task["last_reviewed_at"] == reviewed_at
+        assert task["last_reviewed_agent_turn"] == 2
+        reasons = debug.task_review_context(state)["tasks"][0]["reasons"]
+        assert next(reason for reason in reasons if reason["kind"] == "party_sprite_net_changed")["roles"] == [
+            {"role_id": "0", "from": 2, "to": 208},
+        ]
+
+
+def test_task_review_gate_allows_dialog_but_requires_get_and_each_upsert_before_action():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = review_state()
+        write_state(debug, state)
+        task = debug.run_agent_tool("upsert_task", {
+            "id": "review-me", "description": "Old phase", "rationale": "Earlier dialog.", "object_id": 63,
+        })["task"]
+        debug.dialog_history = [{"time": task["last_reviewed_at"] + 1, "event_object_id": 63, "text": "new phase"}]
+        cycle = debug.new_agent_tool_cycle(state)
+
+        dialog = debug.run_agent_tool(
+            "submit_decision", {"action": "advance_dialog", "reason": "Continue dialog."}, state, tool_cycle=cycle,
+        )
+        assert dialog["ok"] is True
+        blocked = debug.run_agent_tool(
+            "submit_decision", {"action": "navigate", "target_id": 63, "reason": "Move."}, state, tool_cycle=cycle,
+        )
+        assert blocked["error"]["code"] == "task_review_required"
+        assert blocked["error"]["missing_task_ids"] == ["review-me"]
+
+        debug.run_agent_tool("upsert_task", {"id": "review-me"}, state, tool_cycle=cycle)
+        assert debug.run_agent_tool(
+            "submit_decision", {"action": "navigate", "target_id": 63, "reason": "Move."}, state, tool_cycle=cycle,
+        )["ok"] is False
+        debug.run_agent_tool("get_tasks", {}, state, tool_cycle=cycle)
+        debug.run_agent_tool("upsert_task", {"id": "review-me"}, state, tool_cycle=cycle)
+        assert debug.run_agent_tool(
+            "submit_decision", {"action": "navigate", "target_id": 63, "reason": "Move."}, state, tool_cycle=cycle,
+        )["ok"] is True
 
 
 def test_agent_tasks_view_groups_all_statuses_and_returns_compact_records():
@@ -222,3 +391,69 @@ def test_executable_task_overrides_unknown_transition_but_unmatched_task_does_no
             "description": "Later room", "rationale": "Not reachable from this room.", "room_id": "S9/M9:000000000002",
         })
         assert debug.rules_decide_agent(state)["recommended_action"]["args"] == {"id": 10}
+
+
+def test_rules_ignores_pending_review_task_and_empty_ledger_still_explores():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        state = review_state(cash=10)
+        write_state(debug, state)
+        unknown = {"id": 10, "status": "reachable", "transition_candidate": True,
+                   "destination_priority": "unknown", "steps": 1, "kind": "touch"}
+        task_object = {"id": 20, "status": "reachable", "transition_candidate": False,
+                       "steps": 4, "kind": "search", "agent_priority": "normal"}
+        debug.navigation = mock.Mock(return_value={"status": "ok", "targets": [unknown, task_object]})
+        debug.route_to_object = mock.Mock(return_value={"route": {"moves": ["right"], "steps": 1}})
+
+        debug.write_exploration(debug.empty_exploration())
+        assert debug.rules_decide_agent(state)["recommended_action"]["args"] == {"id": 10}
+
+        debug.run_agent_tool("upsert_task", {
+            "id": "stale-task", "description": "Inspect marked object", "rationale": "Earlier evidence.",
+            "priority": 9, "object_id": 20,
+        })
+        state["cash"] = 11
+        write_state(debug, state)
+        assert debug.task_review_context(state)["required"] is True
+        assert debug.rules_decide_agent(state)["recommended_action"]["args"] == {"id": 10}
+
+
+def test_delivery_phase_regression_reviews_old_object_task_without_inventory_item():
+    with tempfile.TemporaryDirectory() as tmp:
+        debug = make_debug_state(tmp)
+        before = review_state(sprite=2, inventory=[])
+        write_state(debug, before)
+        old = debug.run_agent_tool("upsert_task", {
+            "id": "task-drive-beggar",
+            "description": "向目标 63 取酒菜",
+            "rationale": "较早对话把目标 63 作为取货对象。",
+            "object_id": 63,
+        })["task"]
+        after = review_state(sprite=208, inventory=[])
+        write_state(debug, after)
+        debug.dialog_history = [{
+            "time": old["last_reviewed_at"] + 1,
+            "event_object_id": 63,
+            "text": "把酒菜送到楼上客人那里。",
+        }]
+
+        review = debug.task_review_context(after)
+        assert review["required"] is True
+        assert review["tasks"][0]["id"] == "task-drive-beggar"
+        assert {reason["kind"] for reason in review["tasks"][0]["reasons"]} == {
+            "dialog", "party_sprite_net_changed",
+        }
+        assert after["inventory"] == []
+
+        debug.run_agent_tool("upsert_task", {
+            "id": "task-drive-beggar",
+            "status": "completed",
+            "rationale": "目标 63 的新对话与稳定 sprite 净变化共同表明取货阶段已结束。",
+        })
+        successor = debug.run_agent_tool("upsert_task", {
+            "id": "deliver-upstairs",
+            "description": "把酒菜送给楼上客人",
+            "rationale": "相邻对话明确要求上楼交付；sprite 变化仅作为携带状态的数值证据。",
+        })
+        assert successor["task"]["status"] == "active"
+        assert [task["id"] for task in debug.task_ledger()] == ["deliver-upstairs"]

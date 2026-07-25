@@ -13,11 +13,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-GOAL = "通关游戏"
 RUNNING_PHASES = {"running", "interrupting"}
 EXECUTABLE_TOOLS = {"press_buttons", "advance_dialog", "navigation_step", "use_item"}
 CHECKPOINT_BUNDLE_VERSION = 2
-SUPPORTED_CHECKPOINT_BUNDLE_VERSIONS = {1, CHECKPOINT_BUNDLE_VERSION}
 DEFAULT_COMPACT_AT_TOKENS = 128_000
 TOOL_OUTPUT_FULL_TOKENS = 8_000
 TOOL_OUTPUT_PRESSURE_TOKENS = 96_000
@@ -82,7 +80,6 @@ class AgentRuntime:
             "parent_session_id": parent_session_id,
             "checkpoint_id": checkpoint_id,
             "restored_from_session_id": restored_from_session_id,
-            "goal": GOAL,
             "model": self.debug.deepseek_model(),
             "status": "paused",
             "phase": "idle",
@@ -125,6 +122,10 @@ class AgentRuntime:
         value.setdefault("checkpoint_id", None)
         value.setdefault("restored_from_session_id", None)
         value.setdefault("pending_game_instance_id", None)
+        # Older control files carried a permanent macro goal. It is no longer
+        # part of runtime state; silently discard it for in-place compatibility.
+        value.pop("goal", None)
+        self._persist(value)
         return value
 
     def _last_event_seq(self) -> int:
@@ -215,7 +216,7 @@ class AgentRuntime:
     def compact_snapshot(self) -> dict:
         state = self.snapshot()
         return {key: state.get(key) for key in (
-            "session_id", "goal", "model", "status", "phase", "turn", "run_turn",
+            "session_id", "model", "status", "phase", "turn", "run_turn",
             "max_turns", "stop_reason", "usage", "compactions", "last_event_seq",
             "last_request_usage", "context_estimate_tokens", "game_instance_id",
             "parent_session_id", "checkpoint_id", "restored_from_session_id",
@@ -484,7 +485,7 @@ class AgentRuntime:
         path = checkpoint_dir / "agent" / "session.json"
         try:
             bundle = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(bundle, dict) or int(bundle.get("version") or 0) not in SUPPORTED_CHECKPOINT_BUNDLE_VERSIONS:
+            if not isinstance(bundle, dict) or int(bundle.get("version") or 0) != CHECKPOINT_BUNDLE_VERSION:
                 raise ValueError("unsupported agent checkpoint bundle")
             control = bundle.get("control")
             transcript = bundle.get("transcript")
@@ -727,7 +728,7 @@ class AgentRuntime:
             self.reset("game_instance_changed", game_instance_id=str(pending_instance))
 
     async def _run(self, generation: int, *, decide_only: bool) -> None:
-        feedback = "Start or continue pursuing the permanent goal. Inspect the latest stable game state."
+        feedback = "Inspect the latest stable game state and choose the next useful local action."
         replans = 0
         try:
             while int(self.state.get("run_turn") or 0) < int(self.state.get("max_turns") or 1):
@@ -873,13 +874,14 @@ class AgentRuntime:
             from agents import (Agent, AsyncOpenAI, FunctionTool, ModelSettings,
                                 OpenAIChatCompletionsModel, Runner, SQLiteSession,
                                 set_tracing_disabled)
-            from agents.agent import StopAtTools
+            from agents.agent import ToolsToFinalOutputResult
         except ImportError as exc:
             raise RuntimeError("openai-agents is required for persistent DeepSeek sessions") from exc
 
         set_tracing_disabled(disabled=True)
         runtime = self
         submitted_decision: dict | None = None
+        tool_cycle = runtime.debug.new_agent_tool_cycle(runtime.debug.snapshot())
 
         def make_tool(spec: dict) -> Any:
             function = spec["function"]
@@ -889,7 +891,12 @@ class AgentRuntime:
                 nonlocal submitted_decision
                 arguments = runtime._parse_tool_arguments(raw_arguments)
                 started = _now()
-                result = runtime.debug.run_agent_tool(name, arguments, runtime.debug.snapshot())
+                result = runtime.debug.run_agent_tool(
+                    name,
+                    arguments,
+                    runtime.debug.snapshot(),
+                    tool_cycle=tool_cycle,
+                )
                 runtime.emit(
                     "decision" if name == "submit_decision" else "tool",
                     "submitted" if name == "submit_decision" else "completed",
@@ -899,7 +906,7 @@ class AgentRuntime:
                 )
                 if name == "submit_decision":
                     if not result.get("ok"):
-                        raise ValueError(json.dumps(result, ensure_ascii=False))
+                        return json.dumps(result, ensure_ascii=False)
                     submitted_decision = result["decision"]
                     return json.dumps({"ok": True, "accepted": True}, ensure_ascii=False)
                 return json.dumps(result, ensure_ascii=False)
@@ -914,6 +921,19 @@ class AgentRuntime:
 
         tools = [make_tool(spec) for spec in self.debug.agent_tool_specs()]
 
+        def finish_on_accepted_submit(_context: Any, tool_results: list[Any]) -> Any:
+            for tool_result in tool_results:
+                if getattr(getattr(tool_result, "tool", None), "name", None) != "submit_decision":
+                    continue
+                output = getattr(tool_result, "output", None)
+                try:
+                    parsed = json.loads(output) if isinstance(output, str) else output
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(parsed, dict) and parsed.get("ok") is True and parsed.get("accepted") is True:
+                    return ToolsToFinalOutputResult(is_final_output=True, final_output=output)
+            return ToolsToFinalOutputResult(is_final_output=False, final_output=None)
+
         api_key = self.debug.config_value("DEEPSEEK_API_KEY")
         base_url = (self.debug.config_value("DEEPSEEK_BASE_URL", "https://api.deepseek.com") or "https://api.deepseek.com").rstrip("/")
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
@@ -925,15 +945,15 @@ class AgentRuntime:
         instructions = self.debug.agent_system_prompt() + "\n\n" + self.debug.agent_policy_prompt() + """
 
 Use the available read-only query tools as needed. End every decision by calling
-submit_decision. Never execute game controls yourself. The permanent objective is to
-finish the game.
+submit_decision. Never execute game controls yourself. Use current evidence,
+exploration value, and maintained local tasks to choose the next action.
 """
         agent = Agent(
             name="PALPAL persistent player",
             instructions=instructions,
             model=model,
             tools=tools,
-            tool_use_behavior=StopAtTools(stop_at_tool_names=["submit_decision"]),
+            tool_use_behavior=finish_on_accepted_submit,
             model_settings=ModelSettings(temperature=0.2, include_usage=True),
         )
         session = SQLiteSession(self.state["session_id"], self.sqlite_path)
@@ -995,8 +1015,8 @@ finish the game.
                 {
                     "role": "system",
                     "content": (
-                        "Summarize this PALPAL agent transcript compactly. Preserve the permanent goal, "
-                        "tasks, plot evidence, decisions and execution results, known routes, unresolved "
+                        "Summarize this PALPAL agent transcript compactly. Preserve maintained tasks, "
+                        "plot evidence, decisions and execution results, known routes, unresolved "
                         "risks, and latest stable state. Mark object semantics as inference or annotation."
                     ),
                 },
@@ -1011,7 +1031,7 @@ finish the game.
             raise RuntimeError("interrupted")
         replacement = [
             {"role": "user", "content": "Persistent context summary:\n" + summary},
-            {"role": "assistant", "content": "I will preserve this context while continuing the permanent goal."},
+            {"role": "assistant", "content": "I will preserve this context while choosing useful local actions."},
             *items[recent_start:],
         ]
         try:

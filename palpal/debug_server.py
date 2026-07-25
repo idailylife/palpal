@@ -1605,6 +1605,7 @@ class DebugState:
 
     def merge_dialog_turn(self, previous: dict, current: dict) -> None:
         previous["text"] = f"{previous.get('text') or ''}{current.get('text') or ''}"
+        previous["updated_at"] = current.get("time")
         previous["end_sequence"] = current.get("end_sequence")
         previous["end_frame"] = current.get("end_frame", current.get("frame"))
         previous["end_logical_frame"] = current.get("end_logical_frame", current.get("logical_frame", current.get("end_frame", current.get("frame"))))
@@ -2649,8 +2650,13 @@ class DebugState:
                 "id", "description", "priority", "status", "object_id",
                 "transition_key", "room_id", "rationale", "created_at",
                 "updated_at", "created_agent_turn", "updated_agent_turn",
+                "last_reviewed_at", "last_reviewed_agent_turn",
             )
         }
+        result["last_reviewed_at"] = task.get("last_reviewed_at", task.get("updated_at"))
+        result["last_reviewed_agent_turn"] = task.get(
+            "last_reviewed_agent_turn", task.get("updated_agent_turn")
+        )
         if include_history:
             result["history"] = list(task.get("history") or [])[-MAX_TASK_HISTORY:]
         return result
@@ -2694,6 +2700,192 @@ class DebugState:
         counts = {status: len(records) for status, records in grouped.items()}
         counts["total"] = len(tasks)
         return {"ok": True, "counts": counts, "tasks": tasks}
+
+    def task_review_snapshot(self, state: dict | None = None) -> dict:
+        """Capture net game state used to decide whether a task needs review."""
+        state = state if isinstance(state, dict) else read_json(self.state_path)
+        inventory = self.observed_inventory(state)
+        sprites = self.observed_party_sprites(state)
+        return {
+            "cash": int(state.get("cash") or 0),
+            "inventory": {
+                str(item_id): int(item.get("amount") or 0)
+                for item_id, item in inventory.items()
+            },
+            "party_sprites": {
+                str(role_id): int(role.get("scene_sprite_id") or 0)
+                for role_id, role in sprites.items()
+            },
+        }
+
+    @staticmethod
+    def task_evidence_time(entry: dict) -> float | None:
+        for key in ("updated_at", "time", "observed_at"):
+            try:
+                return float(entry.get(key))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def task_review_for(self, task: dict, state: dict | None = None) -> dict | None:
+        if task.get("status") != "active":
+            return None
+        try:
+            reviewed_at = float(task.get("last_reviewed_at") or task.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            reviewed_at = 0.0
+        reasons: list[dict] = []
+        latest = reviewed_at
+
+        try:
+            object_id = int(task.get("object_id") or 0)
+        except (TypeError, ValueError):
+            object_id = 0
+        if object_id > 0:
+            for entry in self.dialog_history:
+                observed_at = self.task_evidence_time(entry)
+                if observed_at is None or observed_at <= reviewed_at:
+                    continue
+                try:
+                    matches = int(entry.get("event_object_id") or 0) == object_id
+                except (TypeError, ValueError):
+                    matches = False
+                if matches:
+                    reasons.append({"kind": "dialog", "object_id": object_id})
+                    latest = max(latest, observed_at)
+                    break
+            for entry in self.event_log:
+                if entry.get("type") not in {"object_changed", "interaction_effect", "interaction_no_effect"}:
+                    continue
+                observed_at = self.task_evidence_time(entry)
+                if observed_at is None or observed_at <= reviewed_at:
+                    continue
+                try:
+                    entry_id = int(entry.get("object_id") or entry.get("target_id") or 0)
+                except (TypeError, ValueError):
+                    entry_id = 0
+                if entry_id == object_id:
+                    reasons.append({"kind": str(entry.get("type")), "object_id": object_id})
+                    latest = max(latest, observed_at)
+                    break
+
+        transition_key = task.get("transition_key")
+        room_id = task.get("room_id")
+        if transition_key or room_id:
+            data = self.read_exploration()
+            transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
+            for by_room in transitions.values():
+                if not isinstance(by_room, dict):
+                    continue
+                for record in by_room.values():
+                    if not isinstance(record, dict):
+                        continue
+                    observed_at = self.task_evidence_time(record)
+                    if observed_at is None or observed_at <= reviewed_at:
+                        continue
+                    key_match = bool(transition_key) and record.get("transition_key") == transition_key
+                    room_match = bool(room_id) and str(room_id) in {
+                        str(record.get("from_room_id")), str(record.get("from_logical_room_id")),
+                        str(record.get("to_room_id")), str(record.get("to_logical_room_id")),
+                    }
+                    if key_match or room_match:
+                        reasons.append({
+                            "kind": "transition",
+                            "transition_key": record.get("transition_key"),
+                            "room_id": room_id if room_match else None,
+                        })
+                        latest = max(latest, observed_at)
+                        break
+
+        current = self.task_review_snapshot(state)
+        baseline = task.get("_review_snapshot") if isinstance(task.get("_review_snapshot"), dict) else {}
+        if not baseline:
+            # Reconstruct the review-time net state for tasks created before
+            # snapshots were introduced. This is intentionally numeric only.
+            baseline = json.loads(json.dumps(current))
+            reconstructed_sprite_roles: set[str] = set()
+            for entry in self.event_log:
+                observed_at = self.task_evidence_time(entry)
+                if observed_at is None or observed_at <= reviewed_at:
+                    continue
+                event_type = entry.get("type")
+                if event_type == "cash_changed":
+                    try:
+                        baseline["cash"] -= int(entry.get("delta") or 0)
+                        latest = max(latest, observed_at)
+                    except (TypeError, ValueError):
+                        pass
+                elif event_type == "inventory_changed":
+                    try:
+                        item_id = str(int(entry.get("item_id") or 0))
+                        baseline["inventory"][item_id] = int(baseline["inventory"].get(item_id) or 0) - int(entry.get("delta") or 0)
+                        latest = max(latest, observed_at)
+                    except (TypeError, ValueError):
+                        pass
+                elif event_type == "party_sprite_changed":
+                    try:
+                        role_id = str(int(entry.get("role_id")))
+                        if role_id not in reconstructed_sprite_roles:
+                            baseline["party_sprites"][role_id] = int(entry.get("from_scene_sprite_id"))
+                            reconstructed_sprite_roles.add(role_id)
+                        latest = max(latest, observed_at)
+                    except (TypeError, ValueError):
+                        pass
+        if baseline:
+            if int(current.get("cash") or 0) != int(baseline.get("cash") or 0):
+                reasons.append({
+                    "kind": "cash_net_changed",
+                    "from": int(baseline.get("cash") or 0),
+                    "to": int(current.get("cash") or 0),
+                })
+            before_inventory = baseline.get("inventory") if isinstance(baseline.get("inventory"), dict) else {}
+            after_inventory = current.get("inventory") if isinstance(current.get("inventory"), dict) else {}
+            changed_items = sorted(
+                key for key in set(before_inventory) | set(after_inventory)
+                if int(before_inventory.get(key) or 0) != int(after_inventory.get(key) or 0)
+            )
+            if changed_items:
+                reasons.append({"kind": "inventory_net_changed", "item_ids": changed_items[:12]})
+            before_sprites = baseline.get("party_sprites") if isinstance(baseline.get("party_sprites"), dict) else {}
+            after_sprites = current.get("party_sprites") if isinstance(current.get("party_sprites"), dict) else {}
+            changed_roles = sorted(
+                key for key in set(before_sprites) & set(after_sprites)
+                if int(before_sprites.get(key) or 0) != int(after_sprites.get(key) or 0)
+            )
+            if changed_roles:
+                reasons.append({
+                    "kind": "party_sprite_net_changed",
+                    "roles": [
+                        {"role_id": role_id, "from": before_sprites.get(role_id), "to": after_sprites.get(role_id)}
+                        for role_id in changed_roles[:8]
+                    ],
+                })
+            if reasons and latest <= reviewed_at:
+                try:
+                    latest = max(reviewed_at, self.state_path.stat().st_mtime)
+                except OSError:
+                    latest = reviewed_at
+
+        if not reasons:
+            return None
+        return {"id": task.get("id"), "reasons": reasons, "latest_evidence_at": latest}
+
+    def task_review_context(self, state: dict | None = None) -> dict:
+        with self.exploration_lock:
+            data = self.read_exploration()
+            tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+            active = [task for task in tasks.values() if isinstance(task, dict) and task.get("status") == "active"]
+        reviews = [review for task in active if (review := self.task_review_for(task, state)) is not None]
+        reviews.sort(key=lambda item: str(item.get("id") or ""))
+        return {"required": bool(reviews), "tasks": reviews}
+
+    def new_agent_tool_cycle(self, state: dict | None = None) -> dict:
+        review = self.task_review_context(state)
+        return {
+            "tasks_queried": False,
+            "required_task_ids": [str(item.get("id")) for item in review.get("tasks") or []],
+            "reviewed_task_ids": [],
+        }
 
     def upsert_agent_task(self, arguments: dict) -> dict:
         task_id = str(arguments.get("id") or "").strip()
@@ -2775,6 +2967,9 @@ class DebugState:
                 changed = {"created": True, **changed}
             existing["updated_at"] = now
             existing["updated_agent_turn"] = turn
+            existing["last_reviewed_at"] = now
+            existing["last_reviewed_agent_turn"] = turn
+            existing["_review_snapshot"] = self.task_review_snapshot()
             existing.setdefault("history", []).append({
                 "time": now, "agent_turn": turn, "changes": changed,
                 "status": existing.get("status"),
@@ -2799,10 +2994,11 @@ class DebugState:
             for task in self.task_ledger(limit=limit)
         ]
 
-    def active_task_context(self) -> dict:
+    def active_task_context(self, state: dict | None = None) -> dict:
         return {
             "active_tasks": self.active_task_summary(),
             "active_tasks_total": len(self.task_ledger(limit=None)),
+            "task_review": self.task_review_context(state),
         }
 
     def object_event_key(self, event: dict) -> str:
@@ -5450,7 +5646,15 @@ class DebugState:
     def executable_task_targets(self, targets: list[dict]) -> list[tuple[dict, dict, str]]:
         """Match active task annotations to targets that can be acted on now."""
         matches = []
+        pending_review_ids = {
+            str(item.get("id"))
+            for item in self.task_review_context().get("tasks") or []
+        }
         for task in self.task_ledger():
+            # The deterministic Rules backend cannot maintain inferred tasks.
+            # Stale tasks therefore lose their override power until an LLM reviews them.
+            if str(task.get("id")) in pending_review_ids:
+                continue
             for target in targets:
                 if target.get("status") not in {"reachable", "transition"}:
                     continue
@@ -6452,6 +6656,7 @@ class DebugState:
                     "description": (
                         "创建或更新本地 agent 任务记忆，不执行游戏动作。已有 id 会更新；未知自选 id 在同时提供 "
                         "description 和 rationale 时按该 id 创建；省略 id 创建时自动生成 task-* id。更新前优先用 get_tasks 核对账本。"
+                        "对已有 id 不提供变化字段表示明确确认继续，也会刷新该任务的证据审计快照。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -6587,7 +6792,7 @@ class DebugState:
     def agent_tool_initial_context(self, state: dict) -> dict:
         return {
             "state_summary": self.agent_state_summary(state),
-            **self.active_task_context(),
+            **self.active_task_context(state),
         }
 
     def agent_tool_messages(self, state: dict) -> list[dict]:
@@ -6641,12 +6846,28 @@ class DebugState:
             "targets_total": len(navigation.get("targets") or []),
         }
 
-    def run_agent_tool(self, name: str, arguments: dict | None = None, state: dict | None = None) -> dict:
+    def run_agent_tool(
+        self,
+        name: str,
+        arguments: dict | None = None,
+        state: dict | None = None,
+        *,
+        tool_cycle: dict | None = None,
+    ) -> dict:
         arguments = arguments if isinstance(arguments, dict) else {}
         state = state or read_json(self.state_path)
         if name == "upsert_task":
-            return self.upsert_agent_task(arguments)
+            result = self.upsert_agent_task(arguments)
+            if result.get("ok") and isinstance(tool_cycle, dict) and tool_cycle.get("tasks_queried"):
+                task_id = str((result.get("task") or {}).get("id") or "")
+                if task_id in set(tool_cycle.get("required_task_ids") or []):
+                    reviewed = tool_cycle.setdefault("reviewed_task_ids", [])
+                    if task_id not in reviewed:
+                        reviewed.append(task_id)
+            return result
         if name == "get_tasks":
+            if isinstance(tool_cycle, dict):
+                tool_cycle["tasks_queried"] = True
             include_closed = arguments.get("include_closed") is True
             limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
             all_tasks = self.task_ledger(include_closed=include_closed, limit=None)
@@ -6723,6 +6944,25 @@ class DebugState:
             submission_error = self.agent_decision_submission_error(arguments)
             if submission_error is not None:
                 return submission_error
+            action = arguments.get("action")
+            if action in {"navigate", "use_item"} and isinstance(tool_cycle, dict):
+                required = set(tool_cycle.get("required_task_ids") or [])
+                reviewed = set(tool_cycle.get("reviewed_task_ids") or [])
+                missing = sorted(required - reviewed)
+                if required and (not tool_cycle.get("tasks_queried") or missing):
+                    return {
+                        "ok": False,
+                        "error": {
+                            "code": "task_review_required",
+                            "message": (
+                                "New plot evidence requires task review before navigate/use_item. "
+                                "Call get_tasks, then upsert_task once for every affected task; an unchanged upsert confirms continue."
+                            ),
+                            "required_task_ids": sorted(required),
+                            "missing_task_ids": missing,
+                            "get_tasks_called": bool(tool_cycle.get("tasks_queried")),
+                        },
+                    }
             decision = self.normalize_agent_submission(arguments, state)
             self.attach_decision_context(state, decision)
             self.validate_agent_decision(decision)
@@ -6866,7 +7106,7 @@ class DebugState:
                 "targets": targets,
             },
             "exploration": self.agent_exploration_summary(self.agent_current_exploration(state)),
-            **self.active_task_context(),
+            **self.active_task_context(state),
             "dialogs": recent_dialogs,
             "dialog_feedback_by_object": {str(obj_id): entries for obj_id, entries in feedback_by_object.items()},
             "events": events[-10:],
@@ -6906,8 +7146,13 @@ class DebugState:
             "当最近建议看起来反复访问同一房间、目标或传送循环时，依据持久 session 中的最近决策和 get_room_memory 判断。"
             "传送目标包含 transition_key、to_semantic_room、confidence、destination_priority、destination_exploration 和 returns_to_recent_room。"
             "任务是 agent 从对话和事件推断的记忆，不是引擎事实。自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
-            "发现、调整、完成或作废任务时调用 upsert_task；更新前先用 get_tasks 核对已有 id，不要自动关闭或过期任务。"
+            "NPC 的明确委托、剧情携带、交付和阶段性目标应创建细粒度 task；普通探索不必为每个对象创建 task，账本为空也要按探索价值行动。"
+            "发现、调整、完成或作废任务时调用 upsert_task；更新前先用 get_tasks 核对已有 id，不要仅凭时间自动关闭任务。"
             "upsert_task 可用稳定自选 id：未知 id 需同时给出完整 description 和 rationale 才会按该 id 创建；省略 id 则自动生成 task-* id。"
+            "task_review.required=true 表示新剧情证据晚于相关 active task 的上次审计。对话仍可继续 advance_dialog；对话结束后若要 navigate 或 use_item，"
+            "必须先调用 get_tasks，再对 task_review.tasks 中每个 id 调用 upsert_task，选择确认继续、改写、completed 或 abandoned。无字段变化的 upsert_task 表示确认继续。"
+            "新证据改变对象身份或任务阶段时，应关闭或改写旧 task，并按需创建后继 task；把新对话与稳定状态变化写入 rationale，但不要把 sprite 数字硬编码成剧情语义。"
+            "背包里没有对应道具，不能否定由相邻对话和稳定 scene_sprite_id 净变化共同证明的剧情携带状态；短暂 sprite 动画若恢复原值则不算阶段变化。"
             "只有 active 任务明确关联到当前可执行对象、当前可达传送，或可达且已知通往任务 room_id 的传送时，才可压过探索策略；不可执行任务不得阻塞探索。"
             "没有可执行 active 任务时，非回退的 unknown 目的地具有最高探索价值，其后是 unexplored、partial、complete；unknown 不代表独立风险。"
             "比较传送时，要在这些目的地探索价值、循环风险、当前房间剩余有用目标之间权衡。"
@@ -7290,6 +7535,7 @@ class DebugState:
         total_tool_calls = 0
         rounds_attempted = 0
         decision_repairs = 0
+        tool_cycle = self.new_agent_tool_cycle(state)
 
         try:
             for _round_index in range(MAX_AGENT_TOOL_ROUNDS):
@@ -7509,7 +7755,7 @@ class DebugState:
                         raise RuntimeError(error)
 
                     if name == "submit_decision":
-                        result = self.run_agent_tool(name, arguments, state)
+                        result = self.run_agent_tool(name, arguments, state, tool_cycle=tool_cycle)
                         tool_trace.append(self.agent_tool_trace_entry(name, arguments, result))
                         if not result.get("ok"):
                             decision_repairs += 1
@@ -7535,7 +7781,7 @@ class DebugState:
                         return decision
 
                     try:
-                        result = self.run_agent_tool(name, arguments, state)
+                        result = self.run_agent_tool(name, arguments, state, tool_cycle=tool_cycle)
                     except Exception as exc:
                         tool_trace.append(self.agent_tool_trace_entry(name, arguments, error=str(exc)))
                         raise RuntimeError(f"Agent tool {name or 'unknown'} failed: {exc}") from exc

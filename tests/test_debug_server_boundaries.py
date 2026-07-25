@@ -174,7 +174,7 @@ def test_http_handler_agent_session_api_and_running_action_boundary(http_server)
     status, _, raw = http_request(base_url, "/agent/session")
     payload = json.loads(raw)
     assert status == 200
-    assert payload["session"]["goal"] == "通关游戏"
+    assert "goal" not in payload["session"]
 
     status, _, raw = http_request(
         base_url,

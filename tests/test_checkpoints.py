@@ -134,6 +134,8 @@ def test_save_checkpoint_writes_manifest_game_and_existing_companion_files():
         assert (checkpoint_dir / 'companion' / 'exploration.json').exists()
         assert (checkpoint_dir / 'companion' / 'logs' / 'navigation.log').exists()
         assert (checkpoint_dir / 'agent' / 'session.json').exists()
+        agent_bundle = json.loads((checkpoint_dir / 'agent' / 'session.json').read_text(encoding='utf-8'))
+        assert 'goal' not in agent_bundle['control']
         assert checkpoint['agent_bundle']['version'] == 2
         assert not (checkpoint_dir / 'state.json').exists()
         assert not (checkpoint_dir / 'screen.bmp').exists()
@@ -317,7 +319,7 @@ def test_checkpoint_restores_agent_as_an_isolated_branch():
         assert runtime.get_tool_output(output_ref)['content'] == archived_output
 
 
-def test_version_one_agent_bundle_without_tool_outputs_remains_compatible():
+def test_version_one_agent_bundle_is_not_supported():
     with tempfile.TemporaryDirectory() as tmp:
         debug = make_debug_state(tmp)
         state = {**make_state(), 'game_instance_id': 'game-a'}
@@ -345,10 +347,9 @@ def test_version_one_agent_bundle_without_tool_outputs_remains_compatible():
             debug.load_checkpoint('agent-v1')
 
         restored = runtime.snapshot()
-        assert restored['stop_reason'] == 'checkpoint_restored'
-        assert restored['turn'] == 3
-        transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)
-        assert transcript == [{'role': 'user', 'content': 'legacy transcript'}]
+        assert restored['stop_reason'] == 'checkpoint_agent_bundle_incompatible'
+        assert restored['turn'] == 0
+        assert 'goal' not in restored
 
 
 def test_old_checkpoint_loads_with_a_new_empty_agent_session():

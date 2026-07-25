@@ -147,6 +147,7 @@ def test_dialog_event_stream_merges_contiguous_lines_once():
         assert debug.dialog_history[0]['start_sequence'] == 1
         assert debug.dialog_history[0]['end_sequence'] == 3
         assert debug.dialog_history[0]['text'] == '逍遥你来的正好，快把门口那个臭要饭的赶走，免得妨碍咱们做生意'
+        assert debug.dialog_history[0]['updated_at'] >= debug.dialog_history[0]['time']
 
 
 
