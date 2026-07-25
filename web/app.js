@@ -34,6 +34,9 @@ const goalsSummary = document.getElementById("goalsSummary");
 const goalsContent = document.getElementById("goalsContent");
 const connectionEl = document.getElementById("connection");
 const runtimeStatusEl = document.getElementById("runtimeStatus");
+const disconnectAlertEl = document.getElementById("disconnectAlert");
+const disconnectMessageEl = document.getElementById("disconnectMessage");
+const disconnectRefreshEl = document.getElementById("disconnectRefresh");
 const overlay = document.getElementById("overlay");
 const logicalRoomEl = document.getElementById("logicalRoom");
 const frameCtx = frameCanvas.getContext("2d");
@@ -51,6 +54,11 @@ let navigationStableEnvironmentKey = null;
 let navigationRefreshTimer = null;
 let navigationRouteRequestId = 0;
 let navigationDiagnosticKey = null;
+let navigationRefreshGeneration = 0;
+let navigationRetryIndex = 0;
+let navigationRetryDueAt = null;
+let navigationRetryRemainingMs = null;
+let navigationFailureWarned = false;
 let explorationRenderKey = null;
 let summaryRenderKey = null;
 let dialogsRenderKey = null;
@@ -67,7 +75,6 @@ let selectedAgentModel = null;
 let agentSession = null;
 let agentSessionEvents = [];
 let agentEventSeq = 0;
-let agentEventSocket = null;
 let agentHasOlderEvents = false;
 let agentOldestTurn = null;
 let agentOlderEventsLoading = false;
@@ -105,6 +112,10 @@ let dialogAdvanceActive = false;
 let dialogAdvanceSending = false;
 let dialogAdvanceCount = 0;
 let dialogAdvanceObservedStartedAt = null;
+let reconnectDelaysMs = [1000, 2000, 4000, 8000, 16000, 30000];
+let pageLifecycleStopped = false;
+const exhaustedTransports = new Set();
+const reconnectChannels = new Set();
 const repeatableButtons = new Set(["up", "down", "left", "right"]);
 const actionCooldownMs = 180;
 const dialogAdvanceDelayMs = 500;
@@ -135,11 +146,26 @@ function clearAgentResultTitle() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) clearAgentResultTitle();
+  if (document.hidden) {
+    pauseDisconnectedWork();
+    return;
+  }
+  clearAgentResultTitle();
+  resumeDisconnectedWork();
 });
 window.addEventListener("focus", clearAgentResultTitle);
 document.addEventListener("pointerdown", clearAgentResultTitle);
 document.addEventListener("keydown", clearAgentResultTitle);
+window.addEventListener("pagehide", (event) => {
+  if (event.persisted) {
+    pauseDisconnectedWork();
+  } else {
+    stopPageConnections();
+  }
+});
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) resumeDisconnectedWork();
+});
 const navigationSettleMs = 400;
 const fallbackAgentModels = ["deepseek-v4-pro", "deepseek-v4-flash"];
 const lastActionAt = new Map();
@@ -232,8 +258,21 @@ function updateNavigationEnvironmentKey(state) {
     navigationLatestEnvironmentKey = key;
     navigationEnvironmentChangedAt = performance.now();
     navigationStableEnvironmentKey = null;
+    resetNavigationRefreshRetry();
   }
   return key;
+}
+
+function resetNavigationRefreshRetry() {
+  if (exhaustedTransports.has("navigation")) return;
+  if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+  navigationRefreshTimer = null;
+  navigationRetryIndex = 0;
+  navigationRetryDueAt = null;
+  navigationRetryRemainingMs = null;
+  navigationFailureWarned = false;
+  navigationRefreshGeneration += 1;
+  navigationRefreshInFlightKey = null;
 }
 
 function navigationCanRefresh(state) {
@@ -545,10 +584,261 @@ function explorationStatusText(status) {
   return labels[status] || status || "unknown";
 }
 
+const transportLabels = {
+  navigation: "navigation",
+  state: "state",
+  frames: "frames",
+  agent: "Agent events",
+};
+const serverControlSelector = [
+  "[data-button]",
+  "[data-use-item]",
+  "[data-nav-go]",
+  "[data-agent-action]",
+  "[data-session-action]",
+  "[data-goals-open]",
+  "[data-agent-load-earlier]",
+  "[data-checkpoint-action]",
+  "#fastDialog",
+  "#transitionsButton",
+  "#transitionsRetry",
+  "[data-goals-retry]",
+].join(",");
+
+function refreshRequired() {
+  return exhaustedTransports.size > 0;
+}
+
+function disableServerControls() {
+  if (!refreshRequired()) return;
+  document.querySelectorAll(serverControlSelector).forEach((control) => {
+    if ("disabled" in control) control.disabled = true;
+  });
+}
+
+function renderDisconnectAlert() {
+  if (!disconnectAlertEl || !disconnectMessageEl) return;
+  const labels = [...exhaustedTransports].map((name) => transportLabels[name] || name);
+  disconnectAlertEl.hidden = labels.length === 0;
+  if (!labels.length) return;
+  disconnectMessageEl.textContent = `PALPAL disconnected (${labels.join(", ")}). Automatic reconnect has stopped. Make sure ./run is running, then refresh this page.`;
+  disableServerControls();
+}
+
+function markTransportExhausted(name) {
+  exhaustedTransports.add(name);
+  renderDisconnectAlert();
+  setConnection();
+}
+
+disconnectRefreshEl?.addEventListener("click", () => window.location.reload());
+new MutationObserver(disableServerControls).observe(document.body, { childList: true, subtree: true });
+
 function setConnection() {
+  if (refreshRequired()) {
+    connectionEl.textContent = "disconnected — refresh required";
+    return;
+  }
   const state = stateConnected ? "state live" : "state reconnecting";
   const frame = frameConnected ? "frames live" : "frames reconnecting";
   connectionEl.textContent = `${state} / ${frame}`;
+}
+
+function createReconnectChannel(name, options) {
+  let socket = null;
+  let retryTimer = null;
+  let retryIndex = 0;
+  let retryDueAt = null;
+  let retryRemainingMs = null;
+  let generation = 0;
+  let started = false;
+  let exhausted = false;
+  let stopped = false;
+
+  const createSocket = options.createSocket || ((url) => new WebSocket(url));
+  const exhaust = options.onExhaust || (() => markTransportExhausted(name));
+
+  function clearRetryTimer() {
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    retryDueAt = null;
+  }
+
+  function armRetry() {
+    if (stopped || exhausted || socket || retryTimer !== null || retryRemainingMs === null) return;
+    if (document.hidden) return;
+    const delay = Math.max(0, retryRemainingMs);
+    retryRemainingMs = null;
+    retryDueAt = performance.now() + delay;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      retryDueAt = null;
+      connect();
+    }, delay);
+  }
+
+  function scheduleRetry() {
+    if (stopped || exhausted || socket || retryTimer !== null) return;
+    if (retryRemainingMs === null) {
+      if (retryIndex >= reconnectDelaysMs.length) {
+        exhausted = true;
+        exhaust();
+        return;
+      }
+      retryRemainingMs = reconnectDelaysMs[retryIndex];
+      retryIndex += 1;
+    }
+    armRetry();
+  }
+
+  function discardSocket() {
+    generation += 1;
+    const previous = socket;
+    socket = null;
+    if (!previous) return;
+    previous.onopen = null;
+    previous.onmessage = null;
+    previous.onclose = null;
+    previous.onerror = null;
+    try {
+      previous.close();
+    } catch (_) {
+      // The socket is already closed.
+    }
+  }
+
+  function connect() {
+    if (stopped || exhausted || socket) return;
+    started = true;
+    if (document.hidden) {
+      if (retryRemainingMs === null) retryRemainingMs = 0;
+      return;
+    }
+    const token = ++generation;
+    let nextSocket;
+    try {
+      nextSocket = createSocket(options.url());
+    } catch (error) {
+      options.onError?.(error);
+      scheduleRetry();
+      return;
+    }
+    socket = nextSocket;
+    nextSocket.onopen = () => {
+      if (token !== generation || socket !== nextSocket) return;
+      retryIndex = 0;
+      retryRemainingMs = null;
+      clearRetryTimer();
+      options.onOpen?.();
+    };
+    nextSocket.onmessage = (event) => {
+      if (token !== generation || socket !== nextSocket) return;
+      options.onMessage?.(event);
+    };
+    nextSocket.onclose = () => {
+      if (token !== generation || socket !== nextSocket) return;
+      socket = null;
+      options.onClose?.();
+      scheduleRetry();
+    };
+    nextSocket.onerror = (error) => {
+      if (token !== generation || socket !== nextSocket) return;
+      options.onError?.(error);
+    };
+  }
+
+  function start() {
+    if (stopped || exhausted) return;
+    started = true;
+    if (retryRemainingMs !== null) {
+      armRetry();
+    } else {
+      connect();
+    }
+  }
+
+  function replace() {
+    if (stopped || exhausted) return;
+    clearRetryTimer();
+    retryIndex = 0;
+    retryRemainingMs = null;
+    discardSocket();
+    start();
+  }
+
+  function pause() {
+    if (retryTimer === null) return;
+    retryRemainingMs = Math.max(0, (retryDueAt || performance.now()) - performance.now());
+    clearRetryTimer();
+  }
+
+  function resume() {
+    if (!started || stopped || exhausted || socket || retryTimer !== null) return;
+    if (retryRemainingMs !== null) {
+      armRetry();
+    } else {
+      connect();
+    }
+  }
+
+  function stop() {
+    stopped = true;
+    clearRetryTimer();
+    retryRemainingMs = null;
+    discardSocket();
+  }
+
+  const channel = {
+    start,
+    replace,
+    pause,
+    resume,
+    stop,
+    status: () => ({
+      exhausted,
+      retryIndex,
+      retryPending: retryTimer !== null || retryRemainingMs !== null,
+      connected: Boolean(socket && socket.readyState === 1),
+    }),
+  };
+  reconnectChannels.add(channel);
+  return channel;
+}
+
+function pauseNavigationRetry() {
+  if (navigationRefreshTimer === null) return;
+  if (navigationRetryDueAt !== null) {
+    navigationRetryRemainingMs = Math.max(0, navigationRetryDueAt - performance.now());
+  }
+  clearTimeout(navigationRefreshTimer);
+  navigationRefreshTimer = null;
+  navigationRetryDueAt = null;
+}
+
+function pauseDisconnectedWork() {
+  reconnectChannels.forEach((channel) => channel.pause());
+  pauseNavigationRetry();
+}
+
+function resumeDisconnectedWork() {
+  if (pageLifecycleStopped) return;
+  reconnectChannels.forEach((channel) => channel.resume());
+  if (!exhaustedTransports.has("navigation") && latestState && !navigationFullReady(latestState)) {
+    scheduleNavigationRefresh(latestState);
+  }
+}
+
+function stopPageConnections() {
+  pageLifecycleStopped = true;
+  reconnectChannels.forEach((channel) => channel.stop());
+  if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+  navigationRefreshTimer = null;
+  navigationRetryDueAt = null;
+  navigationRetryRemainingMs = null;
+  navigationRefreshGeneration += 1;
+  navigationRefreshInFlightKey = null;
 }
 
 function formatAge(seconds) {
@@ -798,7 +1088,8 @@ function renderFastDialogButton(state) {
     dialogAdvanceActive = false;
   }
 
-  fastDialogButton.disabled = dialogAdvanceSending ? !displayedActive : (!displayedActive && !available);
+  fastDialogButton.disabled = refreshRequired()
+    || (dialogAdvanceSending ? !displayedActive : (!displayedActive && !available));
   fastDialogButton.classList.toggle("is-running", displayedActive);
   fastDialogButton.textContent = displayedActive
     ? `Advancing ${displayedCount}/${displayedMax}`
@@ -1440,11 +1731,21 @@ function renderNavigation(state) {
 }
 
 function scheduleNavigationRefresh(state) {
-  if (navigationRefreshTimer) {
-    clearTimeout(navigationRefreshTimer);
-    navigationRefreshTimer = null;
-  }
+  if (pageLifecycleStopped || exhaustedTransports.has("navigation") || document.hidden) return;
   if (!navigationCanRefresh(state)) return;
+  if (navigationRefreshTimer !== null || navigationRefreshInFlightKey) return;
+
+  if (navigationRetryRemainingMs !== null) {
+    const delay = Math.max(0, navigationRetryRemainingMs);
+    navigationRetryRemainingMs = null;
+    navigationRetryDueAt = performance.now() + delay;
+    navigationRefreshTimer = setTimeout(() => {
+      navigationRefreshTimer = null;
+      navigationRetryDueAt = null;
+      if (latestState) scheduleNavigationRefresh(latestState);
+    }, delay);
+    return;
+  }
 
   const key = navigationEnvironmentKey(state);
   const now = performance.now();
@@ -1470,13 +1771,41 @@ function scheduleNavigationRefresh(state) {
     return;
   }
 
-  if (navigationRefreshInFlightKey) return;
   refreshNavigationForKey(key);
 }
 
+function scheduleNavigationRetry() {
+  if (
+    pageLifecycleStopped
+    || exhaustedTransports.has("navigation")
+    || navigationRefreshTimer !== null
+    || navigationRefreshInFlightKey
+  ) {
+    return;
+  }
+  if (navigationRetryRemainingMs === null) {
+    if (navigationRetryIndex >= reconnectDelaysMs.length) {
+      markTransportExhausted("navigation");
+      return;
+    }
+    navigationRetryRemainingMs = reconnectDelaysMs[navigationRetryIndex];
+    navigationRetryIndex += 1;
+  }
+  if (!document.hidden && latestState) scheduleNavigationRefresh(latestState);
+}
+
 async function refreshNavigationForKey(requestKey) {
-  if (navigationRefreshInFlightKey) return;
+  if (
+    navigationRefreshInFlightKey
+    || pageLifecycleStopped
+    || exhaustedTransports.has("navigation")
+    || document.hidden
+  ) {
+    return;
+  }
+  const requestGeneration = ++navigationRefreshGeneration;
   navigationRefreshInFlightKey = requestKey;
+  let failed = false;
   try {
     const response = await fetch("/navigation");
     if (!response.ok) {
@@ -1505,15 +1834,21 @@ async function refreshNavigationForKey(requestKey) {
       renderObjects(latestState);
       drawOverlay(latestState);
     }
+    navigationRetryIndex = 0;
+    navigationRetryRemainingMs = null;
+    navigationFailureWarned = false;
   } catch (error) {
-    console.warn(error);
+    failed = true;
+    if (!navigationFailureWarned) {
+      navigationFailureWarned = true;
+      console.warn("navigation unavailable; retrying with bounded backoff", error);
+    }
   } finally {
-    if (navigationRefreshInFlightKey === requestKey) {
-      navigationRefreshInFlightKey = null;
-    }
-    if (latestState && !navigationFullReady(latestState)) {
-      scheduleNavigationRefresh(latestState);
-    }
+    if (requestGeneration !== navigationRefreshGeneration) return;
+    navigationRefreshInFlightKey = null;
+    if (!latestState || navigationFullReady(latestState)) return;
+    if (failed) scheduleNavigationRetry();
+    else scheduleNavigationRefresh(latestState);
   }
 }
 
@@ -1998,6 +2333,7 @@ function updateExternalControls(state) {
     }
   });
   if (fastDialogButton && running) fastDialogButton.disabled = true;
+  disableServerControls();
 }
 
 function agentStatusLabel(session) {
@@ -2292,11 +2628,15 @@ async function refreshAgentSession() {
 }
 
 function connectAgentEvents() {
-  if (agentEventSocket) agentEventSocket.close();
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${protocol}//${location.host}/agent/session/stream?after=${agentEventSeq}`);
-  agentEventSocket = ws;
-  ws.onmessage = (message) => {
+  agentEventChannel.replace();
+}
+
+const agentEventChannel = createReconnectChannel("agent", {
+  url: () => {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${location.host}/agent/session/stream?after=${agentEventSeq}`;
+  },
+  onMessage: (message) => {
     const event = JSON.parse(message.data);
     if (event.session_id !== agentSession?.session_id || Number(event.seq || 0) <= agentEventSeq) return;
     agentEventSeq = Number(event.seq || agentEventSeq);
@@ -2309,11 +2649,8 @@ function connectAgentEvents() {
       refreshAgentTasks();
     }
     refreshAgentSessionStateOnly();
-  };
-  ws.onclose = () => {
-    if (agentEventSocket === ws) setTimeout(connectAgentEvents, 1000);
-  };
-}
+  },
+});
 
 async function refreshAgentSessionStateOnly() {
   try {
@@ -2414,10 +2751,7 @@ function resetLocalAfterCheckpointLoad() {
   navigationLatestEnvironmentKey = null;
   navigationStableEnvironmentKey = null;
   navigationRouteRequestId += 1;
-  if (navigationRefreshTimer) {
-    clearTimeout(navigationRefreshTimer);
-    navigationRefreshTimer = null;
-  }
+  resetNavigationRefreshRetry();
   agentError = null;
   agentActionStatus = "";
   agentExecutionInFlight = false;
@@ -2927,7 +3261,7 @@ function flashButton(buttonName) {
 }
 
 function sendButton(buttonName) {
-  if (sessionRunning()) return;
+  if (sessionRunning() || refreshRequired()) return;
   const now = performance.now();
   if (!repeatableButtons.has(buttonName)) {
     const last = lastActionAt.get(buttonName) || 0;
@@ -2939,49 +3273,63 @@ function sendButton(buttonName) {
 }
 
 function connectStream() {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${protocol}//${location.host}/stream`);
-  ws.onopen = () => {
-    stateConnected = true;
-    setConnection();
-  };
-  ws.onmessage = (event) => {
-    render(JSON.parse(event.data));
-  };
-  ws.onclose = () => {
-    stateConnected = false;
-    setConnection();
-    setTimeout(connectStream, 1000);
-  };
-  ws.onerror = () => {
-    stateConnected = false;
-    setConnection();
-  };
+  stateStreamChannel.start();
 }
 
+const stateStreamChannel = createReconnectChannel("state", {
+  url: () => {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${location.host}/stream`;
+  },
+  onOpen: () => {
+    stateConnected = true;
+    setConnection();
+  },
+  onMessage: (event) => {
+    render(JSON.parse(event.data));
+  },
+  onClose: () => {
+    stateConnected = false;
+    setConnection();
+  },
+  onError: () => {
+    stateConnected = false;
+    setConnection();
+  },
+});
+
 function connectFrames() {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${protocol}//${location.host}/frames`);
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => {
+  frameStreamChannel.start();
+}
+
+const frameStreamChannel = createReconnectChannel("frames", {
+  url: () => {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${location.host}/frames`;
+  },
+  createSocket: (url) => {
+    const socket = new WebSocket(url);
+    socket.binaryType = "arraybuffer";
+    return socket;
+  },
+  onOpen: () => {
     frameConnected = true;
     setConnection();
-  };
-  ws.onmessage = (event) => {
+  },
+  onMessage: (event) => {
     if (event.data instanceof ArrayBuffer) {
       renderFrame(event.data);
     }
-  };
-  ws.onclose = () => {
+  },
+  onClose: () => {
     frameConnected = false;
     setConnection();
-    setTimeout(connectFrames, 1000);
-  };
-  ws.onerror = () => {
+  },
+  onError: () => {
     frameConnected = false;
     setConnection();
-  };
-}
+  },
+});
 
 document.querySelectorAll("[data-button]").forEach((button) => {
   button.addEventListener("click", () => {

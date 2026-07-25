@@ -661,8 +661,148 @@ async function main() {
       return null;
     }, "Timed out waiting for visual smoke pass");
 
+    const boundedWebSocketRetry = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalDelays = reconnectDelaysMs;
+          let created = 0;
+          let exhausted = 0;
+          class ClosingSocket {
+            constructor() {
+              this.readyState = 0;
+              created += 1;
+              setTimeout(() => {
+                this.readyState = 3;
+                this.onclose?.();
+              }, 0);
+            }
+            close() {
+              this.readyState = 3;
+            }
+          }
+          reconnectDelaysMs = [30];
+          const channel = createReconnectChannel("retry-smoke", {
+            url: () => "ws://retry-smoke",
+            createSocket: () => new ClosingSocket(),
+            onExhaust: () => { exhausted += 1; },
+          });
+          try {
+            channel.start();
+            channel.start();
+            await new Promise((resolve) => setTimeout(resolve, 8));
+            channel.pause();
+            const createdBeforePause = created;
+            await new Promise((resolve) => setTimeout(resolve, 45));
+            const paused = created === createdBeforePause;
+            channel.resume();
+            await new Promise((resolve) => setTimeout(resolve, 45));
+            const createdAtExhaustion = created;
+            channel.start();
+            channel.replace();
+            channel.resume();
+            await new Promise((resolve) => setTimeout(resolve, 15));
+            return {
+              paused,
+              created,
+              createdAtExhaustion,
+              exhausted,
+              status: channel.status(),
+            };
+          } finally {
+            channel.stop();
+            reconnectChannels.delete(channel);
+            reconnectDelaysMs = originalDelays;
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const boundedWebSocketRetryResult = boundedWebSocketRetry.result?.value;
+    if (
+      !boundedWebSocketRetryResult?.paused
+      || boundedWebSocketRetryResult.created !== 2
+      || boundedWebSocketRetryResult.createdAtExhaustion !== 2
+      || boundedWebSocketRetryResult.exhausted !== 1
+      || !boundedWebSocketRetryResult.status?.exhausted
+      || boundedWebSocketRetryResult.status?.retryPending
+    ) {
+      throw new Error(`bounded websocket retry smoke failed (${JSON.stringify(boundedWebSocketRetryResult)})`);
+    }
+
+    const boundedNavigationRetry = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalFetch = window.fetch;
+          const originalDelays = reconnectDelaysMs;
+          const originalState = latestState;
+          let navigationCalls = 0;
+          try {
+            reconnectDelaysMs = [5, 10, 15];
+            latestState = JSON.parse(JSON.stringify(originalState));
+            latestState._debug = { ...(latestState._debug || {}), runtime_stale: false };
+            latestState._navigation = { status: "pending", targets: [] };
+            navigationCache.clear();
+            navigationLatestEnvironmentKey = navigationEnvironmentKey(latestState);
+            navigationEnvironmentChangedAt = performance.now() - navigationSettleMs;
+            navigationStableEnvironmentKey = navigationLatestEnvironmentKey;
+            resetNavigationRefreshRetry();
+            window.fetch = async (url, options) => {
+              if (url === "/navigation") {
+                navigationCalls += 1;
+                throw new TypeError("offline smoke");
+              }
+              return originalFetch(url, options);
+            };
+            scheduleNavigationRefresh(latestState);
+            await new Promise((resolve) => setTimeout(resolve, 90));
+            const callsAtExhaustion = navigationCalls;
+            resumeDisconnectedWork();
+            scheduleNavigationRefresh(latestState);
+            resetLocalAfterCheckpointLoad();
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            return {
+              navigationCalls,
+              callsAtExhaustion,
+              exhausted: exhaustedTransports.has("navigation"),
+              timerCleared: navigationRefreshTimer === null,
+              requestCleared: navigationRefreshInFlightKey === null,
+              alertVisible: disconnectAlertEl?.hidden === false,
+              alertText: disconnectMessageEl?.textContent || "",
+              connection: connectionEl?.textContent || "",
+              controlsDisabled: [...document.querySelectorAll("[data-button]")].every((button) => button.disabled),
+            };
+          } finally {
+            window.fetch = originalFetch;
+            reconnectDelaysMs = originalDelays;
+            latestState = originalState;
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const boundedNavigationRetryResult = boundedNavigationRetry.result?.value;
+    if (
+      boundedNavigationRetryResult?.navigationCalls !== 4
+      || boundedNavigationRetryResult.callsAtExhaustion !== 4
+      || !boundedNavigationRetryResult.exhausted
+      || !boundedNavigationRetryResult.timerCleared
+      || !boundedNavigationRetryResult.requestCleared
+      || !boundedNavigationRetryResult.alertVisible
+      || !boundedNavigationRetryResult.alertText.includes("refresh this page")
+      || boundedNavigationRetryResult.connection !== "disconnected — refresh required"
+      || !boundedNavigationRetryResult.controlsDisabled
+    ) {
+      throw new Error(`bounded navigation retry smoke failed (${JSON.stringify(boundedNavigationRetryResult)})`);
+    }
+
     console.log(
-      `visual smoke ok: ${smoke.width}x${smoke.height}, non-black pixels=${smoke.nonBlack}, tabs/model controls/goals/timeline paging/checkpoint state preservation ok, ${smoke.connection}`
+      `visual smoke ok: ${smoke.width}x${smoke.height}, non-black pixels=${smoke.nonBlack}, tabs/model controls/goals/timeline paging/checkpoint state preservation/bounded disconnect retries ok, ${smoke.connection}`
     );
     if (cdp.exceptions.length) {
       throw new Error(`console exceptions: ${cdp.exceptions.join("; ")}`);
