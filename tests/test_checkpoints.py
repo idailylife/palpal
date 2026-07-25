@@ -1,423 +1,389 @@
 import json
-import tempfile
 from unittest.mock import patch
 
 import pytest
 
-from conftest import fake_load_command, fake_save_command, make_checkpoint_state as make_state, make_startup_state, make_debug_state, write_state
+from tests.support import fake_load_command, fake_save_command, make_checkpoint_state as make_state, make_startup_state, make_debug_state, write_state
 
 
 
-def test_startup_waiting_rejects_save_checkpoint():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        write_state(debug, make_startup_state())
-        with pytest.raises(RuntimeError, match='startup_waiting'):
-            debug.save_checkpoint('cp1', 'CP1')
+def test_startup_waiting_rejects_save_checkpoint(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug, make_startup_state())
+    with pytest.raises(RuntimeError, match='startup_waiting'):
+        debug.save_checkpoint('cp1', 'CP1')
 
 
 
-def test_startup_waiting_allows_load_checkpoint():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        checkpoint_dir = debug.checkpoint_dir('cp1')
-        checkpoint_dir.mkdir(parents=True)
-        (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z'}), encoding='utf-8')
-        write_state(debug, make_startup_state())
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-            result = debug.load_checkpoint('cp1')
-        assert result['ok']
-        assert debug.save_slot_path().read_bytes() == b'checkpoint-rpg'
+def test_startup_waiting_allows_load_checkpoint(tmp_path):
+    debug = make_debug_state(tmp_path)
+    checkpoint_dir = debug.checkpoint_dir('cp1')
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
+    (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z'}), encoding='utf-8')
+    write_state(debug, make_startup_state())
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        result = debug.load_checkpoint('cp1')
+    assert result['ok']
+    assert debug.save_slot_path().read_bytes() == b'checkpoint-rpg'
 
 
 
-def test_start_new_game_writes_start_slot_zero():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        write_state(debug, make_startup_state())
-        previous_session_id = debug.agent_runtime.snapshot()['session_id']
+def test_start_new_game_writes_start_slot_zero(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug, make_startup_state())
+    previous_session_id = debug.agent_runtime.snapshot()['session_id']
 
-        def run(command, slot):
-            assert command == 'start_slot'
-            assert slot == 0
-            return {'action': {'command': command, 'slot': slot}, 'result': {'ok': True, 'action': command, 'slot': slot, 'status': 'start_scheduled'}}
-        with patch.object(debug, 'run_slot_command', side_effect=run):
-            result = debug.start_new_game()
-        assert result['ok']
-        assert result['native_result']['action'] == 'start_slot'
-        assert debug.agent_runtime.snapshot()['session_id'] != previous_session_id
-        assert debug.agent_runtime.snapshot()['turn'] == 0
-        assert debug.agent_runtime.snapshot()['stop_reason'] == 'start_new_game'
-
-
-
-def test_start_new_game_allowed_while_game_is_running():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        write_state(debug, make_state(frame=100))
-        debug.dialogs_path.write_text('[{"source_key":"old","text":"old"}]', encoding='utf-8')
-        debug.events_path.write_text('[{"type":"old"}]', encoding='utf-8')
-        debug.agent_log_path.write_text('{"turn":9}\n', encoding='utf-8')
-        debug.exploration_path.write_text('{"version":9,"rooms":{},"transitions":{},"object_interactions":{"room":{"75":{"attempt_count":1}}}}', encoding='utf-8')
-        debug.run_agent_tool('upsert_task', {
-            'description': 'Old game task',
-            'rationale': 'This must not survive a new game.',
-        })
-        debug.snapshot()
-
-        def run(command, slot):
-            assert command == 'start_slot'
-            assert slot == 0
-            return {'action': {'command': command, 'slot': slot}, 'result': {'ok': True, 'action': command, 'slot': slot, 'status': 'start_scheduled'}}
-        with patch.object(debug, 'run_slot_command', side_effect=run):
-            result = debug.start_new_game()
-        assert result['ok']
-        assert result['native_result']['action'] == 'start_slot'
-        assert not debug.dialogs_path.exists()
-        assert not debug.events_path.exists()
-        assert not debug.agent_log_path.exists()
-        assert not debug.exploration_path.exists()
-        assert debug.agent_tasks_view()['counts']['total'] == 0
-        assert debug.last_raw_frame is None
-        assert debug.logical_frame_offset == 0
-
-
-def test_start_new_game_is_allowed_while_a_dialog_is_active():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        write_state(debug, {**make_state(frame=100), 'dialog': {'active': True}})
-
-        with patch.object(debug, 'run_slot_command', return_value={'result': {'ok': True}}) as run:
-            result = debug.start_new_game()
-
-        assert result['ok']
-        run.assert_called_once_with('start_slot', 0)
+    def run(command, slot):
+        assert command == 'start_slot'
+        assert slot == 0
+        return {'action': {'command': command, 'slot': slot}, 'result': {'ok': True, 'action': command, 'slot': slot, 'status': 'start_scheduled'}}
+    with patch.object(debug, 'run_slot_command', side_effect=run):
+        result = debug.start_new_game()
+    assert result['ok']
+    assert result['native_result']['action'] == 'start_slot'
+    assert debug.agent_runtime.snapshot()['session_id'] != previous_session_id
+    assert debug.agent_runtime.snapshot()['turn'] == 0
+    assert debug.agent_runtime.snapshot()['stop_reason'] == 'start_new_game'
 
 
 
-def test_wait_for_slot_result_accepts_slot_zero():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        start_time = 0.0
-        debug.action_result_path.write_text(json.dumps({'ok': True, 'action': 'start_slot', 'slot': 0}), encoding='utf-8')
-        result = debug.wait_for_slot_result('start_slot', 0, start_time, timeout=0.1)
-        assert result['ok']
-        assert result['slot'] == 0
+def test_start_new_game_allowed_while_game_is_running(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug, make_state(frame=100))
+    debug.dialogs_path.write_text('[{"source_key":"old","text":"old"}]', encoding='utf-8')
+    debug.events_path.write_text('[{"type":"old"}]', encoding='utf-8')
+    debug.agent_log_path.write_text('{"turn":9}\n', encoding='utf-8')
+    debug.exploration_path.write_text('{"version":9,"rooms":{},"transitions":{},"object_interactions":{"room":{"75":{"attempt_count":1}}}}', encoding='utf-8')
+    debug.run_agent_tool('upsert_task', {
+        'description': 'Old game task',
+        'rationale': 'This must not survive a new game.',
+    })
+    debug.snapshot()
+
+    def run(command, slot):
+        assert command == 'start_slot'
+        assert slot == 0
+        return {'action': {'command': command, 'slot': slot}, 'result': {'ok': True, 'action': command, 'slot': slot, 'status': 'start_scheduled'}}
+    with patch.object(debug, 'run_slot_command', side_effect=run):
+        result = debug.start_new_game()
+    assert result['ok']
+    assert result['native_result']['action'] == 'start_slot'
+    assert not debug.dialogs_path.exists()
+    assert not debug.events_path.exists()
+    assert not debug.agent_log_path.exists()
+    assert not debug.exploration_path.exists()
+    assert debug.agent_tasks_view()['counts']['total'] == 0
+    assert debug.last_raw_frame is None
+    assert debug.logical_frame_offset == 0
+
+
+def test_start_new_game_is_allowed_while_a_dialog_is_active(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug, {**make_state(frame=100), 'dialog': {'active': True}})
+
+    with patch.object(debug, 'run_slot_command', return_value={'result': {'ok': True}}) as run:
+        result = debug.start_new_game()
+
+    assert result['ok']
+    run.assert_called_once_with('start_slot', 0)
 
 
 
-def test_save_checkpoint_writes_manifest_game_and_existing_companion_files():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        write_state(debug)
-        debug.dialogs_path.write_text('[{"source_key":"d1","text":"hi"}]', encoding='utf-8')
-        debug.exploration_path.write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
-        debug.navigation_log_path.parent.mkdir(parents=True, exist_ok=True)
-        debug.navigation_log_path.write_text('{"type":"route"}\n', encoding='utf-8')
-        with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
-            result = debug.save_checkpoint('before-door', 'Before Door')
-        checkpoint = result['checkpoint']
-        checkpoint_dir = debug.checkpoint_dir('before-door')
-        assert result['ok']
-        assert checkpoint['version'] == 2
-        assert checkpoint['companion_version'] == 11
-        assert checkpoint['label'] == 'Before Door'
-        assert checkpoint['state']['scene_id'] == 3
-        assert checkpoint['state']['room_id'].startswith('S3/M10:')
-        assert checkpoint['state']['logical_room_id'] == checkpoint['state']['room_id']
-        assert checkpoint['state']['legacy_room_id'] == '3/10/test-room/test-room'
-        assert checkpoint['state']['nav_room_id'] == checkpoint['state']['logical_room_id']
-        assert checkpoint['state']['legacy_nav_room_id'] == '3/10/test-room'
-        assert (checkpoint_dir / 'game.rpg').read_bytes() == b'checkpoint-rpg'
-        assert (checkpoint_dir / 'companion' / 'dialog_history.json').exists()
-        assert (checkpoint_dir / 'companion' / 'exploration.json').exists()
-        assert (checkpoint_dir / 'companion' / 'logs' / 'navigation.log').exists()
-        assert (checkpoint_dir / 'agent' / 'session.json').exists()
-        agent_bundle = json.loads((checkpoint_dir / 'agent' / 'session.json').read_text(encoding='utf-8'))
-        assert 'goal' not in agent_bundle['control']
-        assert checkpoint['agent_bundle']['version'] == 2
-        assert not (checkpoint_dir / 'state.json').exists()
-        assert not (checkpoint_dir / 'screen.bmp').exists()
+def test_wait_for_slot_result_accepts_slot_zero(tmp_path):
+    debug = make_debug_state(tmp_path)
+    start_time = 0.0
+    debug.action_result_path.write_text(json.dumps({'ok': True, 'action': 'start_slot', 'slot': 0}), encoding='utf-8')
+    result = debug.wait_for_slot_result('start_slot', 0, start_time, timeout=0.1)
+    assert result['ok']
+    assert result['slot'] == 0
 
 
 
-def test_load_checkpoint_restores_companion_files_and_refreshes_caches():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        write_state(debug)
-        debug.exploration_path.write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
-        with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
-            debug.save_checkpoint('cp1', 'CP1')
-        debug.dialogs_path.write_text('[{"source_key":"old","text":"old"}]', encoding='utf-8')
-        debug.events_path.write_text('[{"type":"old"}]', encoding='utf-8')
-        debug.agent_log_path.write_text('{"turn":99}\n', encoding='utf-8')
-        debug.dialog_history = [{'source_key': 'old', 'text': 'old'}]
-        debug.event_log = [{'type': 'old'}]
-        checkpoint_dir = debug.checkpoint_dir('cp1')
-        (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"new","text":"new"}]', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'events.json').write_text('[{"type":"new"}]', encoding='utf-8')
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-            result = debug.load_checkpoint('cp1')
-        assert result['ok']
-        assert debug.save_slot_path().read_bytes() == b'checkpoint-rpg'
-        assert debug.dialog_history == [{'source_key': 'dialog::::::new', 'text': 'new', 'source_keys': ['dialog::::::new']}]
-        assert debug.event_log == [{'type': 'new'}]
-        assert not debug.agent_log_path.exists()
+def test_save_checkpoint_writes_manifest_game_and_existing_companion_files(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug)
+    debug.dialogs_path.write_text('[{"source_key":"d1","text":"hi"}]', encoding='utf-8')
+    debug.exploration_path.write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
+    debug.navigation_log_path.parent.mkdir(parents=True, exist_ok=True)
+    debug.navigation_log_path.write_text('{"type":"route"}\n', encoding='utf-8')
+    with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
+        result = debug.save_checkpoint('before-door', 'Before Door')
+    checkpoint = result['checkpoint']
+    checkpoint_dir = debug.checkpoint_dir('before-door')
+    assert result['ok']
+    assert checkpoint['version'] == 2
+    assert checkpoint['companion_version'] == 11
+    assert checkpoint['label'] == 'Before Door'
+    assert checkpoint['state']['scene_id'] == 3
+    assert checkpoint['state']['room_id'].startswith('S3/M10:')
+    assert checkpoint['state']['logical_room_id'] == checkpoint['state']['room_id']
+    assert checkpoint['state']['legacy_room_id'] == '3/10/test-room/test-room'
+    assert checkpoint['state']['nav_room_id'] == checkpoint['state']['logical_room_id']
+    assert checkpoint['state']['legacy_nav_room_id'] == '3/10/test-room'
+    assert (checkpoint_dir / 'game.rpg').read_bytes() == b'checkpoint-rpg'
+    assert (checkpoint_dir / 'companion' / 'dialog_history.json').exists()
+    assert (checkpoint_dir / 'companion' / 'exploration.json').exists()
+    assert (checkpoint_dir / 'companion' / 'logs' / 'navigation.log').exists()
+    assert (checkpoint_dir / 'agent' / 'session.json').exists()
+    agent_bundle = json.loads((checkpoint_dir / 'agent' / 'session.json').read_text(encoding='utf-8'))
+    assert 'goal' not in agent_bundle['control']
+    assert checkpoint['agent_bundle']['version'] == 2
+    assert not (checkpoint_dir / 'state.json').exists()
+    assert not (checkpoint_dir / 'screen.bmp').exists()
 
 
 
-def test_checkpoint_load_keeps_history_and_continues_logical_frame_after_raw_rollback():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        state = make_state(frame=100)
-        write_state(debug, state)
-        debug.snapshot()
-        checkpoint_dir = debug.checkpoint_dir('cp1')
-        (checkpoint_dir / 'companion').mkdir(parents=True)
-        (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z', 'companion_version': 11}), encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"d1","text":"checkpoint dialog","room_key":"test-room","event_object_id":25}]', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'events.json').write_text('[{"type":"checkpoint_event"}]', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'agent_log.jsonl').write_text('{"turn":7}\n', encoding='utf-8')
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command), patch.object(debug, 'clear_runtime_history', wraps=debug.clear_runtime_history) as clear_history:
-            result = debug.load_checkpoint('cp1')
-            rolled_back = make_state(frame=1)
-            write_state(debug, rolled_back)
-            snapshot = debug.snapshot()
-        assert result['ok']
-        assert snapshot['raw_frame'] == 1
-        assert snapshot['logical_frame'] == 101
-        assert snapshot['frame'] == 101
-        assert debug.dialog_history[0]['text'] == 'checkpoint dialog'
-        assert debug.event_log == [{'type': 'checkpoint_event'}]
-        assert debug.read_agent_log(limit=10)[0]['turn'] == 7
-        clear_history.assert_not_called()
+def test_load_checkpoint_restores_companion_files_and_refreshes_caches(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug)
+    debug.exploration_path.write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
+    with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
+        debug.save_checkpoint('cp1', 'CP1')
+    debug.dialogs_path.write_text('[{"source_key":"old","text":"old"}]', encoding='utf-8')
+    debug.events_path.write_text('[{"type":"old"}]', encoding='utf-8')
+    debug.agent_log_path.write_text('{"turn":99}\n', encoding='utf-8')
+    debug.dialog_history = [{'source_key': 'old', 'text': 'old'}]
+    debug.event_log = [{'type': 'old'}]
+    checkpoint_dir = debug.checkpoint_dir('cp1')
+    (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"new","text":"new"}]', encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'events.json').write_text('[{"type":"new"}]', encoding='utf-8')
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        result = debug.load_checkpoint('cp1')
+    assert result['ok']
+    assert debug.save_slot_path().read_bytes() == b'checkpoint-rpg'
+    assert debug.dialog_history == [{'source_key': 'dialog::::::new', 'text': 'new', 'source_keys': ['dialog::::::new']}]
+    assert debug.event_log == [{'type': 'new'}]
+    assert not debug.agent_log_path.exists()
 
 
 
-def test_checkpoint_load_from_startup_uses_companion_history_for_logical_frame_baseline():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        checkpoint_dir = debug.checkpoint_dir('cp1')
-        (checkpoint_dir / 'companion').mkdir(parents=True)
-        (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z', 'companion_version': 11}), encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'dialog_history.json').write_text(json.dumps([{'source_key': 'd1', 'text': '呵～累了，想早點休息', 'room_key': 'test-room', 'event_object_id': 25, 'logical_frame': 4659, 'end_logical_frame': 4659}], ensure_ascii=False), encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'events.json').write_text('[]', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'agent_log.jsonl').write_text(json.dumps({'turn': 6, 'frame': 4729, 'logical_frame': 4729, 'episode': '1/12/test-room/test-room', 'nav_room_id': '1/12/test-room'}) + '\n', encoding='utf-8')
-        write_state(debug, make_startup_state())
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command), patch.object(debug, 'clear_runtime_history', wraps=debug.clear_runtime_history) as clear_history:
-            result = debug.load_checkpoint('cp1')
-            resumed = make_state(frame=1)
-            write_state(debug, resumed)
-            snapshot = debug.snapshot()
-        assert result['ok']
-        assert snapshot['raw_frame'] == 1
-        assert snapshot['logical_frame'] == 4730
-        assert snapshot['frame'] == 4730
-        assert debug.dialog_history[0]['text'] == '呵～累了，想早點休息'
-        clear_history.assert_not_called()
+def test_checkpoint_load_keeps_history_and_continues_logical_frame_after_raw_rollback(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state(frame=100)
+    write_state(debug, state)
+    debug.snapshot()
+    checkpoint_dir = debug.checkpoint_dir('cp1')
+    (checkpoint_dir / 'companion').mkdir(parents=True)
+    (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
+    (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z', 'companion_version': 11}), encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"d1","text":"checkpoint dialog","room_key":"test-room","event_object_id":25}]', encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'events.json').write_text('[{"type":"checkpoint_event"}]', encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'agent_log.jsonl').write_text('{"turn":7}\n', encoding='utf-8')
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command), patch.object(debug, 'clear_runtime_history', wraps=debug.clear_runtime_history) as clear_history:
+        result = debug.load_checkpoint('cp1')
+        rolled_back = make_state(frame=1)
+        write_state(debug, rolled_back)
+        snapshot = debug.snapshot()
+    assert result['ok']
+    assert snapshot['raw_frame'] == 1
+    assert snapshot['logical_frame'] == 101
+    assert snapshot['frame'] == 101
+    assert debug.dialog_history[0]['text'] == 'checkpoint dialog'
+    assert debug.event_log == [{'type': 'checkpoint_event'}]
+    assert debug.read_agent_log(limit=10)[0]['turn'] == 7
+    clear_history.assert_not_called()
 
 
 
-def test_load_checkpoint_discards_incompatible_companion_files():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        write_state(debug)
-        checkpoint_dir = debug.checkpoint_dir('old-cp')
-        (checkpoint_dir / 'companion').mkdir(parents=True)
-        (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'Old', 'created_at': '2026-01-01T00:00:00Z'}), encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":2,"rooms":{"old":{}},"transitions":{}}', encoding='utf-8')
-        (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"new","text":"new"}]', encoding='utf-8')
-        debug.dialogs_path.write_text('[{"source_key":"live","text":"live"}]', encoding='utf-8')
-        debug.events_path.write_text('[{"type":"live"}]', encoding='utf-8')
-        debug.agent_log_path.write_text('{"turn":99}\n', encoding='utf-8')
-        debug.exploration_path.write_text('{"version":11,"rooms":{"live":{}},"transitions":{}}', encoding='utf-8')
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-            result = debug.load_checkpoint('old-cp')
-        assert result['ok']
-        assert result['restored']['exploration.json']['discarded']
-        assert debug.dialog_history == []
-        assert debug.event_log == []
-        assert not debug.dialogs_path.exists()
-        assert not debug.events_path.exists()
-        assert not debug.agent_log_path.exists()
-        assert not debug.exploration_path.exists()
+def test_checkpoint_load_from_startup_uses_companion_history_for_logical_frame_baseline(tmp_path):
+    debug = make_debug_state(tmp_path)
+    checkpoint_dir = debug.checkpoint_dir('cp1')
+    (checkpoint_dir / 'companion').mkdir(parents=True)
+    (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
+    (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z', 'companion_version': 11}), encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'dialog_history.json').write_text(json.dumps([{'source_key': 'd1', 'text': '呵～累了，想早點休息', 'room_key': 'test-room', 'event_object_id': 25, 'logical_frame': 4659, 'end_logical_frame': 4659}], ensure_ascii=False), encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'events.json').write_text('[]', encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'agent_log.jsonl').write_text(json.dumps({'turn': 6, 'frame': 4729, 'logical_frame': 4729, 'episode': '1/12/test-room/test-room', 'nav_room_id': '1/12/test-room'}) + '\n', encoding='utf-8')
+    write_state(debug, make_startup_state())
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command), patch.object(debug, 'clear_runtime_history', wraps=debug.clear_runtime_history) as clear_history:
+        result = debug.load_checkpoint('cp1')
+        resumed = make_state(frame=1)
+        write_state(debug, resumed)
+        snapshot = debug.snapshot()
+    assert result['ok']
+    assert snapshot['raw_frame'] == 1
+    assert snapshot['logical_frame'] == 4730
+    assert snapshot['frame'] == 4730
+    assert debug.dialog_history[0]['text'] == '呵～累了，想早點休息'
+    clear_history.assert_not_called()
 
 
-def test_checkpoint_restores_agent_as_an_isolated_branch():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        state = {**make_state(), 'game_instance_id': 'game-a'}
-        write_state(debug, state)
-        debug.snapshot()
-        runtime = debug.agent_runtime
-        source_session_id = runtime.snapshot()['session_id']
-        saved_decision = {
-            'summary': 'Saved decision',
-            'recommended_intent': 'wait_runtime',
-            'recommended_action': {'tool': 'no_op', 'args': {}, 'dry_run': True},
-        }
-        runtime.state.update(
-            turn=4,
-            pending_decision=saved_decision,
-            usage={'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110},
-            compactions=1,
-        )
-        runtime._persist()
-        runtime._submit(runtime._replace_sdk_session_items(source_session_id, [
-            {'role': 'user', 'content': 'checkpoint context'},
-            {'role': 'assistant', 'content': 'checkpoint response'},
-        ])).result(timeout=5)
-        archived_output = json.dumps({'ok': True, 'events': [{'text': 'checkpoint evidence'}]})
-        output_ref = runtime._archive_tool_output(archived_output)
-        runtime.emit('decision', 'ready', 'Saved activity.')
 
-        with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
-            saved = debug.save_checkpoint('agent-branch', 'Agent Branch')
-        assert saved['checkpoint']['agent_bundle']['tool_outputs'] == 1
-
-        runtime.reset('later_manual_reset')
-        later_session_id = runtime.snapshot()['session_id']
-        runtime.state['turn'] = 9
-        runtime._persist()
-        runtime.emit('decision', 'ready', 'Post-checkpoint activity.')
-
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-            debug.load_checkpoint('agent-branch')
-
-        restored = runtime.snapshot()
-        assert restored['session_id'] not in {source_session_id, later_session_id}
-        assert restored['parent_session_id'] == later_session_id
-        assert restored['restored_from_session_id'] == source_session_id
-        assert restored['checkpoint_id'] == 'agent-branch'
-        assert restored['game_instance_id'] == 'game-a'
-        assert restored['turn'] == 4
-        assert restored['run_turn'] == 0
-        assert restored['pending_decision'] == saved_decision
-        assert restored['usage']['total_tokens'] == 110
-        assert restored['compactions'] == 1
-        transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)
-        assert [item['content'] for item in transcript] == ['checkpoint context', 'checkpoint response']
-        assert runtime.get_tool_output(output_ref)['content'] == archived_output
-        summaries = [event['summary'] for event in runtime.events(limit=500)]
-        assert 'Saved activity.' in summaries
-        assert 'Post-checkpoint activity.' not in summaries
-        assert summaries[-1] == 'Restored Agent branch from checkpoint agent-branch.'
-
-        first_branch_id = restored['session_id']
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-            debug.load_checkpoint('agent-branch')
-        second_branch = runtime.snapshot()
-        assert second_branch['session_id'] != first_branch_id
-        assert second_branch['restored_from_session_id'] == source_session_id
-        assert second_branch['turn'] == 4
-        assert runtime.get_tool_output(output_ref)['content'] == archived_output
+def test_load_checkpoint_discards_incompatible_companion_files(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug)
+    checkpoint_dir = debug.checkpoint_dir('old-cp')
+    (checkpoint_dir / 'companion').mkdir(parents=True)
+    (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
+    (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'Old', 'created_at': '2026-01-01T00:00:00Z'}), encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":2,"rooms":{"old":{}},"transitions":{}}', encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"new","text":"new"}]', encoding='utf-8')
+    debug.dialogs_path.write_text('[{"source_key":"live","text":"live"}]', encoding='utf-8')
+    debug.events_path.write_text('[{"type":"live"}]', encoding='utf-8')
+    debug.agent_log_path.write_text('{"turn":99}\n', encoding='utf-8')
+    debug.exploration_path.write_text('{"version":11,"rooms":{"live":{}},"transitions":{}}', encoding='utf-8')
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        result = debug.load_checkpoint('old-cp')
+    assert result['ok']
+    assert result['restored']['exploration.json']['discarded']
+    assert debug.dialog_history == []
+    assert debug.event_log == []
+    assert not debug.dialogs_path.exists()
+    assert not debug.events_path.exists()
+    assert not debug.agent_log_path.exists()
+    assert not debug.exploration_path.exists()
 
 
-def test_version_one_agent_bundle_is_not_supported():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        state = {**make_state(), 'game_instance_id': 'game-a'}
-        write_state(debug, state)
-        debug.snapshot()
-        runtime = debug.agent_runtime
-        checkpoint_dir = debug.checkpoint_dir('agent-v1')
-        checkpoint_dir.mkdir(parents=True)
-        (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({
-            'version': 2,
-            'label': 'Agent v1',
-            'created_at': '2026-01-01T00:00:00Z',
-        }), encoding='utf-8')
-        (checkpoint_dir / 'agent').mkdir()
-        (checkpoint_dir / 'agent' / 'session.json').write_text(json.dumps({
+def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {**make_state(), 'game_instance_id': 'game-a'}
+    write_state(debug, state)
+    debug.snapshot()
+    runtime = debug.agent_runtime
+    source_session_id = runtime.snapshot()['session_id']
+    saved_decision = {
+        'summary': 'Saved decision',
+        'recommended_intent': 'wait_runtime',
+        'recommended_action': {'tool': 'no_op', 'args': {}, 'dry_run': True},
+    }
+    runtime.state.update(
+        turn=4,
+        pending_decision=saved_decision,
+        usage={'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110},
+        compactions=1,
+    )
+    runtime._persist()
+    runtime._submit(runtime._replace_sdk_session_items(source_session_id, [
+        {'role': 'user', 'content': 'checkpoint context'},
+        {'role': 'assistant', 'content': 'checkpoint response'},
+    ])).result(timeout=5)
+    archived_output = json.dumps({'ok': True, 'events': [{'text': 'checkpoint evidence'}]})
+    output_ref = runtime._archive_tool_output(archived_output)
+    runtime.emit('decision', 'ready', 'Saved activity.')
+
+    with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
+        saved = debug.save_checkpoint('agent-branch', 'Agent Branch')
+    assert saved['checkpoint']['agent_bundle']['tool_outputs'] == 1
+
+    runtime.reset('later_manual_reset')
+    later_session_id = runtime.snapshot()['session_id']
+    runtime.state['turn'] = 9
+    runtime._persist()
+    runtime.emit('decision', 'ready', 'Post-checkpoint activity.')
+
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        debug.load_checkpoint('agent-branch')
+
+    restored = runtime.snapshot()
+    assert restored['session_id'] not in {source_session_id, later_session_id}
+    assert restored['parent_session_id'] == later_session_id
+    assert restored['restored_from_session_id'] == source_session_id
+    assert restored['checkpoint_id'] == 'agent-branch'
+    assert restored['game_instance_id'] == 'game-a'
+    assert restored['turn'] == 4
+    assert restored['run_turn'] == 0
+    assert restored['pending_decision'] == saved_decision
+    assert restored['usage']['total_tokens'] == 110
+    assert restored['compactions'] == 1
+    transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)
+    assert [item['content'] for item in transcript] == ['checkpoint context', 'checkpoint response']
+    assert runtime.get_tool_output(output_ref)['content'] == archived_output
+    summaries = [event['summary'] for event in runtime.events(limit=500)]
+    assert 'Saved activity.' in summaries
+    assert 'Post-checkpoint activity.' not in summaries
+    assert summaries[-1] == 'Restored Agent branch from checkpoint agent-branch.'
+
+    first_branch_id = restored['session_id']
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        debug.load_checkpoint('agent-branch')
+    second_branch = runtime.snapshot()
+    assert second_branch['session_id'] != first_branch_id
+    assert second_branch['restored_from_session_id'] == source_session_id
+    assert second_branch['turn'] == 4
+    assert runtime.get_tool_output(output_ref)['content'] == archived_output
+
+
+@pytest.mark.parametrize("bundle_kind", ["version-one", "corrupt"])
+def test_incompatible_agent_bundle_starts_an_empty_session(tmp_path, bundle_kind):
+    debug = make_debug_state(tmp_path)
+    state = {**make_state(), 'game_instance_id': 'game-a'}
+    write_state(debug, state)
+    debug.snapshot()
+    runtime = debug.agent_runtime
+    previous_session_id = runtime.snapshot()['session_id']
+    checkpoint_id = 'agent-v1' if bundle_kind == 'version-one' else 'corrupt-agent'
+    checkpoint_dir = debug.checkpoint_dir(checkpoint_id)
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
+    (checkpoint_dir / 'manifest.json').write_text(json.dumps({
+        'version': 2,
+        'label': bundle_kind,
+        'created_at': '2026-01-01T00:00:00Z',
+    }), encoding='utf-8')
+    (checkpoint_dir / 'agent').mkdir()
+    agent_bundle = (
+        json.dumps({
             'version': 1,
             'source_session_id': 'a' * 32,
             'control': {'session_id': 'a' * 32, 'turn': 3},
             'transcript': [{'role': 'user', 'content': 'legacy transcript'}],
             'events': [],
-        }), encoding='utf-8')
+        })
+        if bundle_kind == 'version-one'
+        else '{broken'
+    )
+    (checkpoint_dir / 'agent' / 'session.json').write_text(agent_bundle, encoding='utf-8')
 
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-            debug.load_checkpoint('agent-v1')
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        debug.load_checkpoint(checkpoint_id)
 
-        restored = runtime.snapshot()
-        assert restored['stop_reason'] == 'checkpoint_agent_bundle_incompatible'
-        assert restored['turn'] == 0
-        assert 'goal' not in restored
-
-
-def test_old_checkpoint_loads_with_a_new_empty_agent_session():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        state = {**make_state(), 'game_instance_id': 'game-a'}
-        write_state(debug, state)
-        debug.snapshot()
-        previous_session_id = debug.agent_runtime.snapshot()['session_id']
-        debug.agent_runtime.state['turn'] = 3
-        debug.agent_runtime._persist()
-        checkpoint_dir = debug.checkpoint_dir('legacy')
-        checkpoint_dir.mkdir(parents=True)
-        (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({
-            'version': 1,
-            'label': 'Legacy',
-            'created_at': '2026-01-01T00:00:00Z',
-        }), encoding='utf-8')
-
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-            debug.load_checkpoint('legacy')
-
-        restored = debug.agent_runtime.snapshot()
-        assert restored['session_id'] != previous_session_id
-        assert restored['turn'] == 0
-        assert restored['checkpoint_id'] == 'legacy'
-        assert restored['stop_reason'] == 'checkpoint_loaded_without_agent_bundle'
+    restored = runtime.snapshot()
+    assert restored['session_id'] != previous_session_id
+    assert restored['stop_reason'] == 'checkpoint_agent_bundle_incompatible'
+    assert restored['turn'] == 0
+    assert restored['checkpoint_id'] == checkpoint_id
+    assert 'goal' not in restored
 
 
-def test_corrupt_checkpoint_agent_bundle_never_reuses_live_session():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        state = {**make_state(), 'game_instance_id': 'game-a'}
-        write_state(debug, state)
-        debug.snapshot()
-        previous_session_id = debug.agent_runtime.snapshot()['session_id']
-        checkpoint_dir = debug.checkpoint_dir('corrupt-agent')
-        (checkpoint_dir / 'agent').mkdir(parents=True)
-        (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
-        (checkpoint_dir / 'manifest.json').write_text(json.dumps({
-            'version': 2,
-            'label': 'Corrupt Agent',
-            'created_at': '2026-01-01T00:00:00Z',
-        }), encoding='utf-8')
-        (checkpoint_dir / 'agent' / 'session.json').write_text('{broken', encoding='utf-8')
+def test_old_checkpoint_loads_with_a_new_empty_agent_session(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {**make_state(), 'game_instance_id': 'game-a'}
+    write_state(debug, state)
+    debug.snapshot()
+    previous_session_id = debug.agent_runtime.snapshot()['session_id']
+    debug.agent_runtime.state['turn'] = 3
+    debug.agent_runtime._persist()
+    checkpoint_dir = debug.checkpoint_dir('legacy')
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
+    (checkpoint_dir / 'manifest.json').write_text(json.dumps({
+        'version': 1,
+        'label': 'Legacy',
+        'created_at': '2026-01-01T00:00:00Z',
+    }), encoding='utf-8')
 
-        with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-            debug.load_checkpoint('corrupt-agent')
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        debug.load_checkpoint('legacy')
 
-        restored = debug.agent_runtime.snapshot()
-        assert restored['session_id'] != previous_session_id
-        assert restored['turn'] == 0
-        assert restored['checkpoint_id'] == 'corrupt-agent'
-        assert restored['stop_reason'] == 'checkpoint_agent_bundle_incompatible'
+    restored = debug.agent_runtime.snapshot()
+    assert restored['session_id'] != previous_session_id
+    assert restored['turn'] == 0
+    assert restored['checkpoint_id'] == 'legacy'
+    assert restored['stop_reason'] == 'checkpoint_loaded_without_agent_bundle'
 
 
-
-def test_delete_checkpoint_only_removes_target_directory():
-    with tempfile.TemporaryDirectory() as tmp:
-        debug = make_debug_state(tmp)
-        first = debug.checkpoint_dir('first')
-        second = debug.checkpoint_dir('second')
-        first.mkdir(parents=True)
-        second.mkdir(parents=True)
-        (first / 'manifest.json').write_text('{"version":1}', encoding='utf-8')
-        (second / 'manifest.json').write_text('{"version":1}', encoding='utf-8')
-        result = debug.delete_checkpoint('first')
-        assert result['ok']
-        assert not first.exists()
-        assert second.exists()
+def test_delete_checkpoint_only_removes_target_directory(tmp_path):
+    debug = make_debug_state(tmp_path)
+    first = debug.checkpoint_dir('first')
+    second = debug.checkpoint_dir('second')
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / 'manifest.json').write_text('{"version":1}', encoding='utf-8')
+    (second / 'manifest.json').write_text('{"version":1}', encoding='utf-8')
+    result = debug.delete_checkpoint('first')
+    assert result['ok']
+    assert not first.exists()
+    assert second.exists()

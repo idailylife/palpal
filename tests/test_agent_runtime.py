@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from conftest import make_debug_state, make_state, write_state
+from tests.support import make_debug_state, make_state, write_state
 from palpal.agent_runtime import (
     DEFAULT_COMPACT_AT_TOKENS,
     TOOL_OUTPUT_PRESSURE_TARGET_TOKENS,

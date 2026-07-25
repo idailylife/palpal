@@ -8,7 +8,7 @@ import urllib.request
 
 import pytest
 
-from conftest import make_debug_state, make_state, write_state
+from tests.support import make_debug_state, make_state, write_state
 from palpal.debug_server import Handler, Server
 
 
@@ -343,17 +343,41 @@ def active_dialog_event_state(events, party=None):
     return state
 
 
+def run_dialog_scenario(
+    debug,
+    monkeypatch,
+    snapshots,
+    options,
+    *,
+    wait_for_action_clear=True,
+):
+    written = []
+    if callable(snapshots):
+        snapshot = snapshots
+    else:
+        snapshots = iter(snapshots)
+        snapshot = lambda: next(snapshots)
+    monkeypatch.setattr(debug, "snapshot", snapshot)
+    monkeypatch.setattr(
+        debug,
+        "write_action",
+        lambda buttons, frames: written.append((buttons, frames)) or {},
+    )
+    monkeypatch.setattr(
+        debug,
+        "wait_for_action_clear",
+        lambda: wait_for_action_clear,
+    )
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    return debug.advance_dialog(options), written
+
+
 def test_advance_dialog_writes_search_and_stops_when_dialog_ends(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     snapshots = [active_dialog_state(), make_state(), make_state(), make_state(), make_state()]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    result, written = run_dialog_scenario(
+        debug, monkeypatch, snapshots, {"max_presses": 3, "delay_ms": 100},
+    )
     assert result["ok"] is True
     assert result["status"] == "dialog_inactive"
     assert result["presses"] == 1
@@ -371,14 +395,9 @@ def test_advance_dialog_continues_through_transient_inactive_gap(tmp_path, monke
         make_state(),
         make_state(),
     ]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    result, written = run_dialog_scenario(
+        debug, monkeypatch, snapshots, {"max_presses": 3, "delay_ms": 100},
+    )
     assert result["ok"] is True
     assert result["status"] == "dialog_inactive"
     assert result["presses"] == 2
@@ -395,14 +414,9 @@ def test_advance_dialog_waits_through_held_state_until_inactive(tmp_path, monkey
         make_state(),
         make_state(),
     ]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    result, written = run_dialog_scenario(
+        debug, monkeypatch, snapshots, {"max_presses": 3, "delay_ms": 100},
+    )
     assert result["ok"] is True
     assert result["status"] == "dialog_inactive"
     assert result["presses"] == 1
@@ -420,14 +434,9 @@ def test_advance_dialog_waits_for_next_visible_page_before_pressing(tmp_path, mo
         make_state(),
         make_state(),
     ]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    result, written = run_dialog_scenario(
+        debug, monkeypatch, snapshots, {"max_presses": 3, "delay_ms": 100},
+    )
     assert result["ok"] is True
     assert result["status"] == "dialog_inactive"
     assert result["presses"] == 2
@@ -437,13 +446,9 @@ def test_advance_dialog_waits_for_next_visible_page_before_pressing(tmp_path, mo
 def test_advance_dialog_starting_held_waits_without_pressing(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     snapshots = [held_dialog_state(), make_state(), make_state(), make_state(), make_state()]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    result, written = run_dialog_scenario(
+        debug, monkeypatch, snapshots, {"max_presses": 3, "delay_ms": 100},
+    )
     assert result["ok"] is True
     assert result["status"] == "dialog_inactive"
     assert result["presses"] == 0
@@ -452,13 +457,12 @@ def test_advance_dialog_starting_held_waits_without_pressing(tmp_path, monkeypat
 
 def test_advance_dialog_visibility_timeout_does_not_press(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: held_dialog_state())
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 3, "delay_ms": 100})
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        lambda: held_dialog_state(),
+        {"max_presses": 3, "delay_ms": 100},
+    )
     assert result["ok"] is False
     assert result["status"] == "dialog_visibility_timeout"
     assert result["presses"] == 0
@@ -520,23 +524,38 @@ def test_advance_dialog_stops_on_repeated_opponent_line(tmp_path, monkeypatch):
         active_dialog_event_state([monk_a, li_b]),
         active_dialog_event_state([monk_a, li_b, monk_a_again]),
     ]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 2, "stop_on_repeat": True})
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        snapshots,
+        {"max_presses": 2, "stop_on_repeat": True},
+    )
     assert result["ok"] is True
     assert result["status"] == "repeated_dialog_opponent_line"
     assert result["presses"] == 2
     assert written == [(["search"], 1), (["search"], 1)]
 
 
-def test_advance_dialog_does_not_stop_on_repeated_party_line(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("speaker", "message_id", "text"),
+    [
+        ("李逍遥", 589, "我知道了。"),
+        ("系统", 631, "得到５００文钱"),
+    ],
+    ids=["party", "system"],
+)
+def test_advance_dialog_does_not_stop_on_repeated_non_opponent_line(
+    tmp_path, monkeypatch, speaker, message_id, text,
+):
     debug = make_debug_state(tmp_path)
-    first = {"sequence": 1, "frame": 10, "event_object_id": 57, "message_id": 589, "speaker_hint": "李逍遥", "text": "我知道了。"}
+    first = {
+        "sequence": 1,
+        "frame": 10,
+        "event_object_id": 57,
+        "message_id": message_id,
+        "speaker_hint": speaker,
+        "text": text,
+    }
     second = {**first, "sequence": 2, "frame": 11}
     third = {**first, "sequence": 3, "frame": 12}
     snapshots = [
@@ -544,38 +563,12 @@ def test_advance_dialog_does_not_stop_on_repeated_party_line(tmp_path, monkeypat
         active_dialog_event_state([first, second]),
         active_dialog_event_state([first, second, third]),
     ]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 2, "delay_ms": 100, "stop_on_repeat": True})
-    assert result["ok"] is True
-    assert result["status"] == "max_presses"
-    assert result["presses"] == 2
-    assert written == [(["search"], 1), (["search"], 1)]
-
-
-def test_advance_dialog_does_not_stop_on_repeated_system_line(tmp_path, monkeypatch):
-    debug = make_debug_state(tmp_path)
-    first = {"sequence": 1, "frame": 10, "event_object_id": 57, "message_id": 631, "speaker_hint": "系统", "text": "得到５００文钱"}
-    second = {**first, "sequence": 2, "frame": 11}
-    third = {**first, "sequence": 3, "frame": 12}
-    snapshots = [
-        active_dialog_event_state([first]),
-        active_dialog_event_state([first, second]),
-        active_dialog_event_state([first, second, third]),
-    ]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 2, "delay_ms": 100, "stop_on_repeat": True})
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        snapshots,
+        {"max_presses": 2, "delay_ms": 100, "stop_on_repeat": True},
+    )
     assert result["ok"] is True
     assert result["status"] == "max_presses"
     assert result["presses"] == 2
@@ -585,14 +578,12 @@ def test_advance_dialog_does_not_stop_on_repeated_system_line(tmp_path, monkeypa
 def test_advance_dialog_stops_when_active_line_does_not_change(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     snapshots = [active_dialog_state("same line") for _ in range(3)]
-    written = []
-
-    monkeypatch.setattr(debug, "snapshot", lambda: snapshots.pop(0))
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: written.append((buttons, frames)) or {})
-    monkeypatch.setattr(debug, "wait_for_action_clear", lambda: True)
-    monkeypatch.setattr(time, "sleep", lambda seconds: None)
-
-    result = debug.advance_dialog({"max_presses": 100, "delay_ms": 100, "stop_on_repeat": True})
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        snapshots,
+        {"max_presses": 100, "delay_ms": 100, "stop_on_repeat": True},
+    )
     assert result["ok"] is True
     assert result["status"] == "repeated_dialog"
     assert result["presses"] == 2
