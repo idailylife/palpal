@@ -50,9 +50,8 @@ def equipment_item(
 def test_agent_decide_reports_stale_runtime(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state()
-    write_state(debug, state)
     old = time.time() - 10
-    os.utime(debug.state_path, (old, old))
+    debug.set_live_state(state, received_at=old)
     decision = debug.rules_decide_agent(state)
     assert decision['recommended_intent'] == 'wait_runtime'
     assert decision['recommended_action']['args']['reason'] == 'runtime_stale'
@@ -65,9 +64,8 @@ def test_agent_decide_allows_fresh_state_when_frame_is_stale(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state(objects=[target])
     write_state(debug, state)
-    debug.frame_path.write_bytes(b'frame')
     old = time.time() - 10
-    os.utime(debug.frame_path, (old, old))
+    debug.set_live_frame(b'frame', received_at=old)
 
     snapshot = debug.snapshot()
     assert snapshot['_debug']['state_stale'] is False
@@ -105,7 +103,7 @@ def test_advance_dialog_stops_when_dialog_inactive(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state()
     write_state(debug, state)
-    debug.frame_path.write_bytes(b'frame')
+    debug.set_live_frame(b'frame')
     result = debug.advance_dialog({'max_presses': 5})
     assert result['ok']
     assert result['status'] == 'dialog_inactive'

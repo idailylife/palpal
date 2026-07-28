@@ -47,6 +47,7 @@ let latestState = null;
 let selectedRoute = null;
 let activeNavigation = null;
 let navigationRefreshInFlightKey = null;
+let navigationRefreshInFlightToken = null;
 let navigationRenderKey = null;
 let navigationLatestEnvironmentKey = null;
 let navigationEnvironmentChangedAt = 0;
@@ -75,6 +76,9 @@ let selectedAgentModel = null;
 let agentSession = null;
 let agentSessionEvents = [];
 let agentEventSeq = 0;
+let agentSessionRefreshTimer = null;
+let agentSessionRefreshInFlight = false;
+let agentSessionRefreshQueued = false;
 let agentHasOlderEvents = false;
 let agentOldestTurn = null;
 let agentOlderEventsLoading = false;
@@ -248,10 +252,6 @@ function navigationEnvironmentKey(state) {
   return stableJsonStringify(navigationEnvironmentContext(state));
 }
 
-function navigationForEnvironmentKey(navigation, key) {
-  return { ...navigation, environment_key: key };
-}
-
 function updateNavigationEnvironmentKey(state) {
   const key = navigationEnvironmentKey(state);
   if (navigationLatestEnvironmentKey !== key) {
@@ -272,7 +272,19 @@ function resetNavigationRefreshRetry() {
   navigationRetryRemainingMs = null;
   navigationFailureWarned = false;
   navigationRefreshGeneration += 1;
-  navigationRefreshInFlightKey = null;
+}
+
+function deferNavigationRefreshForManualInput() {
+  navigationEnvironmentChangedAt = performance.now();
+  navigationStableEnvironmentKey = null;
+  if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+  navigationRefreshTimer = null;
+  navigationRetryDueAt = null;
+  navigationRetryRemainingMs = null;
+  navigationRetryIndex = 0;
+  navigationFailureWarned = false;
+  navigationRefreshGeneration += 1;
+  if (latestState) scheduleNavigationRefresh(latestState);
 }
 
 function navigationCanRefresh(state) {
@@ -838,7 +850,6 @@ function stopPageConnections() {
   navigationRetryDueAt = null;
   navigationRetryRemainingMs = null;
   navigationRefreshGeneration += 1;
-  navigationRefreshInFlightKey = null;
 }
 
 function formatAge(seconds) {
@@ -857,13 +868,13 @@ function renderRuntimeStatus(state) {
   if (state.status === "waiting_for_game" || !stateFile.available) {
     messages.push("Waiting for game state. Start the game with ./run game, or use ./run dev to run the debug server and game together.");
   } else if (stateFile.stale) {
-    messages.push(`Game state is stale (${formatAge(stateFile.age_seconds)} old). The game process is probably not running or not writing runtime/state.json.`);
+    messages.push(`Game state is stale (${formatAge(stateFile.age_seconds)} old). The game process is probably disconnected from the live socket.`);
   }
 
   if (!frameFile.available) {
-    messages.push("No frame.rgba yet.");
+    messages.push("No live frame yet.");
   } else if (frameFile.stale) {
-    messages.push(`Raw frame is stale (${formatAge(frameFile.age_seconds)} old).`);
+    messages.push(`Live frame is stale (${formatAge(frameFile.age_seconds)} old).`);
   }
 
   runtimeStatusEl.hidden = messages.length === 0;
@@ -1808,7 +1819,9 @@ async function refreshNavigationForKey(requestKey) {
     return;
   }
   const requestGeneration = ++navigationRefreshGeneration;
+  const requestToken = {};
   navigationRefreshInFlightKey = requestKey;
+  navigationRefreshInFlightToken = requestToken;
   let failed = false;
   try {
     const response = await fetch("/navigation");
@@ -1816,24 +1829,23 @@ async function refreshNavigationForKey(requestKey) {
       throw new Error(`navigation failed: ${response.status}`);
     }
     const navigation = await response.json();
-    const returnedKey = navigation.environment_key || requestKey;
-    const requestNavigation = navigationForEnvironmentKey(navigation, requestKey);
-    navigationCache.set(returnedKey, navigation);
-    navigationCache.set(requestKey, requestNavigation);
+    const returnedKey = navigation.environment_key;
+    if (returnedKey) navigationCache.set(returnedKey, navigation);
     if (returnedKey !== requestKey) {
       sendNavigationDiagnostic("navigation_key_mismatch", {
         request_key_length: requestKey.length,
-        returned_key_length: returnedKey.length,
+        returned_key_length: returnedKey?.length || 0,
         request_key_prefix: requestKey.slice(0, 160),
-        returned_key_prefix: returnedKey.slice(0, 160),
+        returned_key_prefix: returnedKey?.slice(0, 160) || "",
       });
     }
     if (
       latestState &&
-      requestKey === navigationStableEnvironmentKey &&
-      navigationEnvironmentKey(latestState) === requestKey
+      returnedKey &&
+      returnedKey === navigationStableEnvironmentKey &&
+      navigationEnvironmentKey(latestState) === returnedKey
     ) {
-      latestState._navigation = requestNavigation;
+      latestState._navigation = navigation;
       renderNavigation(latestState);
       renderObjects(latestState);
       drawOverlay(latestState);
@@ -1848,10 +1860,12 @@ async function refreshNavigationForKey(requestKey) {
       console.warn("navigation unavailable; retrying with bounded backoff", error);
     }
   } finally {
-    if (requestGeneration !== navigationRefreshGeneration) return;
-    navigationRefreshInFlightKey = null;
+    if (navigationRefreshInFlightToken === requestToken) {
+      navigationRefreshInFlightToken = null;
+      navigationRefreshInFlightKey = null;
+    }
     if (!latestState || navigationFullReady(latestState)) return;
-    if (failed) scheduleNavigationRetry();
+    if (failed && requestGeneration === navigationRefreshGeneration) scheduleNavigationRetry();
     else scheduleNavigationRefresh(latestState);
   }
 }
@@ -2621,6 +2635,11 @@ agentTimelineEl?.addEventListener("scroll", () => {
 });
 
 async function refreshAgentSession() {
+  if (agentSessionRefreshTimer !== null) {
+    clearTimeout(agentSessionRefreshTimer);
+    agentSessionRefreshTimer = null;
+  }
+  agentSessionRefreshQueued = false;
   const response = await fetch("/agent/session");
   const result = await response.json();
   if (!response.ok || !result.ok) throw new Error(result.error || "session unavailable");
@@ -2638,7 +2657,8 @@ function connectAgentEvents() {
 const agentEventChannel = createReconnectChannel("agent", {
   url: () => {
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${location.host}/agent/session/stream?after=${agentEventSeq}`;
+    const sessionId = encodeURIComponent(agentSession?.session_id || "");
+    return `${protocol}//${location.host}/agent/session/stream?after=${agentEventSeq}&session_id=${sessionId}`;
   },
   onMessage: (message) => {
     const event = JSON.parse(message.data);
@@ -2652,14 +2672,31 @@ const agentEventChannel = createReconnectChannel("agent", {
     if (event.type === "tool" && event.phase === "completed" && event.details?.name === "upsert_task") {
       refreshAgentTasks();
     }
-    refreshAgentSessionStateOnly();
+    scheduleAgentSessionStateRefresh();
   },
 });
 
+function scheduleAgentSessionStateRefresh() {
+  agentSessionRefreshQueued = true;
+  if (agentSessionRefreshInFlight || agentSessionRefreshTimer !== null) return;
+  agentSessionRefreshTimer = setTimeout(() => {
+    agentSessionRefreshTimer = null;
+    refreshAgentSessionStateOnly();
+  }, 100);
+}
+
 async function refreshAgentSessionStateOnly() {
+  if (agentSessionRefreshInFlight) {
+    agentSessionRefreshQueued = true;
+    return;
+  }
+  agentSessionRefreshQueued = false;
+  agentSessionRefreshInFlight = true;
+  const expectedSessionId = agentSession?.session_id;
   try {
     const response = await fetch("/agent/session");
     const result = await response.json();
+    if (expectedSessionId !== agentSession?.session_id) return;
     const changed = result.ok ? setAgentSession(result.session) : false;
     renderAgentSession();
     if (changed) {
@@ -2668,6 +2705,9 @@ async function refreshAgentSessionStateOnly() {
     }
   } catch (_) {
     // The websocket reconnect path will retry.
+  } finally {
+    agentSessionRefreshInFlight = false;
+    if (agentSessionRefreshQueued) scheduleAgentSessionStateRefresh();
   }
 }
 
@@ -2750,7 +2790,6 @@ function resetLocalAfterCheckpointLoad() {
   navigationCache.clear();
   selectedRoute = null;
   activeNavigation = null;
-  navigationRefreshInFlightKey = null;
   navigationRenderKey = null;
   navigationLatestEnvironmentKey = null;
   navigationStableEnvironmentKey = null;
@@ -3198,37 +3237,35 @@ async function navigateToTarget(targetId) {
   }
 }
 
+let pendingFramePng = null;
+let decodingFramePng = false;
+
+async function drainFramePng() {
+  if (decodingFramePng) return;
+  decodingFramePng = true;
+  try {
+    while (pendingFramePng) {
+      const buffer = pendingFramePng;
+      pendingFramePng = null;
+      const bitmap = await createImageBitmap(new Blob([buffer], { type: "image/png" }));
+      if (frameCanvas.width !== bitmap.width || frameCanvas.height !== bitmap.height) {
+        frameCanvas.width = bitmap.width;
+        frameCanvas.height = bitmap.height;
+      }
+      frameCtx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+    }
+  } catch (error) {
+    console.warn("frame decode failed", error);
+  } finally {
+    decodingFramePng = false;
+    if (pendingFramePng) drainFramePng();
+  }
+}
+
 function renderFrame(buffer) {
-  const view = new DataView(buffer);
-  if (
-    buffer.byteLength < 24 ||
-    view.getUint8(0) !== 0x50 ||
-    view.getUint8(1) !== 0x46 ||
-    view.getUint8(2) !== 0x52 ||
-    view.getUint8(3) !== 0x4d
-  ) {
-    return;
-  }
-
-  const version = view.getUint16(4, true);
-  const width = view.getUint16(6, true);
-  const height = view.getUint16(8, true);
-  const format = view.getUint16(10, true);
-  const payloadLength = view.getUint32(20, true);
-  if (version !== 1 || format !== 1 || payloadLength !== width * height * 4) {
-    return;
-  }
-  if (buffer.byteLength < 24 + payloadLength) {
-    return;
-  }
-
-  if (frameCanvas.width !== width || frameCanvas.height !== height) {
-    frameCanvas.width = width;
-    frameCanvas.height = height;
-  }
-
-  const pixels = new Uint8ClampedArray(buffer, 24, payloadLength);
-  frameCtx.putImageData(new ImageData(pixels, width, height), 0, 0);
+  pendingFramePng = buffer;
+  drainFramePng();
 }
 
 async function sendAction(buttons, frames = 1) {
@@ -3239,7 +3276,9 @@ async function sendAction(buttons, frames = 1) {
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok || result.ok === false) {
-    throw new Error(result.error || `action failed: ${response.status}`);
+    const error = new Error(result.error || `action failed: ${response.status}`);
+    error.code = result.error || null;
+    throw error;
   }
   return result;
 }
@@ -3273,7 +3312,10 @@ function sendButton(buttonName) {
   }
   lastActionAt.set(buttonName, now);
   flashButton(buttonName);
-  sendAction([buttonName], 1).catch((error) => console.warn("action failed", error));
+  deferNavigationRefreshForManualInput();
+  sendAction([buttonName], 1).catch((error) => {
+    if (error.code !== "action_pending") console.warn("action failed", error);
+  });
 }
 
 function connectStream() {

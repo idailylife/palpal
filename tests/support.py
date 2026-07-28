@@ -109,7 +109,7 @@ def make_touch_object(object_id, x=32, y=0, sprite_id=1):
 
 
 def write_state(debug, state=None):
-    debug.state_path.write_text(json.dumps(state or make_state()), encoding="utf-8")
+    debug.set_live_state(state or make_state())
 
 
 def make_debug_state(tmp):

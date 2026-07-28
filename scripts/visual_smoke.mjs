@@ -143,6 +143,89 @@ async function main() {
       return result.result?.value === "complete";
     }, "Timed out waiting for page load");
 
+    const manualInput = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalFetch = window.fetch;
+          const originalState = latestState;
+          const originalCache = new Map(navigationCache);
+          const actions = [];
+          let navigationCalls = 0;
+          try {
+            latestState = JSON.parse(JSON.stringify(originalState || {
+              party_position: { x: 0, y: 0 },
+              dialog: { active: false },
+              objects: [],
+            }));
+            latestState._debug = { ...(latestState._debug || {}), runtime_stale: false };
+            latestState._navigation = { status: "pending", targets: [] };
+            navigationCache.clear();
+            navigationLatestEnvironmentKey = navigationEnvironmentKey(latestState);
+            navigationEnvironmentChangedAt = performance.now();
+            navigationStableEnvironmentKey = null;
+            resetNavigationRefreshRetry();
+            window.fetch = async (url, options) => {
+              if (url === "/action") {
+                actions.push(JSON.parse(options.body).buttons);
+                return { ok: true, json: async () => ({ ok: true }) };
+              }
+              if (url === "/navigation") {
+                navigationCalls += 1;
+                return {
+                  ok: true,
+                  json: async () => ({
+                    status: "ok",
+                    targets: [],
+                    environment_key: navigationEnvironmentKey(latestState),
+                  }),
+                };
+              }
+              return originalFetch(url, options);
+            };
+            document.querySelector('[data-button="left"]')?.click();
+            window.dispatchEvent(new KeyboardEvent("keydown", {
+              key: "ArrowRight",
+              bubbles: true,
+            }));
+            window.dispatchEvent(new KeyboardEvent("keydown", {
+              key: "ArrowRight",
+              repeat: true,
+              bubbles: true,
+            }));
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            return {
+              actions,
+              navigationCalls,
+              settleRemaining: navigationSettleMs - (performance.now() - navigationEnvironmentChangedAt),
+            };
+          } finally {
+            if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+            navigationRefreshTimer = null;
+            navigationCache.clear();
+            originalCache.forEach((value, key) => navigationCache.set(key, value));
+            window.fetch = originalFetch;
+            latestState = originalState;
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const manualInputActions = manualInput.result?.value;
+    if (
+      JSON.stringify(manualInputActions?.actions)
+      !== JSON.stringify([["left"], ["right"], ["right"]])
+      || manualInputActions.navigationCalls !== 0
+      || manualInputActions.settleRemaining <= 250
+    ) {
+      throw new Error(`manual input smoke failed (${JSON.stringify({
+        value: manualInputActions,
+        exception: manualInput.exceptionDetails,
+      })})`);
+    }
+
     const tabs = await cdp.send(
       "Runtime.evaluate",
       {
@@ -732,6 +815,171 @@ async function main() {
       throw new Error(`bounded websocket retry smoke failed (${JSON.stringify(boundedWebSocketRetryResult)})`);
     }
 
+    const agentSessionRefreshSingleFlight = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalFetch = window.fetch;
+          const resolvers = [];
+          let calls = 0;
+          let active = 0;
+          let maxActive = 0;
+          try {
+            if (agentSessionRefreshTimer !== null) clearTimeout(agentSessionRefreshTimer);
+            agentSessionRefreshTimer = null;
+            agentSessionRefreshQueued = false;
+            agentSessionRefreshInFlight = false;
+            window.fetch = async (url, options) => {
+              if (url !== "/agent/session") return originalFetch(url, options);
+              calls += 1;
+              active += 1;
+              maxActive = Math.max(maxActive, active);
+              await new Promise((resolve) => resolvers.push(resolve));
+              active -= 1;
+              return {
+                ok: true,
+                json: async () => ({ ok: true, session: agentSession }),
+              };
+            };
+            for (let index = 0; index < 100; index += 1) scheduleAgentSessionStateRefresh();
+            await new Promise((resolve) => setTimeout(resolve, 130));
+            const firstStarted = calls === 1 && active === 1;
+            for (let index = 0; index < 100; index += 1) scheduleAgentSessionStateRefresh();
+            resolvers.shift()?.();
+            await new Promise((resolve) => setTimeout(resolve, 130));
+            const trailingStarted = calls === 2 && active === 1;
+            resolvers.shift()?.();
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return { calls, maxActive, firstStarted, trailingStarted, active };
+          } finally {
+            resolvers.splice(0).forEach((resolve) => resolve());
+            if (agentSessionRefreshTimer !== null) clearTimeout(agentSessionRefreshTimer);
+            agentSessionRefreshTimer = null;
+            agentSessionRefreshQueued = false;
+            agentSessionRefreshInFlight = false;
+            window.fetch = originalFetch;
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const agentSessionRefreshSingleFlightResult = agentSessionRefreshSingleFlight.result?.value;
+    if (
+      agentSessionRefreshSingleFlightResult?.calls !== 2
+      || agentSessionRefreshSingleFlightResult.maxActive !== 1
+      || !agentSessionRefreshSingleFlightResult.firstStarted
+      || !agentSessionRefreshSingleFlightResult.trailingStarted
+      || agentSessionRefreshSingleFlightResult.active !== 0
+    ) {
+      throw new Error(`agent session refresh single-flight smoke failed (${
+        JSON.stringify(agentSessionRefreshSingleFlightResult)
+      })`);
+    }
+
+    const navigationSingleFlight = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalFetch = window.fetch;
+          const originalState = latestState;
+          const originalCache = new Map(navigationCache);
+          let resolveFirst;
+          let navigationCalls = 0;
+          try {
+            if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+            navigationRefreshTimer = null;
+            navigationCache.clear();
+            resetNavigationRefreshRetry();
+
+            const makeState = (x) => {
+              const state = JSON.parse(JSON.stringify(originalState));
+              state.party_position = { ...(state.party_position || {}), x };
+              state._debug = { ...(state._debug || {}), runtime_stale: false };
+              state._navigation = { status: "pending", targets: [] };
+              return state;
+            };
+            latestState = makeState(101);
+            const firstKey = updateNavigationEnvironmentKey(latestState);
+            navigationEnvironmentChangedAt = performance.now() - navigationSettleMs;
+            const returnedFirstKey = "server-returned-key";
+            window.fetch = async (url) => {
+              if (url === "/diagnostics/navigation") {
+                return { ok: true, json: async () => ({ ok: true }) };
+              }
+              if (url !== "/navigation") return originalFetch(url);
+              navigationCalls += 1;
+              if (navigationCalls === 1) {
+                return new Promise((resolve) => {
+                  resolveFirst = () => resolve({
+                    ok: true,
+                    json: async () => ({
+                      status: "ok",
+                      targets: [],
+                      environment_key: returnedFirstKey,
+                    }),
+                  });
+                });
+              }
+              return {
+                ok: true,
+                json: async () => ({
+                  status: "ok",
+                  targets: [],
+                  environment_key: navigationEnvironmentKey(latestState),
+                }),
+              };
+            };
+
+            scheduleNavigationRefresh(latestState);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            for (const x of [102, 103, 104]) {
+              latestState = makeState(x);
+              updateNavigationEnvironmentKey(latestState);
+              scheduleNavigationRefresh(latestState);
+            }
+            const latestKey = navigationEnvironmentKey(latestState);
+            const callsWhileFirstHung = navigationCalls;
+            navigationEnvironmentChangedAt = performance.now() - navigationSettleMs;
+            resolveFirst();
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            return {
+              callsWhileFirstHung,
+              navigationCalls,
+              requestCleared: navigationRefreshInFlightKey === null,
+              firstRequestKeyCached: navigationCache.has(firstKey),
+              returnedFirstKeyCached: navigationCache.has(returnedFirstKey),
+              latestKeyCached: navigationCache.has(latestKey),
+              latestApplied: latestState._navigation?.environment_key === latestKey,
+            };
+          } finally {
+            if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+            navigationRefreshTimer = null;
+            navigationCache.clear();
+            originalCache.forEach((value, key) => navigationCache.set(key, value));
+            window.fetch = originalFetch;
+            latestState = originalState;
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const navigationSingleFlightResult = navigationSingleFlight.result?.value;
+    if (
+      navigationSingleFlightResult?.callsWhileFirstHung !== 1
+      || navigationSingleFlightResult.navigationCalls !== 2
+      || !navigationSingleFlightResult.requestCleared
+      || navigationSingleFlightResult.firstRequestKeyCached
+      || !navigationSingleFlightResult.returnedFirstKeyCached
+      || !navigationSingleFlightResult.latestKeyCached
+      || !navigationSingleFlightResult.latestApplied
+    ) {
+      throw new Error(`navigation single-flight smoke failed (${JSON.stringify(navigationSingleFlightResult)})`);
+    }
+
     const boundedNavigationRetry = await cdp.send(
       "Runtime.evaluate",
       {
@@ -802,7 +1050,7 @@ async function main() {
     }
 
     console.log(
-      `visual smoke ok: ${smoke.width}x${smoke.height}, non-black pixels=${smoke.nonBlack}, tabs/model controls/goals/timeline paging/checkpoint state preservation/bounded disconnect retries ok, ${smoke.connection}`
+      `visual smoke ok: ${smoke.width}x${smoke.height}, non-black pixels=${smoke.nonBlack}, manual input/navigation single-flight/tabs/model controls/goals/timeline paging/checkpoint state preservation/bounded disconnect retries ok, ${smoke.connection}`
     );
     if (cdp.exceptions.length) {
       throw new Error(`console exceptions: ${cdp.exceptions.join("; ")}`);

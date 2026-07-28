@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import json
 import mimetypes
 import os
 import re
+import select
 import shutil
 import socket
 import struct
@@ -76,6 +78,17 @@ DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL = 0.1
 DIALOG_ADVANCE_VISIBILITY_TIMEOUT = 2.0
 CHECKPOINT_MANIFEST_VERSION = 2
 DEFAULT_CHECKPOINT_SLOT = 99
+LIVE_MAGIC = b"PLIV"
+LIVE_VERSION = 1
+LIVE_HEADER = struct.Struct("<4sHHIIQQ")
+LIVE_MAX_PAYLOAD = 2 * 1024 * 1024
+LIVE_MESSAGE_HELLO = 1
+LIVE_MESSAGE_STATE = 2
+LIVE_MESSAGE_FRAME = 3
+LIVE_MESSAGE_HEARTBEAT = 4
+LIVE_MESSAGE_FRAME_REPEAT = 5
+LIVE_PNG_CACHE_SIZE = 16
+STATE_STREAM_SNAPSHOT_INTERVAL_SECONDS = 0.5
 
 
 def is_logical_room_id(value: object) -> bool:
@@ -131,7 +144,7 @@ def read_json(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"status": "waiting_for_game", "message": "state.json not written yet"}
+        return {"status": "waiting_for_game", "message": "JSON file not available yet"}
     except json.JSONDecodeError as exc:
         return {"status": "state_parse_error", "error": str(exc)}
 
@@ -355,7 +368,46 @@ def rgba_to_png(width: int, height: int, rgba: bytes | memoryview) -> bytes:
     )
 
 
-def pfrm_to_png(raw: bytes) -> bytes:
+def indexed_to_png(
+    width: int,
+    height: int,
+    palette_rgba: bytes | memoryview,
+    pixels: bytes | memoryview,
+) -> bytes:
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid frame dimensions")
+    if len(palette_rgba) == 0 or len(palette_rgba) > 256 * 4 or len(palette_rgba) % 4:
+        raise ValueError("invalid indexed palette")
+    if len(pixels) != width * height:
+        raise ValueError("invalid indexed payload size")
+
+    palette_count = len(palette_rgba) // 4
+    scanlines = bytearray((width + 1) * height)
+    for y in range(height):
+        source_start = y * width
+        target_start = y * (width + 1)
+        scanlines[target_start + 1 : target_start + 1 + width] = pixels[source_start : source_start + width]
+
+    palette = bytearray(palette_count * 3)
+    alpha = bytearray(palette_count)
+    has_alpha = False
+    for index in range(palette_count):
+        palette[index * 3 : index * 3 + 3] = palette_rgba[index * 4 : index * 4 + 3]
+        alpha[index] = palette_rgba[index * 4 + 3]
+        has_alpha = has_alpha or alpha[index] != 0xFF
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 3, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"PLTE", bytes(palette))
+        + (png_chunk(b"tRNS", bytes(alpha)) if has_alpha else b"")
+        + png_chunk(b"IDAT", zlib.compress(bytes(scanlines)))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def pfrm_layout(raw: bytes) -> tuple[int, int, int, memoryview, memoryview | None]:
     if len(raw) < 24 or raw[:4] != b"PFRM":
         raise ValueError("invalid frame header")
     version = struct.unpack_from("<H", raw, 4)[0]
@@ -363,13 +415,158 @@ def pfrm_to_png(raw: bytes) -> bytes:
     height = struct.unpack_from("<H", raw, 8)[0]
     pixel_format = struct.unpack_from("<H", raw, 10)[0]
     payload_length = struct.unpack_from("<I", raw, 20)[0]
-    if version != 1 or pixel_format != 1:
-        raise ValueError("unsupported frame format")
-    if payload_length != width * height * 4:
-        raise ValueError("invalid frame payload length")
-    if len(raw) < 24 + payload_length:
-        raise ValueError("truncated frame payload")
-    return rgba_to_png(width, height, memoryview(raw)[24 : 24 + payload_length])
+    if version == 1 and pixel_format == 1:
+        if payload_length != width * height * 4:
+            raise ValueError("invalid frame payload length")
+        if len(raw) < 24 + payload_length:
+            raise ValueError("truncated frame payload")
+        payload = memoryview(raw)[24 : 24 + payload_length]
+        return width, height, pixel_format, payload, None
+    if version == 2 and pixel_format == 2:
+        palette_count = struct.unpack_from("<I", raw, 12)[0]
+        palette_size = palette_count * 4
+        if palette_count <= 0 or palette_count > 256 or payload_length != palette_size + width * height:
+            raise ValueError("invalid frame payload length")
+        if len(raw) < 24 + payload_length:
+            raise ValueError("truncated frame payload")
+        payload = memoryview(raw)[24 : 24 + payload_length]
+        return width, height, pixel_format, payload[palette_size:], payload[:palette_size]
+    raise ValueError("unsupported frame format")
+
+
+def pfrm_to_png(raw: bytes) -> bytes:
+    width, height, pixel_format, pixels, palette = pfrm_layout(raw)
+    if pixel_format == 1:
+        return rgba_to_png(width, height, pixels)
+    if palette is None:
+        raise ValueError("invalid indexed palette")
+    return indexed_to_png(width, height, palette, pixels)
+
+
+def pfrm_png_cache_key(raw: bytes) -> bytes:
+    digest = hashlib.sha256()
+    if len(raw) >= 24 and raw[:4] == b"PFRM":
+        digest.update(raw[:16])
+        digest.update(raw[20:])
+    else:
+        digest.update(raw)
+    return digest.digest()
+
+
+class LiveBridge:
+    def __init__(self, state: "DebugState", path: Path):
+        self.state = state
+        self.path = path
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.listener: socket.socket | None = None
+        self.owns_path = False
+
+    def start(self) -> None:
+        if self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self.run, name="palpal-live-bridge", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        listener = self.listener
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+        if self.owns_path:
+            self.path.unlink(missing_ok=True)
+            self.owns_path = False
+
+    def prepare_path(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            return
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.1)
+        try:
+            probe.connect(str(self.path))
+        except OSError:
+            self.path.unlink(missing_ok=True)
+        else:
+            raise RuntimeError(f"live socket is already in use: {self.path}")
+        finally:
+            probe.close()
+
+    def run(self) -> None:
+        try:
+            self.prepare_path()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.listener = listener
+            listener.bind(str(self.path))
+            self.owns_path = True
+            listener.listen(1)
+            listener.settimeout(0.5)
+            self.state.set_live_listener_status(True)
+            while not self.stop_event.is_set():
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                self.handle_connection(connection)
+        except Exception as exc:
+            self.state.set_live_listener_status(False, str(exc))
+        finally:
+            self.state.set_live_connected(False)
+            listener = self.listener
+            self.listener = None
+            if listener is not None:
+                try:
+                    listener.close()
+                except OSError:
+                    pass
+            if self.owns_path:
+                self.path.unlink(missing_ok=True)
+                self.owns_path = False
+
+    def recv_exact(self, connection: socket.socket, size: int) -> bytes | None:
+        data = bytearray()
+        while len(data) < size and not self.stop_event.is_set():
+            try:
+                chunk = connection.recv(size - len(data))
+            except socket.timeout:
+                continue
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return bytes(data) if len(data) == size else None
+
+    def handle_connection(self, connection: socket.socket) -> None:
+        connection.settimeout(0.5)
+        self.state.set_live_connected(True)
+        try:
+            while not self.stop_event.is_set():
+                header = self.recv_exact(connection, LIVE_HEADER.size)
+                if header is None:
+                    return
+                magic, version, message_type, flags, payload_length, sequence, monotonic_ms = LIVE_HEADER.unpack(header)
+                if magic != LIVE_MAGIC or version != LIVE_VERSION:
+                    self.state.record_live_protocol_error("invalid_header")
+                    return
+                if flags != 0 or payload_length > LIVE_MAX_PAYLOAD:
+                    self.state.record_live_protocol_error("invalid_payload_length")
+                    return
+                payload = self.recv_exact(connection, payload_length)
+                if payload is None:
+                    return
+                self.state.ingest_live_message(message_type, sequence, monotonic_ms, payload)
+        finally:
+            self.state.set_live_connected(False)
+            try:
+                connection.close()
+            except OSError:
+                pass
 
 
 class DebugState:
@@ -398,6 +595,36 @@ class DebugState:
         self.last_logical_frame: int | None = None
         self.pending_checkpoint_frame_reset: dict | None = None
         self.state_lock = threading.RLock()
+        self.live_lock = threading.RLock()
+        self.live_condition = threading.Condition(self.live_lock)
+        self.live_state: dict | None = None
+        self.live_state_received_at: float | None = None
+        self.live_state_sequence = 0
+        self.live_frame: bytes | None = None
+        self.live_frame_received_at: float | None = None
+        self.live_frame_sequence = 0
+        self.live_png: bytes | None = None
+        self.live_png_frame: bytes | None = None
+        self.live_png_sequence = 0
+        self.live_png_cache: dict[bytes, bytes] = {}
+        self.live_game_instance_id: str | None = None
+        self.live_bridge: LiveBridge | None = None
+        self.state_stream_snapshot_lock = threading.Lock()
+        self.state_stream_snapshot_at = 0.0
+        self.state_stream_snapshot_payload: bytes | None = None
+        self.live_status = {
+            "listening": False,
+            "connected": False,
+            "listener_error": None,
+            "connections": 0,
+            "protocol_errors": 0,
+            "last_protocol_error": None,
+            "last_message_at": None,
+            "last_sequence": 0,
+            "state_messages": 0,
+            "frame_messages": 0,
+            "heartbeats": 0,
+        }
         self.action_lock = threading.Lock()
         self.exploration_lock = threading.Lock()
         self.dialog_advance_lock = threading.Lock()
@@ -411,6 +638,243 @@ class DebugState:
 
     def config_value(self, key: str, default: str | None = None) -> str | None:
         return os.environ.get(key) or self.env_file.get(key) or default
+
+    @property
+    def live_socket_path(self) -> Path:
+        configured = self.config_value("PALPAL_AGENT_SOCKET")
+        return Path(configured).resolve() if configured else self.runtime_dir / "live.sock"
+
+    def start_live_bridge(self) -> None:
+        if self.live_bridge is not None:
+            return
+        self.live_bridge = LiveBridge(self, self.live_socket_path)
+        self.live_bridge.start()
+
+    def stop_live_bridge(self) -> None:
+        bridge = self.live_bridge
+        self.live_bridge = None
+        if bridge is not None:
+            bridge.stop()
+
+    def set_live_listener_status(self, listening: bool, error: str | None = None) -> None:
+        with self.live_condition:
+            self.live_status["listening"] = listening
+            self.live_status["listener_error"] = error
+            self.live_condition.notify_all()
+
+    def set_live_connected(self, connected: bool) -> None:
+        with self.live_condition:
+            if connected and not self.live_status["connected"]:
+                self.live_status["connections"] += 1
+            self.live_status["connected"] = connected
+            self.live_condition.notify_all()
+
+    def record_live_protocol_error(self, reason: str) -> None:
+        with self.live_condition:
+            self.live_status["protocol_errors"] += 1
+            self.live_status["last_protocol_error"] = reason
+            self.live_condition.notify_all()
+
+    def ingest_live_message(
+        self,
+        message_type: int,
+        sequence: int,
+        monotonic_ms: int,
+        payload: bytes,
+    ) -> None:
+        now = time.time()
+        if message_type == LIVE_MESSAGE_HELLO:
+            try:
+                hello = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.record_live_protocol_error("invalid_hello")
+                return
+            game_instance_id = str(hello.get("game_instance_id") or "")
+            with self.live_condition:
+                if game_instance_id and game_instance_id != self.live_game_instance_id:
+                    self.live_state = None
+                    self.live_state_received_at = None
+                    self.live_state_sequence = 0
+                    self.live_frame = None
+                    self.live_frame_received_at = None
+                    self.live_frame_sequence = 0
+                    self.live_png = None
+                    self.live_png_frame = None
+                    self.live_png_sequence = 0
+                    self.live_png_cache.clear()
+                self.live_game_instance_id = game_instance_id or None
+                self.live_status["last_message_at"] = now
+                self.live_status["last_sequence"] = sequence
+                self.live_condition.notify_all()
+            return
+        if message_type == LIVE_MESSAGE_STATE:
+            try:
+                state = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.record_live_protocol_error("invalid_state_json")
+                return
+            if not isinstance(state, dict):
+                self.record_live_protocol_error("invalid_state_type")
+                return
+            self.set_live_state(state, sequence=sequence, received_at=now)
+            return
+        if message_type == LIVE_MESSAGE_FRAME:
+            try:
+                pfrm_layout(payload)
+            except ValueError:
+                self.record_live_protocol_error("invalid_frame")
+                return
+            self.set_live_frame(payload, sequence=sequence, received_at=now)
+            return
+        if message_type == LIVE_MESSAGE_FRAME_REPEAT:
+            if payload:
+                self.record_live_protocol_error("invalid_frame_repeat")
+                return
+            with self.live_lock:
+                frame = self.live_frame
+            if frame is None:
+                self.record_live_protocol_error("frame_repeat_without_frame")
+                return
+            self.set_live_frame(frame, sequence=sequence, received_at=now)
+            return
+        if message_type == LIVE_MESSAGE_HEARTBEAT:
+            with self.live_condition:
+                self.live_status["heartbeats"] += 1
+                self.live_status["last_message_at"] = now
+                self.live_status["last_sequence"] = sequence
+                self.live_condition.notify_all()
+            return
+        self.record_live_protocol_error("unknown_message_type")
+
+    def set_live_state(
+        self,
+        state: dict,
+        *,
+        sequence: int | None = None,
+        received_at: float | None = None,
+    ) -> None:
+        with self.live_condition:
+            next_sequence = sequence if sequence is not None else self.live_state_sequence + 1
+            self.live_state = copy.deepcopy(state)
+            self.live_state_received_at = received_at if received_at is not None else time.time()
+            self.live_state_sequence = int(next_sequence)
+            self.live_status["state_messages"] += 1
+            self.live_status["last_message_at"] = self.live_state_received_at
+            self.live_status["last_sequence"] = int(next_sequence)
+            self.live_condition.notify_all()
+
+    def set_live_frame(
+        self,
+        frame: bytes,
+        *,
+        sequence: int | None = None,
+        received_at: float | None = None,
+    ) -> None:
+        frame = bytes(frame)
+        png_cache_key = pfrm_png_cache_key(frame)
+        with self.live_condition:
+            next_sequence = sequence if sequence is not None else self.live_frame_sequence + 1
+            self.live_frame = frame
+            self.live_frame_received_at = received_at if received_at is not None else time.time()
+            self.live_frame_sequence = int(next_sequence)
+            cached_png = self.live_png_cache.get(png_cache_key)
+            if cached_png is not None:
+                self.live_png_cache.pop(png_cache_key)
+                self.live_png_cache[png_cache_key] = cached_png
+                self.live_png = cached_png
+                self.live_png_frame = png_cache_key
+                self.live_png_sequence = int(next_sequence)
+            else:
+                self.live_png = None
+                self.live_png_frame = None
+                self.live_png_sequence = 0
+            self.live_status["frame_messages"] += 1
+            self.live_status["last_message_at"] = self.live_frame_received_at
+            self.live_status["last_sequence"] = int(next_sequence)
+            self.live_condition.notify_all()
+
+    def read_live_state(self) -> dict:
+        with self.live_lock:
+            if self.live_state is None:
+                return {
+                    "status": "waiting_for_game",
+                    "message": "no live state received from the game",
+                }
+            return copy.deepcopy(self.live_state)
+
+    def live_info(self, kind: str) -> dict:
+        with self.live_lock:
+            if kind == "state":
+                received_at = self.live_state_received_at
+                sequence = self.live_state_sequence
+                available = self.live_state is not None
+            elif kind == "frame":
+                received_at = self.live_frame_received_at
+                sequence = self.live_frame_sequence
+                available = self.live_frame is not None
+            else:
+                raise ValueError(f"unknown live info kind: {kind}")
+        if not available or received_at is None:
+            return {"available": False, "sequence": sequence}
+        age = max(0.0, time.time() - received_at)
+        return {
+            "available": True,
+            "mtime": received_at,
+            "received_at": received_at,
+            "sequence": sequence,
+            "age_seconds": age,
+            "stale": age > STALE_AFTER_SECONDS,
+        }
+
+    def live_transport_snapshot(self) -> dict:
+        with self.live_lock:
+            status = dict(self.live_status)
+            status.update(
+                {
+                    "socket_path": str(self.live_socket_path),
+                    "game_instance_id": self.live_game_instance_id,
+                    "state_sequence": self.live_state_sequence,
+                    "frame_sequence": self.live_frame_sequence,
+                }
+            )
+            return status
+
+    def latest_frame_png(self) -> tuple[int, bytes] | None:
+        with self.live_lock:
+            if self.live_frame is None:
+                return None
+            sequence = self.live_frame_sequence
+            frame = self.live_frame
+            png_cache_key = pfrm_png_cache_key(frame)
+            cached_png = self.live_png_cache.get(png_cache_key)
+            if cached_png is not None:
+                self.live_png_cache.pop(png_cache_key)
+                self.live_png_cache[png_cache_key] = cached_png
+                self.live_png = cached_png
+                self.live_png_frame = png_cache_key
+                self.live_png_sequence = sequence
+                return sequence, cached_png
+        png = pfrm_to_png(frame)
+        with self.live_lock:
+            self.live_png_cache[png_cache_key] = png
+            while len(self.live_png_cache) > LIVE_PNG_CACHE_SIZE:
+                self.live_png_cache.pop(next(iter(self.live_png_cache)))
+            if self.live_frame is not None and pfrm_png_cache_key(self.live_frame) == png_cache_key:
+                self.live_png = png
+                self.live_png_frame = png_cache_key
+                sequence = self.live_frame_sequence
+                self.live_png_sequence = sequence
+            return sequence, png
+
+    def wait_for_frame(self, after_sequence: int, timeout: float) -> int:
+        deadline = time.monotonic() + timeout
+        with self.live_condition:
+            while self.live_frame_sequence <= after_sequence:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.live_condition.wait(remaining)
+            return self.live_frame_sequence
 
     def atomic_write_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> None:
         tmp = path.with_name(
@@ -564,16 +1028,8 @@ class DebugState:
         return self.asset_dir / f"{self.checkpoint_slot if slot is None else int(slot)}.rpg"
 
     @property
-    def state_path(self) -> Path:
-        return self.runtime_dir / "state.json"
-
-    @property
     def screen_path(self) -> Path:
         return self.runtime_dir / "screen.bmp"
-
-    @property
-    def frame_path(self) -> Path:
-        return self.runtime_dir / "frame.rgba"
 
     @property
     def action_path(self) -> Path:
@@ -685,7 +1141,7 @@ class DebugState:
         return {"ok": True, "checkpoints": checkpoints}
 
     def preflight_checkpoint_action(self, state: dict, *, allow_startup_waiting: bool = False) -> None:
-        state_info = self.file_info(self.state_path)
+        state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             raise RuntimeError("state_stale")
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
@@ -709,7 +1165,7 @@ class DebugState:
 
     def preflight_start_new_game(self, state: dict) -> None:
         """Validate a reset without requiring the game to be at a safe save point."""
-        state_info = self.file_info(self.state_path)
+        state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             raise RuntimeError("state_stale")
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
@@ -992,7 +1448,7 @@ class DebugState:
         return restored
 
     def save_checkpoint(self, checkpoint_id: str | None = None, label: str | None = None) -> dict:
-        state = read_json(self.state_path)
+        state = self.read_live_state()
         self.preflight_checkpoint_action(state)
         checkpoint_id = self.checkpoint_id(checkpoint_id)
         checkpoint_dir = self.checkpoint_dir(checkpoint_id)
@@ -1027,7 +1483,7 @@ class DebugState:
             raise
 
     def load_checkpoint(self, checkpoint_id: str) -> dict:
-        state = read_json(self.state_path)
+        state = self.read_live_state()
         self.preflight_checkpoint_action(state, allow_startup_waiting=True)
         checkpoint_dir = self.checkpoint_dir(checkpoint_id)
         manifest = self.checkpoint_manifest(checkpoint_dir)
@@ -1059,7 +1515,7 @@ class DebugState:
         return result
 
     def start_new_game(self) -> dict:
-        state = read_json(self.state_path)
+        state = self.read_live_state()
         self.preflight_start_new_game(state)
         command_result = self.run_slot_command("start_slot", 0)
         self.clear_runtime_history(reason="start_new_game", state=state)
@@ -2703,7 +3159,7 @@ class DebugState:
 
     def task_review_snapshot(self, state: dict | None = None) -> dict:
         """Capture net game state used to decide whether a task needs review."""
-        state = state if isinstance(state, dict) else read_json(self.state_path)
+        state = state if isinstance(state, dict) else self.read_live_state()
         inventory = self.observed_inventory(state)
         sprites = self.observed_party_sprites(state)
         return {
@@ -2861,10 +3317,7 @@ class DebugState:
                     ],
                 })
             if reasons and latest <= reviewed_at:
-                try:
-                    latest = max(reviewed_at, self.state_path.stat().st_mtime)
-                except OSError:
-                    latest = reviewed_at
+                latest = max(reviewed_at, float(self.live_info("state").get("mtime") or reviewed_at))
 
         if not reasons:
             return None
@@ -4786,7 +5239,7 @@ class DebugState:
         return result
 
     def navigation_step(self, state: dict, target_id: int) -> dict:
-        state_info = self.file_info(self.state_path)
+        state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             return {"ok": False, "status": "state_stale", "state_file": state_info, "target_id": target_id}
         if state.get("in_battle"):
@@ -5285,12 +5738,12 @@ class DebugState:
         }
 
     def snapshot(self) -> dict:
-        state = read_json(self.state_path)
+        state = self.read_live_state()
         stable_room_state = self.room_state_stable(state)
         if stable_room_state:
             self.attach_logical_room_fields(state)
-        state_info = self.file_info(self.state_path)
-        frame_info = self.file_info(self.frame_path)
+        state_info = self.live_info("state")
+        frame_info = self.live_info("frame")
         with self.state_lock:
             if state_info.get("available"):
                 self.reset_history_if_frame_restarted(state)
@@ -5330,11 +5783,7 @@ class DebugState:
             "state_file": state_info,
             "frame_file": frame_info,
             "frame_available": frame_info["available"],
-            # Agent actions are driven by the native state bridge. The frame
-            # exporter can legitimately stop advancing while SDLPAL is inside
-            # a dialog/wait loop, even though state and action polling remain
-            # live. Keep that visible for diagnostics without treating it as
-            # an unsafe runtime.
+            "live_transport": self.live_transport_snapshot(),
             "state_stale": state_info.get("stale", True),
             "frame_stale": frame_info.get("stale", True),
             "runtime_stale": state_info.get("stale", True),
@@ -5358,6 +5807,19 @@ class DebugState:
         self.agent_runtime.observe_game_instance(state.get("game_instance_id"))
         state["_debug"]["agent_session"] = self.agent_runtime.compact_snapshot()
         return state
+
+    def state_stream_payload(self) -> bytes:
+        with self.state_stream_snapshot_lock:
+            now = time.monotonic()
+            if (
+                self.state_stream_snapshot_payload is not None
+                and now - self.state_stream_snapshot_at < STATE_STREAM_SNAPSHOT_INTERVAL_SECONDS
+            ):
+                return self.state_stream_snapshot_payload
+            payload = json.dumps(self.snapshot(), ensure_ascii=False).encode("utf-8")
+            self.state_stream_snapshot_payload = payload
+            self.state_stream_snapshot_at = time.monotonic()
+            return payload
 
     def dialog_advance_int(self, value, default: int, lower: int, upper: int) -> int:
         try:
@@ -5702,9 +6164,9 @@ class DebugState:
             current_tool=None,
             message="Inspecting local state.",
         )
-        state = state or read_json(self.state_path)
-        state_info = self.file_info(self.state_path)
-        frame_info = self.file_info(self.frame_path)
+        state = state or self.read_live_state()
+        state_info = self.live_info("state")
+        frame_info = self.live_info("frame")
         navigation = self.navigation(state)
         dialogs = self.dialogs_view(limit=20)
         events = self.event_log[-20:]
@@ -5742,7 +6204,7 @@ class DebugState:
                     "summary": "运行时状态已过期或不可用。",
                     "recommended_intent": "wait_runtime",
                     "recommended_action": self.action_preview("no_op", {"reason": "runtime_stale"}),
-                    "risk": "可见游戏状态可能已经与 runtime/state.json 不一致。",
+                    "risk": "可见游戏状态可能已经与实时 socket 数据不一致。",
                 }
             )
             self.append_agent_decision(state, decision)
@@ -6529,8 +6991,8 @@ class DebugState:
             party_direction = int(state.get("party_direction") or 0)
         except (TypeError, ValueError):
             party_direction = 0
-        state_info = self.file_info(self.state_path)
-        frame_info = self.file_info(self.frame_path)
+        state_info = self.live_info("state")
+        frame_info = self.live_info("frame")
         return {
             "status": state.get("status", "ok"),
             "frame": state.get("frame"),
@@ -7035,7 +7497,7 @@ class DebugState:
             and state.get("in_main_game")
             and not state.get("in_battle")
             and not dialog.get("active")
-            and not self.file_info(self.state_path).get("stale", True)
+            and not self.live_info("state").get("stale", True)
         ):
             context["equipment_review"] = {
                 "pending": True,
@@ -7105,7 +7567,7 @@ class DebugState:
         tool_cycle: dict | None = None,
     ) -> dict:
         arguments = arguments if isinstance(arguments, dict) else {}
-        state = state or read_json(self.state_path)
+        state = state or self.read_live_state()
         if name == "upsert_task":
             result = self.upsert_agent_task(arguments)
             if result.get("ok") and isinstance(tool_cycle, dict) and tool_cycle.get("tasks_queried"):
@@ -7585,7 +8047,7 @@ class DebugState:
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         if dialog.get("active"):
             return "in_dialog"
-        if self.file_info(self.state_path).get("stale", True):
+        if self.live_info("state").get("stale", True):
             return "runtime_stale"
         if check_pending and self.action_path.exists():
             return "action_pending"
@@ -7651,7 +8113,7 @@ class DebugState:
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         if dialog.get("active"):
             return "in_dialog"
-        if self.file_info(self.state_path).get("stale", True):
+        if self.live_info("state").get("stale", True):
             return "runtime_stale"
         if check_pending and self.action_path.exists():
             return "action_pending"
@@ -7729,7 +8191,7 @@ class DebugState:
     def validate_agent_decision(self, decision: dict) -> dict:
         action = decision.get("recommended_action") if isinstance(decision.get("recommended_action"), dict) else {}
         if action.get("tool") == "equip_item":
-            latest_state = read_json(self.state_path)
+            latest_state = self.read_live_state()
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
             error = self.equip_item_validation_error(latest_state, args)
             if error is None:
@@ -7751,7 +8213,7 @@ class DebugState:
             ).strip()
             return decision
         if action.get("tool") == "use_item":
-            latest_state = read_json(self.state_path)
+            latest_state = self.read_live_state()
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
             error = self.use_item_validation_error(latest_state, args)
             if error is None:
@@ -7794,7 +8256,7 @@ class DebugState:
         if target_id <= 0:
             return decision
 
-        latest_state = read_json(self.state_path)
+        latest_state = self.read_live_state()
         route = self.route_to_object(latest_state, target_id, avoid_transitions=True)
         route_status = route.get("status")
         if route_status in {"reachable", "transition", "blocked_by_interactable"}:
@@ -7918,7 +8380,7 @@ class DebugState:
         return DEFAULT_DEEPSEEK_MODEL
 
     def deepseek_decide_agent(self, state: dict | None = None, model: str | None = None) -> dict:
-        state = state or read_json(self.state_path)
+        state = state or self.read_live_state()
         api_key = self.config_value("DEEPSEEK_API_KEY")
         if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is not configured")
@@ -8257,7 +8719,7 @@ class DebugState:
             target_value = str(role_value)
 
         with self.action_lock:
-            state = read_json(self.state_path)
+            state = self.read_live_state()
             args = {"item_id": item_id, "target": "all"} if target_value == "all" else {
                 "item_id": item_id,
                 "role_id": role_value,
@@ -8327,7 +8789,7 @@ class DebugState:
             args["expected_slot_item_id"] = int(expected_slot_item_id)
         start_time = time.time()
         with self.action_lock:
-            state = read_json(self.state_path)
+            state = self.read_live_state()
             error = self.equip_item_validation_error(state, args)
             if error is not None:
                 raise RuntimeError(error)
@@ -8365,12 +8827,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(self.server.state.snapshot())
             return
         if parsed.path == "/navigation":
-            state = read_json(self.server.state.state_path)
+            state = self.server.state.read_live_state()
             self.server.state.attach_logical_room_fields(state)
             self.send_json(self.server.state.navigation(state))
             return
         if parsed.path == "/navigation/transitions":
-            state = read_json(self.server.state.state_path)
+            state = self.server.state.read_live_state()
             self.server.state.attach_logical_room_fields(state)
             identity = self.server.state.room_identity(state)
             from_room_id = identity["id"] if identity else None
@@ -8394,7 +8856,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/navigation/route":
             query = parse_qs(parsed.query)
             target = int((query.get("id") or ["0"])[0])
-            state = read_json(self.server.state.state_path)
+            state = self.server.state.read_live_state()
             self.server.state.attach_logical_room_fields(state)
             route = self.server.state.route_to_object(state, target, avoid_transitions=True)
             if route.get("status") == "unreachable_static":
@@ -8405,7 +8867,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(route)
             return
         if parsed.path == "/exploration":
-            state = read_json(self.server.state.state_path)
+            state = self.server.state.read_live_state()
             self.server.state.attach_logical_room_fields(state)
             self.server.state.update_exploration(state)
             self.send_json(self.server.state.current_exploration(state))
@@ -8414,7 +8876,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"events": self.server.state.event_log[-100:]})
             return
         if parsed.path == "/dialogs":
-            state = read_json(self.server.state.state_path)
+            state = self.server.state.read_live_state()
             self.server.state.attach_logical_room_fields(state)
             self.server.state.record_dialog_event(state)
             query = parse_qs(parsed.query)
@@ -8618,7 +9080,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self.read_body_json()
                 target = int(payload.get("id") or 0)
-                state = read_json(self.server.state.state_path)
+                state = self.server.state.read_live_state()
                 self.server.state.attach_logical_room_fields(state)
                 result = self.server.state.navigation_step(state, target)
                 self.server.state.append_navigation_diagnostic(
@@ -8645,7 +9107,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/diagnostics/navigation":
             try:
                 payload = self.read_body_json()
-                state = read_json(self.server.state.state_path)
+                state = self.server.state.read_live_state()
                 self.server.state.attach_logical_room_fields(state)
                 event_type = str(payload.get("type") or "client_event")
                 details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
@@ -8777,15 +9239,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_frame_png(self) -> None:
         try:
-            raw = self.server.state.frame_path.read_bytes()
-        except FileNotFoundError:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        try:
-            png = pfrm_to_png(raw)
+            latest = self.server.state.latest_frame_png()
         except ValueError as exc:
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             return
+        if latest is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        _, png = latest
         self.send_bytes(png, "image/png", no_cache=True)
 
     def handle_websocket_upgrade(self) -> bool:
@@ -8809,7 +9270,7 @@ class Handler(BaseHTTPRequestHandler):
         last = None
         self.connection.settimeout(1.0)
         while True:
-            payload = json.dumps(self.server.state.snapshot(), ensure_ascii=False).encode("utf-8")
+            payload = self.server.state.state_stream_payload()
             if payload != last:
                 try:
                     self.connection.sendall(websocket_frame(payload, opcode=0x1))
@@ -8821,36 +9282,54 @@ class Handler(BaseHTTPRequestHandler):
     def handle_frame_websocket(self) -> None:
         if not self.handle_websocket_upgrade():
             return
-        last_signature = None
+        last_sequence = 0
         self.connection.settimeout(1.0)
         while True:
             try:
-                stat = self.server.state.frame_path.stat()
-            except FileNotFoundError:
-                time.sleep(0.05)
-                continue
-
-            signature = (stat.st_mtime_ns, stat.st_size)
-            if signature != last_signature:
-                try:
-                    payload = self.server.state.frame_path.read_bytes()
-                    self.connection.sendall(websocket_frame(payload, opcode=0x2))
-                except (FileNotFoundError, BrokenPipeError, ConnectionResetError, socket.timeout):
-                    return
-                last_signature = signature
-            time.sleep(0.02)
+                sequence = self.server.state.wait_for_frame(last_sequence, 0.25)
+                if sequence <= last_sequence:
+                    continue
+                latest = self.server.state.latest_frame_png()
+                if latest is None:
+                    continue
+                sequence, payload = latest
+                self.connection.sendall(websocket_frame(payload, opcode=0x2))
+                last_sequence = sequence
+            except ValueError:
+                last_sequence = sequence
+            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                return
 
     def handle_agent_events_websocket(self, parsed) -> None:
-        if not self.handle_websocket_upgrade():
-            return
         query = parse_qs(parsed.query)
         try:
             after = int((query.get("after") or ["0"])[0])
         except ValueError:
             after = 0
+        current_session_id = str(self.server.state.agent_runtime.snapshot().get("session_id") or "")
+        session_id = str((query.get("session_id") or [current_session_id])[0] or "")
+        if not self.handle_websocket_upgrade():
+            return
+        if not session_id or session_id != current_session_id:
+            return
         self.connection.settimeout(1.0)
         while True:
-            events = self.server.state.agent_runtime.events(after=after, limit=200)
+            events, session_current = self.server.state.agent_runtime.wait_for_events(
+                after=after,
+                limit=200,
+                session_id=session_id,
+                timeout=0.25,
+            )
+            if not session_current:
+                return
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if readable:
+                    preview = self.connection.recv(2, socket.MSG_PEEK)
+                    if not preview or (preview[0] & 0x0F) == 0x8:
+                        return
+            except (OSError, ValueError):
+                return
             for event in events:
                 try:
                     self.connection.sendall(
@@ -8859,7 +9338,6 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, socket.timeout):
                     return
                 after = max(after, int(event.get("seq") or 0))
-            time.sleep(0.1)
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"{self.address_string()} - {fmt % args}")
@@ -8872,6 +9350,7 @@ class Server(ThreadingHTTPServer):
         state = getattr(self, "state", None)
         if state is not None:
             state.cancel_runtime_observations("server_closed")
+            state.stop_live_bridge()
         super().server_close()
 
 
@@ -8890,6 +9369,7 @@ def main() -> int:
         Path(args.asset_dir).resolve(),
         Path(args.game_binary).resolve(),
     )
+    server.state.start_live_bridge()
     print(f"debug console: http://{args.host}:{args.port}")
     print(f"runtime dir: {server.state.runtime_dir}")
     try:

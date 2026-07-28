@@ -377,7 +377,7 @@ def test_manual_execute_writes_action_and_records_delta(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state(frame=7)
     write_state(debug, state)
-    debug.frame_path.write_bytes(b"frame")
+    debug.set_live_frame(b"frame")
     runtime = debug.agent_runtime
     pending = decision("press_buttons", {"buttons": ["search"], "frames": 1}, "inspect_target")
     pending = debug.attach_decision_context(debug.snapshot(), pending)
@@ -422,6 +422,117 @@ def test_events_are_session_isolated_after_reset(tmp_path):
     assert runtime.snapshot()["session_id"] != old_id
     assert all(event["session_id"] == runtime.snapshot()["session_id"] for event in runtime.events())
     assert not any(event["summary"] == "old" for event in runtime.events())
+
+
+def test_idle_event_wait_does_not_scan_event_log(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    runtime.emit("session", "paused", "ready")
+    after = runtime.snapshot()["last_event_seq"]
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("idle live wait scanned events.jsonl")
+
+    monkeypatch.setattr(runtime, "_scan_events", unexpected_scan)
+    events, session_current = runtime.wait_for_events(
+        after,
+        session_id=runtime.snapshot()["session_id"],
+        timeout=0.02,
+    )
+
+    assert events == []
+    assert session_current is True
+
+
+def test_event_wait_wakes_immediately_in_sequence_order(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    session_id = runtime.snapshot()["session_id"]
+    result = []
+
+    def wait():
+        result.append(runtime.wait_for_events(0, session_id=session_id, timeout=1.0))
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    time.sleep(0.03)
+    with runtime.lock:
+        first = runtime.emit("model", "request", "first")
+        second = runtime.emit("decision", "ready", "second")
+    thread.join(timeout=0.5)
+
+    assert not thread.is_alive()
+    events, session_current = result[0]
+    assert session_current is True
+    assert [event["seq"] for event in events] == [first["seq"], second["seq"]]
+
+
+def test_old_event_cursor_falls_back_to_disk_after_cache_overflow(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    for index in range(1_005):
+        runtime.emit("tool", "completed", f"event {index}")
+    scanned = 0
+    original_scan = runtime._scan_events
+
+    def recording_scan(*args, **kwargs):
+        nonlocal scanned
+        scanned += 1
+        return original_scan(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "_scan_events", recording_scan)
+    events = runtime.events(after=0, limit=3)
+
+    assert scanned == 1
+    assert [event["summary"] for event in events] == ["event 0", "event 1", "event 2"]
+
+
+def test_restart_restores_event_tail_sequence_and_cache(tmp_path):
+    agent_dir = tmp_path / "runtime" / "agent"
+    agent_dir.mkdir(parents=True)
+    session_id = "a" * 32
+    lines = [
+        json.dumps({"seq": seq, "session_id": session_id, "summary": f"event {seq}"})
+        for seq in range(1, 1_101)
+    ]
+    (agent_dir / "events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    runtime = make_debug_state(tmp_path).agent_runtime
+
+    assert runtime.snapshot()["last_event_seq"] == 1_100
+    assert len(runtime.event_cache) == 1_000
+    assert runtime.event_cache[0]["seq"] == 101
+
+
+def test_restart_ignores_damaged_event_log_tail(tmp_path):
+    agent_dir = tmp_path / "runtime" / "agent"
+    agent_dir.mkdir(parents=True)
+    session_id = "b" * 32
+    (agent_dir / "events.jsonl").write_text(
+        json.dumps({"seq": 7, "session_id": session_id, "summary": "valid"}) + "\n"
+        + '{"seq":8,"session_id":',
+        encoding="utf-8",
+    )
+
+    runtime = make_debug_state(tmp_path).agent_runtime
+
+    assert runtime.snapshot()["last_event_seq"] == 7
+    assert [event["seq"] for event in runtime.event_cache] == [7]
+
+
+def test_event_wait_ends_when_session_rotates(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    old_session_id = runtime.snapshot()["session_id"]
+    after = runtime.snapshot()["last_event_seq"]
+    result = []
+    thread = threading.Thread(
+        target=lambda: result.append(runtime.wait_for_events(after, session_id=old_session_id, timeout=1.0))
+    )
+    thread.start()
+    time.sleep(0.03)
+
+    runtime.reset("branch_restored")
+    thread.join(timeout=0.5)
+
+    assert not thread.is_alive()
+    assert result == [([], False)]
 
 
 def test_event_turn_pages_keep_complete_turns_and_include_session_at_the_start(tmp_path):

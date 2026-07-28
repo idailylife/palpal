@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable
@@ -23,6 +24,8 @@ TOOL_OUTPUT_PRESSURE_TARGET_TOKENS = 80_000
 TOOL_OUTPUT_RECENT_FULL = 6
 TOOL_OUTPUT_PAGE_CHARS = 6_000
 TOOL_OUTPUT_REF_RE = re.compile(r"tool-[0-9a-f]{32}\.txt")
+EVENT_CACHE_SIZE = 1_000
+EVENT_TAIL_CHUNK_SIZE = 64 * 1024
 
 
 class ReplanRequired(RuntimeError):
@@ -54,6 +57,10 @@ class AgentRuntime:
         self.tool_outputs_root = self.root / "tool_outputs"
         self.tool_outputs_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.event_condition = threading.Condition(self.lock)
+        self.event_cache: deque[dict] = deque(maxlen=EVENT_CACHE_SIZE)
+        self._event_seq = 0
+        self._load_event_tail()
         self.cancel_event = threading.Event()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.thread: threading.Thread | None = None
@@ -143,11 +150,49 @@ class AgentRuntime:
         return value
 
     def _last_event_seq(self) -> int:
+        return self._event_seq
+
+    def _load_event_tail(self) -> None:
+        """Restore the sequence and bounded live cache without scanning the whole log."""
+        recovered: list[dict] = []
         try:
-            lines = self.events_path.read_text(encoding="utf-8").splitlines()
-            return int(json.loads(lines[-1]).get("seq") or 0) if lines else 0
-        except (FileNotFoundError, json.JSONDecodeError, ValueError):
-            return 0
+            with self.events_path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                position = handle.tell()
+                pending = b""
+                while position > 0 and len(recovered) < EVENT_CACHE_SIZE:
+                    size = min(EVENT_TAIL_CHUNK_SIZE, position)
+                    position -= size
+                    handle.seek(position)
+                    parts = (handle.read(size) + pending).split(b"\n")
+                    pending = parts[0]
+                    for raw in reversed(parts[1:]):
+                        if not raw.strip():
+                            continue
+                        try:
+                            event = json.loads(raw.decode("utf-8"))
+                            seq = int(event.get("seq") or 0)
+                        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+                            continue
+                        if seq > 0:
+                            recovered.append(event)
+                            if len(recovered) >= EVENT_CACHE_SIZE:
+                                break
+                if position == 0 and len(recovered) < EVENT_CACHE_SIZE and pending.strip():
+                    try:
+                        event = json.loads(pending.decode("utf-8"))
+                        if int(event.get("seq") or 0) > 0:
+                            recovered.append(event)
+                    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+                        pass
+        except OSError:
+            return
+        recovered.reverse()
+        self.event_cache.extend(recovered)
+        self._event_seq = max((int(event.get("seq") or 0) for event in recovered), default=0)
+
+    def _notify_session_changed(self) -> None:
+        self.event_condition.notify_all()
 
     def _atomic_json(self, path: Path, value: dict) -> None:
         tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
@@ -390,8 +435,11 @@ class AgentRuntime:
             with self.events_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
             state["last_event_seq"] = seq
+            self._event_seq = seq
+            self.event_cache.append(event)
             if state is getattr(self, "state", None):
                 self._persist()
+            self.event_condition.notify_all()
             return event
 
     @classmethod
@@ -424,19 +472,57 @@ class AgentRuntime:
     def events(self, after: int = 0, limit: int = 200, session_id: str | None = None) -> list[dict]:
         limit = max(1, min(int(limit), 500))
         wanted = session_id or self.state.get("session_id")
+        after = int(after)
+        with self.lock:
+            cached = list(self.event_cache)
+            oldest_cached_seq = int(cached[0].get("seq") or 0) if cached else self._event_seq + 1
+            cache_is_complete = len(cached) < EVENT_CACHE_SIZE
+            cache_can_answer = cache_is_complete or after >= oldest_cached_seq - 1
+            if cache_can_answer:
+                return [
+                    event for event in cached
+                    if event.get("session_id") == wanted and int(event.get("seq") or 0) > after
+                ][:limit]
+        return self._scan_events(after, limit, str(wanted or ""))
+
+    def _scan_events(self, after: int, limit: int, session_id: str) -> list[dict]:
         result: list[dict] = []
         try:
-            lines = self.events_path.read_text(encoding="utf-8").splitlines()
-        except FileNotFoundError:
+            handle = self.events_path.open("r", encoding="utf-8")
+        except OSError:
             return []
-        for line in lines:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("session_id") == wanted and int(event.get("seq") or 0) > int(after):
-                result.append(event)
-        return result[:limit]
+        with handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                    seq = int(event.get("seq") or 0)
+                except (json.JSONDecodeError, UnicodeError, AttributeError, TypeError, ValueError):
+                    continue
+                if event.get("session_id") == session_id and seq > after:
+                    result.append(event)
+                    if len(result) >= limit:
+                        break
+        return result
+
+    def wait_for_events(
+        self,
+        after: int,
+        limit: int = 200,
+        session_id: str | None = None,
+        timeout: float = 0.5,
+    ) -> tuple[list[dict], bool]:
+        """Wait for live events; the boolean reports whether the fixed session is still current."""
+        wanted = str(session_id or self.state.get("session_id") or "")
+        events = self.events(after, limit, wanted)
+        if events:
+            return events, True
+        with self.event_condition:
+            if str(self.state.get("session_id") or "") != wanted:
+                return [], False
+            self.event_condition.wait(max(0.0, float(timeout)))
+            if str(self.state.get("session_id") or "") != wanted:
+                return [], False
+        return self.events(after, limit, wanted), True
 
     def event_turn_page(
         self,
@@ -620,8 +706,11 @@ class AgentRuntime:
                         "details": self._safe_details(source.get("details") or {}),
                     }
                     handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    self.event_cache.append(event)
             self.state["last_event_seq"] = seq
+            self._event_seq = seq
             self._persist()
+            self.event_condition.notify_all()
 
     def restore_checkpoint(self, checkpoint_dir: Path, checkpoint_id: str, game_instance_id: str | None) -> dict:
         path = checkpoint_dir / "agent" / "session.json"
@@ -682,6 +771,7 @@ class AgentRuntime:
             restored.update(status="paused", phase="paused", run_turn=0, stop_reason="checkpoint_restored", generation=self.generation)
             self.state = restored
             self._persist()
+            self._notify_session_changed()
         try:
             self._restore_checkpoint_tool_outputs(checkpoint_dir, tool_outputs, restored["session_id"])
             self._submit(self._replace_sdk_session_items(restored["session_id"], transcript)).result(timeout=30)
@@ -753,6 +843,7 @@ class AgentRuntime:
             )
             self.state["generation"] = self.generation
             self._persist()
+            self._notify_session_changed()
             self.emit("session", "paused", f"New session created: {reason}.")
             return self.snapshot()
 

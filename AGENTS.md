@@ -95,13 +95,14 @@ Agent mode is enabled by environment variables:
 ```sh
 PALPAL_AGENT=1
 PALPAL_RUNTIME_DIR=/absolute/path/to/runtime
+PALPAL_AGENT_SOCKET=/absolute/path/to/runtime/live.sock
 PALPAL_SAVE_SLOT=0
 ```
 
-The native bridge writes:
+The native bridge streams over `live.sock`:
 
-- `state.json`: structured state snapshot.
-- `screen.bmp`: latest 320x200 frame.
+- structured JSON state snapshots.
+- indexed 320x200 frames with their 256-color palette.
 
 The native bridge consumes:
 
@@ -115,9 +116,10 @@ button search
 button up
 ```
 
-`agent.c` is responsible for parsing actions, writing JSON manually, and saving
-the screenshot. Keep this dependency-free unless there is a strong reason to add
-a C JSON library.
+`agent.c` is responsible for parsing actions, writing JSON manually, and
+non-blocking Unix-socket transport. Keep this dependency-free unless there is a
+strong reason to add a C JSON or image library. The Python server encodes
+indexed frames as PNG for the browser.
 
 ## State Exposure Priorities
 
@@ -182,11 +184,14 @@ lsof -nP -iTCP:8765 -sTCP:LISTEN
 If the listener exists, retry the read-only localhost request with the agent's
 permission escalation mechanism before concluding the debug server is down.
 
-Smoke test native export:
+Smoke test native streaming:
 
 ```sh
-./run game
-ls -l runtime/state.json runtime/screen.bmp
+./run dev
+curl http://127.0.0.1:8765/state
+curl http://127.0.0.1:8765/frame.png -o /tmp/palpal-frame.png
+test ! -e runtime/state.json
+test ! -e runtime/frame.rgba
 ```
 
 Stop any test game/debug processes before finishing work.

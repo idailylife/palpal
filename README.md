@@ -7,8 +7,8 @@ console for humans and LLM agents.
 
 ## What This Provides
 
-- Native SDLPAL agent mode that exports live game state to `runtime/state.json`.
-- Latest rendered game frame exported to `runtime/frame.rgba`.
+- Native SDLPAL agent mode that streams live game state over a local Unix socket.
+- Indexed 320x200 frames encoded as PNG by the debug server.
 - File-based action injection through `runtime/action.txt`.
 - HTTP endpoints for state and actions.
 - WebSocket stream for live debug updates.
@@ -116,15 +116,13 @@ cmake -S . -B build -DPALPAL_STRICT_WARNINGS=ON
 cmake --build build --target sdlpal
 ```
 
-## Runtime Files
+## Runtime Data
 
-The native agent bridge is intentionally file-based for now. This keeps the
-patch to SDLPAL small and easy to inspect.
-
-SDLPAL writes:
-
-- `runtime/state.json`: live game state snapshot.
-- `runtime/frame.rgba`: latest exported 320x200 RGBA frame.
+High-frequency state and frame data use `runtime/live.sock` by default. The
+socket carries JSON state and the game's native indexed pixels plus palette;
+the payload is never written to a regular file. Set `PALPAL_AGENT_SOCKET` when
+the default path is unsuitable. SDLPAL reconnects automatically when the debug
+server starts or restarts.
 
 The debug server writes:
 
@@ -171,7 +169,7 @@ Live stream:
 ws://127.0.0.1:8765/stream
 ```
 
-Live raw frame stream:
+Live PNG frame stream:
 
 ```text
 ws://127.0.0.1:8765/frames
@@ -285,7 +283,7 @@ and semantic categories should be added as a separate annotation layer.
 ./run debug  # run browser debug server on 127.0.0.1:8765
 ./run game   # run SDLPAL with PALPAL_AGENT=1
 ./run dev    # explicit alias for ./run
-./run visual-smoke  # verify the browser canvas renders live raw frames
+./run visual-smoke  # verify the browser canvas renders live PNG frames
 ./run clean  # remove runtime files
 .venv/bin/python -m pytest      # run Python tests
 .venv/bin/python -m pytest --cov  # run tests with coverage

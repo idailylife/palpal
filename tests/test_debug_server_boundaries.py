@@ -1,10 +1,12 @@
 import json
 import os
+import socket
 import struct
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -26,11 +28,49 @@ def http_request(base_url, path, method="GET", payload=None):
         return exc.code, dict(exc.headers), exc.read()
 
 
+def open_websocket(base_url, path):
+    parsed = urlsplit(base_url)
+    connection = socket.create_connection((parsed.hostname, parsed.port), timeout=1.0)
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {parsed.hostname}:{parsed.port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    connection.sendall(request.encode("ascii"))
+    response = b""
+    while b"\r\n\r\n" not in response:
+        response += connection.recv(4096)
+    assert response.startswith(b"HTTP/1.0 101") or response.startswith(b"HTTP/1.1 101")
+    return connection
+
+
+def receive_websocket_json(connection):
+    header = connection.recv(2)
+    if not header:
+        return None
+    opcode = header[0] & 0x0F
+    length = header[1] & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", connection.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", connection.recv(8))[0]
+    payload = b""
+    while len(payload) < length:
+        payload += connection.recv(length - len(payload))
+    if opcode == 0x8:
+        return None
+    assert opcode == 0x1
+    return json.loads(payload)
+
+
 @pytest.fixture
 def http_server(tmp_path):
     debug = make_debug_state(tmp_path)
     write_state(debug, make_state(frame=7))
-    debug.frame_path.write_bytes(
+    debug.set_live_frame(
         b"PFRM"
         + struct.pack("<HHHH", 1, 1, 1, 1)
         + b"\x00" * 8
@@ -222,6 +262,37 @@ def test_http_handler_agent_session_api_and_running_action_boundary(http_server)
     assert "checkpoint not found" in payload["error"]
 
 
+def test_agent_event_websocket_is_fixed_to_handshake_session(http_server):
+    base_url, debug = http_server
+    runtime = debug.agent_runtime
+    old_session_id = runtime.snapshot()["session_id"]
+    cursor = runtime.emit("session", "paused", "old session ready")["seq"]
+    old_connection = open_websocket(
+        base_url,
+        f"/agent/session/stream?after={cursor}&session_id={old_session_id}",
+    )
+    try:
+        runtime.reset("checkpoint_restored")
+        old_connection.settimeout(1.0)
+        assert receive_websocket_json(old_connection) is None
+    finally:
+        old_connection.close()
+
+    new_session_id = runtime.snapshot()["session_id"]
+    new_cursor = runtime.snapshot()["last_event_seq"]
+    new_connection = open_websocket(
+        base_url,
+        f"/agent/session/stream?after={new_cursor}&session_id={new_session_id}",
+    )
+    try:
+        emitted = runtime.emit("tool", "completed", "new session event")
+        received = receive_websocket_json(new_connection)
+        assert received["seq"] == emitted["seq"]
+        assert received["session_id"] == new_session_id
+    finally:
+        new_connection.close()
+
+
 def test_http_handler_exposes_agent_tasks(http_server):
     base_url, debug = http_server
     task = debug.run_agent_tool("upsert_task", {
@@ -301,7 +372,7 @@ def test_preflight_checkpoint_action_rejects_stale_and_pending_action(tmp_path):
 
     write_state(debug, state)
     old = time.time() - 10
-    os.utime(debug.state_path, (old, old))
+    debug.set_live_state(state, received_at=old)
     with pytest.raises(RuntimeError, match="state_stale"):
         debug.preflight_checkpoint_action(state)
 
