@@ -47,6 +47,59 @@ def equipment_item(
         },
     }
 
+
+def shop_state(*, cash=600, items=None, phase='select', selected_index=0):
+    state = make_state()
+    offers = items or [
+        {
+            **equipment_item(166, '木劍', slot_id=3, modifiers={'attack_strength': 2}),
+            'index': 0,
+            'price': 200,
+            'inventory_count': 0,
+            'equipped_count': 1,
+            'owned_count': 1,
+            'affordable': cash >= 200,
+            'selected': selected_index == 0,
+        },
+        {
+            **equipment_item(201, '皮帽', modifiers={'defense': 5}),
+            'index': 1,
+            'price': 400,
+            'inventory_count': 0,
+            'equipped_count': 0,
+            'owned_count': 0,
+            'affordable': cash >= 400,
+            'selected': selected_index == 1,
+        },
+    ]
+    state['cash'] = cash
+    state['party'] = [{
+        'role_id': 0,
+        'name': '李逍遥',
+        'attack_strength': 35,
+        'magic_strength': 20,
+        'defense': 41,
+        'dexterity': 31,
+        'flee_rate': 32,
+        'poison_resistance': 0,
+        'equipment': [{
+            **equipment_item(196, '头巾', modifiers={'defense': 2}),
+            'slot_id': 0,
+            'slot_key': 'head',
+        }],
+    }]
+    state['shop'] = {
+        'active': True,
+        'mode': 'buy',
+        'store_id': 7,
+        'phase': phase,
+        'selected_index': selected_index,
+        'selected_item_id': offers[selected_index]['item_id'],
+        'items': offers,
+    }
+    return state
+
+
 def test_agent_decide_reports_stale_runtime(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state()
@@ -420,7 +473,11 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     tools = debug.agent_tool_specs()
     names = [tool['function']['name'] for tool in tools]
     by_name = {tool['function']['name']: tool for tool in tools}
-    assert set(names) == {'upsert_task', 'get_tasks', 'get_navigation', 'inspect_target', 'get_observations', 'get_inventory', 'get_equipment', 'get_room_memory', 'get_tool_output', 'submit_decision'}
+    assert set(names) == {
+        'upsert_task', 'get_tasks', 'get_navigation', 'inspect_target',
+        'get_observations', 'get_inventory', 'get_shop', 'get_equipment',
+        'get_room_memory', 'get_tool_output', 'submit_decision',
+    }
     dialog_properties = by_name['get_observations']['function']['parameters']['properties']
     assert 'speaker' in dialog_properties
     assert dialog_properties['speaker']['type'] == 'string'
@@ -439,6 +496,76 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert set(context) == {'state_summary', 'active_tasks', 'active_tasks_total', 'task_review'}
     assert context['task_review'] == {'required': False, 'tasks': []}
     assert names[-1] == 'submit_decision'
+
+
+def test_agent_get_shop_returns_offers_and_equipment_comparison(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = shop_state()
+
+    overview = debug.run_agent_tool('get_shop', {}, state)
+    detail = debug.run_agent_tool('get_shop', {'item_id': 201}, state)
+
+    assert overview['ok']
+    assert overview['shop']['cash'] == 600
+    assert [item['item_id'] for item in overview['shop']['items']] == [166, 201]
+    assert overview['shop']['items'][0]['owned_count'] == 1
+    assert detail['item']['name'] == '皮帽'
+    comparison = detail['equipment_comparisons'][0]
+    assert comparison['role_id'] == 0
+    assert comparison['current_item']['item_id'] == 196
+    assert comparison['stat_delta']['defense'] == 3
+
+
+def test_agent_shop_decisions_require_active_offered_affordable_item(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = shop_state()
+    write_state(debug, state)
+
+    bought = debug.run_agent_tool(
+        'submit_decision',
+        {'action': 'buy_item', 'item_id': 201, 'reason': 'Defense upgrade is worth 400.'},
+        state,
+    )
+    left = debug.run_agent_tool(
+        'submit_decision',
+        {'action': 'leave_shop', 'reason': 'No other purchase is useful.'},
+        state,
+    )
+
+    assert bought['decision']['recommended_intent'] == 'purchase_shop_item'
+    assert bought['decision']['recommended_action']['tool'] == 'shop_buy'
+    assert bought['decision']['recommended_action']['args'] == {'item_id': 201}
+    assert bought['decision']['evidence']['equipment_comparisons'][0]['stat_delta']['defense'] == 3
+    assert left['decision']['recommended_intent'] == 'leave_shop'
+    assert left['decision']['recommended_action']['tool'] == 'shop_leave'
+
+    poor = shop_state(cash=100)
+    write_state(debug, poor)
+    rejected = debug.run_agent_tool(
+        'submit_decision',
+        {'action': 'buy_item', 'item_id': 201, 'reason': 'Try to buy it.'},
+        poor,
+    )['decision']
+    assert rejected['recommended_action']['tool'] == 'no_op'
+    assert rejected['validation']['reason'] == 'shop_action_invalid'
+    assert rejected['validation']['error'] == 'insufficient_cash'
+
+
+def test_active_shop_rejects_non_shop_model_decisions(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = shop_state()
+    write_state(debug, state)
+    decision = debug.normalize_agent_submission(
+        {'action': 'navigate', 'target_id': 9, 'reason': 'Continue exploring.'},
+        state,
+    )
+
+    result = debug.validate_agent_decision(decision)
+
+    assert result['validation']['reason'] == 'in_shop'
+    assert result['recommended_action']['tool'] == 'no_op'
+    assert result['recommended_action']['args']['required_actions'] == ['buy_item', 'leave_shop']
+    assert not debug.action_path.exists()
 
 
 def test_removed_agent_tool_names_are_rejected(tmp_path):
@@ -684,7 +811,10 @@ def test_agent_tool_schema_explains_implicit_event_context_item_target(tmp_path)
         if spec['function']['name'] == 'submit_decision'
     )
     properties = submit['parameters']['properties']
-    assert properties['action']['enum'] == ['wait', 'advance_dialog', 'navigate', 'use_item', 'equip_item']
+    assert properties['action']['enum'] == [
+        'wait', 'advance_dialog', 'navigate', 'use_item', 'equip_item',
+        'buy_item', 'leave_shop',
+    ]
     assert properties['target']['enum'] == ['all']
     assert submit['parameters']['required'] == ['action', 'reason']
     assert submit['parameters']['additionalProperties'] is False
@@ -791,7 +921,7 @@ def test_agent_tools_return_json_serializable_dicts(tmp_path):
     write_state(debug, state)
     debug.event_log = [{'type': 'inventory_changed'}]
     debug.dialog_history = [{'text': 'hello'}]
-    calls = [('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('get_tasks', {'include_closed': True, 'limit': 5}), ('get_navigation', {'limit': 5}), ('inspect_target', {'id': 48, 'limit': 1}), ('get_observations', {'kind': 'both', 'limit': 1}), ('get_observations', {'kind': 'speakers', 'limit': 1}), ('get_inventory', {'limit': 1}), ('get_room_memory', {'room_id': debug.room_identity(state)['id']}), ('get_tool_output', {'output_ref': 'tool-' + ('0' * 32) + '.txt'}), ('submit_decision', {'action': 'wait', 'reason': 'Wait.'})]
+    calls = [('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('get_tasks', {'include_closed': True, 'limit': 5}), ('get_navigation', {'limit': 5}), ('inspect_target', {'id': 48, 'limit': 1}), ('get_observations', {'kind': 'both', 'limit': 1}), ('get_observations', {'kind': 'speakers', 'limit': 1}), ('get_inventory', {'limit': 1}), ('get_shop', {}), ('get_room_memory', {'room_id': debug.room_identity(state)['id']}), ('get_tool_output', {'output_ref': 'tool-' + ('0' * 32) + '.txt'}), ('submit_decision', {'action': 'wait', 'reason': 'Wait.'})]
     for (name, arguments) in calls:
         result = debug.run_agent_tool(name, arguments, state)
         assert isinstance(result, dict)

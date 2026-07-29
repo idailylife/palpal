@@ -164,6 +164,203 @@ def test_navigation_response_identifies_environment_without_animation_frame(tmp_
     assert navigation['environment_key'] != changed_navigation['environment_key']
 
 
+def test_navigation_overview_uses_exactly_three_shared_distance_fields(monkeypatch, tmp_path):
+    objects = [
+        make_touch_object(40 + index, x=(index % 3) * 32, y=(index // 3) * 16)
+        for index in range(6)
+    ]
+    objects.extend(
+        {
+            'id': 60 + index,
+            'x': (index % 3) * 32,
+            'y': (index // 3) * 16,
+            'state': 1,
+            'trigger_mode': 1 + (index % 3),
+            'trigger_script': 100,
+            'blocking': False,
+            'interactable': True,
+        }
+        for index in range(6)
+    )
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=7, height=7, start=(3, 3), objects=objects)
+    calls = []
+    original = debug.navigation_distance_field
+
+    def counted(*args, **kwargs):
+        calls.append(set(args[2]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(debug, 'navigation_distance_field', counted)
+    monkeypatch.setattr(
+        debug,
+        'route_between_nodes',
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('per-target BFS')),
+    )
+
+    navigation = debug.navigation(state)
+
+    assert navigation['status'] == 'ok'
+    assert len(navigation['targets']) == 12
+    assert len(calls) == 3
+
+
+def test_navigation_reuses_blocker_interaction_plan_for_overlapping_touch_targets(monkeypatch, tmp_path):
+    door = {
+        'id': 74, 'x': 16, 'y': 8, 'state': 2, 'trigger_mode': 1,
+        'trigger_script': 8149, 'blocking': True, 'interactable': True,
+    }
+    targets = [
+        make_touch_object(52, x=32, y=0, sprite_id=0),
+        make_touch_object(53, x=32, y=0, sprite_id=21),
+    ]
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=3, height=3, start=(0, 2), objects=[door, *targets])
+    calls = 0
+    original = debug.blocker_interaction_plan
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(debug, 'blocker_interaction_plan', counted)
+    navigation = debug.navigation(state)
+    by_id = {target['id']: target for target in navigation['targets']}
+
+    assert calls == 1
+    assert by_id[52]['status'] == 'blocked_by_interactable'
+    assert by_id[53]['status'] == 'blocked_by_interactable'
+    assert by_id[52]['blocker']['id'] == 74
+    assert by_id[53]['blocker']['id'] == 74
+    assert by_id[52]['steps'] == by_id[53]['steps'] == 0
+
+
+def test_navigation_overlapping_touch_targets_share_the_same_terminal_step(tmp_path):
+    targets = [
+        make_touch_object(52, x=32, y=0, sprite_id=0),
+        make_touch_object(53, x=32, y=0, sprite_id=21),
+    ]
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=3, height=3, start=(1, 1), objects=targets)
+
+    navigation = debug.navigation(state)
+    by_id = {target['id']: target for target in navigation['targets']}
+
+    assert by_id[52]['status'] == 'transition'
+    assert by_id[53]['status'] == 'reachable'
+    assert by_id[52]['steps'] == by_id[53]['steps'] == 1
+
+
+def test_navigation_touch_target_does_not_route_through_another_trigger(tmp_path):
+    intervening = make_touch_object(51, x=16, y=8, sprite_id=0)
+    target = make_touch_object(52, x=32, y=0, sprite_id=21)
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=3, height=3, start=(0, 2), objects=[intervening, target])
+
+    navigation = debug.navigation(state)
+    by_id = {item['id']: item for item in navigation['targets']}
+
+    assert by_id[51]['status'] == 'transition'
+    assert by_id[51]['steps'] == 1
+    assert by_id[52]['status'] == 'blocked_by_transition'
+    assert by_id[52]['steps'] is None
+
+
+def test_navigation_does_not_report_noninteractable_blocker_as_actionable(tmp_path):
+    blocker = {
+        'id': 74, 'x': 16, 'y': 8, 'state': 2, 'trigger_mode': 0,
+        'trigger_script': 0, 'blocking': True, 'interactable': False,
+    }
+    target = make_touch_object(52, x=32, y=0)
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=3, height=3, start=(0, 2), objects=[blocker, target])
+
+    navigation = debug.navigation(state)
+    result = {item['id']: item for item in navigation['targets']}[52]
+
+    assert result['status'] == 'unreachable_static'
+    assert result['steps'] is None
+    assert 'blocker' not in result
+
+
+def test_navigation_touch_target_may_occupy_its_own_blocking_node(tmp_path):
+    target = make_touch_object(52, x=32, y=0)
+    target['blocking'] = True
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=3, height=3, start=(0, 2), objects=[target])
+
+    navigation = debug.navigation(state)
+    result = {item['id']: item for item in navigation['targets']}[52]
+
+    assert result['status'] == 'reachable'
+    assert result['steps'] == 2
+
+
+def test_navigation_search_tie_keeps_route_direction_order(tmp_path):
+    target = {
+        'id': 10, 'x': 32, 'y': 0, 'state': 1, 'trigger_mode': 3,
+        'trigger_script': 100, 'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=7, height=7, start=(3, 3), objects=[target])
+
+    route = debug.route_to_object(state, target_id=10)
+    navigation = debug.navigation(state)
+    result = {item['id']: item for item in navigation['targets']}[10]
+
+    assert result['status'] == route['status'] == 'reachable'
+    assert result['steps'] == route['route']['steps']
+    assert result['required_direction'] == route['required_direction']
+
+
+def test_navigation_graph_cache_keys_all_grid_fields_and_evicts_lru(tmp_path):
+    debug = make_debug_state(tmp_path)
+    base_state = make_state(width=3, height=3)
+    base_grid = decode_nav_grid(base_state)
+    base_graph = debug.navigation_graph(base_grid)
+
+    assert debug.navigation_graph(decode_nav_grid(json.loads(json.dumps(base_state)))) is base_graph
+
+    variants = []
+    for field in ('origin', 'step', 'width', 'height', 'bits'):
+        state = json.loads(json.dumps(base_state))
+        nav_grid = state['nav_grid']
+        if field == 'origin':
+            nav_grid['origin']['x'] += 16
+        elif field == 'step':
+            nav_grid['step']['x'] += 16
+        elif field == 'width':
+            nav_grid['width'] += 1
+        elif field == 'height':
+            nav_grid['height'] += 1
+        else:
+            nav_grid['bits'] = ('0' if nav_grid['bits'][0] != '0' else 'f') + nav_grid['bits'][1:]
+        variants.append(debug.navigation_graph(decode_nav_grid(state)))
+    assert all(graph is not base_graph for graph in variants)
+
+    lru_path = tmp_path / 'lru'
+    lru_path.mkdir()
+    debug = make_debug_state(lru_path)
+    graphs = []
+    grids = []
+    for offset in range(16):
+        state = make_state(width=3, height=3)
+        state['nav_grid']['origin']['x'] = offset * 16
+        grid = decode_nav_grid(state)
+        grids.append(grid)
+        graphs.append(debug.navigation_graph(grid))
+    assert debug.navigation_graph(grids[0]) is graphs[0]
+
+    extra = make_state(width=3, height=3)
+    extra['nav_grid']['origin']['x'] = 16 * 16
+    debug.navigation_graph(decode_nav_grid(extra))
+
+    assert len(debug.navigation_graph_cache) == 16
+    assert debug.navigation_graph(grids[0]) is graphs[0]
+    assert debug.navigation_graph(grids[1]) is not graphs[1]
+
+
 def test_navigation_attaches_logical_room_once_for_raw_state(monkeypatch, tmp_path):
     target = make_touch_object(52, x=32, y=0, sprite_id=0)
     debug = make_debug_state(tmp_path)

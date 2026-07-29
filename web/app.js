@@ -110,6 +110,24 @@ let jsonRenderText = "";
 let jsonLastRenderedAt = 0;
 let jsonPendingTimer = null;
 const navigationCache = new Map();
+const navigationCacheLimit = 32;
+
+function getCachedNavigation(key) {
+  const navigation = navigationCache.get(key);
+  if (!navigation) return null;
+  navigationCache.delete(key);
+  navigationCache.set(key, navigation);
+  return navigation;
+}
+
+function cacheNavigation(key, navigation) {
+  if (!key) return;
+  navigationCache.delete(key);
+  navigationCache.set(key, navigation);
+  while (navigationCache.size > navigationCacheLimit) {
+    navigationCache.delete(navigationCache.keys().next().value);
+  }
+}
 let stateConnected = false;
 let frameConnected = false;
 let dialogAdvanceActive = false;
@@ -1775,10 +1793,10 @@ function scheduleNavigationRefresh(state) {
   }
 
   navigationStableEnvironmentKey = key;
-  const cachedNavigation = navigationCache.get(key);
-  if (cachedNavigation) {
+  const cached = getCachedNavigation(key);
+  if (cached) {
     if (latestState && latestState._navigation?.environment_key !== key) {
-      latestState._navigation = cachedNavigation;
+      latestState._navigation = cached;
       renderNavigation(latestState);
       renderObjects(latestState);
       drawOverlay(latestState);
@@ -1830,7 +1848,7 @@ async function refreshNavigationForKey(requestKey) {
     }
     const navigation = await response.json();
     const returnedKey = navigation.environment_key;
-    if (returnedKey) navigationCache.set(returnedKey, navigation);
+    cacheNavigation(returnedKey, navigation);
     if (returnedKey !== requestKey) {
       sendNavigationDiagnostic("navigation_key_mismatch", {
         request_key_length: requestKey.length,
@@ -2179,7 +2197,7 @@ function renderJson(state, options = {}) {
 
 function render(state) {
   const navKey = updateNavigationEnvironmentKey(state);
-  const cachedNavigation = navigationCache.get(navKey);
+  const cachedNavigation = getCachedNavigation(navKey);
   if (cachedNavigation) {
     state._navigation = cachedNavigation;
   }
@@ -3045,7 +3063,7 @@ function updateNavigationTarget(targetId, patch) {
       target.id === targetId ? { ...target, ...patch } : target
     ),
   };
-  navigationCache.set(navigationEnvironmentKey(latestState), latestState._navigation);
+  cacheNavigation(navigationEnvironmentKey(latestState), latestState._navigation);
 }
 
 async function waitForInteractionResult(stepResult, timeoutMs = 2500) {

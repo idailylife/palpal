@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
-from collections import deque
+from collections import OrderedDict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -88,6 +88,7 @@ LIVE_MESSAGE_FRAME = 3
 LIVE_MESSAGE_HEARTBEAT = 4
 LIVE_MESSAGE_FRAME_REPEAT = 5
 LIVE_PNG_CACHE_SIZE = 16
+NAVIGATION_GRAPH_CACHE_SIZE = 16
 STATE_STREAM_SNAPSHOT_INTERVAL_SECONDS = 0.5
 
 
@@ -607,11 +608,17 @@ class DebugState:
         self.live_png_frame: bytes | None = None
         self.live_png_sequence = 0
         self.live_png_cache: dict[bytes, bytes] = {}
+        self.navigation_graph_lock = threading.RLock()
+        self.navigation_graph_cache: OrderedDict[
+            tuple[tuple[int, int], tuple[int, int], int, int, str],
+            dict[tuple[int, int], tuple[tuple[str, tuple[int, int]], ...]],
+        ] = OrderedDict()
         self.live_game_instance_id: str | None = None
         self.live_bridge: LiveBridge | None = None
         self.state_stream_snapshot_lock = threading.Lock()
         self.state_stream_snapshot_at = 0.0
         self.state_stream_snapshot_payload: bytes | None = None
+        self.state_stream_snapshot_action_pending: bool | None = None
         self.live_status = {
             "listening": False,
             "connected": False,
@@ -625,7 +632,8 @@ class DebugState:
             "frame_messages": 0,
             "heartbeats": 0,
         }
-        self.action_lock = threading.Lock()
+        self.action_lock = threading.RLock()
+        self.pending_written_action: dict | None = None
         self.exploration_lock = threading.Lock()
         self.dialog_advance_lock = threading.Lock()
         self.dialog_advance_cancel = threading.Event()
@@ -762,6 +770,7 @@ class DebugState:
             self.live_status["last_message_at"] = self.live_state_received_at
             self.live_status["last_sequence"] = int(next_sequence)
             self.live_condition.notify_all()
+        self.reconcile_pending_written_action(state)
 
     def set_live_frame(
         self,
@@ -801,6 +810,77 @@ class DebugState:
                     "message": "no live state received from the game",
                 }
             return copy.deepcopy(self.live_state)
+
+    @staticmethod
+    def native_action_status(state: dict | None) -> dict | None:
+        action = state.get("agent_action") if isinstance(state, dict) else None
+        if not isinstance(action, dict):
+            return None
+        try:
+            generation = int(action.get("generation"))
+            remaining_steps = max(0, int(action.get("remaining_steps") or 0))
+        except (TypeError, ValueError):
+            return None
+        return {
+            "generation": generation,
+            "pending": bool(action.get("pending")),
+            "remaining_steps": remaining_steps,
+            "waiting_for_move": bool(action.get("waiting_for_move")),
+        }
+
+    def reconcile_pending_written_action(self, state: dict) -> None:
+        with self.action_lock:
+            pending = self.pending_written_action
+            if not isinstance(pending, dict):
+                return
+            instance_id = str(state.get("game_instance_id") or "")
+            if instance_id != str(pending.get("game_instance_id") or ""):
+                self.pending_written_action = None
+                return
+            native = self.native_action_status(state)
+            if native is not None and native["generation"] != pending.get("generation_before"):
+                self.pending_written_action = None
+
+    def action_pending(self, state: dict | None = None) -> bool:
+        if state is None:
+            state = self.read_live_state()
+        native = self.native_action_status(state)
+        with self.action_lock:
+            local_pending = isinstance(self.pending_written_action, dict)
+        return self.action_path.exists() or local_pending or bool(native and native["pending"])
+
+    def action_handshake(self, state: dict | None = None) -> dict:
+        state = state if isinstance(state, dict) else self.read_live_state()
+        native = self.native_action_status(state)
+        return {
+            "supported": native is not None,
+            "game_instance_id": str(state.get("game_instance_id") or ""),
+            "generation": native["generation"] if native is not None else None,
+        }
+
+    def begin_written_action(self, entry: dict) -> None:
+        handshake = self.action_handshake()
+        entry.update(
+            {
+                "game_instance_id": handshake["game_instance_id"],
+                "action_generation_before": handshake["generation"],
+                "action_handshake_supported": handshake["supported"],
+            }
+        )
+        self.pending_written_action = (
+            {
+                "game_instance_id": handshake["game_instance_id"],
+                "generation_before": handshake["generation"],
+                "written_at": entry["time"],
+            }
+            if handshake["supported"]
+            else None
+        )
+        if not handshake["supported"]:
+            self.append_navigation_diagnostic(
+                "action_handshake_compatibility_mode",
+                {"game_instance_id": handshake["game_instance_id"]},
+            )
 
     def live_info(self, kind: str) -> dict:
         with self.live_lock:
@@ -1148,7 +1228,7 @@ class DebugState:
             raise RuntimeError(str(state.get("status")))
         if state.get("status") == "startup_waiting":
             if allow_startup_waiting:
-                if self.action_path.exists():
+                if self.action_pending(state):
                     raise RuntimeError("action_pending")
                 return
             raise RuntimeError("startup_waiting")
@@ -1160,7 +1240,7 @@ class DebugState:
             raise RuntimeError("entering_scene")
         if state.get("in_main_game") is False:
             raise RuntimeError("not_in_main_game")
-        if self.action_path.exists():
+        if self.action_pending(state):
             raise RuntimeError("action_pending")
 
     def preflight_start_new_game(self, state: dict) -> None:
@@ -1174,7 +1254,7 @@ class DebugState:
             raise RuntimeError("in_battle")
         if state.get("entering_scene"):
             raise RuntimeError("entering_scene")
-        if self.action_path.exists():
+        if self.action_pending(state):
             raise RuntimeError("action_pending")
 
     def refresh_companion_caches(self) -> None:
@@ -1322,14 +1402,19 @@ class DebugState:
         if command not in {"save_slot", "load_slot", "start_slot"}:
             raise ValueError("unsupported slot command")
         with self.action_lock:
-            if self.action_path.exists():
+            if self.action_pending():
                 raise RuntimeError("action_pending")
             try:
                 self.action_result_path.unlink()
             except FileNotFoundError:
                 pass
-            self.atomic_write_text(self.action_path, f"{command} {int(slot)}\n", encoding="ascii")
             entry = {"time": time.time(), "command": command, "slot": int(slot)}
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(self.action_path, f"{command} {int(slot)}\n", encoding="ascii")
+            except Exception:
+                self.pending_written_action = None
+                raise
             self.action_log.append(entry)
             self.append_navigation_diagnostic("action_written", {"action": entry})
             return entry
@@ -1841,7 +1926,7 @@ class DebugState:
                     "dialog_latest_text": (dialog.get("latest_event") or {}).get("text"),
                     "in_battle": bool(state.get("in_battle")),
                     "in_main_game": state.get("in_main_game"),
-                    "action_pending": self.action_path.exists(),
+                    "action_pending": self.action_pending(state),
                 }
             )
         self.navigation_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2619,7 +2704,7 @@ class DebugState:
         if not pending.get("armed"):
             return None
 
-        if self.action_path.exists():
+        if self.action_pending(state):
             return None
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         if dialog.get("active"):
@@ -4722,7 +4807,7 @@ class DebugState:
                 except (TypeError, ValueError):
                     route_age = TRANSITION_OBSERVATION_TIMEOUT_SECONDS + 1
                 if (
-                    not self.action_path.exists()
+                    not self.action_pending(state)
                     and not same_live_transition
                     and route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS
                 ):
@@ -5055,12 +5140,12 @@ class DebugState:
         seen = {start}
         parent: dict[tuple[int, int], tuple[tuple[int, int], str]] = {}
         goal: tuple[int, int] | None = start if start in goals else None
+        graph = self.navigation_graph(grid)
 
         while queue and goal is None:
             node = queue.popleft()
-            for move, delta in MOVE_DELTAS.items():
-                next_node = (node[0] + delta[0], node[1] + delta[1])
-                if next_node in seen or next_node in blocked or not nav_bit(grid, next_node):
+            for move, next_node in graph.get(node, ()):
+                if next_node in seen or next_node in blocked:
                     continue
                 seen.add(next_node)
                 parent[next_node] = (node, move)
@@ -5250,7 +5335,7 @@ class DebugState:
             return {"ok": False, "status": "not_in_main_game", "target_id": target_id}
         if not self.room_state_stable(state):
             return {"ok": False, "status": "entering_scene" if state.get("entering_scene") else "unstable_room_state", "target_id": target_id}
-        if self.action_path.exists():
+        if self.action_pending(state):
             return {"ok": False, "status": "action_pending", "target_id": target_id}
 
         with self.state_lock:
@@ -5511,22 +5596,112 @@ class DebugState:
         start: tuple[int, int],
         blocked: set[tuple[int, int]],
     ) -> tuple[list[tuple[int, int]], dict[tuple[int, int], int]]:
+        order, distance, _ = self.navigation_distance_field(grid, start, blocked)
+        return order, distance
+
+    def navigation_graph(
+        self,
+        grid: dict,
+    ) -> dict[tuple[int, int], tuple[tuple[str, tuple[int, int]], ...]]:
+        key = (
+            grid["origin"],
+            grid["step"],
+            int(grid["width"]),
+            int(grid["height"]),
+            str(grid["bits"]),
+        )
+        with self.navigation_graph_lock:
+            cached = self.navigation_graph_cache.get(key)
+            if cached is not None:
+                self.navigation_graph_cache.move_to_end(key)
+                return cached
+
+        graph: dict[tuple[int, int], tuple[tuple[str, tuple[int, int]], ...]] = {}
+        for y in range(grid["height"]):
+            for x in range(grid["width"]):
+                node = (x, y)
+                if not nav_bit(grid, node):
+                    continue
+                neighbors = []
+                for move, delta in MOVE_DELTAS.items():
+                    next_node = (x + delta[0], y + delta[1])
+                    if nav_bit(grid, next_node):
+                        neighbors.append((move, next_node))
+                graph[node] = tuple(neighbors)
+
+        with self.navigation_graph_lock:
+            existing = self.navigation_graph_cache.get(key)
+            if existing is not None:
+                self.navigation_graph_cache.move_to_end(key)
+                return existing
+            self.navigation_graph_cache[key] = graph
+            while len(self.navigation_graph_cache) > NAVIGATION_GRAPH_CACHE_SIZE:
+                self.navigation_graph_cache.popitem(last=False)
+        return graph
+
+    def navigation_distance_field(
+        self,
+        grid: dict,
+        start: tuple[int, int],
+        blocked: set[tuple[int, int]],
+    ) -> tuple[
+        list[tuple[int, int]],
+        dict[tuple[int, int], int],
+        dict[tuple[int, int], tuple[tuple[int, int], str]],
+    ]:
         blocked = set(blocked)
         blocked.discard(start)
         queue = deque([start])
         order = [start]
         distance = {start: 0}
+        parent: dict[tuple[int, int], tuple[tuple[int, int], str]] = {}
+        graph = self.navigation_graph(grid)
 
         while queue:
             node = queue.popleft()
-            for delta in MOVE_DELTAS.values():
-                next_node = (node[0] + delta[0], node[1] + delta[1])
-                if next_node in distance or next_node in blocked or not nav_bit(grid, next_node):
+            for move, next_node in graph.get(node, ()):
+                if next_node in distance or next_node in blocked:
                     continue
                 distance[next_node] = distance[node] + 1
+                parent[next_node] = (node, move)
                 order.append(next_node)
                 queue.append(next_node)
-        return order, distance
+        return order, distance, parent
+
+    def touch_terminal_goal(
+        self,
+        grid: dict,
+        start: tuple[int, int],
+        order: list[tuple[int, int]],
+        distance: dict[tuple[int, int], int],
+        goals: set[tuple[int, int]],
+        terminal_blocked: set[tuple[int, int]],
+    ) -> tuple[tuple[int, int], tuple[int, int] | None, int] | None:
+        if start in goals:
+            return start, None, 0
+        graph = self.navigation_graph(grid)
+        for node in order:
+            for _, next_node in graph.get(node, ()):
+                if next_node in goals and next_node not in terminal_blocked:
+                    return next_node, node, distance[node] + 1
+        return None
+
+    def distance_field_path(
+        self,
+        start: tuple[int, int],
+        goal: tuple[int, int],
+        parent: dict[tuple[int, int], tuple[tuple[int, int], str]],
+        terminal_parent: tuple[int, int] | None = None,
+    ) -> list[tuple[int, int]]:
+        current = terminal_parent if terminal_parent is not None else goal
+        nodes = [current]
+        while current != start:
+            current = parent[current][0]
+            nodes.append(current)
+        nodes.reverse()
+        if terminal_parent is not None:
+            nodes.append(goal)
+        return nodes
 
     def first_search_goal(
         self,
@@ -5596,16 +5771,23 @@ class DebugState:
             all_touch_nodes.update(nodes)
 
         blocking_by_node = self.blocking_nodes_by_object(state, grid)
-        route_context = {
-            "grid": grid,
-            "target_by_id": {int(obj.get("id") or 0): obj for obj in interactables},
-            "touch_nodes_by_id": touch_nodes_by_id,
-            "blocking_by_node": blocking_by_node,
-        }
         dynamic_blocked = set(blocking_by_node)
-        safe_order, safe_distance = self.reachable_nodes(grid, start, all_touch_nodes | dynamic_blocked)
-        no_dynamic_order, no_dynamic_distance = self.reachable_nodes(grid, start, all_touch_nodes)
-        no_touch_order, no_touch_distance = self.reachable_nodes(grid, start, dynamic_blocked)
+        safe_order, safe_distance, _ = self.navigation_distance_field(
+            grid,
+            start,
+            all_touch_nodes | dynamic_blocked,
+        )
+        no_dynamic_order, no_dynamic_distance, no_dynamic_parent = self.navigation_distance_field(
+            grid,
+            start,
+            all_touch_nodes,
+        )
+        no_touch_order, no_touch_distance, _ = self.navigation_distance_field(
+            grid,
+            start,
+            dynamic_blocked,
+        )
+        interaction_by_blocker_id: dict[int, dict | None] = {}
 
         targets = []
         for obj in interactables:
@@ -5615,56 +5797,98 @@ class DebugState:
             steps = None
             required_direction = None
             blocker = None
+            goals: set[tuple[int, int]] = set()
+            strict_goal: tuple[int, int] | None = None
+            relaxed_goal: tuple[int, int] | None = None
+            relaxed_terminal_parent: tuple[int, int] | None = None
+            no_touch_goal: tuple[int, int] | None = None
 
             if kind == "search":
                 goals, search_dirs = self.goal_nodes(state, grid, obj)
-                route_context.setdefault("goal_nodes_by_id", {})[target_id] = (goals, search_dirs)
-                goal = next((node for node in safe_order if node in goals), None)
-                if goal is not None:
-                    direction = search_dirs.get(goal, int(state.get("party_direction") or 0))
+                strict_goal = next((node for node in safe_order if node in goals), None)
+                relaxed_goal = next((node for node in no_dynamic_order if node in goals), None)
+                no_touch_goal = next((node for node in no_touch_order if node in goals), None)
+                if strict_goal is not None:
+                    direction = search_dirs.get(strict_goal, int(state.get("party_direction") or 0))
                     status = "reachable"
-                    steps = safe_distance[goal]
+                    steps = safe_distance[strict_goal]
                     required_direction = DIR_TO_BUTTON.get(direction, "down")
-                elif any(node in no_dynamic_distance for node in goals):
-                    route = self.route_to_object(state, target_id, avoid_transitions=True, context=route_context)
-                    if route.get("status") == "blocked_by_interactable":
+            elif kind == "touch":
+                goals = touch_nodes_by_id.get(target_id, set())
+                target_node = grid_node(grid, int(obj.get("x") or 0), int(obj.get("y") or 0))
+                target_dynamic_blocked = set(dynamic_blocked)
+                if target_node is not None:
+                    target_dynamic_blocked.discard(target_node)
+                strict_terminal = self.touch_terminal_goal(
+                    grid,
+                    start,
+                    safe_order,
+                    safe_distance,
+                    goals,
+                    target_dynamic_blocked,
+                )
+                relaxed_terminal = self.touch_terminal_goal(
+                    grid,
+                    start,
+                    no_dynamic_order,
+                    no_dynamic_distance,
+                    goals,
+                    set(),
+                )
+                no_touch_terminal = self.touch_terminal_goal(
+                    grid,
+                    start,
+                    no_touch_order,
+                    no_touch_distance,
+                    goals,
+                    target_dynamic_blocked,
+                )
+                if strict_terminal is not None:
+                    strict_goal, _, steps = strict_terminal
+                    status = "transition" if transition_candidate(obj) else "reachable"
+                if relaxed_terminal is not None:
+                    relaxed_goal, relaxed_terminal_parent, _ = relaxed_terminal
+                if no_touch_terminal is not None:
+                    no_touch_goal = no_touch_terminal[0]
+
+            if strict_goal is None and relaxed_goal is not None:
+                relaxed_path = self.distance_field_path(
+                    start,
+                    relaxed_goal,
+                    no_dynamic_parent,
+                    relaxed_terminal_parent,
+                )
+                blocking_object = next(
+                    (
+                        blocking_by_node.get(node)
+                        for node in relaxed_path
+                        if blocking_by_node.get(node) is not None
+                        and int((blocking_by_node.get(node) or {}).get("id") or 0) != target_id
+                    ),
+                    None,
+                )
+                blocker_id = int((blocking_object or {}).get("id") or 0)
+                if blocking_object is not None:
+                    if blocker_id not in interaction_by_blocker_id:
+                        transition_blocked = set(all_touch_nodes)
+                        if kind == "touch":
+                            transition_blocked.difference_update(goals)
+                        interaction_by_blocker_id[blocker_id] = self.blocker_interaction_plan(
+                            state,
+                            grid,
+                            start,
+                            blocking_object,
+                            transition_blocked,
+                            dynamic_blocked,
+                        )
+                    interaction = interaction_by_blocker_id[blocker_id]
+                    if interaction is not None:
                         status = "blocked_by_interactable"
-                        interaction = route.get("interaction") or {}
                         steps = (interaction.get("route") or {}).get("steps")
                         required_direction = interaction.get("required_direction")
-                        blocker = route.get("blocker")
-                elif any(node in no_touch_distance for node in goals):
-                    status = "blocked_by_transition"
-            elif kind == "touch":
-                if transition_candidate(obj):
-                    route = self.route_to_object(state, target_id, avoid_transitions=True, context=route_context)
-                    status = route.get("status") or "unreachable_static"
-                    steps = (route.get("route") or {}).get("steps")
-                else:
-                    goals = touch_nodes_by_id.get(target_id, set())
-                    target_dynamic_blocked = set(dynamic_blocked)
-                    target_node = grid_node(grid, int(obj.get("x") or 0), int(obj.get("y") or 0))
-                    if target_node is not None:
-                        target_dynamic_blocked.discard(target_node)
-                    blocked = (all_touch_nodes - goals) | target_dynamic_blocked
-                    touch_order, touch_distance = self.reachable_nodes(grid, start, blocked)
-                    goal = next((node for node in touch_order if node in goals), None)
-                    if goal is not None:
-                        status = "reachable"
-                        steps = touch_distance[goal]
-                    else:
-                        no_dynamic_blocked = all_touch_nodes - goals
-                        no_dynamic_touch_order, _ = self.reachable_nodes(grid, start, no_dynamic_blocked)
-                        if any(node in goals for node in no_dynamic_touch_order):
-                            route = self.route_to_object(state, target_id, avoid_transitions=True, context=route_context)
-                            if route.get("status") == "blocked_by_interactable":
-                                status = "blocked_by_interactable"
-                                interaction = route.get("interaction") or {}
-                                steps = (interaction.get("route") or {}).get("steps")
-                                required_direction = interaction.get("required_direction")
-                                blocker = route.get("blocker")
-                        elif any(node in no_touch_distance for node in goals):
-                            status = "blocked_by_transition"
+                        blocker = interaction.get("blocker")
+            elif strict_goal is None and no_touch_goal is not None:
+                status = "blocked_by_transition"
 
             target = {
                 "id": target_id,
@@ -5787,7 +6011,7 @@ class DebugState:
             "state_stale": state_info.get("stale", True),
             "frame_stale": frame_info.get("stale", True),
             "runtime_stale": state_info.get("stale", True),
-            "action_pending": self.action_path.exists(),
+            "action_pending": self.action_pending(state),
             "stale_after_seconds": STALE_AFTER_SECONDS,
             "recent_actions": recent_actions,
             "recent_events": recent_events,
@@ -5811,14 +6035,17 @@ class DebugState:
     def state_stream_payload(self) -> bytes:
         with self.state_stream_snapshot_lock:
             now = time.monotonic()
+            action_pending = self.action_pending()
             if (
                 self.state_stream_snapshot_payload is not None
                 and now - self.state_stream_snapshot_at < STATE_STREAM_SNAPSHOT_INTERVAL_SECONDS
+                and self.state_stream_snapshot_action_pending == action_pending
             ):
                 return self.state_stream_snapshot_payload
             payload = json.dumps(self.snapshot(), ensure_ascii=False).encode("utf-8")
             self.state_stream_snapshot_payload = payload
             self.state_stream_snapshot_at = time.monotonic()
+            self.state_stream_snapshot_action_pending = action_pending
             return payload
 
     def dialog_advance_int(self, value, default: int, lower: int, upper: int) -> int:
@@ -5844,10 +6071,10 @@ class DebugState:
     def wait_for_action_clear(self, timeout: float = DIALOG_ADVANCE_ACTION_TIMEOUT) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if not self.action_path.exists():
+            if not self.action_pending():
                 return True
             time.sleep(0.05)
-        return not self.action_path.exists()
+        return not self.action_pending()
 
     def dialog_advance_stop_status(self, state: dict) -> str | None:
         if state.get("status") == "waiting_for_game":
@@ -6031,7 +6258,7 @@ class DebugState:
 
                 if presses >= options["max_presses"]:
                     return finish_result("max_presses")
-                if self.action_path.exists():
+                if self.action_pending(state):
                     return finish_result("action_pending_timeout", ok=False)
 
                 self.write_action([DIALOG_ADVANCE_BUTTON], 1)
@@ -6993,6 +7220,7 @@ class DebugState:
             party_direction = 0
         state_info = self.live_info("state")
         frame_info = self.live_info("frame")
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
         return {
             "status": state.get("status", "ok"),
             "frame": state.get("frame"),
@@ -7013,6 +7241,7 @@ class DebugState:
             "party_direction": state.get("party_direction"),
             "party_direction_button": DIR_TO_BUTTON.get(party_direction, "down"),
             "cash": state.get("cash"),
+            "shop": self.agent_shop(state).get("shop") if shop and shop.get("active") else None,
             "party": [
                 {
                     "role_id": role.get("role_id"),
@@ -7040,9 +7269,56 @@ class DebugState:
             "state_stale": state_info.get("stale", True),
             "frame_stale": frame_info.get("stale", True),
             "runtime_stale": state_info.get("stale", True),
-            "action_pending": self.action_path.exists(),
+            "action_pending": self.action_pending(state),
             "exploration": self.agent_exploration_summary(self.agent_current_exploration(state)),
         }
+
+    def agent_shop(self, state: dict, item_id: int | None = None) -> dict:
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
+        if not shop or shop.get("active") is not True:
+            return {"ok": False, "error": "shop_inactive", "shop": None}
+
+        items = shop.get("items") if isinstance(shop.get("items"), list) else []
+        compact_keys = (
+            "index", "item_id", "name", "price", "inventory_count",
+            "equipped_count", "owned_count", "affordable", "selected",
+            "usable", "equipable", "sellable",
+        )
+        compact_items = [
+            {key: item.get(key) for key in compact_keys if key in item}
+            for item in items
+            if isinstance(item, dict)
+        ]
+        summary = {
+            "active": True,
+            "mode": shop.get("mode"),
+            "store_id": shop.get("store_id"),
+            "phase": shop.get("phase"),
+            "selected_index": shop.get("selected_index"),
+            "selected_item_id": shop.get("selected_item_id"),
+            "cash": state.get("cash"),
+            "items": compact_items,
+        }
+        if item_id is None:
+            return {"ok": True, "shop": summary}
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            item_id = 0
+        candidate = next(
+            (
+                item for item in items
+                if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+            ),
+            None,
+        )
+        if item_id <= 0 or not isinstance(candidate, dict):
+            return {"ok": False, "error": "item_not_offered", "item_id": item_id, "shop": summary}
+        detail = dict(candidate)
+        result = {"ok": True, "shop": summary, "item": detail}
+        if candidate.get("equipable") is True:
+            result["equipment_comparisons"] = self.equipment_comparisons(state, candidate)
+        return result
 
     def agent_inventory(self, state: dict, limit: int = 100) -> dict:
         inventory = state.get("inventory") if isinstance(state.get("inventory"), list) else []
@@ -7406,6 +7682,21 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_shop",
+                    "description": (
+                        "查询当前购买菜单。无参数返回商品、价格、持有数和可负担状态；"
+                        "指定 item_id 返回完整商品元数据，装备类商品还会比较各角色当前同槽装备。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"item_id": {"type": "integer", "minimum": 1}},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_equipment",
                     "description": (
                         "比较装备。无参数时优先返回最早待审查的新装备；也可指定背包中的 item_id。"
@@ -7471,7 +7762,13 @@ class DebugState:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["wait", "advance_dialog", "navigate", "use_item", "equip_item"]},
+                            "action": {
+                                "type": "string",
+                                "enum": [
+                                    "wait", "advance_dialog", "navigate", "use_item",
+                                    "equip_item", "buy_item", "leave_shop",
+                                ],
+                            },
                             "target_id": {"type": "integer", "minimum": 1},
                             "item_id": {"type": "integer", "minimum": 1},
                             "role_id": {"type": "integer", "minimum": 0},
@@ -7639,6 +7936,8 @@ class DebugState:
         if name == "get_inventory":
             limit = self.agent_tool_limit(arguments.get("limit"), 40, 100)
             return {"ok": True, **self.agent_inventory(state, limit=limit)}
+        if name == "get_shop":
+            return self.agent_shop(state, arguments.get("item_id"))
         if name == "get_equipment":
             result = self.agent_equipment(state, arguments.get("item_id"))
             candidate = result.get("candidate") if isinstance(result.get("candidate"), dict) else {}
@@ -7808,6 +8107,8 @@ class DebugState:
                 "legacy_nav_room_id": identity.get("legacy_nav_room_id") if identity else None,
                 "in_main_game": state.get("in_main_game"),
                 "in_battle": state.get("in_battle"),
+                "cash": state.get("cash"),
+                "shop": state.get("shop") if isinstance(state.get("shop"), dict) else None,
                 "party_position": {"x": pos.get("x"), "y": pos.get("y")},
                 "party_direction": state.get("party_direction"),
                 "party": [
@@ -7846,6 +8147,9 @@ class DebugState:
             "dialog.active=true 时提交 {action:'advance_dialog',reason:'...'}。"
             "检查对象或进入传送时提交 {action:'navigate',target_id:<id>,reason:'...'}；服务端根据目标推导语义。"
             "等待时提交 {action:'wait',reason:'...'}。"
+            "shop.active=true 时先调用 get_shop；购买一件商品提交 "
+            "{action:'buy_item',item_id:<id>,reason:'...'}，不购买并退出提交 "
+            "{action:'leave_shop',reason:'...'}。商店选择必须由模型根据现金、持有物和装备比较显式决定。"
             "使用普通队员物品时提交 {action:'use_item',item_id:<id>,role_id:<role>,reason:'...'}；"
             "target_mode=implicit_event_context 时改为 {action:'use_item',item_id:<id>,target:'all',reason:'...'}。"
             "equipment_review.pending=true 时先调用 get_equipment；综合角色定位、属性差值和特殊效果决定是否提交 "
@@ -7853,6 +8157,7 @@ class DebugState:
             "注意 target:'all' 是兼容字段名：对 target_mode=implicit_event_context 的物品，SDLPAL 实际以 0xFFFF "
             "运行使用脚本并沿用最近事件对象，不一定表示对全体队员生效。"
             "不要提交 intent、recommended_action、evidence、risk、alternatives、dry_run 或原始按键。"
+            "不要用固定价格阈值、物品名称规则或规则后端替代模型的购买/退出决策。"
             "不要执行游戏控制，不要声称动作已经执行，也不要包含密钥或 prompts。"
         )
 
@@ -7888,6 +8193,9 @@ class DebugState:
             "将 returns_to_recent_room 和 agent_priority avoid_backtrack 视为回退风险信号；如果选择它们，需要明确说明理由。"
             "对话反馈可以创建或改变目标，但要从提供的对话和状态推断目标，不要匹配固定剧情短语。"
             "如果 dialog.active 为 true，优先选择 advance_dialog。如果 runtime stale、waiting 或 parse-error，建议 wait_runtime。"
+            "如果 shop.active=true，先用 get_shop 查看商品；装备类候选要查看 equipment_comparisons，"
+            "综合现金、已有数量、角色定位、属性差值、特殊效果和任务上下文后，显式选择买一件或退出。"
+            "不确定商品用途或收益时可以退出，但不得把价格或名称当作固定购买规则。"
             "只有在主游戏、非战斗、非对话状态下才可建议 use_inventory_item。先调用 get_inventory，确认物品 usable、"
             "available_amount 大于零，并严格匹配 apply_to_all 的目标形式。可结合物品名称、队伍 HP/MP、任务与剧情上下文"
             "保守推断用途；用途或收益证据不足时不要仅因 usable=true 就建议使用，并在 reason 中说明关键权衡。"
@@ -7957,6 +8265,18 @@ class DebugState:
             intent, preview = "use_inventory_item", self.action_preview("use_item", args)
             evidence["item_id"] = args["item_id"]
             risk = "Item availability, target mode, and consumption risk will be validated against the latest inventory."
+        elif action == "buy_item":
+            item_id = int(raw["item_id"])
+            args = {"item_id": item_id}
+            shop = self.agent_shop(state, item_id)
+            intent, preview = "purchase_shop_item", self.action_preview("shop_buy", args)
+            evidence["item_id"] = item_id
+            evidence["shop_item"] = shop.get("item")
+            evidence["equipment_comparisons"] = shop.get("equipment_comparisons")
+            risk = "The active store, offered item, price, and cash will be revalidated before buying exactly one item."
+        elif action == "leave_shop":
+            intent, preview = "leave_shop", self.action_preview("shop_leave", {})
+            risk = "The active purchase menu will be closed without buying an item."
         else:
             item_id = int(raw["item_id"])
             role_id = int(raw["role_id"])
@@ -7994,8 +8314,19 @@ class DebugState:
             if key not in allowed_keys:
                 issues.append({"field": key, "code": "unsupported_field", "message": f"{key} is not part of the minimal decision contract"})
         action = raw.get("action")
-        if action not in {"wait", "advance_dialog", "navigate", "use_item", "equip_item"}:
-            issues.append({"field": "action", "code": "invalid_action", "message": "action must be wait, advance_dialog, navigate, use_item, or equip_item"})
+        allowed_actions = {
+            "wait", "advance_dialog", "navigate", "use_item", "equip_item",
+            "buy_item", "leave_shop",
+        }
+        if action not in allowed_actions:
+            issues.append({
+                "field": "action",
+                "code": "invalid_action",
+                "message": (
+                    "action must be wait, advance_dialog, navigate, use_item, "
+                    "equip_item, buy_item, or leave_shop"
+                ),
+            })
         if not isinstance(raw.get("reason"), str) or not raw.get("reason", "").strip():
             issues.append({"field": "reason", "code": "invalid_reason", "message": "reason must be a non-empty string"})
         elif len(raw["reason"]) > 300:
@@ -8022,12 +8353,16 @@ class DebugState:
                 issues.append({"field": "item_id", "code": "invalid_item_id", "message": "equip_item requires a positive item_id"})
             if positive_int("role_id", allow_zero=True) is None:
                 issues.append({"field": "role_id", "code": "invalid_role_id", "message": "equip_item requires a non-negative role_id"})
+        if action == "buy_item" and positive_int("item_id") is None:
+            issues.append({"field": "item_id", "code": "invalid_item_id", "message": "buy_item requires a positive item_id"})
         relevant_keys = {
             "wait": {"action", "reason"},
             "advance_dialog": {"action", "reason"},
             "navigate": {"action", "target_id", "reason"},
             "use_item": {"action", "item_id", "role_id", "target", "reason"},
             "equip_item": {"action", "item_id", "role_id", "reason"},
+            "buy_item": {"action", "item_id", "reason"},
+            "leave_shop": {"action", "reason"},
         }.get(action)
         if relevant_keys:
             for key in raw.keys() - relevant_keys:
@@ -8036,6 +8371,52 @@ class DebugState:
         if not issues:
             return None
         return {"ok": False, "error": {"code": "invalid_decision_submission", "message": "submit_decision was not accepted. Correct the listed fields and call submit_decision again.", "issues": issues}}
+
+    def shop_action_validation_error(
+        self,
+        state: dict,
+        action: str,
+        args: dict,
+        check_pending: bool = True,
+    ) -> str | None:
+        if state.get("status") not in {None, "ok"}:
+            return str(state.get("status"))
+        if not state.get("in_main_game"):
+            return "not_in_main_game"
+        if state.get("in_battle"):
+            return "in_battle"
+        if self.live_info("state").get("stale", True):
+            return "runtime_stale"
+        if check_pending and self.action_pending(state):
+            return "action_pending"
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
+        if not shop or shop.get("active") is not True or shop.get("mode") != "buy":
+            return "shop_inactive"
+        if action == "shop_leave":
+            return None
+        if action != "shop_buy":
+            return "invalid_shop_action"
+        try:
+            item_id = int(args.get("item_id") or 0)
+        except (TypeError, ValueError):
+            item_id = 0
+        item = next(
+            (
+                entry for entry in shop.get("items") or []
+                if isinstance(entry, dict) and int(entry.get("item_id") or 0) == item_id
+            ),
+            None,
+        )
+        if item_id <= 0 or not isinstance(item, dict):
+            return "item_not_offered"
+        try:
+            price = int(item.get("price") or 0)
+            cash = int(state.get("cash") or 0)
+        except (TypeError, ValueError):
+            return "invalid_shop_state"
+        if price > cash or item.get("affordable") is not True:
+            return "insufficient_cash"
+        return None
 
     def use_item_validation_error(self, state: dict, args: dict, check_pending: bool = True) -> str | None:
         if state.get("status") not in {None, "ok"}:
@@ -8047,9 +8428,12 @@ class DebugState:
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         if dialog.get("active"):
             return "in_dialog"
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        if shop.get("active"):
+            return "in_shop"
         if self.live_info("state").get("stale", True):
             return "runtime_stale"
-        if check_pending and self.action_path.exists():
+        if check_pending and self.action_pending(state):
             return "action_pending"
 
         try:
@@ -8113,9 +8497,12 @@ class DebugState:
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         if dialog.get("active"):
             return "in_dialog"
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        if shop.get("active"):
+            return "in_shop"
         if self.live_info("state").get("stale", True):
             return "runtime_stale"
-        if check_pending and self.action_path.exists():
+        if check_pending and self.action_pending(state):
             return "action_pending"
         try:
             item_id = int(args.get("item_id") or 0)
@@ -8190,8 +8577,47 @@ class DebugState:
 
     def validate_agent_decision(self, decision: dict) -> dict:
         action = decision.get("recommended_action") if isinstance(decision.get("recommended_action"), dict) else {}
+        tool = action.get("tool")
+        latest_state = self.read_live_state()
+        shop = latest_state.get("shop") if isinstance(latest_state.get("shop"), dict) else {}
+        shop_active = shop.get("active") is True
+        if tool in {"shop_buy", "shop_leave"}:
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            error = self.shop_action_validation_error(latest_state, tool, args)
+            if error is None:
+                return decision
+            self.reject_agent_decision(
+                decision,
+                "shop_action_invalid",
+                action=tool,
+                item_id=args.get("item_id"),
+                error=error,
+            )
+            decision.setdefault("evidence", {})["validation_state_context"] = self.state_context(latest_state)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "shop_action_invalid", "error": error}
+            )
+            decision["risk"] = (
+                f"{decision.get('risk') or ''} Latest-state validation rejected the shop action: {error}."
+            ).strip()
+            return decision
+        if shop_active:
+            self.reject_agent_decision(
+                decision,
+                "in_shop",
+                action=tool,
+                store_id=shop.get("store_id"),
+                phase=shop.get("phase"),
+            )
+            decision.setdefault("evidence", {})["validation_state_context"] = self.state_context(latest_state)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "in_shop", "required_actions": ["buy_item", "leave_shop"]}
+            )
+            decision["risk"] = "A purchase menu is active; only an explicit model buy_item or leave_shop decision is executable."
+            return decision
         if action.get("tool") == "equip_item":
-            latest_state = self.read_live_state()
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
             error = self.equip_item_validation_error(latest_state, args)
             if error is None:
@@ -8213,7 +8639,6 @@ class DebugState:
             ).strip()
             return decision
         if action.get("tool") == "use_item":
-            latest_state = self.read_live_state()
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
             error = self.use_item_validation_error(latest_state, args)
             if error is None:
@@ -8358,6 +8783,13 @@ class DebugState:
                 except (TypeError, ValueError):
                     pass
             return result
+        if tool == "shop_buy":
+            try:
+                return {"item_id": int(args.get("item_id") or 0)}
+            except (TypeError, ValueError):
+                return {"item_id": 0}
+        if tool == "shop_leave":
+            return {}
         return dict(args)
 
     def parse_model_json(self, content: str) -> dict:
@@ -8690,14 +9122,18 @@ class DebugState:
             raise ValueError(f"invalid buttons: {', '.join(invalid)}")
         frames = max(1, min(int(frames), 300))
         with self.action_lock:
-            if self.action_path.exists():
+            if self.action_pending():
                 raise RuntimeError("action_pending")
 
             lines = [f"frames {frames}"]
             lines.extend(f"button {button}" for button in buttons)
-            self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")
-
             entry = {"time": time.time(), "buttons": buttons, "frames": frames}
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")
+            except Exception:
+                self.pending_written_action = None
+                raise
             self.action_log.append(entry)
             self.append_navigation_diagnostic("action_written", {"action": entry})
             return entry
@@ -8732,9 +9168,6 @@ class DebugState:
             except FileNotFoundError:
                 pass
 
-            lines = [f"use_item {item_id} {target_value}"]
-            self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")
-
             entry = {
                 "time": time.time(),
                 "command": "use_item",
@@ -8742,6 +9175,16 @@ class DebugState:
                 "role_id": role_value,
                 "target": "all" if target_value == "all" else "role",
             }
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(
+                    self.action_path,
+                    f"use_item {item_id} {target_value}\n",
+                    encoding="ascii",
+                )
+            except Exception:
+                self.pending_written_action = None
+                raise
             self.action_log.append(entry)
             self.append_navigation_diagnostic("action_written", {"action": entry})
             return entry
@@ -8797,17 +9240,22 @@ class DebugState:
                 self.action_result_path.unlink()
             except FileNotFoundError:
                 pass
-            self.atomic_write_text(
-                self.action_path,
-                f"equip_item {item_id} {role_id}\n",
-                encoding="ascii",
-            )
             entry = {
                 "time": start_time,
                 "command": "equip_item",
                 "item_id": item_id,
                 "role_id": role_id,
             }
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(
+                    self.action_path,
+                    f"equip_item {item_id} {role_id}\n",
+                    encoding="ascii",
+                )
+            except Exception:
+                self.pending_written_action = None
+                raise
             self.action_log.append(entry)
             self.append_navigation_diagnostic("action_written", {"action": entry})
         result = self.wait_for_item_action_result(
@@ -8815,6 +9263,70 @@ class DebugState:
         )
         if not result.get("ok"):
             raise RuntimeError(str(result.get("error") or result.get("status") or "equip_item_failed"))
+        return {**entry, "result": result}
+
+    def wait_for_shop_action_result(
+        self,
+        action: str,
+        item_id: int,
+        start_time: float,
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = self.file_info(self.action_result_path)
+            if info.get("available") and float(info.get("mtime") or 0) >= start_time:
+                result = read_optional_json(self.action_result_path)
+                try:
+                    result_item_id = int(result.get("item_id") or 0)
+                except (TypeError, ValueError):
+                    result_item_id = -1
+                if result.get("action") == action and result_item_id == item_id:
+                    return result
+            time.sleep(0.03)
+        raise TimeoutError(f"{action} {item_id} did not complete")
+
+    def write_shop_action(self, action: str, item_id: int | None = None) -> dict:
+        if action not in {"shop_buy", "shop_leave"}:
+            raise ValueError("action must be shop_buy or shop_leave")
+        try:
+            normalized_item_id = int(item_id or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("item_id must be an integer") from exc
+        args = {"item_id": normalized_item_id} if action == "shop_buy" else {}
+        start_time = time.time()
+        with self.action_lock:
+            state = self.read_live_state()
+            error = self.shop_action_validation_error(state, action, args)
+            if error is not None:
+                raise RuntimeError(error)
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            entry = {
+                "time": start_time,
+                "command": action,
+                "item_id": normalized_item_id,
+            }
+            self.begin_written_action(entry)
+            line = (
+                f"shop_buy {normalized_item_id}\n"
+                if action == "shop_buy"
+                else "shop_leave 1\n"
+            )
+            try:
+                self.atomic_write_text(self.action_path, line, encoding="ascii")
+            except Exception:
+                self.pending_written_action = None
+                raise
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+        result = self.wait_for_shop_action_result(
+            action, normalized_item_id, start_time
+        )
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or result.get("status") or f"{action}_failed"))
         return {**entry, "result": result}
 
 

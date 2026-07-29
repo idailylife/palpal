@@ -342,6 +342,163 @@ def test_action_file_writers_validate_and_replace_results(tmp_path):
         debug.write_slot_action("load_slot", 12)
 
 
+def test_native_action_handshake_closes_consumed_file_race(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "game_instance_id": "game-a",
+        "agent_action": {
+            "generation": 7,
+            "pending": False,
+            "remaining_steps": 0,
+            "waiting_for_move": False,
+        },
+    }
+    write_state(debug, state)
+
+    action = debug.write_action(["up", "up"], 1)
+    assert action["game_instance_id"] == "game-a"
+    assert action["action_generation_before"] == 7
+    assert action["action_handshake_supported"] is True
+
+    debug.action_path.unlink()
+    assert debug.action_pending() is True
+    with pytest.raises(RuntimeError, match="action_pending"):
+        debug.write_action(["down"], 1)
+
+    state["agent_action"] = {
+        "generation": 8,
+        "pending": True,
+        "remaining_steps": 2,
+        "waiting_for_move": True,
+    }
+    write_state(debug, state)
+    assert debug.pending_written_action is None
+    assert debug.action_pending() is True
+    assert debug.snapshot()["_debug"]["action_pending"] is True
+    assert debug.navigation_step(state, 1)["status"] == "action_pending"
+
+    state["agent_action"] = {
+        "generation": 8,
+        "pending": False,
+        "remaining_steps": 0,
+        "waiting_for_move": False,
+    }
+    write_state(debug, state)
+    assert debug.action_pending() is False
+
+
+def test_missing_native_action_uses_legacy_file_compatibility(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug, {**make_state(), "game_instance_id": "old-game"})
+
+    action = debug.write_action(["search"], 1)
+
+    assert action["action_handshake_supported"] is False
+    assert debug.pending_written_action is None
+    assert debug.action_pending() is True
+    debug.action_path.unlink()
+    assert debug.action_pending() is False
+
+
+def test_native_pending_blocks_item_and_equipment_validation_without_action_file(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "game_instance_id": "game-a",
+        "agent_action": {
+            "generation": 12,
+            "pending": True,
+            "remaining_steps": 1,
+            "waiting_for_move": True,
+        },
+    }
+    write_state(debug, state)
+
+    assert debug.use_item_validation_error(state, {"item_id": 1, "role_id": 0}) == "action_pending"
+    assert debug.equip_item_validation_error(state, {"item_id": 1, "role_id": 0}) == "action_pending"
+
+
+def test_shop_action_writer_uses_structured_native_command(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "cash": 600,
+        "game_instance_id": "game-a",
+        "agent_action": {
+            "generation": 12,
+            "pending": False,
+            "remaining_steps": 0,
+            "waiting_for_move": False,
+        },
+        "shop": {
+            "active": True,
+            "mode": "buy",
+            "store_id": 7,
+            "phase": "select",
+            "selected_index": 0,
+            "selected_item_id": 201,
+            "items": [{
+                "index": 0,
+                "item_id": 201,
+                "price": 400,
+                "affordable": True,
+            }],
+        },
+    }
+    write_state(debug, state)
+    monkeypatch.setattr(
+        debug,
+        "wait_for_shop_action_result",
+        lambda action, item_id, start_time: {
+            "ok": True,
+            "status": "purchased",
+            "action": action,
+            "item_id": item_id,
+            "store_id": 7,
+        },
+    )
+
+    result = debug.write_shop_action("shop_buy", 201)
+
+    assert debug.action_path.read_text(encoding="ascii") == "shop_buy 201\n"
+    assert result["command"] == "shop_buy"
+    assert result["action_generation_before"] == 12
+    assert result["result"]["status"] == "purchased"
+
+
+def test_shop_validation_blocks_other_inventory_actions(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "cash": 600,
+        "shop": {
+            "active": True,
+            "mode": "buy",
+            "store_id": 7,
+            "phase": "select",
+            "items": [{"item_id": 201, "price": 400, "affordable": True}],
+        },
+        "party": [{"role_id": 0, "equipment": []}],
+        "inventory": [{
+            "item_id": 201,
+            "amount": 1,
+            "amount_in_use": 0,
+            "usable": True,
+            "apply_to_all": False,
+            "equipable": True,
+            "equipable_role_ids": [0],
+            "equipment_effect": {"slot_id": 0},
+        }],
+    }
+    write_state(debug, state)
+
+    assert debug.shop_action_validation_error(state, "shop_buy", {"item_id": 201}) is None
+    assert debug.shop_action_validation_error(state, "shop_leave", {}) is None
+    assert debug.use_item_validation_error(state, {"item_id": 201, "role_id": 0}) == "in_shop"
+    assert debug.equip_item_validation_error(state, {"item_id": 201, "role_id": 0}) == "in_shop"
+
+
 @pytest.mark.parametrize(
     ("state_update", "expected"),
     [

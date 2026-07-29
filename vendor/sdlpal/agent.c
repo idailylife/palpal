@@ -67,6 +67,7 @@ typedef struct tagPALPALACTIONSTEP
 static PALPALACTIONSTEP g_agent_action_queue[PALPAL_AGENT_MAX_ACTION_STEPS];
 static int g_agent_action_count = 0;
 static int g_agent_action_index = 0;
+static DWORD g_agent_action_generation = 0;
 static DWORD g_agent_last_action_ticks = 0;
 static BOOL g_agent_waiting_for_move = FALSE;
 static int g_agent_wait_x = 0;
@@ -74,6 +75,33 @@ static int g_agent_wait_y = 0;
 static DWORD g_agent_wait_ticks = 0;
 
 static VOID PALPAL_AgentClearActionQueue(VOID);
+
+typedef enum tagPALPALAGENTSHOPPHASE
+{
+   kPalpalAgentShopPhaseSelect = 0,
+   kPalpalAgentShopPhaseConfirm
+} PALPALAGENTSHOPPHASE;
+
+typedef enum tagPALPALAGENTSHOPCOMMAND
+{
+   kPalpalAgentShopCommandNone = 0,
+   kPalpalAgentShopCommandBuy,
+   kPalpalAgentShopCommandLeave
+} PALPALAGENTSHOPCOMMAND;
+
+typedef struct tagPALPALAGENTSHOP
+{
+   BOOL active;
+   WORD store_id;
+   WORD selected_item_id;
+   int selected_index;
+   int item_count;
+   PALPALAGENTSHOPPHASE phase;
+   PALPALAGENTSHOPCOMMAND command;
+   WORD command_item_id;
+} PALPALAGENTSHOP;
+
+static PALPALAGENTSHOP g_agent_shop;
 
 typedef enum tagPALPALAGENTSLOTCOMMAND
 {
@@ -978,6 +1006,70 @@ PALPAL_AgentWriteEquipResult(
 }
 
 static VOID
+PALPAL_AgentWriteShopResult(
+   BOOL ok,
+   const char *status,
+   const char *action,
+   WORD store_id,
+   WORD item_id,
+   WORD price,
+   DWORD cash_before,
+   DWORD cash_after,
+   int owned_before,
+   int owned_after,
+   const char *error
+)
+{
+   char result_path[PAL_MAX_PATH];
+   char tmp_path[PAL_MAX_PATH];
+   FILE *fp;
+
+   PALPAL_AgentPath(result_path, sizeof(result_path), "action_result.json");
+   PALPAL_AgentPath(tmp_path, sizeof(tmp_path), "action_result.json.tmp");
+   fp = fopen(tmp_path, "w");
+   if (!fp)
+   {
+      return;
+   }
+
+   fprintf(fp,
+      "{\"time_ms\":%u,"
+      "\"ok\":%s,"
+      "\"status\":\"%s\","
+      "\"action\":\"%s\","
+      "\"store_id\":%u,"
+      "\"item_id\":%u,"
+      "\"price\":%u,"
+      "\"cash_before\":%u,"
+      "\"cash_after\":%u,"
+      "\"owned_before\":%d,"
+      "\"owned_after\":%d,"
+      "\"error\":",
+      (unsigned int)SDL_GetTicks(),
+      ok ? "true" : "false",
+      status ? status : "unknown",
+      action ? action : "unknown",
+      (unsigned int)store_id,
+      (unsigned int)item_id,
+      (unsigned int)price,
+      (unsigned int)cash_before,
+      (unsigned int)cash_after,
+      owned_before,
+      owned_after);
+   if (error && error[0])
+   {
+      fprintf(fp, "\"%s\"", error);
+   }
+   else
+   {
+      fputs("null", fp);
+   }
+   fputs("}\n", fp);
+   fclose(fp);
+   rename(tmp_path, result_path);
+}
+
+static VOID
 PALPAL_AgentWriteSlotResult(
    BOOL ok,
    const char *status,
@@ -1291,6 +1383,11 @@ PALPAL_AgentUseItem(
       PALPAL_AgentWriteActionResult(FALSE, "in_dialog", item_id, role_id, target_all, FALSE, FALSE, "in_dialog");
       return;
    }
+   if (g_agent_shop.active)
+   {
+      PALPAL_AgentWriteActionResult(FALSE, "in_shop", item_id, role_id, target_all, FALSE, FALSE, "in_shop");
+      return;
+   }
    if (item_id == 0 || item_id >= MAX_OBJECTS)
    {
       PALPAL_AgentWriteActionResult(FALSE, "invalid_item", item_id, role_id, target_all, FALSE, FALSE, "invalid_item");
@@ -1366,6 +1463,11 @@ PALPAL_AgentEquipItem(
    if (PAL_IsInDialog())
    {
       PALPAL_AgentWriteEquipResult(FALSE, "in_dialog", item_id, role_id, -1, 0, "in_dialog");
+      return;
+   }
+   if (g_agent_shop.active)
+   {
+      PALPAL_AgentWriteEquipResult(FALSE, "in_shop", item_id, role_id, -1, 0, "in_shop");
       return;
    }
    if (item_id == 0 || item_id >= MAX_OBJECTS)
@@ -1467,6 +1569,138 @@ PALPAL_AgentQueueButton(
    g_agent_action_count++;
 }
 
+static VOID
+PALPAL_AgentQueueMenuButton(
+   DWORD button
+)
+{
+   if (button == kKeyNone || g_agent_action_count >= PALPAL_AGENT_MAX_ACTION_STEPS)
+   {
+      return;
+   }
+   g_agent_action_queue[g_agent_action_count].buttons = button;
+   g_agent_action_queue[g_agent_action_count].dir = kDirUnknown;
+   g_agent_action_count++;
+}
+
+static int
+PALPAL_AgentShopItemIndex(
+   WORD item_id
+)
+{
+   int i;
+
+   if (!g_agent_shop.active || gpGlobals == NULL ||
+      g_agent_shop.store_id >= gpGlobals->g.nStore)
+   {
+      return -1;
+   }
+   for (i = 0; i < MAX_STORE_ITEM; i++)
+   {
+      WORD offered = gpGlobals->g.lprgStore[g_agent_shop.store_id].rgwItems[i];
+      if (offered == 0)
+      {
+         break;
+      }
+      if (offered == item_id)
+      {
+         return i;
+      }
+   }
+   return -1;
+}
+
+static VOID
+PALPAL_AgentQueueShopBuy(
+   WORD item_id
+)
+{
+   int target_index;
+   int steps;
+   WORD price = 0;
+
+   if (!g_agent_shop.active)
+   {
+      PALPAL_AgentWriteShopResult(FALSE, "shop_inactive", "shop_buy", 0, item_id,
+         0, 0, 0, 0, 0, "shop_inactive");
+      return;
+   }
+   if (g_agent_shop.command != kPalpalAgentShopCommandNone)
+   {
+      PALPAL_AgentWriteShopResult(FALSE, "shop_action_pending", "shop_buy",
+         g_agent_shop.store_id, item_id, 0, gpGlobals->dwCash, gpGlobals->dwCash,
+         0, 0, "shop_action_pending");
+      return;
+   }
+   target_index = PALPAL_AgentShopItemIndex(item_id);
+   if (target_index < 0)
+   {
+      PALPAL_AgentWriteShopResult(FALSE, "item_not_offered", "shop_buy",
+         g_agent_shop.store_id, item_id, 0, gpGlobals->dwCash, gpGlobals->dwCash,
+         0, 0, "item_not_offered");
+      return;
+   }
+   price = gpGlobals->g.rgObject[item_id].item.wPrice;
+   if (price > gpGlobals->dwCash)
+   {
+      PALPAL_AgentWriteShopResult(FALSE, "insufficient_cash", "shop_buy",
+         g_agent_shop.store_id, item_id, price, gpGlobals->dwCash, gpGlobals->dwCash,
+         0, 0, "insufficient_cash");
+      return;
+   }
+
+   g_agent_shop.command = kPalpalAgentShopCommandBuy;
+   g_agent_shop.command_item_id = item_id;
+   if (g_agent_shop.phase == kPalpalAgentShopPhaseConfirm)
+   {
+      if (g_agent_shop.selected_item_id == item_id)
+      {
+         PALPAL_AgentQueueMenuButton(kKeyDown);
+         PALPAL_AgentQueueMenuButton(kKeySearch);
+         return;
+      }
+      PALPAL_AgentQueueMenuButton(kKeyMenu);
+   }
+
+   steps = (target_index - g_agent_shop.selected_index + g_agent_shop.item_count) %
+      g_agent_shop.item_count;
+   while (steps-- > 0)
+   {
+      PALPAL_AgentQueueMenuButton(kKeyDown);
+   }
+   PALPAL_AgentQueueMenuButton(kKeySearch);
+   PALPAL_AgentQueueMenuButton(kKeyDown);
+   PALPAL_AgentQueueMenuButton(kKeySearch);
+}
+
+static VOID
+PALPAL_AgentQueueShopLeave(
+   VOID
+)
+{
+   if (!g_agent_shop.active)
+   {
+      PALPAL_AgentWriteShopResult(FALSE, "shop_inactive", "shop_leave", 0, 0,
+         0, 0, 0, 0, 0, "shop_inactive");
+      return;
+   }
+   if (g_agent_shop.command != kPalpalAgentShopCommandNone)
+   {
+      PALPAL_AgentWriteShopResult(FALSE, "shop_action_pending", "shop_leave",
+         g_agent_shop.store_id, 0, 0, gpGlobals->dwCash, gpGlobals->dwCash,
+         0, 0, "shop_action_pending");
+      return;
+   }
+
+   g_agent_shop.command = kPalpalAgentShopCommandLeave;
+   g_agent_shop.command_item_id = 0;
+   if (g_agent_shop.phase == kPalpalAgentShopPhaseConfirm)
+   {
+      PALPAL_AgentQueueMenuButton(kKeyMenu);
+   }
+   PALPAL_AgentQueueMenuButton(kKeyMenu);
+}
+
 static BOOL
 PALPAL_AgentPartyPosition(
    int *x,
@@ -1495,6 +1729,19 @@ PALPAL_AgentClearActionQueue(
    g_agent_last_action_ticks = 0;
 }
 
+static int
+PALPAL_AgentRemainingActionSteps(
+   VOID
+)
+{
+   int remaining = g_agent_action_count - g_agent_action_index;
+   if (g_agent_waiting_for_move)
+   {
+      remaining++;
+   }
+   return remaining > 0 ? remaining : 0;
+}
+
 static VOID
 PALPAL_AgentLoadActionFile(
    VOID
@@ -1505,6 +1752,8 @@ PALPAL_AgentLoadActionFile(
    char line[128];
    BOOL pending_use_item = FALSE;
    BOOL pending_equip_item = FALSE;
+   BOOL pending_shop_buy = FALSE;
+   BOOL pending_shop_leave = FALSE;
    BOOL pending_target_all = FALSE;
    WORD pending_item_id = 0;
    WORD pending_role_id = 0;
@@ -1575,6 +1824,15 @@ PALPAL_AgentLoadActionFile(
             pending_equip_role_id = (WORD)atoi(target);
          }
       }
+      else if (strcmp(key, "shop_buy") == 0)
+      {
+         pending_shop_buy = TRUE;
+         pending_item_id = (WORD)atoi(value);
+      }
+      else if (strcmp(key, "shop_leave") == 0)
+      {
+         pending_shop_leave = TRUE;
+      }
       else if (strcmp(key, "save_slot") == 0)
       {
          pending_slot_command = kPalpalAgentSlotCommandSave;
@@ -1593,7 +1851,20 @@ PALPAL_AgentLoadActionFile(
    }
 
    fclose(fp);
-   remove(path);
+   if (remove(path) != 0)
+   {
+      PALPAL_AgentClearActionQueue();
+      return;
+   }
+   g_agent_action_generation++;
+   if (pending_shop_buy)
+   {
+      PALPAL_AgentQueueShopBuy(pending_item_id);
+   }
+   else if (pending_shop_leave)
+   {
+      PALPAL_AgentQueueShopLeave();
+   }
    g_agent_action_pending = (g_agent_action_count > 0);
    if (pending_slot_command == kPalpalAgentSlotCommandSave)
    {
@@ -1615,6 +1886,125 @@ PALPAL_AgentLoadActionFile(
    {
       PALPAL_AgentEquipItem(pending_equip_item_id, pending_equip_role_id);
    }
+}
+
+VOID
+PALPAL_AgentBeginBuyMenu(
+   WORD wStoreNum,
+   WORD wSelectedItem
+)
+{
+   int i;
+
+   memset(&g_agent_shop, 0, sizeof(g_agent_shop));
+   if (!PALPAL_AgentEnabled() || gpGlobals == NULL || wStoreNum >= gpGlobals->g.nStore)
+   {
+      return;
+   }
+   g_agent_shop.active = TRUE;
+   g_agent_shop.store_id = wStoreNum;
+   g_agent_shop.selected_item_id = wSelectedItem;
+   g_agent_shop.selected_index = 0;
+   g_agent_shop.phase = kPalpalAgentShopPhaseSelect;
+   for (i = 0; i < MAX_STORE_ITEM; i++)
+   {
+      if (gpGlobals->g.lprgStore[wStoreNum].rgwItems[i] == 0)
+      {
+         break;
+      }
+   }
+   g_agent_shop.item_count = i;
+}
+
+VOID
+PALPAL_AgentObserveBuyMenuSelection(
+   WORD wSelectedItem
+)
+{
+   int index;
+
+   if (!g_agent_shop.active)
+   {
+      return;
+   }
+   index = PALPAL_AgentShopItemIndex(wSelectedItem);
+   if (index >= 0)
+   {
+      g_agent_shop.selected_item_id = wSelectedItem;
+      g_agent_shop.selected_index = index;
+   }
+}
+
+VOID
+PALPAL_AgentObserveBuyMenuPhase(
+   BOOL fConfirming
+)
+{
+   if (g_agent_shop.active)
+   {
+      g_agent_shop.phase = fConfirming
+         ? kPalpalAgentShopPhaseConfirm
+         : kPalpalAgentShopPhaseSelect;
+   }
+}
+
+VOID
+PALPAL_AgentObserveBuyMenuResult(
+   WORD wItem,
+   BOOL fPurchased,
+   DWORD dwCashBefore,
+   DWORD dwCashAfter,
+   INT iOwnedBefore,
+   INT iOwnedAfter
+)
+{
+   WORD price;
+
+   if (!g_agent_shop.active ||
+      g_agent_shop.command != kPalpalAgentShopCommandBuy ||
+      g_agent_shop.command_item_id != wItem)
+   {
+      return;
+   }
+   price = gpGlobals->g.rgObject[wItem].item.wPrice;
+   PALPAL_AgentWriteShopResult(
+      fPurchased,
+      fPurchased ? "purchased" : "purchase_cancelled",
+      "shop_buy",
+      g_agent_shop.store_id,
+      wItem,
+      price,
+      dwCashBefore,
+      dwCashAfter,
+      iOwnedBefore,
+      iOwnedAfter,
+      fPurchased ? NULL : "purchase_cancelled");
+   g_agent_shop.command = kPalpalAgentShopCommandNone;
+   g_agent_shop.command_item_id = 0;
+}
+
+VOID
+PALPAL_AgentEndBuyMenu(
+   VOID
+)
+{
+   if (!g_agent_shop.active)
+   {
+      return;
+   }
+   if (g_agent_shop.command == kPalpalAgentShopCommandLeave)
+   {
+      PALPAL_AgentWriteShopResult(TRUE, "left", "shop_leave",
+         g_agent_shop.store_id, 0, 0, gpGlobals->dwCash, gpGlobals->dwCash,
+         0, 0, NULL);
+   }
+   else if (g_agent_shop.command == kPalpalAgentShopCommandBuy)
+   {
+      PALPAL_AgentWriteShopResult(FALSE, "shop_closed", "shop_buy",
+         g_agent_shop.store_id, g_agent_shop.command_item_id, 0,
+         gpGlobals->dwCash, gpGlobals->dwCash, 0, 0, "shop_closed");
+   }
+   memset(&g_agent_shop, 0, sizeof(g_agent_shop));
 }
 
 VOID
@@ -2033,6 +2423,53 @@ PALPAL_AgentWriteInventory(
       first = 0;
    }
    fprintf(fp, "]");
+}
+
+static VOID
+PALPAL_AgentWriteShop(
+   FILE *fp
+)
+{
+   int i;
+
+   fprintf(fp, "\"shop\":");
+   if (!g_agent_shop.active || gpGlobals == NULL ||
+      g_agent_shop.store_id >= gpGlobals->g.nStore)
+   {
+      fputs("null", fp);
+      return;
+   }
+
+   fprintf(fp,
+      "{\"active\":true,\"mode\":\"buy\",\"store_id\":%u,"
+      "\"phase\":\"%s\",\"selected_index\":%d,\"selected_item_id\":%u,"
+      "\"items\":[",
+      (unsigned int)g_agent_shop.store_id,
+      g_agent_shop.phase == kPalpalAgentShopPhaseConfirm ? "confirm" : "select",
+      g_agent_shop.selected_index,
+      (unsigned int)g_agent_shop.selected_item_id);
+   for (i = 0; i < g_agent_shop.item_count; i++)
+   {
+      WORD item_id = gpGlobals->g.lprgStore[g_agent_shop.store_id].rgwItems[i];
+      int inventory_count = PAL_GetItemAmount(item_id);
+      int equipped_count = PALPAL_AgentEquippedCount(item_id);
+      WORD price = gpGlobals->g.rgObject[item_id].item.wPrice;
+      if (i > 0)
+      {
+         fprintf(fp, ",");
+      }
+      fprintf(fp, "{\"index\":%d,", i);
+      PALPAL_AgentWriteItemMetadata(fp, item_id);
+      fprintf(fp,
+         ",\"inventory_count\":%d,\"equipped_count\":%d,\"owned_count\":%d,"
+         "\"affordable\":%s,\"selected\":%s}",
+         inventory_count,
+         equipped_count,
+         inventory_count + equipped_count,
+         price <= gpGlobals->dwCash ? "true" : "false",
+         i == g_agent_shop.selected_index ? "true" : "false");
+   }
+   fprintf(fp, "]}");
 }
 
 static VOID
@@ -3058,6 +3495,13 @@ PALPAL_AgentWriteState(
 
    fprintf(fp, "{");
    fprintf(fp, "\"game_instance_id\":\"%s\",", g_agent_game_instance_id);
+   fprintf(fp,
+      "\"agent_action\":{\"generation\":%u,\"pending\":%s,"
+      "\"remaining_steps\":%d,\"waiting_for_move\":%s},",
+      (unsigned int)g_agent_action_generation,
+      (g_agent_action_pending || g_agent_action_count > 0 || g_agent_waiting_for_move) ? "true" : "false",
+      PALPAL_AgentRemainingActionSteps(),
+      g_agent_waiting_for_move ? "true" : "false");
    fprintf(fp, "\"frame\":%u,", (unsigned int)gpGlobals->dwFrameNum);
    fprintf(fp, "\"in_main_game\":%s,", gpGlobals->fInMainGame ? "true" : "false");
    fprintf(fp, "\"in_battle\":%s,", gpGlobals->fInBattle ? "true" : "false");
@@ -3101,6 +3545,8 @@ PALPAL_AgentWriteState(
    PALPAL_AgentWriteRoom(fp, gpGlobals->wNumScene, map_id, player_x, player_y);
    fprintf(fp, ",");
    PALPAL_AgentWriteDialog(fp);
+   fprintf(fp, ",");
+   PALPAL_AgentWriteShop(fp);
    fprintf(fp, ",");
 
    PALPAL_AgentWriteParty(fp);

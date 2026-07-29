@@ -74,6 +74,37 @@ PALPAL_AgentObserveDialogText(
    LPCWSTR    lpszText
 );
 
+VOID
+PALPAL_AgentBeginBuyMenu(
+   WORD       wStoreNum,
+   WORD       wSelectedItem
+);
+
+VOID
+PALPAL_AgentObserveBuyMenuSelection(
+   WORD       wSelectedItem
+);
+
+VOID
+PALPAL_AgentObserveBuyMenuPhase(
+   BOOL       fConfirming
+);
+
+VOID
+PALPAL_AgentObserveBuyMenuResult(
+   WORD       wItem,
+   BOOL       fPurchased,
+   DWORD      dwCashBefore,
+   DWORD      dwCashAfter,
+   INT        iOwnedBefore,
+   INT        iOwnedAfter
+);
+
+VOID
+PALPAL_AgentEndBuyMenu(
+   VOID
+);
+
 /* Record that a concrete event object's trigger script ran.  This is used by
  * the companion to attribute a later room change without guessing from map
  * geometry alone. */

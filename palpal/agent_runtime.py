@@ -15,7 +15,10 @@ from typing import Any, Callable
 
 
 RUNNING_PHASES = {"running", "interrupting"}
-EXECUTABLE_TOOLS = {"press_buttons", "advance_dialog", "navigation_step", "use_item", "equip_item"}
+EXECUTABLE_TOOLS = {
+    "press_buttons", "advance_dialog", "navigation_step", "use_item",
+    "equip_item", "shop_buy", "shop_leave",
+}
 CHECKPOINT_BUNDLE_VERSION = 2
 DEFAULT_COMPACT_AT_TOKENS = 128_000
 TOOL_OUTPUT_FULL_TOKENS = 8_000
@@ -1493,10 +1496,16 @@ exploration value, and maintained local tasks to choose the next action.
         action = decision.get("recommended_action") or {}
         tool = action.get("tool")
         dialog_active = bool((state.get("dialog") or {}).get("active"))
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        shop_active = shop.get("active") is True
         if dialog_active and tool != "advance_dialog":
             return "in_dialog"
         if not dialog_active and tool == "advance_dialog":
             return "dialog_inactive"
+        if shop_active and tool not in {"shop_buy", "shop_leave"}:
+            return "in_shop"
+        if not shop_active and tool in {"shop_buy", "shop_leave"}:
+            return "shop_inactive"
         return None
 
     @staticmethod
@@ -1542,7 +1551,7 @@ exploration value, and maintained local tasks to choose the next action.
             if isinstance(buttons, str):
                 buttons = [buttons]
             action_result = self.debug.write_action([str(item).lower() for item in buttons], int(args.get("frames") or 1))
-            after = self._wait_action_and_stable()
+            after = self._wait_action_and_stable(action=action_result)
         elif tool == "advance_dialog":
             action_result = self.debug.advance_dialog(args)
             if not action_result.get("ok"):
@@ -1550,14 +1559,20 @@ exploration value, and maintained local tasks to choose the next action.
             after = self._wait_state_quiet()
         elif tool == "use_item":
             action_result = self.debug.write_use_item_action(args.get("item_id"), args.get("role_id"), args.get("target"))
-            after = self._wait_action_and_stable()
+            after = self._wait_action_and_stable(action=action_result)
         elif tool == "equip_item":
             action_result = self.debug.write_equip_item_action(
                 args.get("item_id"),
                 args.get("role_id"),
                 args.get("expected_slot_item_id"),
             )
-            after = self._wait_action_and_stable()
+            after = self._wait_action_and_stable(action=action_result)
+        elif tool in {"shop_buy", "shop_leave"}:
+            action_result = self.debug.write_shop_action(
+                tool,
+                args.get("item_id") if tool == "shop_buy" else None,
+            )
+            after = self._wait_action_and_stable(action=action_result)
         else:
             action_result = self._navigate(int(args.get("id") or 0))
             after = self._wait_state_quiet()
@@ -1571,15 +1586,136 @@ exploration value, and maintained local tasks to choose the next action.
         self.emit("state_diff", "observed", "Observed stable state changes.", delta)
         return result
 
-    def _wait_action_and_stable(self, timeout: float = 10.0, quiet_window: float = 2.0) -> dict:
-        deadline = time.monotonic() + timeout
-        while self.debug.action_path.exists() and time.monotonic() < deadline:
+    def _wait_action_completion(
+        self,
+        action: dict,
+        *,
+        receipt_timeout: float = 3.0,
+        completion_timeout: float = 10.0,
+    ) -> dict:
+        if not action.get("action_handshake_supported"):
+            self.debug.append_navigation_diagnostic(
+                "action_handshake_compatibility_wait",
+                {"action": action},
+            )
+            deadline = time.monotonic() + completion_timeout
+            while self.debug.action_path.exists() and time.monotonic() < deadline:
+                if self.cancel_event.is_set():
+                    raise RuntimeError("interrupted")
+                time.sleep(0.04)
+            if self.debug.action_path.exists():
+                raise RuntimeError("action_timeout")
+            return self.debug.snapshot()
+
+        instance_id = str(action.get("game_instance_id") or "")
+        generation_before = action.get("action_generation_before")
+        receipt_started = time.monotonic()
+        receipt_deadline = receipt_started + receipt_timeout
+        received_generation = None
+        latest = self.debug.read_live_state()
+        while time.monotonic() < receipt_deadline:
             if self.cancel_event.is_set():
                 raise RuntimeError("interrupted")
+            latest = self.debug.read_live_state()
+            if str(latest.get("game_instance_id") or "") != instance_id:
+                raise RuntimeError("game_instance_changed")
+            if self.debug.live_info("state").get("stale", True):
+                raise RuntimeError("state_stale")
+            native = self.debug.native_action_status(latest)
+            if native is not None and native["generation"] != generation_before:
+                received_generation = native["generation"]
+                break
             time.sleep(0.04)
-        if self.debug.action_path.exists():
-            raise RuntimeError("action_timeout")
-        return self._wait_state_quiet(timeout=max(0.1, deadline - time.monotonic()), quiet_window=quiet_window)
+        if received_generation is None:
+            self.debug.append_navigation_diagnostic(
+                "action_generation_timeout",
+                {
+                    "game_instance_id": instance_id,
+                    "generation_before": generation_before,
+                    "wait_ms": round((time.monotonic() - receipt_started) * 1000, 1),
+                },
+                state=latest,
+            )
+            raise RuntimeError("action_generation_timeout")
+
+        receipt_ms = (time.monotonic() - receipt_started) * 1000
+        action["action_generation"] = received_generation
+        action["action_receipt_wait_ms"] = round(receipt_ms, 1)
+        native = self.debug.native_action_status(latest)
+        self.debug.append_navigation_diagnostic(
+            "action_generation_confirmed",
+            {
+                "game_instance_id": instance_id,
+                "generation_before": generation_before,
+                "generation": received_generation,
+                "pending": bool(native and native["pending"]),
+                "remaining_steps": native["remaining_steps"] if native else None,
+                "wait_ms": round(receipt_ms, 1),
+            },
+            state=latest,
+        )
+
+        completion_started = time.monotonic()
+        completion_deadline = completion_started + completion_timeout
+        while time.monotonic() < completion_deadline:
+            if self.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            latest = self.debug.read_live_state()
+            if str(latest.get("game_instance_id") or "") != instance_id:
+                raise RuntimeError("game_instance_changed")
+            if self.debug.live_info("state").get("stale", True):
+                raise RuntimeError("state_stale")
+            native = self.debug.native_action_status(latest)
+            if native is not None and native["generation"] == received_generation and not native["pending"]:
+                action["action_completion_wait_ms"] = round(
+                    (time.monotonic() - completion_started) * 1000,
+                    1,
+                )
+                self.debug.append_navigation_diagnostic(
+                    "action_completion_confirmed",
+                    {
+                        "game_instance_id": instance_id,
+                        "generation": received_generation,
+                        "receipt_wait_ms": round(receipt_ms, 1),
+                        "completion_wait_ms": round((time.monotonic() - completion_started) * 1000, 1),
+                        "remaining_steps": native["remaining_steps"],
+                    },
+                    state=latest,
+                )
+                return latest
+            time.sleep(0.04)
+
+        native = self.debug.native_action_status(latest)
+        self.debug.append_navigation_diagnostic(
+            "action_completion_timeout",
+            {
+                "game_instance_id": instance_id,
+                "generation": received_generation,
+                "wait_ms": round((time.monotonic() - completion_started) * 1000, 1),
+                "remaining_steps": native["remaining_steps"] if native else None,
+                "waiting_for_move": native["waiting_for_move"] if native else None,
+            },
+            state=latest,
+        )
+        raise RuntimeError("action_completion_timeout")
+
+    def _wait_action_and_stable(
+        self,
+        timeout: float = 10.0,
+        quiet_window: float = 2.0,
+        action: dict | None = None,
+    ) -> dict:
+        if isinstance(action, dict):
+            self._wait_action_completion(action, completion_timeout=timeout)
+        else:
+            deadline = time.monotonic() + timeout
+            while self.debug.action_pending() and time.monotonic() < deadline:
+                if self.cancel_event.is_set():
+                    raise RuntimeError("interrupted")
+                time.sleep(0.04)
+            if self.debug.action_pending():
+                raise RuntimeError("action_timeout")
+        return self._wait_state_quiet(timeout=timeout, quiet_window=quiet_window)
 
     def _wait_state_quiet(self, timeout: float = 10.0, quiet_window: float = 2.0) -> dict:
         deadline = time.monotonic() + timeout
@@ -1606,6 +1742,8 @@ exploration value, and maintained local tasks to choose the next action.
         progress = []
         terminal = {"arrived", "transitioned", "interacting"}
         observing = {"transition_observing"}
+        no_progress_key = None
+        no_progress_count = 0
         for step in range(1, 241):
             if self.cancel_event.is_set():
                 raise RuntimeError("interrupted")
@@ -1628,7 +1766,57 @@ exploration value, and maintained local tasks to choose the next action.
             if not result.get("ok"):
                 raise RuntimeError(f"navigation_{status or 'failed'}")
             if result.get("action"):
-                self._wait_action_and_stable(quiet_window=0.2)
+                before_position = (state.get("party_position") or {}).copy()
+                after_action = self._wait_action_and_stable(
+                    quiet_window=0.2,
+                    action=result["action"],
+                )
+                expected = result.get("expected_node")
+                if isinstance(expected, dict):
+                    actual = after_action.get("party_position") or {}
+                    before_xy = (
+                        int(before_position.get("x") or 0),
+                        int(before_position.get("y") or 0),
+                    )
+                    actual_xy = (int(actual.get("x") or 0), int(actual.get("y") or 0))
+                    expected_xy = (int(expected.get("x") or 0), int(expected.get("y") or 0))
+                    diagnostic = {
+                        "target_id": target_id,
+                        "generation": result["action"].get("action_generation"),
+                        "expected_position": {"x": expected_xy[0], "y": expected_xy[1]},
+                        "actual_position": {"x": actual_xy[0], "y": actual_xy[1]},
+                        "start_position": {"x": before_xy[0], "y": before_xy[1]},
+                        "segment_steps": result.get("segment_steps"),
+                        "remaining_steps": result.get("remaining_steps"),
+                    }
+                    if actual_xy == expected_xy:
+                        self.debug.append_navigation_diagnostic(
+                            "navigation_expected_node_reached",
+                            diagnostic,
+                            state=after_action,
+                        )
+                        no_progress_key = None
+                        no_progress_count = 0
+                    elif actual_xy != before_xy:
+                        self.debug.append_navigation_diagnostic(
+                            "navigation_segment_partial",
+                            diagnostic,
+                            state=after_action,
+                        )
+                        no_progress_key = None
+                        no_progress_count = 0
+                    else:
+                        direction = int(state.get("party_direction") or 0)
+                        key = (before_xy, direction, expected_xy)
+                        no_progress_count = no_progress_count + 1 if key == no_progress_key else 1
+                        no_progress_key = key
+                        self.debug.append_navigation_diagnostic(
+                            "navigation_segment_no_progress",
+                            {**diagnostic, "attempt": no_progress_count},
+                            state=after_action,
+                        )
+                        if no_progress_count > 1:
+                            raise RuntimeError("navigation_no_progress")
             if status in terminal:
                 terminal_result = {
                     "ok": True,
@@ -1684,12 +1872,23 @@ exploration value, and maintained local tasks to choose the next action.
             (item.get("id"), item.get("state"), item.get("vanish_time"), item.get("interactable"), item.get("blocking"))
             for item in state.get("objects") or [] if isinstance(item, dict)
         )
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        shop_items = tuple(
+            (
+                item.get("item_id"), item.get("owned_count"),
+                item.get("affordable"), item.get("selected"),
+            )
+            for item in shop.get("items") or [] if isinstance(item, dict)
+        )
         return (
             state.get("scene_id"), state.get("map_id"), state.get("room_key"),
             pos.get("x"), pos.get("y"), state.get("party_direction"),
             bool(dialog.get("active")), dialog.get("message_id"), state.get("in_battle"),
             state.get("entering_scene"), latest_dialog_event.get("sequence"),
             latest_event.get("time"), latest_event.get("type"), latest_event.get("object_id"),
+            state.get("cash"),
+            bool(shop.get("active")), shop.get("mode"), shop.get("store_id"),
+            shop.get("phase"), shop.get("selected_item_id"), shop_items,
             inventory, objects,
         )
 
@@ -1698,12 +1897,21 @@ exploration value, and maintained local tasks to choose the next action.
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
         latest = dialog.get("latest_event") or {}
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
         return {
             "scene_id": state.get("scene_id"), "map_id": state.get("map_id"),
             "room_key": state.get("room_key") or (state.get("room") or {}).get("key"),
             "region_key": state.get("region_key"),
             "position": {"x": pos.get("x"), "y": pos.get("y"), "direction": state.get("party_direction")},
             "dialog": {"active": bool(dialog.get("active")), "message_id": latest.get("message_id"), "event_object_id": latest.get("event_object_id"), "text": latest.get("text")},
+            "cash": state.get("cash"),
+            "shop": {
+                "active": bool(shop.get("active")),
+                "mode": shop.get("mode"),
+                "store_id": shop.get("store_id"),
+                "phase": shop.get("phase"),
+                "selected_item_id": shop.get("selected_item_id"),
+            },
             "in_battle": bool(state.get("in_battle")), "entering_scene": bool(state.get("entering_scene")),
         }
 
@@ -1716,7 +1924,8 @@ exploration value, and maintained local tasks to choose the next action.
             for key in (
                 "ok", "status", "presses", "steps", "target_id", "frames",
                 "buttons", "observation_id", "command", "item_id", "role_id",
-                "slot_id", "slot_key", "previous_item_id",
+                "slot_id", "slot_key", "previous_item_id", "store_id",
+                "price", "cash_before", "cash_after", "owned_before", "owned_after",
             )
             if key in result
         }
@@ -1726,7 +1935,9 @@ exploration value, and maintained local tasks to choose the next action.
                 key: native_result.get(key)
                 for key in (
                     "ok", "status", "action", "item_id", "role_id",
-                    "slot_id", "slot_key", "previous_item_id", "error",
+                    "slot_id", "slot_key", "previous_item_id", "store_id",
+                    "price", "cash_before", "cash_after", "owned_before",
+                    "owned_after", "error",
                 )
                 if key in native_result
             }
@@ -1783,6 +1994,11 @@ exploration value, and maintained local tasks to choose the next action.
             "position": (position(before), position(after)),
             "room": ({key: before.get(key) for key in ("scene_id", "map_id", "room_key", "region_key")}, {key: after.get(key) for key in ("scene_id", "map_id", "room_key", "region_key")}),
             "dialog": (AgentRuntime._compact_state(before)["dialog"], AgentRuntime._compact_state(after)["dialog"]),
+            "cash": (before.get("cash"), after.get("cash")),
+            "shop": (
+                AgentRuntime._compact_state(before)["shop"],
+                AgentRuntime._compact_state(after)["shop"],
+            ),
         }
         for key, (old, new) in fields.items():
             if old != new:

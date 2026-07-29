@@ -905,6 +905,31 @@ def test_state_delta_reports_equipment_slot_change():
     }]
 
 
+def test_state_delta_reports_shop_cash_and_owned_item_change():
+    before = make_state()
+    before['cash'] = 600
+    before['inventory'] = []
+    before['shop'] = {
+        'active': True,
+        'mode': 'buy',
+        'store_id': 7,
+        'phase': 'select',
+        'selected_item_id': 201,
+        'items': [{'item_id': 201, 'owned_count': 0, 'affordable': True, 'selected': True}],
+    }
+    after = json.loads(json.dumps(before))
+    after['cash'] = 200
+    after['inventory'] = [{'item_id': 201, 'amount': 1, 'amount_in_use': 0}]
+    after['shop']['items'][0]['owned_count'] = 1
+    after['shop']['items'][0]['affordable'] = False
+
+    delta = AgentRuntime.state_delta(before, after)
+
+    assert delta['cash'] == {'before': 600, 'after': 200}
+    assert delta['inventory_changes'] == [{'item_id': 201, 'before': 0, 'after': 1}]
+    assert AgentRuntime._state_signature(before) != AgentRuntime._state_signature(after)
+
+
 def test_live_dialog_invalidates_navigation_and_requests_replan(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -915,6 +940,71 @@ def test_live_dialog_invalidates_navigation_and_requests_replan(tmp_path):
     feedback = runtime._replan_feedback("in_dialog", state)
     assert "new dialog" in feedback
     assert "in_dialog" in feedback
+
+
+def test_live_shop_allows_only_shop_actions_and_replans_after_exit(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state()
+    state['shop'] = {
+        'active': True,
+        'mode': 'buy',
+        'store_id': 7,
+        'phase': 'select',
+        'selected_item_id': 201,
+        'items': [{'item_id': 201, 'price': 400, 'affordable': True}],
+    }
+
+    assert runtime._decision_replan_reason(
+        decision('navigation_step', {'id': 10}, 'inspect_target'),
+        state,
+    ) == 'in_shop'
+    assert runtime._decision_replan_reason(
+        decision('shop_buy', {'item_id': 201}, 'purchase_shop_item'),
+        state,
+    ) is None
+    state['shop'] = None
+    assert runtime._decision_replan_reason(
+        decision('shop_leave', {}, 'leave_shop'),
+        state,
+    ) == 'shop_inactive'
+
+
+def test_execute_shop_buy_uses_structured_writer(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    before = make_state()
+    before['cash'] = 600
+    before['shop'] = {
+        'active': True,
+        'mode': 'buy',
+        'store_id': 7,
+        'phase': 'select',
+        'selected_item_id': 201,
+        'items': [{'item_id': 201, 'price': 400, 'affordable': True}],
+    }
+    after = json.loads(json.dumps(before))
+    after['cash'] = 200
+    after['inventory'] = [{'item_id': 201, 'amount': 1, 'amount_in_use': 0}]
+    calls = []
+    debug.snapshot = lambda: before
+    debug.write_shop_action = lambda action, item_id=None: calls.append((action, item_id)) or {
+        'command': action,
+        'item_id': item_id,
+        'result': {'ok': True, 'action': action, 'item_id': item_id, 'status': 'purchased'},
+    }
+    monkeypatch.setattr(runtime, '_wait_action_and_stable', lambda **_kwargs: after)
+    recommendation = debug.attach_decision_context(
+        before,
+        decision('shop_buy', {'item_id': 201}, 'purchase_shop_item'),
+    )
+
+    result = runtime._execute_decision(recommendation)
+
+    assert calls == [('shop_buy', 201)]
+    assert result['tool'] == 'shop_buy'
+    assert result['delta']['cash'] == {'before': 600, 'after': 200}
+    assert result['delta']['inventory_changes'] == [{'item_id': 201, 'before': 0, 'after': 1}]
 
 
 def test_quiet_window_restarts_when_dialog_reappears(tmp_path):
@@ -1101,6 +1191,166 @@ def test_navigation_treats_dialog_started_during_navigation_as_success(tmp_path)
     assert result["target_id"] == 57
     assert result["steps"] == 2
     assert [entry["status"] for entry in result["progress"]] == ["stepping", "in_dialog"]
+
+
+def test_action_wait_accepts_direct_generation_completion_snapshot(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    completed = {
+        **make_state(),
+        "game_instance_id": "game-a",
+        "agent_action": {
+            "generation": 8,
+            "pending": False,
+            "remaining_steps": 0,
+            "waiting_for_move": False,
+        },
+    }
+    write_state(debug, completed)
+
+    observed = runtime._wait_action_completion(
+        {
+            "time": time.time(),
+            "game_instance_id": "game-a",
+            "action_generation_before": 7,
+            "action_handshake_supported": True,
+        },
+        receipt_timeout=0.1,
+        completion_timeout=0.1,
+    )
+
+    assert observed["agent_action"]["generation"] == 8
+    assert observed["agent_action"]["pending"] is False
+
+
+def test_action_wait_has_distinct_generation_and_completion_timeouts(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    waiting_for_receipt = {
+        **make_state(),
+        "game_instance_id": "game-a",
+        "agent_action": {
+            "generation": 7,
+            "pending": False,
+            "remaining_steps": 0,
+            "waiting_for_move": False,
+        },
+    }
+    write_state(debug, waiting_for_receipt)
+    action = {
+        "time": time.time(),
+        "game_instance_id": "game-a",
+        "action_generation_before": 7,
+        "action_handshake_supported": True,
+    }
+
+    with pytest.raises(RuntimeError, match="action_generation_timeout"):
+        runtime._wait_action_completion(action, receipt_timeout=0.01, completion_timeout=0.01)
+
+    waiting_for_completion = {
+        **waiting_for_receipt,
+        "agent_action": {
+            "generation": 8,
+            "pending": True,
+            "remaining_steps": 1,
+            "waiting_for_move": True,
+        },
+    }
+    write_state(debug, waiting_for_completion)
+    with pytest.raises(RuntimeError, match="action_completion_timeout"):
+        runtime._wait_action_completion(action, receipt_timeout=0.01, completion_timeout=0.01)
+
+
+def test_action_wait_exits_on_game_instance_change(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    write_state(
+        debug,
+        {
+            **make_state(),
+            "game_instance_id": "game-b",
+            "agent_action": {
+                "generation": 1,
+                "pending": False,
+                "remaining_steps": 0,
+                "waiting_for_move": False,
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="game_instance_changed"):
+        runtime._wait_action_completion(
+            {
+                "time": time.time(),
+                "game_instance_id": "game-a",
+                "action_generation_before": 0,
+                "action_handshake_supported": True,
+            },
+            receipt_timeout=0.1,
+            completion_timeout=0.1,
+        )
+
+
+def test_navigation_replans_after_partial_segment_execution(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    source = make_state(start=(1, 1))
+    partial = make_state(start=(1, 2))
+    states = [source, partial]
+    results = [
+        {
+            "ok": True,
+            "status": "stepping",
+            "target_id": 95,
+            "move": "down",
+            "segment_steps": 3,
+            "remaining_steps": 2,
+            "expected_node": {"x": 16, "y": 32},
+            "action": {"action_generation_before": 10},
+        },
+        {"ok": True, "status": "arrived", "target_id": 95},
+    ]
+
+    debug.snapshot = lambda: states.pop(0) if states else partial
+    debug.navigation_step = lambda state, target_id: results.pop(0)
+    monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: partial)
+
+    result = runtime._navigate(95)
+
+    assert result["status"] == "arrived"
+    assert [entry["status"] for entry in result["progress"]] == ["stepping", "arrived"]
+
+
+def test_navigation_stops_after_one_identical_no_progress_retry(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    stationary = make_state(start=(1, 1))
+    action = {"action_generation_before": 20}
+    result = {
+        "ok": True,
+        "status": "stepping",
+        "target_id": 95,
+        "move": "up",
+        "segment_steps": 2,
+        "remaining_steps": 4,
+        "expected_node": {"x": 16, "y": -8},
+        "action": action,
+    }
+    writes = []
+
+    debug.snapshot = lambda: stationary
+
+    def navigation_step(state, target_id):
+        writes.append((result["move"], result["segment_steps"], result["remaining_steps"]))
+        return result
+
+    debug.navigation_step = navigation_step
+    monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: stationary)
+
+    with pytest.raises(RuntimeError, match="navigation_no_progress"):
+        runtime._navigate(95)
+
+    assert writes == [("up", 2, 4), ("up", 2, 4)]
 
 
 def test_navigation_in_dialog_before_execution_still_requests_replan(tmp_path):
