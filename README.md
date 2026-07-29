@@ -9,10 +9,13 @@ console for humans and LLM agents.
 
 - Native SDLPAL agent mode that streams live game state over a local Unix socket.
 - Indexed 320x200 frames encoded as PNG by the debug server.
-- File-based action injection through `runtime/action.txt`.
-- HTTP endpoints for state and actions.
-- WebSocket stream for live debug updates.
-- Browser debug UI with game frame, state summary, object list, and raw JSON.
+- File-based action injection and completion results through
+  `runtime/action.txt` and `runtime/action_result.json`.
+- HTTP endpoints for state, actions, navigation, inventory/equipment,
+  checkpoints, and persistent Agent sessions.
+- WebSocket streams for live state, frames, and Agent events.
+- Browser debug UI with the game frame, state and object inspection,
+  navigation, equipment, checkpoints, Agent timeline/goals, and raw JSON.
 - Local-only asset fetch helper for DOS game resources.
 
 Game resources are not committed to this repository. They are fetched or copied
@@ -124,9 +127,19 @@ the payload is never written to a regular file. Set `PALPAL_AGENT_SOCKET` when
 the default path is unsuitable. SDLPAL reconnects automatically when the debug
 server starts or restarts.
 
-The debug server writes:
+The native bridge and debug server keep lower-frequency coordination and durable
+data under `runtime/`:
 
-- `runtime/action.txt`: next action for SDLPAL to consume.
+- `action.txt`: next action for SDLPAL to consume.
+- `action_result.json`: native completion details for item, equipment, shop, and
+  checkpoint actions.
+- `exploration.json`, `events.json`, and `dialog_history.json`: learned map,
+  state-event, and dialog history.
+- `logs/`: game, debug-server, and navigation diagnostics.
+- `agent/`: persistent Agent session metadata, activity events, SDK transcript,
+  and archived tool outputs.
+- `checkpoints/`: local game saves plus their matching exploration and Agent
+  session bundles.
 
 Example action file:
 
@@ -143,7 +156,10 @@ up down left right menu search page_up page_down repeat auto defend
 use_item throw_item flee status force home end
 ```
 
-## HTTP API
+## Core HTTP API
+
+The following are the main public endpoints; the browser UI also uses
+specialized diagnostics and history endpoints.
 
 Get current state:
 
@@ -162,6 +178,34 @@ curl -X POST http://127.0.0.1:8765/action \
 `/action` writes one pending `runtime/action.txt` command at a time. If SDLPAL
 has not consumed the previous action yet, the server returns `400` with
 `action_pending` instead of overwriting it.
+
+Read a frame or navigation state:
+
+```text
+GET  /frame.png
+GET  /navigation
+GET  /navigation/route?id=123
+GET  /navigation/transitions
+POST /navigation/step          {"id":123}
+```
+
+Use or equip an inventory item:
+
+```text
+POST /inventory/use            {"item_id":123,"role_id":0}
+POST /inventory/use            {"item_id":123,"target":"all"}
+POST /inventory/equip          {"item_id":123,"role_id":0}
+```
+
+Manage local checkpoints:
+
+```text
+GET    /checkpoints
+POST   /checkpoints/save       {"label":"before boss"}
+POST   /checkpoints/load       {"id":"checkpoint-id"}
+DELETE /checkpoints/checkpoint-id
+POST   /startup/new
+```
 
 Live stream:
 
@@ -226,14 +270,15 @@ cumulative billed tokens, the latest agent-run usage, and a conservative
 estimate of the currently persisted context separately. Token estimates use
 UTF-8 byte size so Chinese output is not severely undercounted.
 
-The persistent model sees nine tools: `upsert_task`, `get_tasks`, `get_navigation`,
-`inspect_target`, `get_observations`, `get_inventory`, `get_room_memory`, and
-`get_tool_output`, followed by `submit_decision`. Query outputs up to about 8000
-estimated tokens stay verbatim. Larger JSON or text outputs are atomically
-archived under the current session's `runtime/agent/tool_outputs/` directory;
-the transcript keeps a valid JSON preview with key fields, head/tail excerpts,
-original size, and a reloadable `output_ref`. `get_tool_output` reads only the
-current session's archive in pages of at most 6000 characters.
+The persistent model sees eleven tools: `upsert_task`, `get_tasks`,
+`get_navigation`, `inspect_target`, `get_observations`, `get_shop`,
+`get_equipment`, `get_inventory`, `get_room_memory`, `get_tool_output`, and
+`submit_decision`. Query outputs up to about 8000 estimated tokens stay
+verbatim. Larger JSON or text outputs are atomically archived under the current
+session's `runtime/agent/tool_outputs/` directory; the transcript keeps a valid
+JSON preview with key fields, head/tail excerpts, original size, and a
+reloadable `output_ref`. `get_tool_output` reads only the current session's
+archive in pages of at most 6000 characters.
 
 At 96000 estimated context tokens, older tool results are archived until the
 estimate is near 80000 while the six most recent complete tool results remain
@@ -243,12 +288,15 @@ agent instructions or session metadata; an empty task ledger still permits norma
 After actions, the runtime requires a two-second quiet state before starting the
 next decision.
 
-`submit_decision` accepts only a minimal action plus a short reason. Depending
-on `action`, the model adds `target_id`, or `item_id` with exactly one of
-`role_id` and `target: "all"`. The server derives the internal intent, evidence,
-risk, and executable preview; the former nested decision payload is rejected.
+`submit_decision` accepts only a minimal action plus a short reason.
+`navigate` adds `target_id`; `use_item` adds `item_id` and exactly one of
+`role_id` and `target: "all"`; `equip_item` adds `item_id` and `role_id`;
+`buy_item` adds `item_id`; and `wait`, `advance_dialog`, and `leave_shop` need no
+additional fields. The server derives the internal intent, evidence, risk, and
+executable preview; the former nested decision payload is rejected.
 
-Reserved but not implemented yet:
+The checkpoint endpoints above are implemented. These separate root-level
+bridge endpoints remain reserved but are not implemented yet:
 
 - `POST /reset`
 - `POST /save`
@@ -256,15 +304,18 @@ Reserved but not implemented yet:
 
 ## State Model
 
-The exported state currently focuses on map exploration:
+The exported state currently supports map exploration and the implemented
+inventory, equipment, and shop workflows:
 
 - frame and mode flags
 - `scene_id`, `map_id`, and `region_key`
 - viewport and party position
-- party members, HP/MP, level, and money
-- inventory entries
+- party members, HP/MP, level, money, and equipped items
+- inventory entries with item metadata and usable/equippable properties
+- active shop mode, selection phase, offered items, and prices
+- dialog state and recent dialog events
 - current scene event objects
-- nearby blocked map tiles
+- nearby blocked map tiles and the local navigation grid
 
 Do not treat `(scene_id, map_id)` as a unique room id. A location should be
 identified by scene, map, coordinates/region, and relevant event/story state.

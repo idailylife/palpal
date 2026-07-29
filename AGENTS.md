@@ -15,17 +15,23 @@ automation layer.
 ## Important Paths
 
 - `vendor/sdlpal/`: vendored SDLPAL source.
-- `vendor/sdlpal/agent.c`: native file bridge for state, screenshots, and actions.
+- `vendor/sdlpal/agent.c`: native hybrid bridge for streamed state/frames and
+  file-backed actions/results.
 - `vendor/sdlpal/agent.h`: native bridge declarations.
 - `vendor/sdlpal/game.c`: patched main game loop for agent mode.
 - `vendor/sdlpal/input.c`: patched input loop so action files work during wait loops.
 - `vendor/sdlpal/main.c`: patched startup to skip splash/menu in agent mode.
+- `vendor/sdlpal/uigame.c`: patched item, equipment, and shop UI handling.
 - `palpal/debug_server.py`: HTTP/WebSocket debug server.
+- `palpal/agent_runtime.py`: persistent Agent session, tasks, tools, and event stream.
+- `palpal/observations.py`: structured observation lifecycle and persistence.
 - `web/`: browser debug UI.
 - `scripts/fetch_assets.py`: local-only asset fetch helper.
-- `run`: project command wrapper for assets/build/debug/game/dev.
+- `run`: project command wrapper for assets/build/debug/game/dev, visual smoke,
+  and runtime cleanup.
 - `CMakeLists.txt`: native CMake build for the patched SDLPAL target and local helper targets.
-- `runtime/`: generated state/action/screenshot files; gitignored.
+- `runtime/`: generated actions/results, logs, observations, Agent sessions, and
+  checkpoints; gitignored.
 - `data/pal/`: local game resources; gitignored.
 
 ## Non-Negotiable Constraints
@@ -33,8 +39,9 @@ automation layer.
 - Do not commit game resources, generated runtime files, object files, binaries,
   or save files.
 - Keep the SDLPAL patch narrow and easy to audit.
-- Preserve the file bridge unless there is a clear reason to replace it with an
-  in-process API.
+- Preserve the hybrid bridge unless there is a clear reason to replace it with
+  an in-process API: high-frequency state/frames use the Unix socket, while
+  actions, results, checkpoints, and durable Agent data remain file-backed.
 - Treat object labels/categories as annotations, not as facts provided by the
   engine.
 - Do not assume `(scene_id, map_id)` uniquely identifies a room.
@@ -108,6 +115,11 @@ The native bridge consumes:
 
 - `action.txt`: line-oriented action request.
 
+Native item, equipment, and shop actions publish completion details through
+`action_result.json`. The Python server also maintains lower-frequency,
+file-backed exploration, dialog, observation, checkpoint, and Agent session
+data under `runtime/`.
+
 Action format:
 
 ```txt
@@ -123,24 +135,28 @@ indexed frames as PNG for the browser.
 
 ## State Exposure Priorities
 
-Current priority is map exploration and debugging:
+Current exposure supports map exploration, inventory/equipment decisions, and
+shop interactions:
 
 - party position and direction
 - scene/map/region
-- party stats
-- inventory
+- party stats and equipped items
+- inventory and item metadata
+- active shop state, offered items, prices, and purchase results
 - event objects
 - interactable/blocking flags
 - trigger and auto script ids
-- local walkability
+- local walkability and navigation grid
+- checkpoint-backed game and Agent session branches
 
 Next useful extensions:
 
 - battle UI state and enemy/player action state
 - stable object annotation table
 - script opcode tracing
-- save/load/reset endpoints wired through the native bridge
-- richer region graph for navigation
+- root-level save/load/reset endpoints wired through the native bridge
+- a persistent cross-room region/transition graph beyond the current per-map
+  navigation graph and learned transitions
 
 ## Verification Checklist
 
@@ -153,7 +169,7 @@ Run after native changes:
 Run after Python/server changes:
 
 ```sh
-PYTHONPYCACHEPREFIX=.pycache python3 -m py_compile palpal/debug_server.py scripts/fetch_assets.py
+PYTHONPYCACHEPREFIX=.pycache python3 -m compileall -q palpal scripts/fetch_assets.py
 ```
 
 Run Python tests:
@@ -196,12 +212,17 @@ test ! -e runtime/frame.rgba
 
 Stop any test game/debug processes before finishing work.
 
+Treat an existing server on port 8765 as a user-owned live instance. Start with
+read-only inspection; do not send game actions, restart it, or run mutating
+smoke tests against it unless the user authorizes that. Use isolated ports and
+runtime directories for tests whenever possible.
+
 ## Common Pitfalls
 
 - SDLPAL wait loops often call `PAL_ProcessEvent()` instead of returning to the
   main frame loop. Keep action polling available there.
-- `screen.bmp` may be written before the game has advanced to a normal frame;
-  this is still useful for early debug visibility.
+- `/screen.bmp` is a legacy compatibility fallback. The current native bridge
+  streams frames over `live.sock` and does not normally write this file.
 - SDL2 and SDL3 return values differ for some functions. Check compatibility
   wrappers before changing native code.
 - Object names like "door", "cabinet", or "monster" are not first-class engine
