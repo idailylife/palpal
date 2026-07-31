@@ -506,6 +506,205 @@ def test_navigation_transition_records_observed_destination(tmp_path):
     assert record['to_location_id'] == to_identity['id']
 
 
+def test_dynamic_touch_native_trigger_is_handed_to_navigation_request(tmp_path):
+    target = {
+        'id': 117, 'x': 96, 'y': 0, 'sprite_id': 21, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 5925, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=7, height=7, start=(0, 6), objects=[target], frame=10)
+    source.update({'scene_id': 5, 'map_id': 2, 'room': {'key': 'dock'}})
+    write_state(debug, source)
+    debug.snapshot()
+
+    started = debug.navigation_step(source, target_id=117)
+    assert started['status'] == 'stepping'
+    assert started['segment_steps'] == 6
+    assert started['remaining_steps'] == 0
+    assert 'observation_id' not in started
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+
+    destination = make_state(width=4, height=4, start=(2, 2), objects=[], frame=11)
+    destination.update({'scene_id': 15, 'map_id': 3, 'room': {'key': 'shore'}})
+    destination['trigger_observation'] = {
+        'generation': 7,
+        'event_object_id': 117,
+        'trigger_script': 5925,
+        'completed': True,
+        'source': {'scene_id': 5, 'map_id': 2, 'x': 96, 'y': 0},
+        'destination': {'scene_id': 15, 'map_id': 3, 'x': 32, 'y': 16, 'frame': 11},
+    }
+    write_state(debug, destination)
+    debug.snapshot()
+
+    pending = debug.pending_transition_observation
+    assert pending is not None
+    assert pending['owner'] == 'navigation'
+    observation_id = pending['observation_id']
+    assert debug.navigation_transition_requests == {117: observation_id}
+    observing = debug.navigation_step(destination, target_id=117)
+    assert observing['ok'] is True
+    assert observing['status'] == 'transition_observing'
+
+    destination['frame'] = 12
+    write_state(debug, destination)
+    transitioned = debug.navigation_step(destination, target_id=117)
+    assert transitioned['ok'] is True
+    assert transitioned['status'] == 'transitioned'
+    assert transitioned['transition']['confirmation'] == 'native_trigger'
+    assert transitioned['transition']['from_scene_id'] == 5
+    assert transitioned['transition']['to_scene_id'] == 15
+    source_identity = debug.room_identity(source)
+    last_route = debug.read_exploration()['rooms'][source_identity['id']]['last_route']
+    assert last_route['pending'] is False
+    assert last_route['outcome'] == 'transitioned'
+
+    diagnostics = [
+        json.loads(line)
+        for line in debug.navigation_log_path.read_text(encoding='utf-8').splitlines()
+    ]
+    owner = next(entry for entry in diagnostics if entry['type'] == 'native_transition_owner')
+    assert owner['owner'] == 'navigation'
+    assert owner['expected_position'] == {'x': 96, 'y': 0}
+    assert owner['source_position'] == {'x': 96, 'y': 0}
+    assert owner['association_rejected_reason'] is None
+
+
+def test_dynamic_touch_dialog_interrupt_preserves_navigation_transition_observer(tmp_path):
+    target = {
+        'id': 117, 'x': 32, 'y': 0, 'sprite_id': 21, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 5925, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[target], frame=10)
+    write_state(debug, source)
+    debug.snapshot()
+    assert debug.navigation_step(source, target_id=117)['status'] == 'stepping'
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+
+    destination = make_state(objects=[], frame=11)
+    destination.update({'scene_id': 15, 'map_id': 3, 'room': {'key': 'shore'}})
+    destination['dialog'] = {'active': True, 'visible': True, 'latest_event': {'text': '靠岸'}}
+    destination['trigger_observation'] = {
+        'generation': 7, 'event_object_id': 117, 'trigger_script': 5925, 'completed': True,
+        'source': {'scene_id': 3, 'map_id': 10, 'x': 32, 'y': 0},
+        'destination': {'scene_id': 15, 'map_id': 3, **destination['party_position']},
+    }
+    write_state(debug, destination)
+    debug.snapshot()
+    observation_id = debug.navigation_transition_requests[117]
+
+    interrupted = debug.navigation_step(destination, target_id=117)
+    assert interrupted == {'ok': False, 'status': 'in_dialog', 'target_id': 117}
+    assert debug.navigation_transition_requests[117] == observation_id
+    assert debug.pending_transition_observation['observation_id'] == observation_id
+    assert debug.observations.get(observation_id)['status'] == 'pending'
+
+
+def test_dynamic_touch_without_position_change_is_not_recorded_as_transition(tmp_path):
+    target = {
+        'id': 117, 'x': 32, 'y': 0, 'sprite_id': 21, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 5925, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[target], frame=10)
+    write_state(debug, source)
+    debug.snapshot()
+    assert debug.navigation_step(source, target_id=117)['status'] == 'stepping'
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+
+    triggered = make_state(start=(2, 0), objects=[target], frame=11)
+    triggered['trigger_observation'] = {
+        'generation': 1, 'event_object_id': 117, 'trigger_script': 5925, 'completed': True,
+        'source': {'scene_id': 3, 'map_id': 10, 'x': 32, 'y': 0},
+        'destination': {'scene_id': 3, 'map_id': 10, 'x': 32, 'y': 0, 'frame': 11},
+    }
+    write_state(debug, triggered)
+    debug.snapshot()
+
+    assert debug.pending_transition_observation is None
+    assert debug.read_exploration()['transitions'] == {}
+
+
+def test_dynamic_touch_owner_rejects_mismatched_navigation_route(tmp_path):
+    target = {
+        'id': 117, 'x': 32, 'y': 0, 'sprite_id': 21, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 5925, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[target])
+    route = debug.route_to_object(source, target_id=117)
+    identity = debug.room_identity(source)
+    cases = [
+        (
+            'navigation_target_mismatch',
+            lambda last_route, _room: last_route.__setitem__('target_id', 999),
+        ),
+        (
+            'navigation_target_not_touch',
+            lambda last_route, _room: last_route['target_selection'].__setitem__('kind', 'search'),
+        ),
+        (
+            'navigation_route_outside_observation_window',
+            lambda last_route, _room: last_route.__setitem__('updated_at', time.time() - 10),
+        ),
+        (
+            'navigation_expected_source_mismatch',
+            lambda last_route, _room: last_route['expected_node'].__setitem__('x', 999),
+        ),
+        (
+            'navigation_source_room_mismatch',
+            lambda _last_route, room: room.__setitem__('scene_id', 99),
+        ),
+    ]
+
+    for expected_reason, mutate in cases:
+        debug.remember_navigation_route(source, 117, route['route'], 1, 0, 'reachable')
+        data = debug.read_exploration()
+        room = data['rooms'][identity['id']]
+        mutate(room['last_route'], room)
+        debug.write_exploration(data)
+
+        owner, details = debug.native_transition_observation_owner(
+            source,
+            117,
+            {'scene_id': 3, 'map_id': 10, 'x': 32, 'y': 0},
+        )
+
+        assert owner == 'background'
+        assert details['association_rejected_reason'] == expected_reason
+
+
+def test_navigation_step_drops_request_mapping_after_observation_retention_cleanup(tmp_path):
+    debug = make_debug_state(tmp_path)
+    missing = make_state(objects=[])
+    observation_id = debug.observations.register(
+        'transition', owner='navigation', timeout=4, payload={}
+    )
+    debug.navigation_transition_requests[117] = observation_id
+    debug.pending_transition_observation = {
+        'object_id': 117,
+        'observation_id': observation_id,
+        'owner': 'navigation',
+    }
+    debug.observations.cancel(observation_id, 'test_cleanup')
+    debug.observations.consume(observation_id, owner='navigation')
+    write_state(debug, missing)
+
+    result = debug.navigation_step(missing, target_id=117)
+
+    assert result['status'] == 'unknown_target'
+    assert debug.navigation_transition_requests == {}
+    assert debug.pending_transition_observation is None
+
+
 def test_navigation_step_keeps_pending_transition_until_destination_is_stable(tmp_path):
     target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
     debug = make_debug_state(tmp_path)
@@ -881,6 +1080,174 @@ def test_intra_room_transition_freezes_source_and_uses_nearest_portal(tmp_path):
     assert known['from_location_id'].endswith('.48')
     assert known['to_location_id'].endswith('.47')
     assert known['returns_to_recent_room'] is False
+
+
+def test_script_control_on_non_grid_position_waits_without_bad_start_and_records_boat_transition(
+    tmp_path, monkeypatch,
+):
+    boat = {
+        'id': 52, 'x': 32, 'y': 0, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 4631, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=4, height=4, start=(1, 1), objects=[boat], frame=10)
+    source.update({'scene_id': 5, 'map_id': 2, 'room': {'key': 'dock'}})
+    write_state(debug, source)
+    debug.snapshot()
+
+    scripted = dict(source)
+    scripted['frame'] = 11
+    scripted['party_position'] = {'x': 17, 'y': 9}
+    scripted['trigger_observation'] = {
+        'generation': 1,
+        'event_object_id': 52,
+        'trigger_script': 4631,
+        'completed': False,
+        'source': {'scene_id': 5, 'map_id': 2, 'x': 16, 'y': 8},
+    }
+    write_state(debug, scripted)
+    debug.snapshot()
+    monkeypatch.setattr(
+        debug,
+        'route_to_object',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError('route_to_object must not run while the game owns control')
+        ),
+    )
+
+    waiting = debug.navigation_step(scripted, target_id=52)
+
+    assert waiting['ok'] is True
+    assert waiting['status'] == 'waiting_for_control'
+    assert debug.pending_transition_observation is not None
+
+    destination = make_state(width=4, height=4, start=(2, 2), objects=[], frame=12)
+    destination.update({'scene_id': 15, 'map_id': 3, 'room': {'key': 'boat'}})
+    destination['trigger_observation'] = {
+        **scripted['trigger_observation'],
+        'completed': True,
+        'destination': {'scene_id': 15, 'map_id': 3, 'x': 32, 'y': 16, 'frame': 12},
+    }
+    write_state(debug, destination)
+    debug.snapshot()
+    destination['frame'] = 13
+    write_state(debug, destination)
+    debug.snapshot()
+
+    transitions = debug.read_exploration()['transitions']
+    record = next(iter(next(iter(transitions.values())).values()))
+    assert record['from_scene_id'] == 5
+    assert record['from_map_id'] == 2
+    assert record['to_scene_id'] == 15
+    assert record['to_map_id'] == 3
+
+
+def test_confirmed_trigger_keeps_observation_beyond_confirmation_timeout(tmp_path):
+    portal = {
+        'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[portal], frame=10)
+    write_state(debug, source)
+    started = debug.navigation_step(source, target_id=48)
+    assert started['ok'] is True
+    pending = debug.pending_transition_observation
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+
+    scripted = dict(source)
+    scripted['frame'] = 11
+    scripted['trigger_observation'] = {
+        'generation': 1,
+        'event_object_id': 48,
+        'trigger_script': 4631,
+        'completed': False,
+        'source': {'scene_id': 3, 'map_id': 10, 'x': 16, 'y': 8},
+    }
+    pending['sent_at'] -= 5
+    write_state(debug, scripted)
+    debug.snapshot()
+
+    assert debug.pending_transition_observation is pending
+    assert pending['trigger_generation'] == 1
+    assert pending['control_started_at'] is not None
+    assert pending['landing_started_at'] is None
+
+
+def test_trigger_control_timeout_is_not_deferred_to_a_later_navigation_request(tmp_path):
+    portal = {
+        'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[portal], frame=10)
+    write_state(debug, source)
+    assert debug.navigation_step(source, target_id=48)['ok'] is True
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+    scripted = dict(source)
+    scripted['frame'] = 11
+    scripted['trigger_observation'] = {
+        'generation': 1,
+        'event_object_id': 48,
+        'trigger_script': 4631,
+        'completed': False,
+        'source': {'scene_id': 3, 'map_id': 10, 'x': 16, 'y': 8},
+    }
+    write_state(debug, scripted)
+    debug.snapshot()
+    debug.pending_transition_observation['control_last_progress_at'] -= 31
+    debug.snapshot()
+
+    result = debug.navigation_step(scripted, target_id=48)
+
+    assert result['ok'] is True
+    assert result['status'] == 'waiting_for_control'
+    assert debug.pending_transition_observation is None
+
+
+def test_long_dialog_suspends_native_trigger_control_timeout(tmp_path):
+    target = {
+        'id': 60, 'x': 96, 'y': 0, 'sprite_id': 207, 'state': 1,
+        'trigger_mode': 6, 'trigger_script': 5486, 'auto_script': 5583,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=7, height=7, start=(0, 6), objects=[target], frame=10)
+    write_state(debug, source)
+    debug.snapshot()
+    assert debug.navigation_step(source, target_id=60)['ok'] is True
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+
+    dialog = dict(source)
+    dialog['frame'] = 11
+    dialog['dialog'] = {
+        'active': True,
+        'visible': True,
+        'latest_event': {'sequence': 9, 'message_id': 956, 'text': '被你感動的．．'},
+    }
+    dialog['trigger_observation'] = {
+        'generation': 1,
+        'event_object_id': 60,
+        'trigger_script': 5486,
+        'completed': False,
+        'source': {'scene_id': 3, 'map_id': 10, 'x': 96, 'y': 0},
+    }
+    write_state(debug, dialog)
+    debug.snapshot()
+    pending = debug.pending_transition_observation
+    pending['control_last_progress_at'] -= 31
+
+    debug.snapshot()
+
+    assert debug.pending_transition_observation is pending
+    assert debug.observations.get(pending['observation_id'])['status'] == 'pending'
+    assert debug.navigation_step(dialog, target_id=60)['status'] == 'in_dialog'
 
 
 def test_same_room_trigger_without_position_jump_is_not_recorded(tmp_path):

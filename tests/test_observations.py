@@ -52,6 +52,33 @@ def test_observation_timeout_and_cancel_wake_waiters():
     assert cancelled["reason"] == "agent_interrupt"
 
 
+def test_pending_observation_can_be_rescheduled_for_a_longer_phase():
+    observations = ObservationCoordinator()
+    observation_id = observations.register("transition", owner="navigation", timeout=0.01)
+
+    rescheduled = observations.reschedule(observation_id, 0.2)
+    time.sleep(0.02)
+
+    assert rescheduled["status"] == "pending"
+    assert observations.get(observation_id)["status"] == "pending"
+    observations.complete(observation_id, {"status": "transitioned"})
+    assert observations.consume(observation_id, owner="navigation")["status"] == "completed"
+
+
+def test_pending_observation_timeout_can_be_suspended_and_rearmed():
+    observations = ObservationCoordinator()
+    observation_id = observations.register("transition", owner="navigation", timeout=0.01)
+
+    suspended = observations.suspend_timeout(observation_id)
+    time.sleep(0.02)
+
+    assert suspended["deadline"] is None
+    assert observations.get(observation_id)["status"] == "pending"
+    observations.reschedule(observation_id, 0.01)
+    time.sleep(0.02)
+    assert observations.get(observation_id)["status"] == "timed_out"
+
+
 def test_clear_all_removes_pending_and_completed_requests():
     observations = ObservationCoordinator()
     pending_id = observations.register("interaction", owner="navigation", timeout=1)

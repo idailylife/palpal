@@ -2,6 +2,21 @@
   box-sizing: border-box;
 }
 
+.battleStatus {
+  display: grid;
+  gap: 6px;
+  color: #d9e7f2;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.battleStatus > div {
+  padding: 7px 9px;
+  border: 1px solid rgba(255, 196, 92, 0.22);
+  border-radius: 7px;
+  background: rgba(64, 43, 18, 0.36);
+}
+
 body {
   margin: 0;
   background: #101214;
@@ -66,19 +81,75 @@ body {
   margin-bottom: 12px;
 }
 
-#connection {
-  color: #9fb1c1;
-  text-align: right;
+.statusBar {
+  display: grid;
+  flex: 1 1 auto;
+  grid-template-columns: repeat(4, minmax(74px, 1fr));
+  gap: 6px;
+  width: min(100%, 560px);
 }
 
-.runtimeStatus {
-  width: min(100%, 960px);
-  margin: 0 0 12px;
-  padding: 8px 10px;
-  border: 1px solid #69542a;
+.statusChip {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  min-height: 42px;
+  padding: 5px 8px;
+  border: 1px solid #394550;
   border-radius: 6px;
+  background: #171c21;
+  box-shadow: inset 3px 0 0 #65727d;
+}
+
+.statusChip span {
+  color: #8fa4b5;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.1;
+  text-transform: uppercase;
+}
+
+.statusChip strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #e8edf2;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.statusChip[data-tone="live"] {
+  border-color: #315e4a;
+  background: #13231c;
+  box-shadow: inset 3px 0 0 #56d38b;
+}
+
+.statusChip[data-tone="busy"] {
+  border-color: #31566c;
+  background: #12202a;
+  box-shadow: inset 3px 0 0 #66c7ff;
+}
+
+.statusChip[data-tone="pending"],
+.statusChip[data-tone="warning"] {
+  border-color: #69542a;
   background: #211b10;
-  color: #ffd98a;
+  box-shadow: inset 3px 0 0 #e1ad4d;
+}
+
+.statusChip[data-tone="error"] {
+  border-color: #743c40;
+  background: #2a1517;
+  box-shadow: inset 3px 0 0 #ff7b72;
+}
+
+.statusChip[data-tone="idle"] {
+  border-color: #394550;
+  background: #171c21;
+  box-shadow: inset 3px 0 0 #65727d;
 }
 
 .screenWrap {
@@ -569,6 +640,9 @@ button.is-active {
 .agentActivity.is-ready .agentActivityIcon { color: #7ee3ae; }
 .agentActivity.is-request .agentActivityIcon,
 .agentActivity.is-progress .agentActivityIcon { color: #66e3ff; }
+.agentActivity.is-failed .agentActivityIcon { color: #ff8f8f; }
+.agentActivity.is-stopped .agentActivityIcon,
+.agentActivity.is-retry .agentActivityIcon { color: #ffd666; }
 .agentActivity.is-current .agentActivityIcon { color: #66e3ff; animation: agentPulse 1s ease-in-out infinite; }
 
 @keyframes agentPulse { 50% { opacity: .35; } }
@@ -579,6 +653,32 @@ button.is-active {
 .agentActivity details { margin-top: 5px; }
 .agentActivity summary { color: #8fa0af; cursor: pointer; font-size: 11px; }
 .agentActivity pre { background: #0b0e11; border-radius: 5px; font-size: 10px; margin: 5px 0 0; max-height: 300px; padding: 7px; }
+.agentBattleGroup {
+  border-left: 2px solid #715b31;
+  margin: 4px 0 4px 22px;
+  min-width: 0;
+  padding-left: 10px;
+}
+
+.agentBattleGroup[open] { border-left-color: #d6a84c; }
+.agentBattleGroup.is-completed { border-left-color: #4f8067; }
+.agentBattleGroup.is-failed { border-left-color: #9b5151; }
+.agentBattleGroup.is-stopped { border-left-color: #8c732d; }
+
+.agentBattleGroup > summary {
+  align-items: baseline;
+  color: #e7c879;
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  list-style-position: inside;
+  padding: 7px 0;
+}
+
+.agentBattleGroup > summary span { font-size: 12px; font-weight: 700; }
+.agentBattleGroup > summary small { color: #8fa0af; font-size: 10px; text-align: right; }
+.agentBattleEvents { min-width: 0; }
 .agentTimelineEmpty { color: #8fa0af; padding: 30px 10px; text-align: center; }
 
 .agentLoadEarlier {
@@ -1542,11 +1642,12 @@ pre {
   .toolbar {
     align-items: flex-start;
     flex-direction: column;
-    gap: 4px;
+    gap: 8px;
   }
 
-  #connection {
-    text-align: left;
+  .statusBar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
   }
 
   .controls {

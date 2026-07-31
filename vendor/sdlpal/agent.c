@@ -103,6 +103,62 @@ typedef struct tagPALPALAGENTSHOP
 
 static PALPALAGENTSHOP g_agent_shop;
 
+typedef enum tagPALPALAGENTBATTLEPHASE
+{
+   kPalpalAgentBattleNone = 0,
+   kPalpalAgentBattlePreBattle,
+   kPalpalAgentBattleResolving,
+   kPalpalAgentBattleCommand,
+   kPalpalAgentBattleReward,
+   kPalpalAgentBattleEnding
+} PALPALAGENTBATTLEPHASE;
+
+typedef struct tagPALPALAGENTBATTLE
+{
+   DWORD generation;
+   DWORD command_generation;
+   PALPALAGENTBATTLEPHASE phase;
+   BOOL awaiting_ack;
+   WORD current_player_index;
+   WORD enemy_object_id[MAX_ENEMIES_IN_TEAM];
+   WORD enemy_max_hp[MAX_ENEMIES_IN_TEAM];
+   WORD player_role[MAX_PLAYERS_IN_PARTY];
+   WORD player_hp_before[MAX_PLAYERS_IN_PARTY];
+   WORD player_mp_before[MAX_PLAYERS_IN_PARTY];
+   WORD player_level_before[MAX_PLAYERS_IN_PARTY];
+   WORD player_status_before[MAX_PLAYERS_IN_PARTY][kStatusAll];
+   WORD player_status_after[MAX_PLAYERS_IN_PARTY][kStatusAll];
+   WORD player_magics_before[MAX_PLAYERS_IN_PARTY][MAX_PLAYER_MAGICS];
+   WORD player_new_magics[MAX_PLAYERS_IN_PARTY][MAX_PLAYER_MAGICS];
+   DWORD started_ticks;
+} PALPALAGENTBATTLE;
+
+typedef struct tagPALPALAGENTLASTBATTLE
+{
+   BOOL valid;
+   DWORD generation;
+   int result;
+   BOOL is_boss;
+   DWORD ended_frame;
+   DWORD duration_ms;
+   int exp_gained;
+   int cash_gained;
+   WORD enemy_object_id[MAX_ENEMIES_IN_TEAM];
+   WORD player_role[MAX_PLAYERS_IN_PARTY];
+   WORD player_hp_before[MAX_PLAYERS_IN_PARTY];
+   WORD player_mp_before[MAX_PLAYERS_IN_PARTY];
+   WORD player_level_before[MAX_PLAYERS_IN_PARTY];
+   WORD player_hp_after[MAX_PLAYERS_IN_PARTY];
+   WORD player_mp_after[MAX_PLAYERS_IN_PARTY];
+   WORD player_level_after[MAX_PLAYERS_IN_PARTY];
+   WORD player_status_before[MAX_PLAYERS_IN_PARTY][kStatusAll];
+   WORD player_status_after[MAX_PLAYERS_IN_PARTY][kStatusAll];
+   WORD player_new_magics[MAX_PLAYERS_IN_PARTY][MAX_PLAYER_MAGICS];
+} PALPALAGENTLASTBATTLE;
+
+static PALPALAGENTBATTLE g_agent_battle;
+static PALPALAGENTLASTBATTLE g_agent_last_battle;
+
 typedef enum tagPALPALAGENTSLOTCOMMAND
 {
    kPalpalAgentSlotCommandNone = 0,
@@ -173,6 +229,19 @@ static PALPALDIALOGEVENT g_agent_latest_dialog_event;
 static PALPALDIALOGEVENT g_agent_dialog_events[PALPAL_AGENT_DIALOG_EVENT_CAPACITY];
 static int g_agent_dialog_event_next = 0;
 static int g_agent_dialog_event_count = 0;
+
+typedef struct tagPALPALAGENTCHOICE
+{
+   BOOL active;
+   DWORD generation;
+   WORD event_object_id;
+   WORD script_entry;
+   int selected_index;
+   BOOL command_pending;
+   int requested_index;
+} PALPALAGENTCHOICE;
+
+static PALPALAGENTCHOICE g_agent_choice;
 
 #define PALPAL_DIALOG_ACTIVE_GRACE_MS 1000
 
@@ -1115,6 +1184,85 @@ PALPAL_AgentWriteSlotResult(
    rename(tmp_path, result_path);
 }
 
+static VOID
+PALPAL_AgentWriteBattleResult(
+   BOOL ok,
+   const char *status,
+   DWORD battle_generation,
+   DWORD command_generation,
+   WORD player_index,
+   const char *action_type,
+   WORD object_id,
+   SHORT target_index
+)
+{
+   char result_path[PAL_MAX_PATH];
+   char tmp_path[PAL_MAX_PATH];
+   FILE *fp;
+
+   PALPAL_AgentPath(result_path, sizeof(result_path), "action_result.json");
+   PALPAL_AgentPath(tmp_path, sizeof(tmp_path), "action_result.json.tmp");
+   fp = fopen(tmp_path, "w");
+   if (!fp)
+   {
+      return;
+   }
+   fprintf(fp,
+      "{\"time_ms\":%u,\"ok\":%s,\"status\":\"%s\","
+      "\"action\":\"battle_action\",\"battle_generation\":%u,"
+      "\"command_generation\":%u,\"player_index\":%u,"
+      "\"action_type\":\"%s\",\"object_id\":%u,\"target_index\":%d,"
+      "\"error\":%s%s%s}\n",
+      (unsigned int)SDL_GetTicks(),
+      ok ? "true" : "false",
+      status ? status : "unknown",
+      (unsigned int)battle_generation,
+      (unsigned int)command_generation,
+      (unsigned int)player_index,
+      action_type ? action_type : "",
+      (unsigned int)object_id,
+      (int)target_index,
+      ok ? "" : "\"",
+      ok ? "null" : (status ? status : "unknown"),
+      ok ? "" : "\"");
+   fclose(fp);
+   rename(tmp_path, result_path);
+}
+
+static VOID
+PALPAL_AgentWriteChoiceResult(
+   BOOL ok,
+   const char *status,
+   DWORD generation,
+   int requested_index,
+   int selected_index,
+   const char *error
+)
+{
+   char result_path[PAL_MAX_PATH];
+   char tmp_path[PAL_MAX_PATH];
+   FILE *fp;
+
+   PALPAL_AgentPath(result_path, sizeof(result_path), "action_result.json");
+   PALPAL_AgentPath(tmp_path, sizeof(tmp_path), "action_result.json.tmp");
+   fp = fopen(tmp_path, "w");
+   if (!fp) return;
+   fprintf(fp,
+      "{\"time_ms\":%u,\"ok\":%s,\"status\":\"%s\","
+      "\"action\":\"choice_select\",\"generation\":%u,"
+      "\"requested_index\":%d,\"selected_index\":%d,"
+      "\"semantic\":\"%s\",\"error\":",
+      (unsigned int)SDL_GetTicks(), ok ? "true" : "false",
+      status ? status : "unknown", (unsigned int)generation,
+      requested_index, selected_index,
+      selected_index == 1 ? "yes" : "no");
+   if (error && error[0]) fprintf(fp, "\"%s\"", error);
+   else fputs("null", fp);
+   fputs("}\n", fp);
+   fclose(fp);
+   rename(tmp_path, result_path);
+}
+
 static BOOL
 PALPAL_AgentSlotCommandAllowed(
    const char *action,
@@ -1583,6 +1731,47 @@ PALPAL_AgentQueueMenuButton(
    g_agent_action_count++;
 }
 
+static VOID
+PALPAL_AgentQueueChoiceSelect(
+   DWORD generation,
+   int option_index
+)
+{
+   if (!g_agent_choice.active)
+   {
+      PALPAL_AgentWriteChoiceResult(FALSE, "choice_inactive", generation,
+         option_index, -1, "choice_inactive");
+      return;
+   }
+   if (generation != g_agent_choice.generation)
+   {
+      PALPAL_AgentWriteChoiceResult(FALSE, "stale_choice_command", generation,
+         option_index, g_agent_choice.selected_index, "stale_choice_command");
+      return;
+   }
+   if (option_index < 0 || option_index > 1)
+   {
+      PALPAL_AgentWriteChoiceResult(FALSE, "invalid_choice_option", generation,
+         option_index, g_agent_choice.selected_index, "invalid_choice_option");
+      return;
+   }
+   if (g_agent_choice.command_pending)
+   {
+      PALPAL_AgentWriteChoiceResult(FALSE, "choice_action_pending", generation,
+         option_index, g_agent_choice.selected_index, "choice_action_pending");
+      return;
+   }
+
+   g_agent_choice.command_pending = TRUE;
+   g_agent_choice.requested_index = option_index;
+   if (g_agent_choice.selected_index != option_index)
+   {
+      PALPAL_AgentQueueMenuButton(option_index > g_agent_choice.selected_index
+         ? kKeyRight : kKeyLeft);
+   }
+   PALPAL_AgentQueueMenuButton(kKeySearch);
+}
+
 static int
 PALPAL_AgentShopItemIndex(
    WORD item_id
@@ -1754,6 +1943,8 @@ PALPAL_AgentLoadActionFile(
    BOOL pending_equip_item = FALSE;
    BOOL pending_shop_buy = FALSE;
    BOOL pending_shop_leave = FALSE;
+   BOOL pending_battle_action = FALSE;
+   BOOL pending_choice_select = FALSE;
    BOOL pending_target_all = FALSE;
    WORD pending_item_id = 0;
    WORD pending_role_id = 0;
@@ -1761,6 +1952,16 @@ PALPAL_AgentLoadActionFile(
    WORD pending_equip_role_id = 0;
    PALPALAGENTSLOTCOMMAND pending_slot_command = kPalpalAgentSlotCommandNone;
    int pending_slot = 0;
+   DWORD pending_battle_generation = 0;
+   DWORD pending_command_generation = 0;
+   WORD pending_battle_player = 0;
+   WORD pending_battle_object = 0;
+   SHORT pending_battle_target = -2;
+   char pending_battle_type[32];
+   DWORD pending_choice_generation = 0;
+   int pending_choice_index = -1;
+
+   pending_battle_type[0] = '\0';
 
    PALPAL_AgentPath(path, sizeof(path), "action.txt");
    fp = fopen(path, "r");
@@ -1833,6 +2034,37 @@ PALPAL_AgentLoadActionFile(
       {
          pending_shop_leave = TRUE;
       }
+      else if (strcmp(key, "battle_action") == 0)
+      {
+         unsigned int battle_generation, command_generation;
+         unsigned int player_index, object_id;
+         int target_index;
+         char action_type[32];
+         if (sscanf(line, "%31s %u %u %u %31s %u %d",
+               key, &battle_generation, &command_generation, &player_index,
+               action_type, &object_id, &target_index) == 7)
+         {
+            pending_battle_action = TRUE;
+            pending_battle_generation = (DWORD)battle_generation;
+            pending_command_generation = (DWORD)command_generation;
+            pending_battle_player = (WORD)player_index;
+            pending_battle_object = (WORD)object_id;
+            pending_battle_target = (SHORT)target_index;
+            strncpy(pending_battle_type, action_type, sizeof(pending_battle_type) - 1);
+            pending_battle_type[sizeof(pending_battle_type) - 1] = '\0';
+         }
+      }
+      else if (strcmp(key, "choice_select") == 0)
+      {
+         unsigned int generation;
+         int option_index;
+         if (sscanf(line, "%31s %u %d", key, &generation, &option_index) == 3)
+         {
+            pending_choice_select = TRUE;
+            pending_choice_generation = (DWORD)generation;
+            pending_choice_index = option_index;
+         }
+      }
       else if (strcmp(key, "save_slot") == 0)
       {
          pending_slot_command = kPalpalAgentSlotCommandSave;
@@ -1857,7 +2089,58 @@ PALPAL_AgentLoadActionFile(
       return;
    }
    g_agent_action_generation++;
-   if (pending_shop_buy)
+   if (pending_choice_select)
+   {
+      PALPAL_AgentQueueChoiceSelect(pending_choice_generation, pending_choice_index);
+   }
+   else if (pending_battle_action)
+   {
+      const char *status;
+      if (strcmp(pending_battle_type, "continue") == 0)
+      {
+         if (!gpGlobals->fInBattle ||
+             pending_battle_generation != g_agent_battle.generation ||
+             pending_command_generation != g_agent_battle.command_generation)
+         {
+            status = "stale_battle_command";
+         }
+         else if (!g_agent_battle.awaiting_ack ||
+                  g_agent_battle.phase != kPalpalAgentBattleReward)
+         {
+            status = "battle_not_awaiting_ack";
+         }
+         else
+         {
+            PALPAL_AgentQueueButton("search");
+            g_agent_battle.awaiting_ack = FALSE;
+            status = NULL;
+         }
+      }
+      else
+      {
+         status = PALPAL_BattleSubmitAction(
+            pending_battle_generation,
+            pending_command_generation,
+            pending_battle_player,
+            pending_battle_type,
+            pending_battle_object,
+            pending_battle_target);
+         if (status == NULL)
+         {
+            g_agent_battle.phase = kPalpalAgentBattleResolving;
+         }
+      }
+      PALPAL_AgentWriteBattleResult(
+         status == NULL,
+         status == NULL ? "submitted" : status,
+         pending_battle_generation,
+         pending_command_generation,
+         pending_battle_player,
+         pending_battle_type,
+         pending_battle_object,
+         pending_battle_target);
+   }
+   else if (pending_shop_buy)
    {
       PALPAL_AgentQueueShopBuy(pending_item_id);
    }
@@ -1886,6 +2169,55 @@ PALPAL_AgentLoadActionFile(
    {
       PALPAL_AgentEquipItem(pending_equip_item_id, pending_equip_role_id);
    }
+}
+
+VOID
+PALPAL_AgentBeginChoice(
+   WORD wEventObjectID,
+   WORD wScriptEntry
+)
+{
+   DWORD generation = g_agent_choice.generation + 1;
+   memset(&g_agent_choice, 0, sizeof(g_agent_choice));
+   if (!PALPAL_AgentEnabled()) return;
+   g_agent_choice.active = TRUE;
+   g_agent_choice.generation = generation ? generation : 1;
+   g_agent_choice.event_object_id = wEventObjectID;
+   g_agent_choice.script_entry = wScriptEntry;
+   g_agent_choice.selected_index = 0;
+   g_agent_choice.requested_index = -1;
+}
+
+VOID
+PALPAL_AgentObserveChoiceSelection(
+   WORD wSelectedIndex
+)
+{
+   if (g_agent_choice.active && wSelectedIndex < 2)
+   {
+      g_agent_choice.selected_index = (int)wSelectedIndex;
+   }
+}
+
+VOID
+PALPAL_AgentEndChoice(
+   WORD wSelectedIndex
+)
+{
+   int selected_index;
+   if (!g_agent_choice.active) return;
+   selected_index = (wSelectedIndex == MENUITEM_VALUE_CANCELLED) ? 0 : (int)wSelectedIndex;
+   g_agent_choice.selected_index = selected_index;
+   if (g_agent_choice.command_pending)
+   {
+      BOOL matched = selected_index == g_agent_choice.requested_index;
+      PALPAL_AgentWriteChoiceResult(matched,
+         matched ? "selected" : "choice_selection_mismatch",
+         g_agent_choice.generation, g_agent_choice.requested_index,
+         selected_index, matched ? NULL : "choice_selection_mismatch");
+   }
+   g_agent_choice.active = FALSE;
+   g_agent_choice.command_pending = FALSE;
 }
 
 VOID
@@ -2008,6 +2340,197 @@ PALPAL_AgentEndBuyMenu(
 }
 
 VOID
+PALPAL_AgentBattleBegin(
+   VOID
+)
+{
+   DWORD generation = g_agent_battle.generation + 1;
+   int i;
+
+   memset(&g_agent_battle, 0, sizeof(g_agent_battle));
+   g_agent_battle.generation = generation ? generation : 1;
+   g_agent_battle.phase = kPalpalAgentBattlePreBattle;
+   g_agent_battle.started_ticks = SDL_GetTicks();
+   if (gpGlobals == NULL)
+   {
+      return;
+   }
+   for (i = 0; i < MAX_ENEMIES_IN_TEAM; i++)
+   {
+      g_agent_battle.enemy_object_id[i] = g_Battle.rgEnemy[i].wObjectID;
+      g_agent_battle.enemy_max_hp[i] = g_Battle.rgEnemy[i].e.wHealth;
+   }
+   for (i = 0; i < MAX_PLAYERS_IN_PARTY; i++)
+   {
+      if (i <= gpGlobals->wMaxPartyMemberIndex)
+      {
+         WORD role = gpGlobals->rgParty[i].wPlayerRole;
+         g_agent_battle.player_role[i] = role;
+         g_agent_battle.player_hp_before[i] = gpGlobals->g.PlayerRoles.rgwHP[role];
+         g_agent_battle.player_mp_before[i] = gpGlobals->g.PlayerRoles.rgwMP[role];
+         g_agent_battle.player_level_before[i] = gpGlobals->g.PlayerRoles.rgwLevel[role];
+         memcpy(g_agent_battle.player_status_before[i],
+            gpGlobals->rgPlayerStatus[role],
+            sizeof(g_agent_battle.player_status_before[i]));
+         {
+            int j;
+            for (j = 0; j < MAX_PLAYER_MAGICS; j++)
+            {
+               g_agent_battle.player_magics_before[i][j] =
+                  gpGlobals->g.PlayerRoles.rgwMagic[j][role];
+            }
+         }
+      }
+      else
+      {
+         g_agent_battle.player_role[i] = 0xFFFF;
+      }
+   }
+}
+
+VOID
+PALPAL_AgentBattleCommandReady(
+   WORD wPlayerIndex
+)
+{
+   if (!PALPAL_AgentEnabled() || !gpGlobals || !gpGlobals->fInBattle)
+   {
+      return;
+   }
+   g_agent_battle.command_generation++;
+   if (g_agent_battle.command_generation == 0)
+   {
+      g_agent_battle.command_generation = 1;
+   }
+   g_agent_battle.phase = kPalpalAgentBattleCommand;
+   g_agent_battle.awaiting_ack = FALSE;
+   g_agent_battle.current_player_index = wPlayerIndex;
+}
+
+VOID
+PALPAL_AgentBattleRewardBegin(
+   VOID
+)
+{
+   if (g_agent_battle.generation)
+   {
+      g_agent_battle.command_generation++;
+      g_agent_battle.phase = kPalpalAgentBattleReward;
+      g_agent_battle.awaiting_ack = TRUE;
+   }
+}
+
+VOID
+PALPAL_AgentBattleEnding(
+   VOID
+)
+{
+   int i, j;
+   if (g_agent_battle.generation)
+   {
+      g_agent_battle.phase = kPalpalAgentBattleEnding;
+      g_agent_battle.awaiting_ack = FALSE;
+      for (i = 0; gpGlobals && i < MAX_PLAYERS_IN_PARTY; i++)
+      {
+         WORD role = g_agent_battle.player_role[i];
+         if (role == 0xFFFF || role >= MAX_PLAYER_ROLES) continue;
+         memcpy(g_agent_battle.player_status_after[i],
+            gpGlobals->rgPlayerStatus[role],
+            sizeof(g_agent_battle.player_status_after[i]));
+         for (j = 0; j < MAX_PLAYER_MAGICS; j++)
+         {
+            WORD magic = gpGlobals->g.PlayerRoles.rgwMagic[j][role];
+            int k, known = 0;
+            if (magic == 0) continue;
+            for (k = 0; k < MAX_PLAYER_MAGICS; k++)
+            {
+               if (g_agent_battle.player_magics_before[i][k] == magic)
+               {
+                  known = 1;
+                  break;
+               }
+            }
+            if (!known)
+            {
+               g_agent_battle.player_new_magics[i][j] = magic;
+            }
+         }
+      }
+   }
+}
+
+VOID
+PALPAL_AgentBattleEnd(
+   INT iResult
+)
+{
+   int i;
+
+   memset(&g_agent_last_battle, 0, sizeof(g_agent_last_battle));
+   g_agent_last_battle.valid = TRUE;
+   g_agent_last_battle.generation = g_agent_battle.generation;
+   g_agent_last_battle.result = iResult;
+   g_agent_last_battle.is_boss = g_Battle.fIsBoss;
+   g_agent_last_battle.ended_frame = gpGlobals ? gpGlobals->dwFrameNum : 0;
+   g_agent_last_battle.duration_ms = SDL_GetTicks() - g_agent_battle.started_ticks;
+   g_agent_last_battle.exp_gained = g_Battle.iExpGained;
+   g_agent_last_battle.cash_gained = g_Battle.iCashGained;
+   for (i = 0; i < MAX_ENEMIES_IN_TEAM; i++)
+   {
+      g_agent_last_battle.enemy_object_id[i] = g_agent_battle.enemy_object_id[i];
+   }
+   for (i = 0; i < MAX_PLAYERS_IN_PARTY; i++)
+   {
+      WORD role = g_agent_battle.player_role[i];
+      g_agent_last_battle.player_role[i] = role;
+      g_agent_last_battle.player_hp_before[i] = g_agent_battle.player_hp_before[i];
+      g_agent_last_battle.player_mp_before[i] = g_agent_battle.player_mp_before[i];
+      g_agent_last_battle.player_level_before[i] = g_agent_battle.player_level_before[i];
+      memcpy(g_agent_last_battle.player_status_before[i],
+         g_agent_battle.player_status_before[i],
+         sizeof(g_agent_last_battle.player_status_before[i]));
+      memcpy(g_agent_last_battle.player_status_after[i],
+         g_agent_battle.player_status_after[i],
+         sizeof(g_agent_last_battle.player_status_after[i]));
+      memcpy(g_agent_last_battle.player_new_magics[i],
+         g_agent_battle.player_new_magics[i],
+         sizeof(g_agent_last_battle.player_new_magics[i]));
+      if (gpGlobals && role != 0xFFFF && role < MAX_PLAYER_ROLES)
+      {
+         g_agent_last_battle.player_hp_after[i] = gpGlobals->g.PlayerRoles.rgwHP[role];
+         g_agent_last_battle.player_mp_after[i] = gpGlobals->g.PlayerRoles.rgwMP[role];
+         g_agent_last_battle.player_level_after[i] = gpGlobals->g.PlayerRoles.rgwLevel[role];
+      }
+   }
+   g_agent_battle.phase = kPalpalAgentBattleNone;
+   g_agent_battle.awaiting_ack = FALSE;
+}
+
+DWORD
+PALPAL_AgentBattleGeneration(
+   VOID
+)
+{
+   return g_agent_battle.generation;
+}
+
+DWORD
+PALPAL_AgentBattleCommandGeneration(
+   VOID
+)
+{
+   return g_agent_battle.command_generation;
+}
+
+BOOL
+PALPAL_AgentBattleAwaitingAck(
+   VOID
+)
+{
+   return g_agent_battle.awaiting_ack;
+}
+
+VOID
 PALPAL_AgentPollAction(
    VOID
 )
@@ -2079,7 +2602,8 @@ PALPAL_AgentPollAction(
          g_agent_injected_dir = step->dir;
          g_agent_dir_active = TRUE;
       }
-      if (step->dir != kDirUnknown && PALPAL_AgentPartyPosition(&x, &y))
+      if (step->dir != kDirUnknown && !gpGlobals->fInBattle &&
+          PALPAL_AgentPartyPosition(&x, &y))
       {
          g_agent_waiting_for_move = TRUE;
          g_agent_wait_x = x;
@@ -2547,6 +3071,450 @@ PALPAL_AgentWriteParty(
 }
 
 static const char *
+PALPAL_AgentBattleResultName(
+   int result
+)
+{
+   switch (result)
+   {
+   case kBattleResultWon: return "won";
+   case kBattleResultLost: return "lost";
+   case kBattleResultFleed: return "fled";
+   case kBattleResultTerminated: return "terminated";
+   case kBattleResultPause: return "paused";
+   case kBattleResultPreBattle: return "pre_battle";
+   default: return "ongoing";
+   }
+}
+
+static const char *
+PALPAL_AgentBattlePhaseName(
+   VOID
+)
+{
+   switch (g_agent_battle.phase)
+   {
+   case kPalpalAgentBattlePreBattle:
+      return g_Battle.BattleResult == kBattleResultPreBattle ? "pre_battle" : "resolving";
+   case kPalpalAgentBattleCommand: return "command";
+   case kPalpalAgentBattleReward: return "reward";
+   case kPalpalAgentBattleEnding: return "ending";
+   default: return "resolving";
+   }
+}
+
+static const char *
+PALPAL_AgentFighterStateName(
+   FIGHTERSTATE state
+)
+{
+   switch (state)
+   {
+   case kFighterCom: return "command";
+   case kFighterAct: return "acting";
+   default: return "waiting";
+   }
+}
+
+static const char *
+PALPAL_AgentBattleActionName(
+   BATTLEACTIONTYPE action
+)
+{
+   switch (action)
+   {
+   case kBattleActionDefend: return "defend";
+   case kBattleActionAttack: return "attack";
+   case kBattleActionMagic: return "magic";
+   case kBattleActionCoopMagic: return "coop_magic";
+   case kBattleActionFlee: return "flee";
+   case kBattleActionThrowItem: return "throw_item";
+   case kBattleActionUseItem: return "use_item";
+   case kBattleActionAttackMate: return "attack_mate";
+   default: return "pass";
+   }
+}
+
+static VOID
+PALPAL_AgentWriteStatusValues(
+   FILE *fp,
+   WORD *values
+)
+{
+   int i;
+   fprintf(fp, "[");
+   for (i = 0; i < kStatusAll; i++)
+   {
+      if (i > 0) fprintf(fp, ",");
+      fprintf(fp, "%u", values[i]);
+   }
+   fprintf(fp, "]");
+}
+
+static VOID
+PALPAL_AgentWritePlayerPoisons(
+   FILE *fp,
+   WORD role
+)
+{
+   int i, first = 1;
+   fprintf(fp, "[");
+   for (i = 0; i < MAX_POISONS; i++)
+   {
+      POISONSTATUS *poison = &gpGlobals->rgPoisonStatus[i][role];
+      if (poison->wPoisonID == 0) continue;
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"poison_id\":%u,\"script\":%u,\"name\":",
+         poison->wPoisonID, poison->wPoisonScript);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(poison->wPoisonID));
+      fprintf(fp, "}");
+      first = 0;
+   }
+   fprintf(fp, "]");
+}
+
+static VOID
+PALPAL_AgentWriteEnemyPoisons(
+   FILE *fp,
+   BATTLEENEMY *enemy
+)
+{
+   int i, first = 1;
+   fprintf(fp, "[");
+   for (i = 0; i < MAX_POISONS; i++)
+   {
+      POISONSTATUS *poison = &enemy->rgPoisons[i];
+      if (poison->wPoisonID == 0) continue;
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"poison_id\":%u,\"script\":%u,\"name\":",
+         poison->wPoisonID, poison->wPoisonScript);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(poison->wPoisonID));
+      fprintf(fp, "}");
+      first = 0;
+   }
+   fprintf(fp, "]");
+}
+
+static VOID
+PALPAL_AgentWriteBattleTargets(
+   FILE *fp,
+   BOOL enemy_side
+)
+{
+   int i, first = 1;
+   fprintf(fp, "[");
+   if (enemy_side)
+   {
+      for (i = 0; i <= g_Battle.wMaxEnemyIndex; i++)
+      {
+         if (g_Battle.rgEnemy[i].wObjectID == 0 || g_Battle.rgEnemy[i].e.wHealth == 0)
+            continue;
+         if (!first) fprintf(fp, ",");
+         fprintf(fp, "%d", i);
+         first = 0;
+      }
+   }
+   else
+   {
+      for (i = 0; i <= gpGlobals->wMaxPartyMemberIndex; i++)
+      {
+         if (!first) fprintf(fp, ",");
+         fprintf(fp, "%d", i);
+         first = 0;
+      }
+   }
+   fprintf(fp, "]");
+}
+
+static VOID
+PALPAL_AgentWriteBattleActionEntry(
+   FILE *fp,
+   BOOL *first,
+   const char *type,
+   WORD object_id,
+   const char *target_side,
+   BOOL target_all
+)
+{
+   if (!*first) fprintf(fp, ",");
+   fprintf(fp,
+      "{\"action_type\":\"%s\",\"object_id\":%u,\"target_side\":\"%s\","
+      "\"target_mode\":\"%s\",\"valid_target_indices\":",
+      type, object_id, target_side, target_all ? "all" :
+      (strcmp(target_side, "none") == 0 ? "none" : "single"));
+   if (target_all || strcmp(target_side, "none") == 0)
+   {
+      fprintf(fp, "[]");
+   }
+   else
+   {
+      PALPAL_AgentWriteBattleTargets(fp, strcmp(target_side, "enemy") == 0);
+   }
+   if (object_id != 0)
+   {
+      fprintf(fp, ",\"name\":");
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(object_id));
+   }
+   fprintf(fp, "}");
+   *first = FALSE;
+}
+
+static VOID
+PALPAL_AgentWriteBattleActions(
+   FILE *fp
+)
+{
+   BOOL first = TRUE;
+   WORD player_index = g_agent_battle.current_player_index;
+   WORD role;
+   int i;
+
+   fprintf(fp, "\"available_actions\":[");
+   if (g_agent_battle.phase == kPalpalAgentBattleReward && g_agent_battle.awaiting_ack)
+   {
+      PALPAL_AgentWriteBattleActionEntry(fp, &first, "continue", 0, "none", FALSE);
+   }
+   else if (g_agent_battle.phase == kPalpalAgentBattleCommand &&
+            player_index <= gpGlobals->wMaxPartyMemberIndex)
+   {
+      role = gpGlobals->rgParty[player_index].wPlayerRole;
+      PALPAL_AgentWriteBattleActionEntry(fp, &first, "attack", 0, "enemy",
+         PAL_PlayerCanAttackAll(role));
+      if (gpGlobals->rgPlayerStatus[role][kStatusSilence] == 0)
+      {
+         for (i = 0; i < MAX_PLAYER_MAGICS; i++)
+         {
+            WORD object_id = gpGlobals->g.PlayerRoles.rgwMagic[i][role];
+            WORD number, flags;
+            if (object_id == 0 || object_id >= MAX_OBJECTS) continue;
+            number = gpGlobals->g.rgObject[object_id].magic.wMagicNumber;
+            flags = gpGlobals->g.rgObject[object_id].magic.wFlags;
+            if (number >= gpGlobals->g.nMagic ||
+                !(flags & kMagicFlagUsableInBattle) ||
+                gpGlobals->g.lprgMagic[number].wCostMP > gpGlobals->g.PlayerRoles.rgwMP[role])
+               continue;
+            PALPAL_AgentWriteBattleActionEntry(fp, &first, "magic", object_id,
+               (flags & kMagicFlagUsableToEnemy) ? "enemy" : "player",
+               (flags & kMagicFlagApplyToAll) != 0);
+         }
+      }
+      if (PALPAL_BattleCoopActionAvailable())
+      {
+         WORD object_id = PAL_GetPlayerCooperativeMagic(role);
+         WORD flags = gpGlobals->g.rgObject[object_id].magic.wFlags;
+         if (object_id != 0)
+         {
+            PALPAL_AgentWriteBattleActionEntry(fp, &first, "coop_magic", object_id,
+               (flags & kMagicFlagUsableToEnemy) ? "enemy" : "player",
+               (flags & kMagicFlagApplyToAll) != 0);
+         }
+      }
+      for (i = 0; i < MAX_INVENTORY; i++)
+      {
+         WORD object_id = gpGlobals->rgInventory[i].wItem;
+         WORD flags;
+         if (object_id == 0 || gpGlobals->rgInventory[i].nAmount <=
+               gpGlobals->rgInventory[i].nAmountInUse) continue;
+         flags = gpGlobals->g.rgObject[object_id].item.wFlags;
+         if (flags & kItemFlagUsable)
+            PALPAL_AgentWriteBattleActionEntry(fp, &first, "use_item", object_id,
+               "player", (flags & kItemFlagApplyToAll) != 0);
+         if (flags & kItemFlagThrowable)
+            PALPAL_AgentWriteBattleActionEntry(fp, &first, "throw_item", object_id,
+               "enemy", (flags & kItemFlagApplyToAll) != 0);
+      }
+      PALPAL_AgentWriteBattleActionEntry(fp, &first, "defend", 0, "none", FALSE);
+      if (!g_Battle.fIsBoss)
+         PALPAL_AgentWriteBattleActionEntry(fp, &first, "flee", 0, "none", FALSE);
+   }
+   fprintf(fp, "]");
+}
+
+static VOID
+PALPAL_AgentWriteBattle(
+   FILE *fp
+)
+{
+   int i;
+
+   fprintf(fp, "\"battle\":");
+   if (!gpGlobals->fInBattle)
+   {
+      fprintf(fp, "null");
+      return;
+   }
+   for (i = 0; i <= g_Battle.wMaxEnemyIndex; i++)
+   {
+      if (g_agent_battle.enemy_object_id[i] != g_Battle.rgEnemy[i].wObjectID)
+      {
+         g_agent_battle.enemy_object_id[i] = g_Battle.rgEnemy[i].wObjectID;
+         g_agent_battle.enemy_max_hp[i] = g_Battle.rgEnemy[i].e.wHealth;
+      }
+   }
+   fprintf(fp,
+      "{\"generation\":%u,\"command_generation\":%u,\"result\":\"%s\","
+      "\"phase\":\"%s\",\"is_boss\":%s,\"current_player_index\":%u,"
+      "\"awaiting_ack\":%s,\"players\":[",
+      (unsigned int)g_agent_battle.generation,
+      (unsigned int)g_agent_battle.command_generation,
+      PALPAL_AgentBattleResultName(g_Battle.BattleResult),
+      PALPAL_AgentBattlePhaseName(),
+      g_Battle.fIsBoss ? "true" : "false",
+      g_agent_battle.current_player_index,
+      g_agent_battle.awaiting_ack ? "true" : "false");
+   for (i = 0; i <= gpGlobals->wMaxPartyMemberIndex; i++)
+   {
+      WORD role = gpGlobals->rgParty[i].wPlayerRole;
+      BATTLEPLAYER *player = &g_Battle.rgPlayer[i];
+      if (i > 0) fprintf(fp, ",");
+      fprintf(fp, "{\"index\":%d,\"role_id\":%u,\"name\":", i, role);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(gpGlobals->g.PlayerRoles.rgwName[role]));
+      fprintf(fp,
+         ",\"hp\":%u,\"max_hp\":%u,\"mp\":%u,\"max_mp\":%u,\"level\":%u,"
+         "\"attack_strength\":%u,\"magic_strength\":%u,\"defense\":%u,"
+         "\"dexterity\":%u,\"flee_rate\":%u,\"poison_resistance\":%u,"
+         "\"attack_all\":%s,\"cooperative_magic_id\":%u,"
+         "\"elemental_resistance\":[%u,%u,%u,%u,%u],\"status\":",
+         gpGlobals->g.PlayerRoles.rgwHP[role],
+         gpGlobals->g.PlayerRoles.rgwMaxHP[role],
+         gpGlobals->g.PlayerRoles.rgwMP[role],
+         gpGlobals->g.PlayerRoles.rgwMaxMP[role],
+         gpGlobals->g.PlayerRoles.rgwLevel[role],
+         PAL_GetPlayerAttackStrength(role), PAL_GetPlayerMagicStrength(role),
+         PAL_GetPlayerDefense(role), PAL_GetPlayerDexterity(role),
+         PAL_GetPlayerFleeRate(role), PAL_GetPlayerPoisonResistance(role),
+         PAL_PlayerCanAttackAll(role) ? "true" : "false",
+         PAL_GetPlayerCooperativeMagic(role),
+         PAL_GetPlayerElementalResistance(role, 0),
+         PAL_GetPlayerElementalResistance(role, 1),
+         PAL_GetPlayerElementalResistance(role, 2),
+         PAL_GetPlayerElementalResistance(role, 3),
+         PAL_GetPlayerElementalResistance(role, 4));
+      PALPAL_AgentWriteStatusValues(fp, gpGlobals->rgPlayerStatus[role]);
+      fprintf(fp, ",\"poisons\":");
+      PALPAL_AgentWritePlayerPoisons(fp, role);
+      fprintf(fp,
+         ",\"time_meter\":%.2f,\"fighter_state\":\"%s\",\"defending\":%s,"
+         "\"submitted_action\":{\"action_type\":\"%s\",\"object_id\":%u,\"target_index\":%d}}",
+         player->flTimeMeter, PALPAL_AgentFighterStateName(player->state),
+         player->fDefending ? "true" : "false",
+         PALPAL_AgentBattleActionName(player->action.ActionType),
+         player->action.wActionID, player->action.sTarget);
+   }
+   fprintf(fp, "],\"enemies\":[");
+   for (i = 0; i <= g_Battle.wMaxEnemyIndex; i++)
+   {
+      BATTLEENEMY *enemy = &g_Battle.rgEnemy[i];
+      WORD object_id = enemy->wObjectID;
+      if (i > 0) fprintf(fp, ",");
+      fprintf(fp,
+         "{\"slot_index\":%d,\"present\":%s,\"object_id\":%u,\"enemy_id\":%u,\"name\":",
+         i, object_id ? "true" : "false", object_id,
+         object_id ? gpGlobals->g.rgObject[object_id].enemy.wEnemyID : 0);
+      PALPAL_AgentWriteJsonWideString(fp, object_id ? PAL_GetWord(object_id) : L"");
+      fprintf(fp,
+         ",\"hp\":%u,\"max_hp\":%u,\"level\":%u,\"attack_strength\":%u,"
+         "\"magic_strength\":%u,\"defense\":%u,\"dexterity\":%u,\"flee_rate\":%u,"
+         "\"poison_resistance\":%u,\"physical_resistance\":%u,"
+         "\"exp\":%u,\"cash\":%u,\"magic_id\":%u,\"magic_rate\":%u,"
+         "\"attack_equiv_item_id\":%u,\"attack_equiv_item_rate\":%u,"
+         "\"steal_item_id\":%u,\"steal_item_count\":%u,\"dual_move\":%u,"
+         "\"collect_value\":%u,"
+         "\"elemental_resistance\":[%u,%u,%u,%u,%u],\"status\":",
+         enemy->e.wHealth, g_agent_battle.enemy_max_hp[i], enemy->e.wLevel,
+         enemy->e.wAttackStrength, enemy->e.wMagicStrength, enemy->e.wDefense,
+         enemy->e.wDexterity, enemy->e.wFleeRate, enemy->e.wPoisonResistance,
+         enemy->e.wPhysicalResistance, enemy->e.wExp, enemy->e.wCash,
+         enemy->e.wMagic, enemy->e.wMagicRate, enemy->e.wAttackEquivItem,
+         enemy->e.wAttackEquivItemRate, enemy->e.wStealItem, enemy->e.nStealItem,
+         enemy->e.wDualMove, enemy->e.wCollectValue, enemy->e.wElemResistance[0],
+         enemy->e.wElemResistance[1], enemy->e.wElemResistance[2],
+         enemy->e.wElemResistance[3], enemy->e.wElemResistance[4]);
+      PALPAL_AgentWriteStatusValues(fp, enemy->rgwStatus);
+      fprintf(fp, ",\"poisons\":");
+      PALPAL_AgentWriteEnemyPoisons(fp, enemy);
+      fprintf(fp, ",\"time_meter\":%.2f,\"fighter_state\":\"%s\"}",
+         enemy->flTimeMeter, PALPAL_AgentFighterStateName(enemy->state));
+   }
+   fprintf(fp, "],");
+   PALPAL_AgentWriteBattleActions(fp);
+   fprintf(fp, "}");
+}
+
+static VOID
+PALPAL_AgentWriteLastBattle(
+   FILE *fp
+)
+{
+   int i, first;
+   fprintf(fp, "\"last_battle\":");
+   if (!g_agent_last_battle.valid)
+   {
+      fprintf(fp, "null");
+      return;
+   }
+   fprintf(fp,
+      "{\"generation\":%u,\"result\":\"%s\",\"is_boss\":%s,\"ended_frame\":%u,"
+      "\"duration_ms\":%u,\"exp_gained\":%d,\"cash_gained\":%d,\"enemies\":[",
+      (unsigned int)g_agent_last_battle.generation,
+      PALPAL_AgentBattleResultName(g_agent_last_battle.result),
+      g_agent_last_battle.is_boss ? "true" : "false",
+      (unsigned int)g_agent_last_battle.ended_frame,
+      (unsigned int)g_agent_last_battle.duration_ms,
+      g_agent_last_battle.exp_gained, g_agent_last_battle.cash_gained);
+   first = 1;
+   for (i = 0; i < MAX_ENEMIES_IN_TEAM; i++)
+   {
+      WORD object_id = g_agent_last_battle.enemy_object_id[i];
+      if (!object_id) continue;
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"object_id\":%u,\"name\":", object_id);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(object_id));
+      fprintf(fp, "}");
+      first = 0;
+   }
+   fprintf(fp, "],\"players\":[");
+   first = 1;
+   for (i = 0; i < MAX_PLAYERS_IN_PARTY; i++)
+   {
+      WORD role = g_agent_last_battle.player_role[i];
+      if (role == 0xFFFF || role >= MAX_PLAYER_ROLES) continue;
+      if (!first) fprintf(fp, ",");
+      fprintf(fp,
+         "{\"index\":%d,\"role_id\":%u,\"name\":", i, role);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(gpGlobals->g.PlayerRoles.rgwName[role]));
+      fprintf(fp,
+         ",\"hp_before\":%u,\"hp_after\":%u,\"mp_before\":%u,\"mp_after\":%u,"
+         "\"level_before\":%u,\"level_after\":%u,\"knocked_out\":%s,"
+         "\"status_before\":",
+         g_agent_last_battle.player_hp_before[i], g_agent_last_battle.player_hp_after[i],
+         g_agent_last_battle.player_mp_before[i], g_agent_last_battle.player_mp_after[i],
+         g_agent_last_battle.player_level_before[i], g_agent_last_battle.player_level_after[i],
+         g_agent_last_battle.player_hp_after[i] == 0 ? "true" : "false");
+      PALPAL_AgentWriteStatusValues(fp, g_agent_last_battle.player_status_before[i]);
+      fprintf(fp, ",\"status_after\":");
+      PALPAL_AgentWriteStatusValues(fp, g_agent_last_battle.player_status_after[i]);
+      fprintf(fp, ",\"new_magics\":[");
+      {
+         int j, magic_first = 1;
+         for (j = 0; j < MAX_PLAYER_MAGICS; j++)
+         {
+            WORD magic = g_agent_last_battle.player_new_magics[i][j];
+            if (magic == 0) continue;
+            if (!magic_first) fprintf(fp, ",");
+            fprintf(fp, "{\"object_id\":%u,\"name\":", magic);
+            PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(magic));
+            fprintf(fp, "}");
+            magic_first = 0;
+         }
+      }
+      fprintf(fp, "]}");
+      first = 0;
+   }
+   fprintf(fp, "]}");
+}
+
+static const char *
 PALPAL_AgentDialogPositionName(
    BYTE position
 )
@@ -2822,6 +3790,43 @@ PALPAL_AgentWriteDialog(
       }
    }
    fputs("]}", fp);
+}
+
+static VOID
+PALPAL_AgentWriteChoice(
+   FILE *fp
+)
+{
+   fprintf(fp, "\"choice\":");
+   if (!g_agent_choice.active)
+   {
+      fputs("null", fp);
+      return;
+   }
+   fprintf(fp,
+      "{\"active\":true,\"generation\":%u,\"kind\":\"script_confirm\","
+      "\"event_object_id\":%u,\"script_entry\":%u,"
+      "\"selected_index\":%d,\"command_pending\":%s,\"prompt\":",
+      (unsigned int)g_agent_choice.generation,
+      (unsigned int)g_agent_choice.event_object_id,
+      (unsigned int)g_agent_choice.script_entry,
+      g_agent_choice.selected_index,
+      g_agent_choice.command_pending ? "true" : "false");
+   if (g_agent_latest_dialog_event.valid)
+   {
+      PALPAL_AgentWriteDialogEvent(fp, &g_agent_latest_dialog_event);
+   }
+   else
+   {
+      fputs("null", fp);
+   }
+   fputs(",\"options\":[{\"index\":0,\"semantic\":\"no\",\"word_id\":", fp);
+   fprintf(fp, "%u,\"text\":", (unsigned int)CONFIRMMENU_LABEL_NO);
+   PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(CONFIRMMENU_LABEL_NO));
+   fputs("},{\"index\":1,\"semantic\":\"yes\",\"word_id\":", fp);
+   fprintf(fp, "%u,\"text\":", (unsigned int)CONFIRMMENU_LABEL_YES);
+   PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(CONFIRMMENU_LABEL_YES));
+   fputs("}]}", fp);
 }
 
 static VOID
@@ -3442,6 +4447,9 @@ PALPAL_AgentWriteStartupState(
    fprintf(fp, "\"frame\":0,");
    fprintf(fp, "\"in_main_game\":false,");
    fprintf(fp, "\"in_battle\":false,");
+   fprintf(fp, "\"battle\":null,");
+   fprintf(fp, "\"last_battle\":null,");
+   fprintf(fp, "\"choice\":null,");
    fprintf(fp, "\"entering_scene\":false,");
    fprintf(fp, "\"startup_mode\":\"wait\",");
    fprintf(fp, "\"selected_save_slot\":%d", g_agent_startup_slot);
@@ -3505,6 +4513,10 @@ PALPAL_AgentWriteState(
    fprintf(fp, "\"frame\":%u,", (unsigned int)gpGlobals->dwFrameNum);
    fprintf(fp, "\"in_main_game\":%s,", gpGlobals->fInMainGame ? "true" : "false");
    fprintf(fp, "\"in_battle\":%s,", gpGlobals->fInBattle ? "true" : "false");
+   PALPAL_AgentWriteBattle(fp);
+   fprintf(fp, ",");
+   PALPAL_AgentWriteLastBattle(fp);
+   fprintf(fp, ",");
    fprintf(fp, "\"entering_scene\":%s,", gpGlobals->fEnteringScene ? "true" : "false");
    fprintf(fp, "\"scene_id\":%u,\"map_id\":%u,", gpGlobals->wNumScene, map_id);
    fprintf(fp, "\"cash\":%u,", (unsigned int)gpGlobals->dwCash);
@@ -3545,6 +4557,8 @@ PALPAL_AgentWriteState(
    PALPAL_AgentWriteRoom(fp, gpGlobals->wNumScene, map_id, player_x, player_y);
    fprintf(fp, ",");
    PALPAL_AgentWriteDialog(fp);
+   fprintf(fp, ",");
+   PALPAL_AgentWriteChoice(fp);
    fprintf(fp, ",");
    PALPAL_AgentWriteShop(fp);
    fprintf(fp, ",");

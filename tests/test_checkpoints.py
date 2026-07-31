@@ -145,6 +145,14 @@ def test_load_checkpoint_restores_companion_files_and_refreshes_caches(tmp_path)
     debug.agent_log_path.write_text('{"turn":99}\n', encoding='utf-8')
     debug.dialog_history = [{'source_key': 'old', 'text': 'old'}]
     debug.event_log = [{'type': 'old'}]
+    observation_id = debug.observations.register(
+        'transition', owner='navigation', timeout=30.0, payload={'object_id': 60},
+    )
+    debug.navigation_transition_requests[60] = observation_id
+    debug.pending_transition_observation = {
+        'object_id': 60,
+        'observation_id': observation_id,
+    }
     checkpoint_dir = debug.checkpoint_dir('cp1')
     (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"new","text":"new"}]', encoding='utf-8')
     (checkpoint_dir / 'companion' / 'events.json').write_text('[{"type":"new"}]', encoding='utf-8')
@@ -154,6 +162,9 @@ def test_load_checkpoint_restores_companion_files_and_refreshes_caches(tmp_path)
     assert debug.save_slot_path().read_bytes() == b'checkpoint-rpg'
     assert debug.dialog_history == [{'source_key': 'dialog::::::new', 'text': 'new', 'source_keys': ['dialog::::::new']}]
     assert debug.event_log == [{'type': 'new'}]
+    assert debug.navigation_transition_requests == {}
+    assert debug.pending_transition_observation is None
+    assert debug.observations.get(observation_id) is None
     assert not debug.agent_log_path.exists()
 
 

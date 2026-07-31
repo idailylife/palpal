@@ -161,6 +161,10 @@ async function main() {
               objects: [],
             }));
             latestState._debug = { ...(latestState._debug || {}), runtime_stale: false };
+            latestState.control = {
+              ...(latestState.control || {}),
+              allowed_actions: ["press_buttons"],
+            };
             latestState._navigation = { status: "pending", targets: [] };
             navigationCache.clear();
             navigationLatestEnvironmentKey = navigationEnvironmentKey(latestState);
@@ -223,6 +227,127 @@ async function main() {
       throw new Error(`manual input smoke failed (${JSON.stringify({
         value: manualInputActions,
         exception: manualInput.exceptionDetails,
+      })})`);
+    }
+
+    const controlTakeover = await cdp.send(
+      "Runtime.evaluate",
+      {
+        returnByValue: true,
+        expression: `(() => {
+          const originalState = latestState;
+          const originalSession = agentSession;
+          const originalExhausted = new Set(exhaustedTransports);
+          const left = document.querySelector('[data-button="left"]');
+          const originalLeftDisabled = left?.disabled;
+          const originalLeftMarker = left?.dataset.controlDisabled;
+          const semanticButton = document.createElement("button");
+          semanticButton.dataset.useItem = "999";
+          semanticButton.disabled = true;
+          document.body.appendChild(semanticButton);
+          try {
+            const state = JSON.parse(JSON.stringify(originalState || {}));
+            state.party_position = state.party_position || { x: 0, y: 0 };
+            state.objects = [];
+            state.inventory = [];
+            state.shop = null;
+            state.dialog = { active: false };
+            state.in_battle = false;
+            state.control = {
+              owner: "client",
+              phase: "ready",
+              navigation_ready: true,
+              allowed_actions: [
+                "press_buttons", "navigation_step", "use_item",
+                "shop_buy", "shop_leave", "advance_dialog",
+              ],
+            };
+            state._debug = {
+              ...(state._debug || {}),
+              runtime_stale: false,
+            };
+            state._navigation = {
+              status: "ok",
+              targets: [{ id: 999, kind: "touch", status: "reachable", steps: 1 }],
+            };
+            state._navigation.environment_key = navigationEnvironmentKey(state);
+            latestState = state;
+            navigationRenderKey = null;
+            const session = {
+              ...(originalSession || {}),
+              session_id: originalSession?.session_id || "control-smoke",
+              status: "paused",
+            };
+            agentSession = session;
+            left.disabled = false;
+            delete left.dataset.controlDisabled;
+            renderNavigation(state);
+            updateExternalControls(state);
+
+            setAgentSession({ ...session, status: "running" });
+            updateExternalControls(state);
+            const locked = left.disabled && left.dataset.controlDisabled === "control";
+            updateExternalControls(state);
+            const markerPreserved = left.dataset.controlDisabled === "control";
+
+            state._navigation.targets[0].steps = 2;
+            renderNavigation(state);
+            updateExternalControls(state);
+            updateExternalControls(state);
+            const navigationLocked = document.querySelector('[data-nav-go="999"]')?.disabled === true;
+
+            setAgentSession({ ...session, status: "interrupting" });
+            updateExternalControls(state);
+            const interruptingStayedLocked = left.disabled === true
+              && left.dataset.controlDisabled === "control";
+            setAgentSession({ ...session, status: "paused", stop_reason: "execution_failed" });
+            const navigationButton = document.querySelector('[data-nav-go="999"]');
+            const manualRestored = left.disabled === false && !left.dataset.controlDisabled;
+            const navigationRestored = navigationButton?.disabled === false;
+            const semanticPreserved = semanticButton.disabled === true && !semanticButton.dataset.controlDisabled;
+
+            exhaustedTransports.add("state");
+            updateExternalControls(state);
+            setAgentSession({ ...session, status: "running" });
+            setAgentSession({ ...session, status: "paused" });
+            const disconnectStayedLocked = left.disabled === true;
+
+            return {
+              locked,
+              markerPreserved,
+              navigationLocked,
+              interruptingStayedLocked,
+              manualRestored,
+              navigationRestored,
+              semanticPreserved,
+              disconnectStayedLocked,
+            };
+          } finally {
+            semanticButton.remove();
+            exhaustedTransports.clear();
+            originalExhausted.forEach((name) => exhaustedTransports.add(name));
+            agentSession = originalSession;
+            latestState = originalState;
+            navigationRenderKey = null;
+            if (originalState) render(originalState);
+            if (left) {
+              left.disabled = originalLeftDisabled;
+              if (originalLeftMarker === undefined) delete left.dataset.controlDisabled;
+              else left.dataset.controlDisabled = originalLeftMarker;
+            }
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const controlTakeoverState = controlTakeover.result?.value;
+    if (
+      !controlTakeoverState
+      || Object.values(controlTakeoverState).some((value) => value !== true)
+    ) {
+      throw new Error(`manual takeover smoke failed (${JSON.stringify({
+        value: controlTakeoverState,
+        exception: controlTakeover.exceptionDetails,
       })})`);
     }
 
@@ -713,7 +838,9 @@ async function main() {
             const started = performance.now();
             const check = () => {
               const frame = document.getElementById("frame");
-              const connection = document.getElementById("connection")?.textContent || "";
+              const stateStatus = document.getElementById("stateStatusValue")?.textContent || "";
+              const frameStatus = document.getElementById("framesStatusValue")?.textContent || "";
+              const connection = "state " + stateStatus.toLowerCase() + " / frames " + frameStatus.toLowerCase();
               if (!frame) {
                 resolve({ ok: false, reason: "missing #frame canvas" });
                 return;
@@ -724,7 +851,7 @@ async function main() {
               for (let i = 0; i < data.length; i += 4) {
                 if (data[i] || data[i + 1] || data[i + 2]) nonBlack++;
               }
-              const live = connection.includes("state live") && connection.includes("frames live");
+              const live = stateStatus === "Live" && frameStatus === "Live";
               if (live && nonBlack > 100) {
                 resolve({ ok: true, connection, nonBlack, width: frame.width, height: frame.height });
               } else if (performance.now() - started > ${timeoutMs}) {
@@ -899,6 +1026,7 @@ async function main() {
               const state = JSON.parse(JSON.stringify(originalState));
               state.party_position = { ...(state.party_position || {}), x };
               state._debug = { ...(state._debug || {}), runtime_stale: false };
+              state.control = { ...(state.control || {}), navigation_ready: true };
               state._navigation = { status: "pending", targets: [] };
               return state;
             };
@@ -994,6 +1122,7 @@ async function main() {
             reconnectDelaysMs = [5, 10, 15];
             latestState = JSON.parse(JSON.stringify(originalState));
             latestState._debug = { ...(latestState._debug || {}), runtime_stale: false };
+            latestState.control = { ...(latestState.control || {}), navigation_ready: true };
             latestState._navigation = { status: "pending", targets: [] };
             navigationCache.clear();
             navigationLatestEnvironmentKey = navigationEnvironmentKey(latestState);
@@ -1022,7 +1151,7 @@ async function main() {
               requestCleared: navigationRefreshInFlightKey === null,
               alertVisible: disconnectAlertEl?.hidden === false,
               alertText: disconnectMessageEl?.textContent || "",
-              connection: connectionEl?.textContent || "",
+              refreshRequired: refreshRequired(),
               controlsDisabled: [...document.querySelectorAll("[data-button]")].every((button) => button.disabled),
             };
           } finally {
@@ -1043,7 +1172,7 @@ async function main() {
       || !boundedNavigationRetryResult.requestCleared
       || !boundedNavigationRetryResult.alertVisible
       || !boundedNavigationRetryResult.alertText.includes("refresh this page")
-      || boundedNavigationRetryResult.connection !== "disconnected — refresh required"
+      || !boundedNavigationRetryResult.refreshRequired
       || !boundedNavigationRetryResult.controlsDisabled
     ) {
       throw new Error(`bounded navigation retry smoke failed (${JSON.stringify(boundedNavigationRetryResult)})`);

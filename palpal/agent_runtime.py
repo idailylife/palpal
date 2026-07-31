@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 RUNNING_PHASES = {"running", "interrupting"}
 EXECUTABLE_TOOLS = {
-    "press_buttons", "advance_dialog", "navigation_step", "use_item",
+    "press_buttons", "advance_dialog", "choice_select", "navigation_step", "use_item",
     "equip_item", "shop_buy", "shop_leave",
 }
 CHECKPOINT_BUNDLE_VERSION = 2
@@ -29,6 +29,8 @@ TOOL_OUTPUT_PAGE_CHARS = 6_000
 TOOL_OUTPUT_REF_RE = re.compile(r"tool-[0-9a-f]{32}\.txt")
 EVENT_CACHE_SIZE = 1_000
 EVENT_TAIL_CHUNK_SIZE = 64 * 1024
+BATTLE_INSTRUCTION_LIMIT = 100
+BATTLE_CONTROL_TIMEOUT_SECONDS = 30.0
 
 
 class ReplanRequired(RuntimeError):
@@ -41,6 +43,475 @@ def _now() -> float:
 
 def _stamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+class BattleDelegate:
+    """Single-controller child workflow for one native battle generation."""
+
+    def __init__(self, runtime: "AgentRuntime"):
+        self.runtime = runtime
+        self.debug = runtime.debug
+        self.before: dict | None = None
+        self.actions: list[dict] = []
+
+    def _control(self) -> dict:
+        value = self.runtime.state.get("battle_delegate")
+        return value if isinstance(value, dict) else {}
+
+    def _persist_control(self, **updates: Any) -> dict:
+        with self.runtime.lock:
+            value = dict(self._control())
+            value.update(updates)
+            self.runtime.state["battle_delegate"] = value
+            self.runtime._persist()
+            return value
+
+    @staticmethod
+    def _group_id(control: dict) -> str:
+        return (
+            f"battle:{control.get('game_instance_id') or '-'}:"
+            f"{int(control.get('battle_generation') or 0)}:"
+            f"{control.get('child_session_id') or '-'}"
+        )
+
+    def _emit(self, phase: str, summary: str, details: dict | None = None) -> dict:
+        control = self._control()
+        payload = {
+            "battle_delegate": {
+                "child_session_id": control.get("child_session_id"),
+                "battle_generation": int(control.get("battle_generation") or 0),
+                "group_id": self._group_id(control),
+                "depth": 1,
+                "status": control.get("status"),
+            },
+            **(details or {}),
+        }
+        return self.runtime.emit("battle", phase, summary, payload)
+
+    def _begin(self, state: dict) -> dict:
+        battle = state["battle"]
+        generation = int(battle["generation"])
+        instance_id = str(state.get("game_instance_id") or "")
+        existing = self._control()
+        reusable = (
+            int(existing.get("battle_generation") or 0) == generation
+            and str(existing.get("game_instance_id") or "") == instance_id
+            and existing.get("child_session_id")
+        )
+        child_id = str(existing["child_session_id"]) if reusable else uuid.uuid4().hex
+        instruction_count = int(existing.get("instruction_count") or 0) if reusable else 0
+        self.before = json.loads(json.dumps(battle, ensure_ascii=False))
+        self.actions = list(existing.get("actions") or []) if reusable else []
+        control = self._persist_control(
+            child_session_id=child_id,
+            parent_session_id=self.runtime.state.get("session_id"),
+            game_instance_id=instance_id,
+            battle_generation=generation,
+            status="running",
+            phase=str(battle.get("phase") or "resolving"),
+            instruction_count=instruction_count,
+            instruction_limit=BATTLE_INSTRUCTION_LIMIT,
+            stop_reason=None,
+            started_at=existing.get("started_at") if reusable else _stamp(),
+            ended_at=None,
+            summary=None,
+            actions=self.actions,
+        )
+        self._emit(
+            "started",
+            "Battle Agent resumed." if reusable else "Battle Agent started.",
+            {"phase": control.get("phase"), "instruction_count": instruction_count},
+        )
+        return control
+
+    @staticmethod
+    def _battle_from(state: dict) -> dict | None:
+        return state.get("battle") if isinstance(state.get("battle"), dict) else None
+
+    def _wait_for_control_or_end(self, generation: int) -> dict:
+        deadline = time.monotonic() + BATTLE_CONTROL_TIMEOUT_SECONDS
+        while True:
+            if self.runtime.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            state = self.debug.snapshot()
+            battle = self._battle_from(state)
+            if battle is None:
+                last = state.get("last_battle")
+                if isinstance(last, dict) and int(last.get("generation") or 0) == generation:
+                    return state
+                if not state.get("in_battle"):
+                    return state
+            elif int(battle.get("generation") or 0) != generation:
+                raise RuntimeError("battle_generation_changed")
+            elif battle.get("phase") in {"command", "reward"}:
+                return state
+            if time.monotonic() >= deadline:
+                raise RuntimeError("battle_control_timeout")
+            time.sleep(0.05)
+
+    @staticmethod
+    def _default_action(battle: dict) -> dict:
+        available = [
+            action for action in battle.get("available_actions") or []
+            if isinstance(action, dict)
+        ]
+        if not available:
+            raise RuntimeError("battle_not_commandable")
+        action = next(
+            (item for item in available if item.get("action_type") == "continue"),
+            None,
+        )
+        if action is None:
+            action = next(
+                (item for item in available if item.get("action_type") == "attack"),
+                available[0],
+            )
+        mode = action.get("target_mode")
+        targets = action.get("valid_target_indices") or []
+        return {
+            "action_type": action.get("action_type"),
+            "object_id": int(action.get("object_id") or 0),
+            "target_index": -1 if mode == "all" else (-2 if mode == "none" else int(targets[0])),
+        }
+
+    async def _provider_action(self, state: dict, feedback: str) -> dict:
+        provider = self.runtime.battle_decision_provider
+        if provider is None:
+            return await self._sdk_action(state, feedback)
+        value = provider(state, self.runtime.state.get("model"), feedback)
+        if asyncio.iscoroutine(value):
+            value = await value
+        if not isinstance(value, dict):
+            raise RuntimeError("invalid_battle_submission")
+        return value.get("args") if isinstance(value.get("args"), dict) else value
+
+    async def _sdk_action(self, state: dict, feedback: str) -> dict:
+        if not self.debug.config_value("DEEPSEEK_API_KEY"):
+            action = self._default_action(state["battle"])
+            self._emit(
+                "tool_output",
+                "Default battle policy selected an action.",
+                {"policy": "default", "output": action},
+            )
+            return action
+        try:
+            from agents import (Agent, AsyncOpenAI, FunctionTool, ModelSettings,
+                                OpenAIChatCompletionsModel, Runner, SQLiteSession,
+                                set_tracing_disabled)
+            from agents.agent import ToolsToFinalOutputResult
+        except ImportError as exc:
+            raise RuntimeError("openai-agents is required for battle delegation") from exc
+
+        set_tracing_disabled(disabled=True)
+        submitted: dict | None = None
+        runtime = self.runtime
+
+        async def get_battle(_context: Any, _raw: str) -> str:
+            self._emit(
+                "tool_called",
+                "Battle Agent called get_battle.",
+                {"tool": "get_battle", "arguments": {}},
+            )
+            try:
+                latest = self.debug.snapshot()
+                output = {"ok": True, "battle": latest.get("battle")}
+            except Exception as exc:
+                self._emit(
+                    "tool_output",
+                    "get_battle failed.",
+                    {"tool": "get_battle", "output": {"ok": False, "error": str(exc)}},
+                )
+                raise
+            self._emit(
+                "tool_output",
+                "get_battle returned the latest battle state.",
+                {"tool": "get_battle", "output": output},
+            )
+            return json.dumps(output, ensure_ascii=False)
+
+        async def submit(_context: Any, raw: str) -> str:
+            nonlocal submitted
+            try:
+                args = runtime._parse_tool_arguments(raw)
+            except Exception as exc:
+                self._emit(
+                    "tool_called",
+                    "Battle Agent called submit_battle_action.",
+                    {"tool": "submit_battle_action", "raw_arguments": raw},
+                )
+                self._emit(
+                    "tool_output",
+                    "submit_battle_action arguments were invalid.",
+                    {"tool": "submit_battle_action", "raw_arguments": raw, "error": str(exc)},
+                )
+                raise
+            self._emit(
+                "tool_called",
+                "Battle Agent called submit_battle_action.",
+                {"tool": "submit_battle_action", "arguments": args},
+            )
+            try:
+                latest = self.debug.snapshot()
+                battle = latest.get("battle") if isinstance(latest.get("battle"), dict) else {}
+                args = {
+                    **args,
+                    "battle_generation": battle.get("generation"),
+                    "command_generation": battle.get("command_generation"),
+                }
+                error = self.debug.battle_action_validation_error(latest, args)
+            except Exception as exc:
+                self._emit(
+                    "tool_output",
+                    "submit_battle_action failed.",
+                    {"tool": "submit_battle_action", "output": {"ok": False, "error": str(exc)}},
+                )
+                raise
+            if error:
+                output = {"ok": False, "error": error}
+                self._emit(
+                    "tool_output",
+                    "submit_battle_action was rejected.",
+                    {"tool": "submit_battle_action", "output": output},
+                )
+                return json.dumps(output, ensure_ascii=False)
+            submitted = args
+            output = {"ok": True, "accepted": True}
+            self._emit(
+                "tool_output",
+                "submit_battle_action was accepted.",
+                {"tool": "submit_battle_action", "output": output},
+            )
+            return json.dumps(output, ensure_ascii=False)
+
+        get_tool = FunctionTool(
+            name="get_battle",
+            description="Read the latest structured battle state and legal actions.",
+            params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            on_invoke_tool=get_battle,
+            strict_json_schema=False,
+        )
+        submit_tool = FunctionTool(
+            name="submit_battle_action",
+            description="Submit exactly one legal action from available_actions.",
+            params_json_schema={
+                "type": "object",
+                "properties": {
+                    "action_type": {"type": "string"},
+                    "object_id": {"type": "integer"},
+                    "target_index": {"type": "integer"},
+                },
+                "required": ["action_type", "object_id", "target_index"],
+                "additionalProperties": False,
+            },
+            on_invoke_tool=submit,
+            strict_json_schema=False,
+        )
+
+        def finish(_context: Any, results: list[Any]) -> Any:
+            for result in results:
+                if getattr(getattr(result, "tool", None), "name", None) != "submit_battle_action":
+                    continue
+                try:
+                    output = json.loads(result.output)
+                except (AttributeError, TypeError, json.JSONDecodeError):
+                    continue
+                if output.get("accepted"):
+                    return ToolsToFinalOutputResult(is_final_output=True, final_output=result.output)
+            return ToolsToFinalOutputResult(is_final_output=False, final_output=None)
+
+        client = AsyncOpenAI(
+            api_key=self.debug.config_value("DEEPSEEK_API_KEY"),
+            base_url=(self.debug.config_value("DEEPSEEK_BASE_URL", "https://api.deepseek.com") or "https://api.deepseek.com").rstrip("/"),
+        )
+        model = OpenAIChatCompletionsModel(
+            model=runtime.state.get("model"),
+            openai_client=client,
+            buffer_streamed_tool_calls=True,
+        )
+        agent = Agent(
+            name="PALPAL battle child",
+            instructions=(
+                "You control one PALPAL battle. You only have get_battle and "
+                "submit_battle_action. Preserve scarce MP and consumables when a normal "
+                "attack is sufficient; use healing or stronger actions when survival needs it. "
+                "Never invent targets or actions. Submit exactly one current legal action."
+            ),
+            model=model,
+            tools=[get_tool, submit_tool],
+            tool_use_behavior=finish,
+            model_settings=ModelSettings(temperature=0.1, include_usage=True),
+        )
+        session = SQLiteSession(self._control()["child_session_id"], runtime.sqlite_path)
+        prompt = json.dumps({
+            "feedback": feedback,
+            "battle": state["battle"],
+            "active_tasks": self.debug.active_task_summary(),
+            "resource_policy": "Prefer attacks; spend MP/items only for survival or material advantage.",
+        }, ensure_ascii=False, separators=(",", ":"))
+        stream = Runner.run_streamed(agent, prompt, session=session, max_turns=6)
+        runtime.active_stream = stream
+        async for _event in stream.stream_events():
+            if runtime.cancel_event.is_set():
+                stream.cancel("immediate")
+        if submitted is None:
+            raise RuntimeError("submit_battle_action_not_called")
+        return submitted
+
+    def _summary(self, state: dict, instruction_count: int) -> dict:
+        last = state.get("last_battle") if isinstance(state.get("last_battle"), dict) else {}
+        result = str(last.get("result") or "terminated")
+        players = []
+        for player in last.get("players") or []:
+            if not isinstance(player, dict):
+                continue
+            players.append({
+                key: player.get(key) for key in (
+                    "index", "role_id", "name", "hp_before", "hp_after",
+                    "mp_before", "mp_after", "level_before", "level_after",
+                    "knocked_out", "status_before", "status_after", "new_magics",
+                )
+            })
+        used_items: dict[str, int] = {}
+        for action in self.actions:
+            if action.get("action_type") in {"use_item", "throw_item"}:
+                key = str(int(action.get("object_id") or 0))
+                used_items[key] = used_items.get(key, 0) + 1
+        return {
+            "battle_generation": last.get("generation") or self._control().get("battle_generation"),
+            "result": result,
+            "is_boss": bool(last.get("is_boss")),
+            "enemies": [entry.get("name") for entry in last.get("enemies") or [] if isinstance(entry, dict)],
+            "instruction_count": instruction_count,
+            "duration_ms": last.get("duration_ms"),
+            "players": players,
+            "used_items": [
+                {"object_id": int(object_id), "count": count}
+                for object_id, count in sorted(used_items.items(), key=lambda item: int(item[0]))
+            ],
+            "exp_gained": int(last.get("exp_gained") or 0),
+            "cash_gained": int(last.get("cash_gained") or 0),
+        }
+
+    async def _audit_action(self, battle: dict, action: dict, result: dict) -> None:
+        try:
+            from agents import SQLiteSession
+            session = SQLiteSession(self._control()["child_session_id"], self.runtime.sqlite_path)
+            await session.add_items([
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"battle": battle, "instruction": int(self._control().get("instruction_count") or 0) + 1},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"submitted_battle_action": action, "native_result": result.get("result")},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            ])
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            # The action audit is also retained in control.json; a transcript
+            # storage failure must not send a second game action.
+            return
+
+    async def run(self, initial_state: dict) -> dict:
+        control = self._begin(initial_state)
+        generation = int(control["battle_generation"])
+        invalid = 0
+        feedback = "Choose one legal action for the current command window."
+        while True:
+            state = await asyncio.to_thread(self._wait_for_control_or_end, generation)
+            battle = self._battle_from(state)
+            if battle is None:
+                summary = self._summary(state, int(self._control().get("instruction_count") or 0))
+                self._persist_control(
+                    status="completed",
+                    phase="ended",
+                    stop_reason=summary["result"],
+                    ended_at=_stamp(),
+                    summary=summary,
+                    actions=self.actions,
+                )
+                self._emit(
+                    "completed",
+                    (
+                        f"Battle {summary.get('result')}: "
+                        f"{', '.join(summary.get('enemies') or ['unknown enemies'])}."
+                    ),
+                    {"summary": summary},
+                )
+                return summary
+            count = int(self._control().get("instruction_count") or 0)
+            if count >= BATTLE_INSTRUCTION_LIMIT:
+                raise RuntimeError("battle_instruction_limit")
+            self._persist_control(phase=str(battle.get("phase") or "resolving"))
+            self._emit(
+                "request",
+                f"Battle Agent requested action {count + 1}.",
+                {"instruction": count + 1, "feedback": feedback},
+            )
+            native_action_started = False
+            try:
+                args = await self._provider_action(state, feedback)
+                latest = await asyncio.to_thread(self.debug.snapshot)
+                latest_battle = self._battle_from(latest)
+                if latest_battle is None:
+                    continue
+                args = {
+                    **args,
+                    "battle_generation": latest_battle.get("generation"),
+                    "command_generation": latest_battle.get("command_generation"),
+                }
+                self._emit(
+                    "tool_called",
+                    "Battle Agent submitted the native battle action.",
+                    {"tool": "native_battle_action", "arguments": args},
+                )
+                native_action_started = True
+                result = await asyncio.to_thread(self.debug.write_battle_action, args)
+                self._emit(
+                    "tool_output",
+                    "Native battle action completed.",
+                    {"tool": "native_battle_action", "output": result},
+                )
+            except Exception as exc:
+                if native_action_started:
+                    self._emit(
+                        "tool_output",
+                        "Native battle action failed.",
+                        {"tool": "native_battle_action", "output": {"ok": False, "error": str(exc)}},
+                    )
+                invalid += 1
+                self._emit(
+                    "retry",
+                    f"Battle action attempt {invalid} failed; replanning.",
+                    {"attempt": invalid, "error": str(exc)},
+                )
+                if invalid >= 3:
+                    raise RuntimeError("battle_replan_exhausted") from exc
+                feedback = f"Previous submission failed ({exc}); reread battle and submit a current legal action."
+                continue
+            invalid = 0
+            count += 1
+            action = {
+                key: result.get(key) for key in (
+                    "battle_generation", "command_generation", "player_index",
+                    "action_type", "object_id", "target_index",
+                )
+            }
+            await self._audit_action(battle, action, result)
+            self.actions.append(action)
+            self._persist_control(
+                instruction_count=count,
+                phase="resolving",
+                actions=self.actions,
+            )
+            feedback = "The action was accepted. Wait for the next control window."
 
 
 class AgentRuntime:
@@ -72,7 +543,9 @@ class AgentRuntime:
         self.generation = 0
         # Tests may replace this with a sync or async callable(state, model, feedback).
         self.decision_provider: Callable[..., Any] | None = None
+        self.battle_decision_provider: Callable[..., Any] | None = None
         self.state = self._load_or_create()
+        self.battle_delegate = BattleDelegate(self)
 
     def _blank(
         self,
@@ -114,6 +587,7 @@ class AgentRuntime:
                 "ownership_counts": None,
                 "pending": [],
             },
+            "battle_delegate": None,
         }
 
     def _load_or_create(self) -> dict:
@@ -146,6 +620,14 @@ class AgentRuntime:
         if not isinstance(review.get("pending"), list):
             review["pending"] = []
         review.setdefault("pending", [])
+        battle_delegate = value.get("battle_delegate")
+        if isinstance(battle_delegate, dict) and battle_delegate.get("status") == "running":
+            battle_delegate["status"] = "stopped"
+            battle_delegate["phase"] = "stopped"
+            battle_delegate["stop_reason"] = "server_restarted"
+            battle_delegate["ended_at"] = _stamp()
+        elif battle_delegate is not None and not isinstance(battle_delegate, dict):
+            value["battle_delegate"] = None
         # Older control files carried a permanent macro goal. It is no longer
         # part of runtime state; silently discard it for in-place compatibility.
         value.pop("goal", None)
@@ -286,6 +768,7 @@ class AgentRuntime:
         compact["equipment_review"] = {
             "pending": len((state.get("equipment_review") or {}).get("pending") or []),
         }
+        compact["battle_delegate"] = state.get("battle_delegate")
         return compact
 
     @staticmethod
@@ -883,6 +1366,8 @@ class AgentRuntime:
 
     def start(self, model: str | None, max_turns: int, *, decide_only: bool = False) -> dict:
         max_turns = max(1, min(int(max_turns), 100))
+        if decide_only and self.debug.snapshot().get("in_battle"):
+            raise RuntimeError("decide_once_unavailable_in_battle")
         with self.lock:
             if self.is_running():
                 raise RuntimeError("agent_session_running")
@@ -916,6 +1401,16 @@ class AgentRuntime:
             loop = self.loop
         self.debug.cancel_dialog_advance()
         self.debug.observations.cancel_all("agent_interrupt", owner="navigation")
+        delegate = self.state.get("battle_delegate")
+        if isinstance(delegate, dict) and delegate.get("status") == "running":
+            delegate.update(status="stopped", phase="stopped", stop_reason="interrupted", ended_at=_stamp())
+            with self.lock:
+                self._persist()
+            self.battle_delegate._emit(
+                "stopped",
+                "Battle Agent stopped by interruption.",
+                {"reason": "interrupted"},
+            )
         if stream is not None and loop is not None:
             loop.call_soon_threadsafe(stream.cancel, "immediate")
         self.emit("interrupt", "interrupting", "Immediate interrupt requested.")
@@ -934,7 +1429,13 @@ class AgentRuntime:
             result = await asyncio.to_thread(self._execute_decision, decision)
             with self.lock:
                 self.state.update(last_execution=result, pending_decision=None)
-            self._pause("manual_execute_complete")
+            action_result = result.get("result") if isinstance(result, dict) else None
+            stop_reason = (
+                "interrupted_by_battle"
+                if isinstance(action_result, dict) and action_result.get("status") == "interrupted_by_battle"
+                else "manual_execute_complete"
+            )
+            self._pause(stop_reason)
             return result
         except Exception as exc:
             self.emit("error", "error", f"Execution failed: {exc}")
@@ -973,6 +1474,53 @@ class AgentRuntime:
                     self._pause("interrupted")
                     return
                 before = await asyncio.to_thread(self.debug.snapshot)
+                if self._game_control_active(before):
+                    before = await asyncio.to_thread(self._wait_for_control)
+                if before.get("in_battle"):
+                    if not isinstance(before.get("battle"), dict):
+                        self._pause("battle_state_unavailable")
+                        return
+                    try:
+                        summary = await self.battle_delegate.run(before)
+                    except Exception as exc:
+                        reason = str(exc) or "battle_delegate_failed"
+                        stopped = self.cancel_event.is_set() or reason == "interrupted"
+                        terminal_status = "stopped" if stopped else "failed"
+                        control = self.state.get("battle_delegate")
+                        already_stopped = (
+                            isinstance(control, dict)
+                            and control.get("status") == "stopped"
+                        )
+                        if not already_stopped:
+                            self.battle_delegate._persist_control(
+                                status=terminal_status,
+                                phase=terminal_status,
+                                stop_reason=reason,
+                                ended_at=_stamp(),
+                            )
+                            self.battle_delegate._emit(
+                                terminal_status,
+                                f"Battle Agent {terminal_status}: {reason}.",
+                                {"reason": reason},
+                            )
+                        self._pause(
+                            reason,
+                            details={"battle_delegate": self.state.get("battle_delegate")},
+                            summary=f"Agent paused: battle delegation failed ({reason}).",
+                        )
+                        return
+                    if summary.get("result") == "lost":
+                        self._pause(
+                            "battle_lost",
+                            details={"summary": summary},
+                            summary="Agent paused after battle defeat.",
+                        )
+                        return
+                    feedback = (
+                        "Battle completed; resume the story from this deterministic summary:\n"
+                        + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+                    )
+                    continue
                 if self._unsafe_state_reason(before):
                     self._pause(self._unsafe_state_reason(before) or "unsafe_state")
                     return
@@ -986,6 +1534,8 @@ class AgentRuntime:
                     self._pause("interrupted")
                     return
                 latest = await asyncio.to_thread(self.debug.snapshot)
+                if self._game_control_active(latest):
+                    latest = await asyncio.to_thread(self._wait_for_control)
                 validation_rejection = self._decision_validation_rejection(decision)
                 if validation_rejection:
                     replans += 1
@@ -1087,13 +1637,39 @@ class AgentRuntime:
         debug = state.get("_debug") or {}
         if debug.get("runtime_stale"):
             return "runtime_stale"
-        if state.get("in_battle"):
-            return "battle_unsupported"
-        if debug.get("action_pending"):
-            return "action_pending"
+        if state.get("in_battle") and not isinstance(state.get("battle"), dict):
+            return "battle_state_unavailable"
+        control = state.get("control") if isinstance(state.get("control"), dict) else {}
+        if control.get("phase") in {"action_pending", "game_script", "entering_scene"}:
+            return "game_controlled"
         if state.get("in_main_game") is False:
             return "not_in_main_game"
         return None
+
+    @staticmethod
+    def _game_control_active(state: dict) -> bool:
+        control = state.get("control") if isinstance(state.get("control"), dict) else {}
+        return control.get("phase") in {"action_pending", "game_script", "entering_scene"}
+
+    def _wait_for_control(self, timeout: float = 30.0) -> dict:
+        latest = self.debug.snapshot()
+        last_progress_at = time.monotonic()
+        progress_signature = self.debug.game_control_progress_signature(latest)
+        while self._game_control_active(latest):
+            if self.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            time.sleep(0.05)
+            latest = self.debug.snapshot()
+            unsafe_reason = self._unsafe_state_reason(latest)
+            if unsafe_reason not in {None, "game_controlled"}:
+                raise RuntimeError(unsafe_reason)
+            latest_signature = self.debug.game_control_progress_signature(latest)
+            if latest_signature != progress_signature:
+                progress_signature = latest_signature
+                last_progress_at = time.monotonic()
+            elif time.monotonic() - last_progress_at >= timeout:
+                raise RuntimeError("game_control_timeout")
+        return latest
 
     async def _decide(self, state: dict, feedback: str) -> dict:
         if self.decision_provider:
@@ -1496,8 +2072,13 @@ exploration value, and maintained local tasks to choose the next action.
         action = decision.get("recommended_action") or {}
         tool = action.get("tool")
         dialog_active = bool((state.get("dialog") or {}).get("active"))
+        choice_active = bool((state.get("choice") or {}).get("active"))
         shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
         shop_active = shop.get("active") is True
+        if choice_active and tool != "choice_select":
+            return "in_choice"
+        if not choice_active and tool == "choice_select":
+            return "choice_inactive"
         if dialog_active and tool != "advance_dialog":
             return "in_dialog"
         if not dialog_active and tool == "advance_dialog":
@@ -1531,6 +2112,8 @@ exploration value, and maintained local tasks to choose the next action.
         before = self.debug.snapshot()
         if self.cancel_event.is_set():
             raise RuntimeError("interrupted")
+        if self._game_control_active(before):
+            before = self._wait_for_control()
         reason = self._unsafe_state_reason(before)
         if reason and reason != "not_in_main_game":
             raise RuntimeError(reason)
@@ -1557,6 +2140,11 @@ exploration value, and maintained local tasks to choose the next action.
             if not action_result.get("ok"):
                 raise RuntimeError(action_result.get("status") or "dialog_advance_failed")
             after = self._wait_state_quiet()
+        elif tool == "choice_select":
+            action_result = self.debug.write_choice_action(
+                args.get("generation"), args.get("option_index")
+            )
+            after = self._wait_action_and_stable(action=action_result)
         elif tool == "use_item":
             action_result = self.debug.write_use_item_action(args.get("item_id"), args.get("role_id"), args.get("target"))
             after = self._wait_action_and_stable(action=action_result)
@@ -1715,6 +2303,9 @@ exploration value, and maintained local tasks to choose the next action.
                 time.sleep(0.04)
             if self.debug.action_pending():
                 raise RuntimeError("action_timeout")
+        latest = self.debug.snapshot()
+        if self._game_control_active(latest):
+            self._wait_for_control(timeout=30.0)
         return self._wait_state_quiet(timeout=timeout, quiet_window=quiet_window)
 
     def _wait_state_quiet(self, timeout: float = 10.0, quiet_window: float = 2.0) -> dict:
@@ -1726,6 +2317,12 @@ exploration value, and maintained local tasks to choose the next action.
             if self.cancel_event.is_set():
                 raise RuntimeError("interrupted")
             latest = self.debug.snapshot()
+            if self._game_control_active(latest):
+                latest = self._wait_for_control(timeout=30.0)
+                deadline = time.monotonic() + timeout
+                last = None
+                quiet_since = time.monotonic()
+                continue
             signature = self._state_signature(latest)
             if signature == last:
                 if time.monotonic() - quiet_since >= quiet_window:
@@ -1741,7 +2338,7 @@ exploration value, and maintained local tasks to choose the next action.
             raise RuntimeError("navigation_target_missing")
         progress = []
         terminal = {"arrived", "transitioned", "interacting"}
-        observing = {"transition_observing"}
+        observing = {"transition_observing", "waiting_for_control"}
         no_progress_key = None
         no_progress_count = 0
         for step in range(1, 241):
@@ -1752,6 +2349,9 @@ exploration value, and maintained local tasks to choose the next action.
             progress.append({key: result.get(key) for key in ("status", "move", "segment_steps", "remaining_steps", "required_direction", "observation_id")})
             self.emit("navigation", "progress", f"Navigation step {step}: {result.get('status')}.", {"step": step, "target_id": target_id, "result": progress[-1]})
             status = result.get("status")
+            if status == "waiting_for_control":
+                self._wait_for_control()
+                continue
             if status == "entering_scene":
                 self._wait_scene_transition()
                 return {"ok": True, "status": "transitioned", "steps": step, "target_id": target_id, "progress": progress[-20:]}
@@ -1759,6 +2359,22 @@ exploration value, and maintained local tasks to choose the next action.
                 return {
                     "ok": True,
                     "status": "interrupted_by_dialog",
+                    "steps": step,
+                    "target_id": target_id,
+                    "progress": progress[-20:],
+                }
+            if status == "in_battle":
+                return {
+                    "ok": True,
+                    "status": "interrupted_by_battle",
+                    "steps": step,
+                    "target_id": target_id,
+                    "progress": progress[-20:],
+                }
+            if status == "in_shop":
+                return {
+                    "ok": True,
+                    "status": "interrupted_by_shop",
                     "steps": step,
                     "target_id": target_id,
                     "progress": progress[-20:],
@@ -1873,6 +2489,7 @@ exploration value, and maintained local tasks to choose the next action.
             for item in state.get("objects") or [] if isinstance(item, dict)
         )
         shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else {}
         shop_items = tuple(
             (
                 item.get("item_id"), item.get("owned_count"),
@@ -1889,6 +2506,7 @@ exploration value, and maintained local tasks to choose the next action.
             state.get("cash"),
             bool(shop.get("active")), shop.get("mode"), shop.get("store_id"),
             shop.get("phase"), shop.get("selected_item_id"), shop_items,
+            bool(choice.get("active")), choice.get("generation"), choice.get("selected_index"),
             inventory, objects,
         )
 
@@ -1898,12 +2516,14 @@ exploration value, and maintained local tasks to choose the next action.
         dialog = state.get("dialog") or {}
         latest = dialog.get("latest_event") or {}
         shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else {}
         return {
             "scene_id": state.get("scene_id"), "map_id": state.get("map_id"),
             "room_key": state.get("room_key") or (state.get("room") or {}).get("key"),
             "region_key": state.get("region_key"),
             "position": {"x": pos.get("x"), "y": pos.get("y"), "direction": state.get("party_direction")},
             "dialog": {"active": bool(dialog.get("active")), "message_id": latest.get("message_id"), "event_object_id": latest.get("event_object_id"), "text": latest.get("text")},
+            "choice": choice if choice.get("active") else None,
             "cash": state.get("cash"),
             "shop": {
                 "active": bool(shop.get("active")),
@@ -1994,6 +2614,7 @@ exploration value, and maintained local tasks to choose the next action.
             "position": (position(before), position(after)),
             "room": ({key: before.get(key) for key in ("scene_id", "map_id", "room_key", "region_key")}, {key: after.get(key) for key in ("scene_id", "map_id", "room_key", "region_key")}),
             "dialog": (AgentRuntime._compact_state(before)["dialog"], AgentRuntime._compact_state(after)["dialog"]),
+            "choice": (AgentRuntime._compact_state(before)["choice"], AgentRuntime._compact_state(after)["choice"]),
             "cash": (before.get("cash"), after.get("cash")),
             "shop": (
                 AgentRuntime._compact_state(before)["shop"],

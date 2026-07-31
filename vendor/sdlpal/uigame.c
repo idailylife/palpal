@@ -302,7 +302,7 @@ PAL_SelectionMenu(
 	//
 	// Activate the menu
 	//
-	wReturnValue = PAL_ReadMenu(NULL, rgMenuItem, nWords, nDefault, MENUITEM_COLOR);
+	wReturnValue = PAL_ReadMenu(PALPAL_AgentObserveChoiceSelection, rgMenuItem, nWords, nDefault, MENUITEM_COLOR);
 
 	//
 	// Delete the boxes

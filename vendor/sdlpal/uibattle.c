@@ -20,6 +20,7 @@
 //
 
 #include "main.h"
+#include "agent.h"
 #include "fight.h"
 
 extern WORD g_rgPlayerPos[3][3][2];
@@ -340,6 +341,187 @@ PAL_BattleUIIsActionValid(
    return TRUE;
 }
 
+BOOL
+PALPAL_BattleCoopActionAvailable(
+   VOID
+)
+{
+   return PAL_BattleUIIsActionValid(kBattleUIActionCoopMagic);
+}
+
+static BOOL
+PALPAL_BattleMagicLearned(
+   WORD wPlayerRole,
+   WORD wObjectID
+)
+{
+   int i;
+   for (i = 0; i < MAX_PLAYER_MAGICS; i++)
+   {
+      if (gpGlobals->g.PlayerRoles.rgwMagic[i][wPlayerRole] == wObjectID)
+      {
+         return TRUE;
+      }
+   }
+   return FALSE;
+}
+
+static BOOL
+PALPAL_BattleEnemyTargetValid(
+   SHORT sTarget
+)
+{
+   return sTarget >= 0 && sTarget <= (SHORT)g_Battle.wMaxEnemyIndex &&
+      g_Battle.rgEnemy[sTarget].wObjectID != 0 &&
+      g_Battle.rgEnemy[sTarget].e.wHealth > 0;
+}
+
+static BOOL
+PALPAL_BattlePlayerTargetValid(
+   SHORT sTarget
+)
+{
+   return sTarget >= 0 && sTarget <= (SHORT)gpGlobals->wMaxPartyMemberIndex;
+}
+
+const char *
+PALPAL_BattleSubmitAction(
+   DWORD dwBattleGeneration,
+   DWORD dwCommandGeneration,
+   WORD wPlayerIndex,
+   const char *action,
+   WORD wObjectID,
+   SHORT sTarget
+)
+{
+   WORD role;
+   WORD flags = 0;
+   WORD magic_number;
+   BOOL target_enemy = FALSE;
+   BOOL target_all = FALSE;
+
+   if (!gpGlobals || !gpGlobals->fInBattle ||
+       dwBattleGeneration != PALPAL_AgentBattleGeneration() ||
+       dwCommandGeneration != PALPAL_AgentBattleCommandGeneration())
+   {
+      return "stale_battle_command";
+   }
+   if (g_Battle.BattleResult != kBattleResultOnGoing ||
+       g_Battle.UI.state == kBattleUIWait ||
+       wPlayerIndex != g_Battle.UI.wCurPlayerIndex ||
+       wPlayerIndex > gpGlobals->wMaxPartyMemberIndex ||
+       g_Battle.rgPlayer[wPlayerIndex].state != kFighterCom)
+   {
+      return "battle_not_commandable";
+   }
+   if (action == NULL)
+   {
+      return "action_unavailable";
+   }
+
+   role = gpGlobals->rgParty[wPlayerIndex].wPlayerRole;
+   if (strcmp(action, "attack") == 0)
+   {
+      g_Battle.UI.wActionType = kBattleActionAttack;
+      target_enemy = TRUE;
+      target_all = PAL_PlayerCanAttackAll(role);
+      wObjectID = 0;
+   }
+   else if (strcmp(action, "magic") == 0)
+   {
+      if (wObjectID == 0 || wObjectID >= MAX_OBJECTS ||
+          !PALPAL_BattleMagicLearned(role, wObjectID) ||
+          gpGlobals->rgPlayerStatus[role][kStatusSilence] != 0)
+      {
+         return "action_unavailable";
+      }
+      magic_number = gpGlobals->g.rgObject[wObjectID].magic.wMagicNumber;
+      if (magic_number >= gpGlobals->g.nMagic ||
+          !(gpGlobals->g.rgObject[wObjectID].magic.wFlags & kMagicFlagUsableInBattle) ||
+          gpGlobals->g.lprgMagic[magic_number].wCostMP >
+             gpGlobals->g.PlayerRoles.rgwMP[role])
+      {
+         return "action_unavailable";
+      }
+      flags = gpGlobals->g.rgObject[wObjectID].magic.wFlags;
+      g_Battle.UI.wActionType = kBattleActionMagic;
+      target_enemy = (flags & kMagicFlagUsableToEnemy) != 0;
+      target_all = (flags & kMagicFlagApplyToAll) != 0;
+   }
+   else if (strcmp(action, "coop_magic") == 0)
+   {
+      WORD coop = PAL_GetPlayerCooperativeMagic(role);
+      if (!PAL_BattleUIIsActionValid(kBattleUIActionCoopMagic) ||
+          coop == 0 || wObjectID != coop)
+      {
+         return "action_unavailable";
+      }
+      flags = gpGlobals->g.rgObject[wObjectID].magic.wFlags;
+      g_Battle.UI.wActionType = kBattleActionCoopMagic;
+      target_enemy = (flags & kMagicFlagUsableToEnemy) != 0;
+      target_all = (flags & kMagicFlagApplyToAll) != 0;
+   }
+   else if (strcmp(action, "use_item") == 0 ||
+            strcmp(action, "throw_item") == 0)
+   {
+      WORD required = strcmp(action, "use_item") == 0
+         ? kItemFlagUsable : kItemFlagThrowable;
+      if (wObjectID == 0 || wObjectID >= MAX_OBJECTS ||
+          !(gpGlobals->g.rgObject[wObjectID].item.wFlags & required) ||
+          PAL_GetItemAmount(wObjectID) <= 0)
+      {
+         return "action_unavailable";
+      }
+      flags = gpGlobals->g.rgObject[wObjectID].item.wFlags;
+      g_Battle.UI.wActionType = strcmp(action, "use_item") == 0
+         ? kBattleActionUseItem : kBattleActionThrowItem;
+      target_enemy = strcmp(action, "throw_item") == 0;
+      target_all = (flags & kItemFlagApplyToAll) != 0;
+   }
+   else if (strcmp(action, "defend") == 0)
+   {
+      if (sTarget != -2 || wObjectID != 0)
+      {
+         return "invalid_target";
+      }
+      g_Battle.UI.wActionType = kBattleActionDefend;
+   }
+   else if (strcmp(action, "flee") == 0)
+   {
+      if (g_Battle.fIsBoss || sTarget != -2 || wObjectID != 0)
+      {
+         return "action_unavailable";
+      }
+      g_Battle.UI.wActionType = kBattleActionFlee;
+   }
+   else
+   {
+      return "action_unavailable";
+   }
+
+   if (target_enemy || strcmp(action, "use_item") == 0 ||
+       strcmp(action, "magic") == 0 || strcmp(action, "coop_magic") == 0)
+   {
+      if (target_all)
+      {
+         if (sTarget != -1)
+         {
+            return "invalid_target";
+         }
+      }
+      else if (target_enemy ? !PALPAL_BattleEnemyTargetValid(sTarget)
+                            : !PALPAL_BattlePlayerTargetValid(sTarget))
+      {
+         return "invalid_target";
+      }
+   }
+
+   g_Battle.UI.wObjectID = wObjectID;
+   g_Battle.UI.iSelectedIndex = sTarget;
+   PAL_BattleCommitAction(FALSE);
+   return NULL;
+}
+
 static VOID
 PAL_BattleUIDrawMiscMenu(
    WORD       wCurrentItem,
@@ -605,6 +787,7 @@ PAL_BattleUIPlayerReady(
    g_Battle.UI.state = kBattleUISelectMove;
    g_Battle.UI.wSelectedAction = 0;
    g_Battle.UI.MenuState = kBattleMenuMain;
+   PALPAL_AgentBattleCommandReady(wPlayerIndex);
 
 #ifndef PAL_CLASSIC
    //

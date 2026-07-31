@@ -21,6 +21,8 @@ const dialogsEl = document.getElementById("dialogs");
 const eventsEl = document.getElementById("events");
 const inventoryEl = document.getElementById("inventory");
 const equipmentEl = document.getElementById("equipment");
+const battleSectionEl = document.getElementById("battleSection");
+const battleStatusEl = document.getElementById("battleStatus");
 const frameCanvas = document.getElementById("frame");
 const fastDialogButton = document.getElementById("fastDialog");
 const transitionsButton = document.getElementById("transitionsButton");
@@ -32,8 +34,16 @@ const goalsDialog = document.getElementById("goalsDialog");
 const goalsClose = document.getElementById("goalsClose");
 const goalsSummary = document.getElementById("goalsSummary");
 const goalsContent = document.getElementById("goalsContent");
-const connectionEl = document.getElementById("connection");
-const runtimeStatusEl = document.getElementById("runtimeStatus");
+const statusChipEls = Object.fromEntries(
+  [...document.querySelectorAll("[data-status-kind]")]
+    .map((element) => [element.dataset.statusKind, element]),
+);
+const statusValueEls = {
+  state: document.getElementById("stateStatusValue"),
+  frames: document.getElementById("framesStatusValue"),
+  game: document.getElementById("gameStatusValue"),
+  agent: document.getElementById("agentStatusValue"),
+};
 const disconnectAlertEl = document.getElementById("disconnectAlert");
 const disconnectMessageEl = document.getElementById("disconnectMessage");
 const disconnectRefreshEl = document.getElementById("disconnectRefresh");
@@ -309,6 +319,7 @@ function navigationCanRefresh(state) {
   return Boolean(
     state?._navigation &&
     state._navigation.status !== "no_nav_grid" &&
+    state?.control?.navigation_ready === true &&
     !state?._debug?.runtime_stale
   );
 }
@@ -322,7 +333,15 @@ function navigationFullReady(state) {
 }
 
 function navigationTargetActionable(state, targetId) {
-  if (!navigationFullReady(state) || state?.dialog?.active || state?.in_battle || state?._debug?.runtime_stale || sessionRunning()) {
+  if (
+    !navigationFullReady(state)
+    || state?.control?.navigation_ready !== true
+    || !(state?.control?.allowed_actions || []).includes("navigation_step")
+    || state?.dialog?.active
+    || state?.in_battle
+    || state?._debug?.runtime_stale
+    || sessionRunning()
+  ) {
     return false;
   }
   const target = navigationTargets(state).get(targetId);
@@ -376,6 +395,31 @@ navigationEl.addEventListener("keydown", (event) => {
 });
 
 inventoryEl.addEventListener("click", (event) => {
+  const shopEl = event.target.closest("[data-shop-action]");
+  if (shopEl && inventoryEl.contains(shopEl)) {
+    const action = shopEl.dataset.shopAction;
+    const path = action === "buy" ? "/shop/buy" : "/shop/leave";
+    const payload = action === "buy"
+      ? { item_id: Number(shopEl.dataset.shopItem) }
+      : {};
+    fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+      .then(async (response) => {
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || result.ok === false) {
+          throw new Error(result.error || `shop action failed: ${response.status}`);
+        }
+        await refreshState();
+      })
+      .catch((error) => {
+        agentActionStatus = `Shop action failed: ${error instanceof Error ? error.message : String(error)}`;
+        if (latestState) renderAgent(latestState);
+      });
+    return;
+  }
   const actionEl = event.target.closest("[data-use-item]");
   if (!actionEl || !inventoryEl.contains(actionEl)) return;
   useInventoryItem(Number(actionEl.dataset.useItem), actionEl.dataset.useTarget)
@@ -590,6 +634,7 @@ function explorationStatusText(status) {
     stepping: "stepping",
     complete: "complete",
     action_pending: "pending",
+    waiting_for_control: "game control",
     no_nav_grid: "no grid",
     no_visible_frontier: "no visible frontier",
     route_blocked: "route blocked",
@@ -623,6 +668,7 @@ const transportLabels = {
 const serverControlSelector = [
   "[data-button]",
   "[data-use-item]",
+  "[data-shop-action]",
   "[data-nav-go]",
   "[data-agent-action]",
   "[data-session-action]",
@@ -658,20 +704,109 @@ function renderDisconnectAlert() {
 function markTransportExhausted(name) {
   exhaustedTransports.add(name);
   renderDisconnectAlert();
-  setConnection();
+  renderStatusBar();
 }
 
 disconnectRefreshEl?.addEventListener("click", () => window.location.reload());
 new MutationObserver(disableServerControls).observe(document.body, { childList: true, subtree: true });
 
-function setConnection() {
-  if (refreshRequired()) {
-    connectionEl.textContent = "disconnected — refresh required";
-    return;
+function setStatusChip(kind, value, tone, detail = value) {
+  const chip = statusChipEls[kind];
+  const valueEl = statusValueEls[kind];
+  if (!chip || !valueEl) return;
+  if (valueEl.textContent !== value) valueEl.textContent = value;
+  if (chip.dataset.tone !== tone) chip.dataset.tone = tone;
+  const title = `${chip.querySelector("span")?.textContent || kind}: ${detail}`;
+  if (chip.title !== title) chip.title = title;
+}
+
+function stateTransportStatus(state) {
+  if (exhaustedTransports.has("state")) return ["Disconnected", "error"];
+  if (!stateConnected) return ["Reconnecting", "pending"];
+  const stateFile = state?._debug?.state_file || {};
+  if (!state || state.status === "waiting_for_game" || !stateFile.available) {
+    return ["Waiting", "warning"];
   }
-  const state = stateConnected ? "state live" : "state reconnecting";
-  const frame = frameConnected ? "frames live" : "frames reconnecting";
-  connectionEl.textContent = `${state} / ${frame}`;
+  if (stateFile.stale) return ["Stale", "warning"];
+  return ["Live", "live"];
+}
+
+function frameTransportStatus(state) {
+  if (exhaustedTransports.has("frames")) return ["Disconnected", "error"];
+  if (!frameConnected) return ["Reconnecting", "pending"];
+  const frameFile = state?._debug?.frame_file || {};
+  if (!state || !frameFile.available) return ["Waiting", "warning"];
+  if (frameFile.stale) return ["Stale", "warning"];
+  return ["Live", "live"];
+}
+
+function gameStatus(state) {
+  const stateFile = state?._debug?.state_file || {};
+  if (!state || state.status === "waiting_for_game" || !stateFile.available || stateFile.stale) {
+    return ["Waiting", "pending"];
+  }
+
+  const control = state.control || {};
+  const phase = control.phase || "unavailable";
+  if (state.in_battle || phase === "battle") {
+    const battlePhase = state.battle?.phase;
+    const labels = {
+      command: "Command",
+      resolving: "Resolving",
+      reward: "Reward",
+      ending: "Ending",
+      pre_battle: "Starting",
+    };
+    return [labels[battlePhase] || "Battle", battlePhase === "command" || battlePhase === "reward" ? "live" : "busy"];
+  }
+  if (state.dialog?.active || state._debug?.dialog_advance_status?.running || dialogAdvanceActive || phase === "dialog") {
+    return ["Dialog", "busy"];
+  }
+  if (state.shop?.active || phase === "shop") return ["Shop", "busy"];
+  if (state.entering_scene || phase === "entering_scene") return ["Scene Change", "busy"];
+  if (control.owner === "game" || ["action_pending", "game_script"].includes(phase)) {
+    return ["Game Busy", "busy"];
+  }
+  if (phase === "ready" || control.owner === "client") return ["Ready", "live"];
+  return ["Waiting", "pending"];
+}
+
+function agentStatus(state) {
+  const debug = state?._debug || {};
+  const snapshotSession = debug.agent_session || {};
+  const persistentSession = agentSession || snapshotSession;
+  const delegate = snapshotSession.battle_delegate || persistentSession.battle_delegate || {};
+  if (["running", "interrupting"].includes(delegate.status)) {
+    const count = Number(delegate.instruction_count || 0);
+    const limit = Number(delegate.instruction_limit || 100);
+    return [`Battle ${count}/${limit}`, "busy", `${delegate.status} · ${delegate.phase || "waiting"}`];
+  }
+
+  const transient = debug.agent_status || {};
+  if (transient.running || agentRequestInFlight || agentExecutionInFlight) {
+    const thinking = ["preparing", "waiting_for_model", "processing_response"].includes(transient.phase);
+    return [thinking ? "Thinking" : "Running", "busy", transient.message || transient.phase || "running"];
+  }
+
+  const status = persistentSession.status;
+  if (status === "running") return ["Running", "busy", persistentSession.phase || "running"];
+  if (status === "interrupting") return ["Interrupting", "warning"];
+  if (status === "paused") return ["Paused", "warning", persistentSession.stop_reason || "paused"];
+  if (transient.error || agentError || status === "error") {
+    return ["Error", "error", transient.error || agentError || persistentSession.stop_reason || "error"];
+  }
+  return ["Idle", "idle"];
+}
+
+function renderStatusBar(state = latestState) {
+  const [stateValue, stateTone] = stateTransportStatus(state);
+  const [frameValue, frameTone] = frameTransportStatus(state);
+  const [gameValue, gameTone] = gameStatus(state);
+  const [agentValue, agentTone, agentDetail] = agentStatus(state);
+  setStatusChip("state", stateValue, stateTone);
+  setStatusChip("frames", frameValue, frameTone);
+  setStatusChip("game", gameValue, gameTone);
+  setStatusChip("agent", agentValue, agentTone, agentDetail || agentValue);
 }
 
 function createReconnectChannel(name, options) {
@@ -870,35 +1005,6 @@ function stopPageConnections() {
   navigationRefreshGeneration += 1;
 }
 
-function formatAge(seconds) {
-  if (!Number.isFinite(seconds)) return "unknown";
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  return `${Math.round(seconds / 3600)}h`;
-}
-
-function renderRuntimeStatus(state) {
-  const debug = state._debug || {};
-  const stateFile = debug.state_file || {};
-  const frameFile = debug.frame_file || {};
-  const messages = [];
-
-  if (state.status === "waiting_for_game" || !stateFile.available) {
-    messages.push("Waiting for game state. Start the game with ./run game, or use ./run dev to run the debug server and game together.");
-  } else if (stateFile.stale) {
-    messages.push(`Game state is stale (${formatAge(stateFile.age_seconds)} old). The game process is probably disconnected from the live socket.`);
-  }
-
-  if (!frameFile.available) {
-    messages.push("No live frame yet.");
-  } else if (frameFile.stale) {
-    messages.push(`Live frame is stale (${formatAge(frameFile.age_seconds)} old).`);
-  }
-
-  runtimeStatusEl.hidden = messages.length === 0;
-  runtimeStatusEl.textContent = messages.join(" ");
-}
-
 function renderSummary(state) {
   const pos = state.party_position || {};
   const viewport = state.viewport || {};
@@ -957,7 +1063,9 @@ function renderCheckpoints(state) {
   const labelSelectionEnd = existingInput?.selectionEnd ?? labelSelectionStart;
   const stateBusy = Boolean(checkpointBusy) || sessionRunning();
   const startupWaiting = state?.status === "startup_waiting";
-  const stableMainGame = state?.in_main_game !== false && !state?._debug?.runtime_stale && !state?.dialog?.active && !state?.in_battle && !state?.entering_scene && !state?._debug?.action_pending;
+  const stableMainGame = state?.control?.phase === "ready"
+    && state?.in_main_game !== false
+    && !state?._debug?.runtime_stale;
   const canSave = !stateBusy && stableMainGame;
   const canLoad = !stateBusy && !state?._debug?.action_pending && (startupWaiting || stableMainGame);
   // Starting over is a reset, not a checkpoint operation: the opening scene
@@ -967,6 +1075,7 @@ function renderCheckpoints(state) {
     && !state?._debug?.action_pending
     && !state?.in_battle
     && !state?.entering_scene
+    && (startupWaiting || state?.control?.owner !== "game")
     && (startupWaiting || !state?._debug?.runtime_stale)
     && !["waiting_for_game", "state_parse_error"].includes(state?.status);
   const renderKey = JSON.stringify({
@@ -1095,7 +1204,8 @@ function renderDialogCurrent(state) {
 }
 
 function canAdvanceDialog(state) {
-  return Boolean(state?.dialog?.active) && !state?.in_battle && !state?._debug?.runtime_stale;
+  return Boolean(state?.dialog?.active)
+    && (state?.control?.allowed_actions || []).includes("advance_dialog");
 }
 
 function renderFastDialogButton(state) {
@@ -1316,7 +1426,10 @@ function agentDecisionContextMatches(decision, state) {
 }
 
 function agentActionExecutable(action) {
-  return ["press_buttons", "advance_dialog", "navigation_step", "use_item", "equip_item"].includes(action?.tool);
+  return [
+    "press_buttons", "advance_dialog", "navigation_step", "use_item",
+    "equip_item", "shop_buy", "shop_leave",
+  ].includes(action?.tool);
 }
 
 function agentExecutionDisabledReason(decision, state, agentBusy) {
@@ -1328,6 +1441,7 @@ function agentExecutionDisabledReason(decision, state, agentBusy) {
   if (!decision || !action) return "No recommendation to execute.";
   if (!agentDecisionContextMatches(decision, state)) return "Decision is for an older room. Ask Agent again.";
   if (action.tool === "no_op") return "Recommendation has no executable action.";
+  if (!(state?.control?.allowed_actions || []).includes(action.tool)) return "Game currently owns control.";
   if (!agentActionExecutable(action)) return `Unsupported action tool: ${action.tool || "unknown"}.`;
   if (action.tool === "navigation_step" && !Number(action.args?.id)) return "Navigation target is missing.";
   if (action.tool === "use_item" && !Number(action.args?.item_id)) return "Inventory item is missing.";
@@ -1504,7 +1618,7 @@ function renderAgent(state) {
   const html = `
     <div class="agentControls">
       ${modelSelect}
-      <button data-agent-action="decide" ${agentBusy ? "disabled" : ""}>Decide Once</button>
+      <button data-agent-action="decide" ${agentBusy || state.in_battle ? "disabled" : ""}>Decide Once</button>
       <button data-agent-action="execute" ${executeDisabled ? "disabled" : ""}>${agentExecutionInFlight ? "Executing..." : "Execute Action"}</button>
       <button data-agent-action="open">Open Agent Mode</button>
       <span class="agentStatusText">${escapeHtml(agentStatusText(agentStatus, executeDisabledReason, decision))}</span>
@@ -1543,14 +1657,21 @@ function itemFlagLabels(item) {
 
 function renderInventory(state) {
   const items = state.inventory || [];
-  if (!items.length) {
+  const shop = state.shop || {};
+  const shopActive = shop.active === true;
+  if (!items.length && !shopActive) {
     inventoryRenderKey = setPanelHtml(inventoryEl, '<div class="navEmpty">Inventory is empty.</div>', "empty", inventoryRenderKey);
     return;
   }
 
   const firstRole = state.party?.[0]?.role_id ?? 0;
-  const disabled = Boolean(state.in_battle || state.dialog?.active || state._debug?.runtime_stale || sessionRunning());
-  const renderKey = JSON.stringify(items.map((item) => [
+  const disabled = Boolean(!(state.control?.allowed_actions || []).includes("use_item") || sessionRunning());
+  const shopBuyDisabled = sessionRunning()
+    || !(state.control?.allowed_actions || []).includes("shop_buy");
+  const shopLeaveDisabled = sessionRunning()
+    || !(state.control?.allowed_actions || []).includes("shop_leave");
+  const renderKey = JSON.stringify({
+    items: items.map((item) => [
     item.slot,
     item.item_id,
     item.name,
@@ -1559,8 +1680,29 @@ function renderInventory(state) {
     item.equipped_count,
     item.flags,
     disabled,
-  ]));
-  inventoryRenderKey = setPanelHtml(inventoryEl, items.map((item) => {
+    ]),
+    shop: shopActive ? {
+      phase: shop.phase,
+      cash: state.cash,
+      buyDisabled: shopBuyDisabled,
+      leaveDisabled: shopLeaveDisabled,
+      items: (shop.items || []).map((item) => [
+        item.item_id, item.name, item.price, item.affordable, item.owned_count,
+      ]),
+    } : null,
+  });
+  const shopHtml = shopActive ? `<div class="shopControls">
+    <strong>Shop</strong>
+    ${(shop.items || []).map((item) => `
+      <div class="inventoryItem">
+        <span>${escapeHtml(item.name || `#${item.item_id}`)} · ${item.price ?? 0}</span>
+        <button class="miniButton" data-shop-action="buy" data-shop-item="${item.item_id}"
+          ${shopBuyDisabled || item.affordable !== true ? "disabled" : ""}>Buy</button>
+      </div>
+    `).join("")}
+    <button class="miniButton" data-shop-action="leave" ${shopLeaveDisabled ? "disabled" : ""}>Leave shop</button>
+  </div>` : "";
+  inventoryRenderKey = setPanelHtml(inventoryEl, shopHtml + items.map((item) => {
     const flags = itemFlagLabels(item).map((flag) => `<span class="tag">${flag}</span>`).join("");
     const target = item.apply_to_all ? "all" : String(firstRole);
     const useButton = item.usable
@@ -1670,6 +1812,11 @@ function renderNavigation(state) {
     activeTarget: activeNavigation?.targetId ?? null,
     activeStatus: activeNavigation?.status ?? null,
     dialog: Boolean(state.dialog?.active),
+    inBattle: Boolean(state.in_battle),
+    runtimeStale: Boolean(state._debug?.runtime_stale),
+    agentRunning: sessionRunning(),
+    navigationReady: state.control?.navigation_ready === true,
+    navigationAllowed: (state.control?.allowed_actions || []).includes("navigation_step"),
     navigationStatus: state._navigation?.status ?? null,
     fullReady,
     targets: targets.map((target) => [
@@ -1896,6 +2043,7 @@ function navigationRunText(status) {
     interacting: "Action",
     arrived: "Arrived",
     action_pending: "Pending",
+    waiting_for_control: "Game",
   };
   return labels[status] || "Stop";
 }
@@ -2105,6 +2253,7 @@ function drawExploration(state) {
 
 function drawOverlay(state) {
   ctx.clearRect(0, 0, overlay.width, overlay.height);
+  if (state.in_battle) return;
   const viewport = state.viewport || { x: 0, y: 0 };
   const scaleX = overlay.width / 320;
   const scaleY = overlay.height / 200;
@@ -2195,6 +2344,28 @@ function renderJson(state, options = {}) {
   updateJsonStatus();
 }
 
+function renderBattle(state) {
+  const battle = state.battle;
+  const delegate = state._debug?.agent_session?.battle_delegate || {};
+  if (battleSectionEl) battleSectionEl.hidden = !battle && !state.last_battle;
+  if (navigationEl?.closest("section")) navigationEl.closest("section").hidden = Boolean(state.in_battle);
+  if (explorationEl?.closest("section")) explorationEl.closest("section").hidden = Boolean(state.in_battle);
+  if (!battleStatusEl) return;
+  const current = battle ? `
+    <div><strong>${battle.is_boss ? "Boss battle" : "Battle"} · ${escapeHtml(battle.phase || "resolving")}</strong></div>
+    <div>${battle.phase === "resolving" ? "Game acting…" : battle.phase === "command" ? `Waiting for player ${Number(battle.current_player_index || 0)}` : battle.phase === "reward" ? "Reward confirmation" : escapeHtml(battle.result || "")}</div>
+    <div>Players: ${(battle.players || []).map((item) => `${escapeHtml(item.name || `#${item.index}`)} ${Number(item.hp || 0)}/${Number(item.max_hp || 0)} HP`).join(" · ")}</div>
+    <div>Enemies: ${(battle.enemies || []).filter((item) => item.present).map((item) => `${escapeHtml(item.name || `#${item.slot_index}`)} ${Number(item.hp || 0)}/${Number(item.max_hp || 0)} HP`).join(" · ")}</div>
+    ${delegate.child_session_id ? `<div>Battle Agent: ${escapeHtml(delegate.status || "-")} · ${escapeHtml(delegate.phase || "-")} · ${Number(delegate.instruction_count || 0)}/${Number(delegate.instruction_limit || 100)}</div>` : ""}
+  ` : "";
+  const last = !battle && state.last_battle ? `
+    <div><strong>Last battle: ${escapeHtml(state.last_battle.result || "-")}</strong></div>
+    <div>${(state.last_battle.enemies || []).map((item) => escapeHtml(item.name || "")).filter(Boolean).join(" · ")}</div>
+    <div>EXP ${Number(state.last_battle.exp_gained || 0)} · Cash ${Number(state.last_battle.cash_gained || 0)}</div>
+  ` : "";
+  battleStatusEl.innerHTML = current || last;
+}
+
 function render(state) {
   const navKey = updateNavigationEnvironmentKey(state);
   const cachedNavigation = getCachedNavigation(navKey);
@@ -2202,19 +2373,20 @@ function render(state) {
     state._navigation = cachedNavigation;
   }
   latestState = state;
+  renderStatusBar(state);
   renderJson(state);
-  renderRuntimeStatus(state);
   renderSummary(state);
   renderCheckpoints(state);
   renderAgent(state);
   renderAgentSession();
-  updateExternalControls(state);
+  renderBattle(state);
   renderFastDialogButton(state);
   renderDialogs(state);
   renderEvents(state);
   renderInventory(state);
   renderEquipment(state);
   renderNavigation(state);
+  updateExternalControls(state);
   renderExploration(state);
   renderObjects(state);
   drawOverlay(state);
@@ -2264,6 +2436,7 @@ function sessionRunning() {
 
 function setAgentSession(nextSession) {
   if (!nextSession) return false;
+  const wasRunning = sessionRunning();
   const changed = Boolean(agentSession?.session_id && agentSession.session_id !== nextSession.session_id);
   agentSession = nextSession;
   if (changed) {
@@ -2274,6 +2447,14 @@ function setAgentSession(nextSession) {
     agentOlderEventsLoading = false;
     agentHistoryExpanded = false;
     agentUnread = 0;
+  }
+  renderStatusBar();
+  if (latestState && wasRunning !== sessionRunning()) {
+    renderCheckpoints(latestState);
+    renderFastDialogButton(latestState);
+    renderInventory(latestState);
+    renderNavigation(latestState);
+    updateExternalControls(latestState);
   }
   return changed;
 }
@@ -2359,16 +2540,26 @@ async function loadEarlierAgentEvents() {
 
 function updateExternalControls(state) {
   const running = sessionRunning();
-  document.querySelectorAll("[data-button], [data-use-item], [data-nav-go]").forEach((button) => {
-    if (running) {
-      button.dataset.agentDisabled = button.disabled ? "already" : "agent";
+  const allowed = new Set(state?.control?.allowed_actions || []);
+  document.querySelectorAll("[data-button], [data-use-item], [data-shop-action], [data-nav-go]").forEach((button) => {
+    const action = button.matches("[data-button]")
+      ? "press_buttons"
+      : button.matches("[data-use-item]")
+        ? "use_item"
+        : button.matches("[data-shop-action]")
+          ? (button.dataset.shopAction === "buy" ? "shop_buy" : "shop_leave")
+        : "navigation_step";
+    if (running || !allowed.has(action)) {
+      if (!button.dataset.controlDisabled) {
+        button.dataset.controlDisabled = button.disabled ? "already" : "control";
+      }
       button.disabled = true;
-    } else if (button.dataset.agentDisabled === "agent") {
-      button.disabled = false;
-      delete button.dataset.agentDisabled;
+    } else if (button.dataset.controlDisabled) {
+      if (button.dataset.controlDisabled === "control") button.disabled = false;
+      delete button.dataset.controlDisabled;
     }
   });
-  if (fastDialogButton && running) fastDialogButton.disabled = true;
+  if (fastDialogButton && (running || !allowed.has("advance_dialog"))) fastDialogButton.disabled = true;
   disableServerControls();
 }
 
@@ -2390,6 +2581,8 @@ function renderAgentSession() {
   const lastUsage = session.last_request_usage || {};
   const running = ["running", "interrupting"].includes(session.status);
   const pending = Boolean(session.pending_decision);
+  const battleDelegate = session.battle_delegate || {};
+  const inBattle = Boolean(latestState?.in_battle);
   const headerRenderKey = JSON.stringify([
     session.status,
     session.stop_reason,
@@ -2405,6 +2598,9 @@ function renderAgentSession() {
     session.parent_session_id,
     session.checkpoint_id,
     session.restored_from_session_id,
+    battleDelegate.status,
+    battleDelegate.phase,
+    battleDelegate.instruction_count,
   ]);
   if (agentSessionHeaderRenderKey !== headerRenderKey) {
     agentSessionHeaderEl.innerHTML = `
@@ -2418,13 +2614,14 @@ function renderAgentSession() {
         <div><dt>Context est.</dt><dd>${Number(session.context_estimate_tokens || 0).toLocaleString()}</dd></div>
         <div><dt>Compactions</dt><dd>${Number(session.compactions || 0)}</dd></div>
         <div><dt>Lineage</dt><dd>${escapeHtml(session.checkpoint_id ? `checkpoint ${session.checkpoint_id}` : session.parent_session_id ? "session branch" : "game")}</dd></div>
+        ${battleDelegate.child_session_id ? `<div><dt>Battle child</dt><dd>${escapeHtml(battleDelegate.status || "-")} · ${escapeHtml(battleDelegate.phase || "-")} · ${Number(battleDelegate.instruction_count || 0)}/${Number(battleDelegate.instruction_limit || 100)}</dd></div>` : ""}
       </dl>`;
     agentSessionHeaderRenderKey = headerRenderKey;
   }
   const model = selectedAgentModel || session.model || fallbackAgentModels[0];
   // Keep native form controls mounted across high-frequency state updates.
   // Replacing an open <select> closes its popup before the user can choose.
-  const controlsRenderKey = JSON.stringify([running, pending, Boolean(session.turn)]);
+  const controlsRenderKey = JSON.stringify([running, pending, Boolean(session.turn), inBattle]);
   if (agentSessionControlsRenderKey !== controlsRenderKey) {
     agentSessionControlsEl.innerHTML = `
       <label>Model<select data-session-model ${running ? "disabled" : ""}>${fallbackAgentModels.map((item) => `<option ${item === model ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}</select></label>
@@ -2432,7 +2629,7 @@ function renderAgentSession() {
       <div class="agentSessionButtons">
         <button data-session-action="run" ${running ? "disabled" : ""}>${session.turn ? "Ask Agent / Resume" : "Ask Agent"}</button>
         <button data-session-action="interrupt" ${running ? "" : "disabled"}>Interrupt</button>
-        <button data-session-action="decide" ${running ? "disabled" : ""}>Decide Once</button>
+        <button data-session-action="decide" ${running || inBattle ? "disabled" : ""}>Decide Once</button>
         <button data-session-action="execute" ${running || !pending ? "disabled" : ""}>Execute</button>
         <button data-session-action="reset" ${running ? "disabled" : ""}>Reset Session</button>
         <button data-goals-open>Goals (<span data-goals-count>…</span>)</button>
@@ -2516,11 +2713,81 @@ function closeGoalsDialog() {
 }
 
 function eventIcon(event) {
-  if (event.type === "error") return "×";
-  if (["pause", "interrupt"].includes(event.type)) return "Ⅱ";
+  if (event.type === "error" || event.phase === "failed") return "×";
+  if (["pause", "interrupt"].includes(event.type) || event.phase === "stopped") return "Ⅱ";
+  if (event.phase === "retry") return "↻";
   if (["completed", "observed", "ready"].includes(event.phase)) return "✓";
   if (["request", "progress", "validating", "executing", "deciding"].includes(event.phase)) return "●";
   return "·";
+}
+
+const battleTerminalPhases = new Set(["completed", "failed", "stopped"]);
+const battleTerminalStatuses = new Set(["completed", "failed", "stopped"]);
+
+function battleDelegateMetadata(event) {
+  const metadata = event?.details?.battle_delegate;
+  return metadata && typeof metadata === "object" && metadata.group_id ? metadata : null;
+}
+
+function agentEventVisibleDetails(event) {
+  if (!event?.details || typeof event.details !== "object") return null;
+  const details = Object.fromEntries(
+    Object.entries(event.details).filter(([key]) => key !== "battle_delegate")
+  );
+  return Object.keys(details).length ? details : null;
+}
+
+function agentTimelineItems(events) {
+  const items = [];
+  events.forEach((event) => {
+    const metadata = battleDelegateMetadata(event);
+    const previous = items.at(-1);
+    if (metadata && previous?.kind === "battle" && previous.groupId === metadata.group_id) {
+      previous.events.push(event);
+      return;
+    }
+    if (metadata) {
+      items.push({ kind: "battle", groupId: metadata.group_id, metadata, events: [event] });
+    } else {
+      items.push({ kind: "event", event });
+    }
+  });
+  return items;
+}
+
+function battleTimelineGroupTerminal(group) {
+  if (group.events.some((event) => battleTerminalPhases.has(event.phase))) return true;
+  const delegate = agentSession?.battle_delegate || latestState?._debug?.agent_session?.battle_delegate || {};
+  return (
+    delegate.child_session_id === group.metadata.child_session_id
+    && Number(delegate.battle_generation || 0) === Number(group.metadata.battle_generation || 0)
+    && battleTerminalStatuses.has(delegate.status)
+  );
+}
+
+function renderAgentActivity(event, currentEventSeq, openDetails) {
+  const details = agentEventVisibleDetails(event);
+  return `<article class="agentActivity is-${escapeHtml(event.type)} is-${escapeHtml(event.phase)}${Number(event.seq || 0) === currentEventSeq ? " is-current" : ""}" data-event-seq="${Number(event.seq || 0)}">
+    <span class="agentActivityIcon" aria-hidden="true">${eventIcon(event)}</span>
+    <div><div class="agentActivityTitle"><strong>${escapeHtml(event.summary || event.type)}</strong><time>${escapeHtml(event.time || "")}${event.elapsed != null ? ` · ${event.elapsed}s` : ""}</time></div>
+    ${details ? `<details ${openDetails.has(String(event.seq || 0)) ? "open" : ""}><summary>Details</summary><pre>${escapeHtml(JSON.stringify(details, null, 2))}</pre></details>` : ""}</div>
+  </article>`;
+}
+
+function renderBattleTimelineGroup(group, currentEventSeq, openDetails, openBattleGroups) {
+  const terminal = battleTimelineGroupTerminal(group);
+  const latest = group.events.at(-1) || {};
+  const status = terminal
+    ? (battleTerminalPhases.has(latest.phase) ? latest.phase : "stopped")
+    : (agentSession?.battle_delegate?.phase || latest.phase || "running");
+  const toolCalls = group.events.filter((event) => event.phase === "tool_called").length;
+  const shouldOpen = !terminal || openBattleGroups.has(group.groupId);
+  return `<details class="agentBattleGroup is-${escapeHtml(status)}" data-battle-group="${escapeHtml(group.groupId)}" data-terminal="${terminal}" ${shouldOpen ? "open" : ""}>
+    <summary><span>Battle Agent</span><small>${escapeHtml(status)} · ${toolCalls} tools · ${group.events.length} events</small></summary>
+    <div class="agentBattleEvents">
+      ${group.events.map((event) => renderAgentActivity(event, currentEventSeq, openDetails)).join("")}
+    </div>
+  </details>`;
 }
 
 function renderAgentTimeline({ anchorScrollHeight = null, anchorScrollTop = 0 } = {}) {
@@ -2537,7 +2804,13 @@ function renderAgentTimeline({ anchorScrollHeight = null, anchorScrollTop = 0 } 
       .map((details) => details.closest(".agentActivity")?.dataset.eventSeq)
       .filter(Boolean)
   );
-  const timelineRenderKey = `${agentSession?.session_id || ""}:${agentSession?.status || ""}:${agentSessionEvents.length}:${agentSessionEvents[0]?.seq || 0}:${latestEvent?.seq || 0}:${agentHasOlderEvents}`;
+  const openBattleGroups = new Set(
+    [...agentTimelineEl.querySelectorAll(".agentBattleGroup[data-terminal='true'][open]")]
+      .map((details) => details.dataset.battleGroup)
+      .filter(Boolean)
+  );
+  const battleDelegate = agentSession?.battle_delegate || latestState?._debug?.agent_session?.battle_delegate || {};
+  const timelineRenderKey = `${agentSession?.session_id || ""}:${agentSession?.status || ""}:${agentSessionEvents.length}:${agentSessionEvents[0]?.seq || 0}:${latestEvent?.seq || 0}:${agentHasOlderEvents}:${battleDelegate.child_session_id || ""}:${battleDelegate.status || ""}:${battleDelegate.phase || ""}:${battleDelegate.instruction_count || 0}`;
   if (agentTimelineRenderKey === timelineRenderKey) {
     if (agentJumpLatestEl) {
       agentJumpLatestEl.hidden = agentUnread === 0;
@@ -2557,11 +2830,10 @@ function renderAgentTimeline({ anchorScrollHeight = null, anchorScrollTop = 0 } 
   agentTimelineEl.innerHTML = agentSessionEvents.length ? earlierButton + [...groups.entries()].map(([turn, events]) => `
     <section class="agentTurn">
       <h3>${turn ? `Turn ${turn}` : "Session"}</h3>
-      ${events.map((event) => `<article class="agentActivity is-${escapeHtml(event.type)} is-${escapeHtml(event.phase)}${Number(event.seq || 0) === currentEventSeq ? " is-current" : ""}" data-event-seq="${Number(event.seq || 0)}">
-        <span class="agentActivityIcon" aria-hidden="true">${eventIcon(event)}</span>
-        <div><div class="agentActivityTitle"><strong>${escapeHtml(event.summary || event.type)}</strong><time>${escapeHtml(event.time || "")}${event.elapsed != null ? ` · ${event.elapsed}s` : ""}</time></div>
-        ${event.details && Object.keys(event.details).length ? `<details ${openDetails.has(String(event.seq || 0)) ? "open" : ""}><summary>Details</summary><pre>${escapeHtml(JSON.stringify(event.details, null, 2))}</pre></details>` : ""}</div>
-      </article>`).join("")}
+      ${agentTimelineItems(events).map((item) => item.kind === "battle"
+        ? renderBattleTimelineGroup(item, currentEventSeq, openDetails, openBattleGroups)
+        : renderAgentActivity(item.event, currentEventSeq, openDetails)
+      ).join("")}
     </section>`).join("") : '<div class="agentTimelineEmpty">No activity yet. Ask Agent to start.</div>';
   agentTimelineRenderKey = timelineRenderKey;
   if (anchorScrollHeight != null) {
@@ -3012,7 +3284,8 @@ async function waitForPositionChange(startKey, timeoutMs = 900) {
 
 async function waitForNavigationProgress(stepResult, startKey) {
   const expectedKey = routeNodePositionKey(stepResult.expected_node || stepResult.route?.nodes?.[1]);
-  const deadline = performance.now() + 2500;
+  let deadline = performance.now() + 2500;
+  let controlDeadlineApplied = false;
   while (performance.now() < deadline) {
     await sleep(35);
     const response = await fetch("/state");
@@ -3021,6 +3294,13 @@ async function waitForNavigationProgress(stepResult, startKey) {
     const key = partyPositionKey(state);
     if (expectedKey ? key === expectedKey : key !== startKey) {
       return true;
+    }
+    if (["action_pending", "game_script", "entering_scene"].includes(state.control?.phase)) {
+      if (!controlDeadlineApplied) {
+        deadline = performance.now() + 30000;
+        controlDeadlineApplied = true;
+      }
+      continue;
     }
     if (state._debug?.runtime_stale || state.in_battle) {
       return false;
@@ -3199,6 +3479,12 @@ async function navigateToTarget(targetId) {
         continue;
       }
 
+      if (result.ok && result.status === "waiting_for_control") {
+        await sleep(80);
+        await refreshState();
+        continue;
+      }
+
       if (result.ok && result.status === "transitioned") {
         unlockNavigation("transitioned");
         await refreshState();
@@ -3322,7 +3608,11 @@ function flashButton(buttonName) {
 }
 
 function sendButton(buttonName) {
-  if (sessionRunning() || refreshRequired()) return;
+  if (
+    sessionRunning()
+    || refreshRequired()
+    || !(latestState?.control?.allowed_actions || []).includes("press_buttons")
+  ) return;
   const now = performance.now();
   if (!repeatableButtons.has(buttonName)) {
     const last = lastActionAt.get(buttonName) || 0;
@@ -3347,18 +3637,18 @@ const stateStreamChannel = createReconnectChannel("state", {
   },
   onOpen: () => {
     stateConnected = true;
-    setConnection();
+    renderStatusBar();
   },
   onMessage: (event) => {
     render(JSON.parse(event.data));
   },
   onClose: () => {
     stateConnected = false;
-    setConnection();
+    renderStatusBar();
   },
   onError: () => {
     stateConnected = false;
-    setConnection();
+    renderStatusBar();
   },
 });
 
@@ -3378,7 +3668,7 @@ const frameStreamChannel = createReconnectChannel("frames", {
   },
   onOpen: () => {
     frameConnected = true;
-    setConnection();
+    renderStatusBar();
   },
   onMessage: (event) => {
     if (event.data instanceof ArrayBuffer) {
@@ -3387,11 +3677,11 @@ const frameStreamChannel = createReconnectChannel("frames", {
   },
   onClose: () => {
     frameConnected = false;
-    setConnection();
+    renderStatusBar();
   },
   onError: () => {
     frameConnected = false;
-    setConnection();
+    renderStatusBar();
   },
 });
 
@@ -3472,4 +3762,4 @@ refreshAgentTasks();
 connectStream();
 connectFrames();
 refreshCheckpoints();
-setConnection();
+renderStatusBar();

@@ -25,9 +25,25 @@
       <section class="screenPane">
         <div class="toolbar">
           <strong>PALPAL Debug</strong>
-          <span id="connection">connecting</span>
+          <div id="statusBar" class="statusBar" aria-label="Runtime status">
+            <div class="statusChip" data-status-kind="state" data-tone="pending" title="State: Reconnecting">
+              <span>State</span>
+              <strong id="stateStatusValue">Reconnecting</strong>
+            </div>
+            <div class="statusChip" data-status-kind="frames" data-tone="pending" title="Frames: Reconnecting">
+              <span>Frames</span>
+              <strong id="framesStatusValue">Reconnecting</strong>
+            </div>
+            <div class="statusChip" data-status-kind="game" data-tone="pending" title="Game: Waiting">
+              <span>Game</span>
+              <strong id="gameStatusValue">Waiting</strong>
+            </div>
+            <div class="statusChip" data-status-kind="agent" data-tone="idle" title="Agent: Idle">
+              <span>Agent</span>
+              <strong id="agentStatusValue">Idle</strong>
+            </div>
+          </div>
         </div>
-        <div id="runtimeStatus" class="runtimeStatus" hidden></div>
         <div class="screenWrap">
           <canvas id="frame" width="320" height="200" aria-label="latest game frame"></canvas>
           <canvas id="overlay" width="640" height="400"></canvas>
@@ -92,6 +108,10 @@
               <span class="agentMode">single step</span>
             </div>
             <div id="agent" class="agent"></div>
+          </section>
+          <section id="battleSection" hidden>
+            <h2>Battle</h2>
+            <div id="battleStatus" class="battleStatus"></div>
           </section>
           <section>
             <h2>Dialog History</h2>

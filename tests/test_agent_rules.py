@@ -191,6 +191,27 @@ def test_agent_expands_minimal_dialog_submission(tmp_path):
     assert not debug.action_path.exists()
 
 
+def test_agent_expands_choice_submission_with_current_generation(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state['choice'] = {
+        'active': True,
+        'generation': 9,
+        'prompt': {'text': '要聽故事嗎？'},
+        'options': [
+            {'index': 0, 'semantic': 'no', 'text': '否'},
+            {'index': 1, 'semantic': 'yes', 'text': '是'},
+        ],
+    }
+    decision = debug.normalize_agent_submission(
+        {'action': 'select_choice', 'option_index': 1, 'reason': '聽故事。'},
+        state,
+    )
+    assert decision['recommended_action']['tool'] == 'choice_select'
+    assert decision['recommended_action']['args'] == {'generation': 9, 'option_index': 1}
+    assert decision['evidence']['choice']['option']['semantic'] == 'yes'
+
+
 def test_agent_expands_minimal_wait_submission(tmp_path):
     debug = make_debug_state(tmp_path)
     decision = debug.normalize_agent_submission({'action': 'wait', 'reason': 'No clear target.'}, make_state())
@@ -812,7 +833,7 @@ def test_agent_tool_schema_explains_implicit_event_context_item_target(tmp_path)
     )
     properties = submit['parameters']['properties']
     assert properties['action']['enum'] == [
-        'wait', 'advance_dialog', 'navigate', 'use_item', 'equip_item',
+        'wait', 'advance_dialog', 'select_choice', 'navigate', 'use_item', 'equip_item',
         'buy_item', 'leave_shop',
     ]
     assert properties['target']['enum'] == ['all']

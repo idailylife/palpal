@@ -56,6 +56,7 @@ MAX_TASK_HISTORY = 20
 MAX_ACTIVE_TASK_CONTEXT = 8
 MAX_ACTIVE_TASK_DESCRIPTION = 160
 TRANSITION_OBSERVATION_TIMEOUT_SECONDS = 4.0
+GAME_CONTROL_TIMEOUT_SECONDS = 30.0
 TRANSITION_STABLE_SNAPSHOTS = 2
 MAX_NAVIGATION_SEGMENT_STEPS = 8
 VIEWPORT_WIDTH = 320
@@ -849,6 +850,134 @@ class DebugState:
             local_pending = isinstance(self.pending_written_action, dict)
         return self.action_path.exists() or local_pending or bool(native and native["pending"])
 
+    def control_state(self, state: dict, state_info: dict | None = None) -> dict:
+        """Derive the client/game control contract from the compatible native fields."""
+        has_transport_info = isinstance(state_info, dict)
+        state_info = state_info if has_transport_info else {}
+        trigger = self.native_trigger_generation(state)
+        trigger_details = {}
+        if trigger is not None:
+            trigger_details = {
+                "trigger_generation": int(trigger.get("generation") or 0),
+                "event_object_id": int(trigger.get("event_object_id") or 0),
+            }
+
+        unavailable = (
+            (has_transport_info and (
+                not state_info.get("available")
+                or state_info.get("stale", True)
+            ))
+            or state.get("status") in {"waiting_for_game", "state_parse_error", "startup_waiting"}
+            or state.get("in_main_game") is False
+        )
+        dialog_active = bool((state.get("dialog") or {}).get("active"))
+        choice_active = bool((state.get("choice") or {}).get("active"))
+        shop_active = bool((state.get("shop") or {}).get("active"))
+        if unavailable:
+            owner, phase, allowed = "game", "unavailable", []
+        elif state.get("in_battle"):
+            battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+            if battle is None:
+                owner, phase, allowed = "game", "battle", []
+            elif self.action_pending(state):
+                owner, phase, allowed = "game", "battle", []
+            elif battle.get("phase") in {"command", "reward"}:
+                owner, phase, allowed = "client", "battle", ["battle_action", "press_buttons"]
+            else:
+                owner, phase, allowed = "game", "battle", []
+        elif state.get("entering_scene"):
+            owner, phase, allowed = "game", "entering_scene", []
+        elif self.action_pending(state):
+            owner, phase, allowed = "game", "action_pending", []
+        elif choice_active:
+            owner, phase, allowed = "client", "choice", ["choice_select", "press_buttons"]
+        elif dialog_active:
+            owner, phase, allowed = "client", "dialog", ["advance_dialog"]
+        elif shop_active:
+            owner, phase, allowed = "client", "shop", ["shop_buy", "shop_leave"]
+        elif trigger is not None and trigger.get("completed") is not True:
+            owner, phase, allowed = "game", "game_script", []
+        else:
+            owner, phase, allowed = (
+                "client",
+                "ready",
+                ["press_buttons", "navigation_step", "use_item", "equip_item"],
+            )
+        control = {
+            "owner": owner,
+            "phase": phase,
+            "allowed_actions": allowed,
+            "navigation_ready": phase == "ready",
+        }
+        if state.get("in_battle"):
+            control["battle_state_available"] = isinstance(state.get("battle"), dict)
+        if phase == "game_script":
+            control.update(trigger_details)
+        return control
+
+    @staticmethod
+    def game_control_progress_signature(state: dict) -> tuple:
+        """Return meaningful control progress without treating frame ticks as progress."""
+        trigger = state.get("trigger_observation") if isinstance(state.get("trigger_observation"), dict) else {}
+        destination = trigger.get("destination") if isinstance(trigger.get("destination"), dict) else {}
+        action = state.get("agent_action") if isinstance(state.get("agent_action"), dict) else {}
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        dialog_event = dialog.get("latest_event") if isinstance(dialog.get("latest_event"), dict) else {}
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        position = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        return (
+            str(state.get("game_instance_id") or ""),
+            int(trigger.get("generation") or 0),
+            int(trigger.get("event_object_id") or 0),
+            bool(trigger.get("completed")),
+            destination.get("scene_id"),
+            destination.get("map_id"),
+            destination.get("x"),
+            destination.get("y"),
+            int(action.get("generation") or 0),
+            bool(action.get("pending")),
+            int(action.get("remaining_steps") or 0),
+            bool(action.get("waiting_for_move")),
+            state.get("scene_id"),
+            state.get("map_id"),
+            bool(state.get("entering_scene")),
+            position.get("x"),
+            position.get("y"),
+            bool(dialog.get("active")),
+            dialog_event.get("sequence"),
+            dialog_event.get("message_id"),
+            bool(state.get("in_battle")),
+            battle.get("generation"),
+            battle.get("command_generation"),
+            battle.get("phase"),
+            bool(shop.get("active")),
+        )
+
+    def action_control_error(
+        self,
+        state: dict,
+        action: str,
+        state_info: dict | None = None,
+    ) -> str | None:
+        control = self.control_state(state, state_info)
+        if state.get("in_battle") and control.get("battle_state_available") is False:
+            return "battle_state_unavailable"
+        if action in control["allowed_actions"]:
+            return None
+        phase = str(control["phase"])
+        return {
+            "unavailable": "runtime_stale",
+            "battle": "in_battle",
+            "battle_state_unavailable": "battle_state_unavailable",
+            "entering_scene": "entering_scene",
+            "action_pending": "action_pending",
+            "dialog": "in_dialog",
+            "choice": "in_choice",
+            "shop": "in_shop",
+            "game_script": "game_controlled",
+        }.get(phase, "action_not_allowed")
+
     def action_handshake(self, state: dict | None = None) -> dict:
         state = state if isinstance(state, dict) else self.read_live_state()
         native = self.native_action_status(state)
@@ -1232,14 +1361,19 @@ class DebugState:
                     raise RuntimeError("action_pending")
                 return
             raise RuntimeError("startup_waiting")
+        if state.get("in_main_game") is False:
+            raise RuntimeError("not_in_main_game")
+        control = self.control_state(state, state_info)
+        if control["owner"] == "game" and control["phase"] not in {"battle", "entering_scene", "action_pending"}:
+            raise RuntimeError("game_controlled")
         if state.get("in_battle"):
             raise RuntimeError("in_battle")
         if (state.get("dialog") or {}).get("active"):
             raise RuntimeError("in_dialog")
+        if control["phase"] == "shop":
+            raise RuntimeError("in_shop")
         if state.get("entering_scene"):
             raise RuntimeError("entering_scene")
-        if state.get("in_main_game") is False:
-            raise RuntimeError("not_in_main_game")
         if self.action_pending(state):
             raise RuntimeError("action_pending")
 
@@ -4293,10 +4427,15 @@ class DebugState:
         payload = {
             **observation,
             "frozen_source_state": state,
+            "game_instance_id": str(state.get("game_instance_id") or ""),
             "object_id": int(object_id),
             "sent_at": time.time(),
             "baseline_trigger_generation": baseline_generation,
             "trigger_generation": None,
+            "control_started_at": None,
+            "control_last_progress_at": None,
+            "control_progress_signature": None,
+            "landing_started_at": None,
             "candidate_room_id": None,
             "stable_snapshots": 0,
             "last_frame": None,
@@ -4316,6 +4455,89 @@ class DebugState:
                 self.observations.cancel(previous_id, "superseded")
             self.navigation_transition_requests[int(object_id)] = observation_id
         return observation_id
+
+    def native_transition_observation_owner(
+        self,
+        state: dict,
+        object_id: int,
+        source: dict,
+    ) -> tuple[str, dict]:
+        """Associate a native touch trigger with the route that just reached it."""
+        identity = self.room_identity(state)
+        details = {
+            "owner": "background",
+            "route_age_seconds": None,
+            "expected_position": None,
+            "source_position": {"x": source.get("x"), "y": source.get("y")},
+            "association_rejected_reason": None,
+        }
+        if identity is None:
+            details["association_rejected_reason"] = "navigation_source_room_missing"
+            return "background", details
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = (data.get("rooms") or {}).get(identity["id"])
+            last_route = room.get("last_route") if isinstance(room, dict) else None
+
+        if not isinstance(last_route, dict) or not last_route.get("pending"):
+            details["association_rejected_reason"] = "navigation_route_not_pending"
+            return "background", details
+
+        try:
+            route_target_id = int(last_route.get("target_id") or 0)
+        except (TypeError, ValueError):
+            route_target_id = 0
+        if route_target_id != object_id:
+            details["association_rejected_reason"] = "navigation_target_mismatch"
+            return "background", details
+
+        target_selection = (
+            last_route.get("target_selection")
+            if isinstance(last_route.get("target_selection"), dict)
+            else {}
+        )
+        if target_selection.get("kind") != "touch":
+            details["association_rejected_reason"] = "navigation_target_not_touch"
+            return "background", details
+
+        try:
+            route_age = time.time() - float(last_route.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            route_age = TRANSITION_OBSERVATION_TIMEOUT_SECONDS + 1
+        details["route_age_seconds"] = route_age
+        if route_age < 0 or route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
+            details["association_rejected_reason"] = "navigation_route_outside_observation_window"
+            return "background", details
+
+        expected = last_route.get("expected_node") if isinstance(last_route.get("expected_node"), dict) else {}
+        details["expected_position"] = {"x": expected.get("x"), "y": expected.get("y")}
+        try:
+            expected_matches = (
+                int(expected.get("x")) == int(source.get("x"))
+                and int(expected.get("y")) == int(source.get("y"))
+            )
+        except (TypeError, ValueError):
+            expected_matches = False
+        if not expected_matches:
+            details["association_rejected_reason"] = "navigation_expected_source_mismatch"
+            return "background", details
+
+        try:
+            frozen_source_matches = (
+                int(room.get("scene_id")) == int(source.get("scene_id"))
+                and int(room.get("map_id")) == int(source.get("map_id"))
+                and int(identity.get("scene_id")) == int(source.get("scene_id"))
+                and int(identity.get("map_id")) == int(source.get("map_id"))
+            )
+        except (AttributeError, TypeError, ValueError):
+            frozen_source_matches = False
+        if not frozen_source_matches:
+            details["association_rejected_reason"] = "navigation_source_room_mismatch"
+            return "background", details
+
+        details["owner"] = "navigation"
+        return "navigation", details
 
     def discover_native_transition_observation(self, state: dict) -> None:
         if isinstance(self.pending_transition_observation, dict):
@@ -4372,11 +4594,25 @@ class DebugState:
         from_identity = self.room_identity(previous)
         if from_identity is None:
             return
-        self.mark_pending_transition_observation(previous, object_id, owner="background")
+        owner, owner_details = self.native_transition_observation_owner(previous, object_id, source)
+        self.append_navigation_diagnostic(
+            "native_transition_owner",
+            {
+                "object_id": object_id,
+                "generation": generation,
+                **owner_details,
+            },
+            state,
+        )
+        self.mark_pending_transition_observation(previous, object_id, owner=owner)
         pending = self.pending_transition_observation
         if not isinstance(pending, dict):
             return
         pending["trigger_generation"] = generation
+        pending["control_started_at"] = time.time()
+        pending["control_last_progress_at"] = pending["control_started_at"]
+        pending["control_progress_signature"] = self.game_control_progress_signature(state)
+        self.observations.suspend_timeout(pending.get("observation_id"))
         observed_from = pending.get("observed_from_state") if isinstance(pending, dict) else None
         if isinstance(observed_from, dict):
             observed_from["party_position"] = {"x": source.get("x"), "y": source.get("y")}
@@ -4389,6 +4625,7 @@ class DebugState:
                 "source": source,
                 "from_room_id": from_identity["id"],
                 "completed": native.get("completed") is True,
+                "owner": owner,
             },
             state,
         )
@@ -4445,51 +4682,108 @@ class DebugState:
         except (TypeError, ValueError):
             self.pending_transition_observation = None
             return None
-        if sent_at and time.time() - sent_at > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
-            self.append_navigation_diagnostic(
-                "native_transition_rejected",
-                {"reason": "destination_unstable_timeout", "object_id": object_id},
-                state,
-            )
-            self.observations.cancel(pending.get("observation_id"), "destination_unstable_timeout")
-            self.finish_navigation_route(
-                pending.get("from_room"),
-                object_id,
-                "transition_timeout",
-            )
-            self.pending_transition_observation = None
-            return None
+        now = time.time()
         from_identity = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
         if object_id <= 0 or from_identity is None:
             self.observations.cancel(pending.get("observation_id"), "invalid_transition_observation")
             self.finish_navigation_route(from_identity, object_id, "transition_invalid")
             self.pending_transition_observation = None
             return None
-        native = self.native_trigger_observation(state)
+        native_generation = self.native_trigger_generation(state)
         if pending.get("trigger_generation") is None:
-            if native is None:
+            if native_generation is None:
+                if sent_at and now - sent_at > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
+                    self.append_navigation_diagnostic(
+                        "native_transition_rejected",
+                        {"reason": "trigger_confirmation_timeout", "object_id": object_id},
+                        state,
+                    )
+                    self.observations.cancel(
+                        pending.get("observation_id"),
+                        "trigger_confirmation_timeout",
+                    )
+                    self.finish_navigation_route(
+                        pending.get("from_room"),
+                        object_id,
+                        "transition_timeout",
+                    )
+                    self.pending_transition_observation = None
                 return None
             try:
-                generation = int(native.get("generation") or 0)
-                native_object_id = int(native.get("event_object_id") or 0)
-                native_script = int(native.get("trigger_script") or 0)
+                generation = int(native_generation.get("generation") or 0)
+                native_object_id = int(native_generation.get("event_object_id") or 0)
+                native_script = int(native_generation.get("trigger_script") or 0)
                 expected_script = int((pending.get("object") or {}).get("trigger_script") or 0)
             except (TypeError, ValueError):
                 return None
             if generation <= baseline_generation or native_object_id != object_id or native_script != expected_script:
                 return None
             pending["trigger_generation"] = generation
-        elif native is None:
+            pending["control_started_at"] = now
+            pending["control_last_progress_at"] = now
+            pending["control_progress_signature"] = self.game_control_progress_signature(state)
+            self.observations.suspend_timeout(pending.get("observation_id"))
+        elif native_generation is None:
             return None
         else:
             try:
                 if (
-                    int(native.get("generation") or 0) != int(pending.get("trigger_generation") or 0)
-                    or int(native.get("event_object_id") or 0) != object_id
+                    int(native_generation.get("generation") or 0) != int(pending.get("trigger_generation") or 0)
+                    or int(native_generation.get("event_object_id") or 0) != object_id
                 ):
                     return None
             except (TypeError, ValueError):
                 return None
+        if native_generation.get("completed") is not True:
+            progress_signature = self.game_control_progress_signature(state)
+            control = self.control_state(state)
+            if control.get("phase") in {"dialog", "battle", "shop"}:
+                pending["control_last_progress_at"] = now
+                pending["control_progress_signature"] = progress_signature
+                return None
+            if progress_signature != pending.get("control_progress_signature"):
+                pending["control_last_progress_at"] = now
+                pending["control_progress_signature"] = progress_signature
+                return None
+            control_last_progress_at = float(
+                pending.get("control_last_progress_at")
+                or pending.get("control_started_at")
+                or now
+            )
+            if now - control_last_progress_at <= GAME_CONTROL_TIMEOUT_SECONDS:
+                return None
+            self.append_navigation_diagnostic(
+                "game_control_timeout",
+                {
+                    "object_id": object_id,
+                    "generation": pending.get("trigger_generation"),
+                    "timeout_seconds": GAME_CONTROL_TIMEOUT_SECONDS,
+                },
+                state,
+            )
+            self.observations.cancel(pending.get("observation_id"), "game_control_timeout")
+            self.finish_navigation_route(pending.get("from_room"), object_id, "game_control_timeout")
+            if self.navigation_transition_requests.get(object_id) == pending.get("observation_id"):
+                self.navigation_transition_requests.pop(object_id, None)
+            self.pending_transition_observation = None
+            return None
+        if pending.get("landing_started_at") is None:
+            pending["landing_started_at"] = now
+            self.observations.reschedule(
+                pending.get("observation_id"),
+                TRANSITION_OBSERVATION_TIMEOUT_SECONDS,
+            )
+        elif now - float(pending.get("landing_started_at") or now) > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
+            self.append_navigation_diagnostic(
+                "native_transition_rejected",
+                {"reason": "destination_unstable_timeout", "object_id": object_id},
+                state,
+            )
+            self.observations.cancel(pending.get("observation_id"), "destination_unstable_timeout")
+            self.finish_navigation_route(pending.get("from_room"), object_id, "transition_timeout")
+            self.pending_transition_observation = None
+            return None
+        native = native_generation
         destination = native.get("destination") if isinstance(native.get("destination"), dict) else None
         if destination is not None:
             try:
@@ -5327,20 +5621,34 @@ class DebugState:
         state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             return {"ok": False, "status": "state_stale", "state_file": state_info, "target_id": target_id}
-        if state.get("in_battle"):
+        control = self.control_state(state, state_info)
+        phase = control["phase"]
+        if phase in {"action_pending", "game_script", "entering_scene"}:
+            return {
+                "ok": True,
+                "status": "waiting_for_control",
+                "control": control,
+                "target_id": target_id,
+            }
+        if phase == "battle":
             return {"ok": False, "status": "in_battle", "target_id": target_id}
-        if (state.get("dialog") or {}).get("active"):
+        if phase == "dialog":
             return {"ok": False, "status": "in_dialog", "target_id": target_id}
+        if phase == "shop":
+            return {"ok": False, "status": "in_shop", "target_id": target_id}
         if state.get("in_main_game") is False:
             return {"ok": False, "status": "not_in_main_game", "target_id": target_id}
         if not self.room_state_stable(state):
             return {"ok": False, "status": "entering_scene" if state.get("entering_scene") else "unstable_room_state", "target_id": target_id}
-        if self.action_pending(state):
-            return {"ok": False, "status": "action_pending", "target_id": target_id}
 
         with self.state_lock:
             observation_id = self.navigation_transition_requests.get(target_id)
             request = self.observations.get(observation_id)
+            if observation_id and request is None:
+                self.navigation_transition_requests.pop(target_id, None)
+                pending = self.pending_transition_observation
+                if isinstance(pending, dict) and pending.get("observation_id") == observation_id:
+                    self.pending_transition_observation = None
             if request is not None and request.get("status") == "completed":
                 completed = self.observations.consume(observation_id, owner="navigation")
                 self.navigation_transition_requests.pop(target_id, None)
@@ -5746,6 +6054,13 @@ class DebugState:
         return indexes
 
     def navigation(self, state: dict) -> dict:
+        control = self.control_state(state)
+        if not control["navigation_ready"]:
+            return {
+                "status": "waiting_for_control",
+                "control_phase": control["phase"],
+                "targets": [],
+            }
         self.attach_logical_room_fields(state)
         environment_payload = self.navigation_environment_payload(state)
         if not self.room_state_stable(state):
@@ -5917,6 +6232,13 @@ class DebugState:
         }
 
     def lightweight_navigation(self, state: dict) -> dict:
+        control = self.control_state(state)
+        if not control["navigation_ready"]:
+            return {
+                "status": "waiting_for_control",
+                "control_phase": control["phase"],
+                "targets": [],
+            }
         self.attach_logical_room_fields(state)
         if not self.room_state_stable(state):
             return {"status": "entering_scene" if state.get("entering_scene") else "unstable_room_state", "targets": []}
@@ -5963,17 +6285,19 @@ class DebugState:
 
     def snapshot(self) -> dict:
         state = self.read_live_state()
-        stable_room_state = self.room_state_stable(state)
-        if stable_room_state:
-            self.attach_logical_room_fields(state)
         state_info = self.live_info("state")
+        control = self.control_state(state, state_info)
+        stable_room_state = self.room_state_stable(state)
+        client_stable_room_state = stable_room_state and control["owner"] == "client"
+        if client_stable_room_state:
+            self.attach_logical_room_fields(state)
         frame_info = self.live_info("frame")
         with self.state_lock:
             if state_info.get("available"):
                 self.reset_history_if_frame_restarted(state)
                 self.discover_native_transition_observation(state)
-                if stable_room_state:
-                    self.observe_pending_transition_destination(state)
+                self.observe_pending_transition_destination(state)
+                if client_stable_room_state:
                     self.last_stable_room_state = state
                 elif state.get("entering_scene"):
                     self.append_navigation_diagnostic("unstable_room_state_ignored", {"reason": "entering_scene"}, state)
@@ -5982,7 +6306,7 @@ class DebugState:
                 self.record_dialog_event(state)
                 self.observe_dialog_gates(state)
                 self.observe_pending_interaction_outcome(state)
-            if state_info.get("available") and stable_room_state:
+            if state_info.get("available") and client_stable_room_state:
                 state["_navigation"] = self.lightweight_navigation(state)
                 if self.pending_transition_observation is None:
                     state["_exploration"] = self.update_exploration(state)
@@ -6028,6 +6352,7 @@ class DebugState:
             "dialog_advance_status": self.dialog_advance_status_snapshot(),
             "timeline": timeline,
         }
+        state["control"] = control
         self.agent_runtime.observe_game_instance(state.get("game_instance_id"))
         state["_debug"]["agent_session"] = self.agent_runtime.compact_snapshot()
         return state
@@ -6087,6 +6412,8 @@ class DebugState:
             return "in_battle"
         if state.get("in_main_game") is False:
             return "not_in_main_game"
+        if bool((state.get("choice") or {}).get("active")):
+            return "choice_active"
         if not (state.get("dialog") or {}).get("active"):
             return "dialog_inactive"
         return None
@@ -6214,9 +6541,11 @@ class DebugState:
                 }
 
             state = self.snapshot()
+            if bool((state.get("choice") or {}).get("active")):
+                return finish_result("choice_active")
             state, stop_status = self.dialog_advance_wait_for_visible(state)
             if stop_status:
-                return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "cancelled"})
+                return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "choice_active", "cancelled"})
 
             previous_active_key = self.dialog_advance_active_event_key(state)
             repeated_active_presses = 0
@@ -6233,9 +6562,11 @@ class DebugState:
             while True:
                 if self.dialog_advance_cancel.is_set():
                     return finish_result("cancelled")
+                if bool((state.get("choice") or {}).get("active")):
+                    return finish_result("choice_active")
                 state, stop_status = self.dialog_advance_wait_for_visible(state)
                 if stop_status:
-                    return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "cancelled"})
+                    return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "choice_active", "cancelled"})
 
                 event_observation = self.dialog_advance_observe_events(
                     state,
@@ -6261,7 +6592,12 @@ class DebugState:
                 if self.action_pending(state):
                     return finish_result("action_pending_timeout", ok=False)
 
-                self.write_action([DIALOG_ADVANCE_BUTTON], 1)
+                self.write_action(
+                    [DIALOG_ADVANCE_BUTTON],
+                    1,
+                    control_action="advance_dialog",
+                    control_state=state,
+                )
                 presses += 1
                 self.update_dialog_advance_status(presses=presses)
                 if not self.wait_for_action_clear():
@@ -6444,6 +6780,20 @@ class DebugState:
                     "recommended_intent": "wait_runtime",
                     "recommended_action": self.action_preview("no_op", {"reason": "battle_state_not_modeled"}),
                     "risk": "战斗 UI 状态暴露不足，无法给出可靠的 dry-run 建议。",
+                }
+            )
+            self.append_agent_decision(state, decision)
+            return decision
+
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else None
+        if choice and choice.get("active"):
+            decision.update(
+                {
+                    "summary": "剧情选单正在等待显式选择。",
+                    "recommended_intent": "wait_runtime",
+                    "recommended_action": self.action_preview("no_op", {"reason": "choice_requires_model"}),
+                    "evidence": {**decision["evidence"], "choice": choice},
+                    "risk": "规则后端不会替模型猜测剧情选择。",
                 }
             )
             self.append_agent_decision(state, decision)
@@ -7221,6 +7571,7 @@ class DebugState:
         state_info = self.live_info("state")
         frame_info = self.live_info("frame")
         shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else None
         return {
             "status": state.get("status", "ok"),
             "frame": state.get("frame"),
@@ -7242,6 +7593,7 @@ class DebugState:
             "party_direction_button": DIR_TO_BUTTON.get(party_direction, "down"),
             "cash": state.get("cash"),
             "shop": self.agent_shop(state).get("shop") if shop and shop.get("active") else None,
+            "choice": choice if choice and choice.get("active") else None,
             "party": [
                 {
                     "role_id": role.get("role_id"),
@@ -7765,7 +8117,7 @@ class DebugState:
                             "action": {
                                 "type": "string",
                                 "enum": [
-                                    "wait", "advance_dialog", "navigate", "use_item",
+                                    "wait", "advance_dialog", "select_choice", "navigate", "use_item",
                                     "equip_item", "buy_item", "leave_shop",
                                 ],
                             },
@@ -7773,6 +8125,7 @@ class DebugState:
                             "item_id": {"type": "integer", "minimum": 1},
                             "role_id": {"type": "integer", "minimum": 0},
                             "target": {"type": "string", "enum": ["all"]},
+                            "option_index": {"type": "integer", "minimum": 0},
                             "reason": {"type": "string", "minLength": 1, "maxLength": 300},
                         },
                         "required": ["action", "reason"],
@@ -8022,7 +8375,7 @@ class DebugState:
 
     def compact_agent_tool_arguments(self, name: str, arguments: dict) -> dict:
         if name == "submit_decision":
-            return {key: arguments.get(key) for key in ("action", "target_id", "item_id", "role_id", "target", "reason") if key in arguments}
+            return {key: arguments.get(key) for key in ("action", "target_id", "item_id", "role_id", "target", "option_index", "reason") if key in arguments}
         payload = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
         if len(payload.encode("utf-8")) <= 800:
             return arguments
@@ -8056,6 +8409,7 @@ class DebugState:
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
         latest = dialog.get("latest_event") or {}
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else None
         identity = self.room_identity(state)
         room = state.get("room") if isinstance(state.get("room"), dict) else {}
         room_payload = dict(room)
@@ -8127,6 +8481,7 @@ class DebugState:
                     "message_id": latest.get("message_id"),
                     "event_object_id": latest.get("event_object_id"),
                 },
+                "choice": choice,
             },
             "navigation": {
                 "status": navigation.get("status"),
@@ -8145,6 +8500,8 @@ class DebugState:
             "你是 PALPAL 的只读游戏自动化顾问。"
             "必须调用 submit_decision 结束本轮，只提交最小动作和一句简短 reason。"
             "dialog.active=true 时提交 {action:'advance_dialog',reason:'...'}。"
+            "choice.active=true 时必须阅读 prompt 和 options，并提交 "
+            "{action:'select_choice',option_index:<index>,reason:'...'}；不得依赖默认项。"
             "检查对象或进入传送时提交 {action:'navigate',target_id:<id>,reason:'...'}；服务端根据目标推导语义。"
             "等待时提交 {action:'wait',reason:'...'}。"
             "shop.active=true 时先调用 get_shop；购买一件商品提交 "
@@ -8193,6 +8550,7 @@ class DebugState:
             "将 returns_to_recent_room 和 agent_priority avoid_backtrack 视为回退风险信号；如果选择它们，需要明确说明理由。"
             "对话反馈可以创建或改变目标，但要从提供的对话和状态推断目标，不要匹配固定剧情短语。"
             "如果 dialog.active 为 true，优先选择 advance_dialog。如果 runtime stale、waiting 或 parse-error，建议 wait_runtime。"
+            "如果 choice.active=true，必须根据问题与选项文本显式选择 select_choice；此时不要推进对话或导航。"
             "如果 shop.active=true，先用 get_shop 查看商品；装备类候选要查看 equipment_comparisons，"
             "综合现金、已有数量、角色定位、属性差值、特殊效果和任务上下文后，显式选择买一件或退出。"
             "不确定商品用途或收益时可以退出，但不得把价格或名称当作固定购买规则。"
@@ -8248,6 +8606,20 @@ class DebugState:
         elif action == "advance_dialog":
             intent, preview = "advance_dialog", self.action_preview("advance_dialog", self.normalize_dialog_advance_args({}))
             risk = "Dialogue advancement uses the server safety limits and stable-state observer."
+        elif action == "select_choice":
+            option_index = int(raw["option_index"])
+            choice = state.get("choice") if isinstance(state.get("choice"), dict) else {}
+            option = next(
+                (item for item in choice.get("options") or [] if int(item.get("index", -1)) == option_index),
+                None,
+            )
+            intent = "select_choice"
+            preview = self.action_preview("choice_select", {
+                "generation": int(choice.get("generation") or 0),
+                "option_index": option_index,
+            })
+            evidence["choice"] = {"prompt": choice.get("prompt"), "option": option}
+            risk = "The active choice generation and selected option will be revalidated before confirmation."
         elif action == "navigate":
             target_id = int(raw["target_id"])
             target = next((item for item in state.get("objects") or [] if str(item.get("id")) == str(target_id)), None)
@@ -8309,13 +8681,13 @@ class DebugState:
     def agent_decision_submission_error(self, raw: dict) -> dict | None:
         """Return a repairable error for the minimal submit_decision contract."""
         issues: list[dict] = []
-        allowed_keys = {"action", "target_id", "item_id", "role_id", "target", "reason"}
+        allowed_keys = {"action", "target_id", "item_id", "role_id", "target", "option_index", "reason"}
         for key in raw:
             if key not in allowed_keys:
                 issues.append({"field": key, "code": "unsupported_field", "message": f"{key} is not part of the minimal decision contract"})
         action = raw.get("action")
         allowed_actions = {
-            "wait", "advance_dialog", "navigate", "use_item", "equip_item",
+            "wait", "advance_dialog", "select_choice", "navigate", "use_item", "equip_item",
             "buy_item", "leave_shop",
         }
         if action not in allowed_actions:
@@ -8323,7 +8695,7 @@ class DebugState:
                 "field": "action",
                 "code": "invalid_action",
                 "message": (
-                    "action must be wait, advance_dialog, navigate, use_item, "
+                    "action must be wait, advance_dialog, select_choice, navigate, use_item, "
                     "equip_item, buy_item, or leave_shop"
                 ),
             })
@@ -8341,6 +8713,8 @@ class DebugState:
 
         if action == "navigate" and positive_int("target_id") is None:
             issues.append({"field": "target_id", "code": "invalid_target_id", "message": "navigate requires a positive target_id"})
+        if action == "select_choice" and positive_int("option_index", allow_zero=True) is None:
+            issues.append({"field": "option_index", "code": "invalid_option_index", "message": "select_choice requires a non-negative option_index"})
         if action == "use_item":
             if positive_int("item_id") is None:
                 issues.append({"field": "item_id", "code": "invalid_item_id", "message": "use_item requires a positive item_id"})
@@ -8358,6 +8732,7 @@ class DebugState:
         relevant_keys = {
             "wait": {"action", "reason"},
             "advance_dialog": {"action", "reason"},
+            "select_choice": {"action", "option_index", "reason"},
             "navigate": {"action", "target_id", "reason"},
             "use_item": {"action", "item_id", "role_id", "target", "reason"},
             "equip_item": {"action", "item_id", "role_id", "reason"},
@@ -8383,12 +8758,11 @@ class DebugState:
             return str(state.get("status"))
         if not state.get("in_main_game"):
             return "not_in_main_game"
-        if state.get("in_battle"):
-            return "in_battle"
         if self.live_info("state").get("stale", True):
             return "runtime_stale"
-        if check_pending and self.action_pending(state):
-            return "action_pending"
+        control_error = self.action_control_error(state, action)
+        if control_error is not None and (check_pending or control_error != "action_pending"):
+            return control_error
         shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
         if not shop or shop.get("active") is not True or shop.get("mode") != "buy":
             return "shop_inactive"
@@ -8423,18 +8797,11 @@ class DebugState:
             return str(state.get("status"))
         if not state.get("in_main_game"):
             return "not_in_main_game"
-        if state.get("in_battle"):
-            return "in_battle"
-        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
-        if dialog.get("active"):
-            return "in_dialog"
-        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
-        if shop.get("active"):
-            return "in_shop"
         if self.live_info("state").get("stale", True):
             return "runtime_stale"
-        if check_pending and self.action_pending(state):
-            return "action_pending"
+        control_error = self.action_control_error(state, "use_item")
+        if control_error is not None and (check_pending or control_error != "action_pending"):
+            return control_error
 
         try:
             item_id = int(args.get("item_id") or 0)
@@ -8492,18 +8859,11 @@ class DebugState:
             return str(state.get("status"))
         if not state.get("in_main_game"):
             return "not_in_main_game"
-        if state.get("in_battle"):
-            return "in_battle"
-        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
-        if dialog.get("active"):
-            return "in_dialog"
-        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
-        if shop.get("active"):
-            return "in_shop"
         if self.live_info("state").get("stale", True):
             return "runtime_stale"
-        if check_pending and self.action_pending(state):
-            return "action_pending"
+        control_error = self.action_control_error(state, "equip_item")
+        if control_error is not None and (check_pending or control_error != "action_pending"):
+            return control_error
         try:
             item_id = int(args.get("item_id") or 0)
             role_id = int(args.get("role_id"))
@@ -8581,6 +8941,29 @@ class DebugState:
         latest_state = self.read_live_state()
         shop = latest_state.get("shop") if isinstance(latest_state.get("shop"), dict) else {}
         shop_active = shop.get("active") is True
+        choice = latest_state.get("choice") if isinstance(latest_state.get("choice"), dict) else None
+        choice_active = bool(choice and choice.get("active"))
+        if tool == "choice_select":
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            error = self.choice_action_validation_error(
+                latest_state,
+                int(args.get("generation") or 0),
+                int(args.get("option_index", -1)),
+            )
+            if error is None:
+                return decision
+            self.reject_agent_decision(decision, "choice_action_invalid", error=error)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview("no_op", {"reason": error})
+            return decision
+        if choice_active:
+            self.reject_agent_decision(decision, "in_choice", action=tool)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "in_choice", "required_action": "select_choice"}
+            )
+            decision["risk"] = "A story choice is active; only an explicit select_choice decision is executable."
+            return decision
         if tool in {"shop_buy", "shop_leave"}:
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
             error = self.shop_action_validation_error(latest_state, tool, args)
@@ -9116,14 +9499,24 @@ class DebugState:
         self.finish_agent_status()
         return decision
 
-    def write_action(self, buttons: list[str], frames: int) -> dict:
+    def write_action(
+        self,
+        buttons: list[str],
+        frames: int,
+        *,
+        control_action: str = "press_buttons",
+        control_state: dict | None = None,
+    ) -> dict:
         invalid = [button for button in buttons if button not in VALID_BUTTONS]
         if invalid:
             raise ValueError(f"invalid buttons: {', '.join(invalid)}")
         frames = max(1, min(int(frames), 300))
         with self.action_lock:
-            if self.action_pending():
-                raise RuntimeError("action_pending")
+            state = control_state if isinstance(control_state, dict) else self.read_live_state()
+            state_info = None if control_state is not None else self.live_info("state")
+            control_error = self.action_control_error(state, control_action, state_info)
+            if control_error is not None:
+                raise RuntimeError(control_error)
 
             lines = [f"frames {frames}"]
             lines.extend(f"button {button}" for button in buttons)
@@ -9286,6 +9679,87 @@ class DebugState:
             time.sleep(0.03)
         raise TimeoutError(f"{action} {item_id} did not complete")
 
+    def choice_action_validation_error(self, state: dict, generation: int, option_index: int) -> str | None:
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else None
+        if not choice or choice.get("active") is not True:
+            return "choice_inactive"
+        if generation != int(choice.get("generation") or 0):
+            return "stale_choice_command"
+        options = choice.get("options") if isinstance(choice.get("options"), list) else []
+        if option_index not in {
+            int(option.get("index")) for option in options
+            if isinstance(option, dict) and option.get("index") is not None
+        }:
+            return "invalid_choice_option"
+        if choice.get("command_pending"):
+            return "choice_action_pending"
+        control_error = self.action_control_error(state, "choice_select")
+        return control_error
+
+    def wait_for_choice_action_result(
+        self,
+        generation: int,
+        start_time: float,
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = self.file_info(self.action_result_path)
+            if info.get("available") and float(info.get("mtime") or 0) >= start_time:
+                result = read_optional_json(self.action_result_path)
+                if (
+                    result.get("action") == "choice_select"
+                    and int(result.get("generation") or 0) == generation
+                ):
+                    return result
+            time.sleep(0.02)
+        raise TimeoutError(f"choice_select generation {generation} did not complete")
+
+    def write_choice_action(self, generation: int, option_index: int) -> dict:
+        try:
+            generation = int(generation)
+            option_index = int(option_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("generation and option_index must be integers") from exc
+        start_time = time.time()
+        with self.action_lock:
+            state = self.read_live_state()
+            error = self.choice_action_validation_error(state, generation, option_index)
+            if error is not None:
+                raise RuntimeError(error)
+            choice = state["choice"]
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            entry = {
+                "time": start_time,
+                "command": "choice_select",
+                "generation": generation,
+                "option_index": option_index,
+                "prompt": choice.get("prompt"),
+                "option": next(
+                    (item for item in choice.get("options") or [] if int(item.get("index", -1)) == option_index),
+                    None,
+                ),
+            }
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(
+                    self.action_path,
+                    f"choice_select {generation} {option_index}\n",
+                    encoding="ascii",
+                )
+            except Exception:
+                self.pending_written_action = None
+                raise
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+        result = self.wait_for_choice_action_result(generation, start_time)
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or result.get("status") or "choice_select_failed"))
+        return {**entry, "result": result}
+
     def write_shop_action(self, action: str, item_id: int | None = None) -> dict:
         if action not in {"shop_buy", "shop_leave"}:
             raise ValueError("action must be shop_buy or shop_leave")
@@ -9329,6 +9803,121 @@ class DebugState:
             raise RuntimeError(str(result.get("error") or result.get("status") or f"{action}_failed"))
         return {**entry, "result": result}
 
+    def battle_action_validation_error(self, state: dict, args: dict) -> str | None:
+        if not state.get("in_battle"):
+            return "not_in_battle"
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        if battle is None:
+            return "battle_state_unavailable"
+        try:
+            battle_generation = int(args.get("battle_generation"))
+            command_generation = int(args.get("command_generation"))
+            object_id = int(args.get("object_id") or 0)
+            target_index = int(args.get("target_index", -2))
+        except (TypeError, ValueError):
+            return "invalid_battle_action"
+        if (
+            battle_generation != int(battle.get("generation") or 0)
+            or command_generation != int(battle.get("command_generation") or 0)
+        ):
+            return "stale_battle_command"
+        if self.action_pending(state):
+            return "action_pending"
+        action_type = str(args.get("action_type") or "")
+        available = battle.get("available_actions") if isinstance(battle.get("available_actions"), list) else []
+        match = next(
+            (
+                action for action in available
+                if isinstance(action, dict)
+                and action.get("action_type") == action_type
+                and int(action.get("object_id") or 0) == object_id
+            ),
+            None,
+        )
+        if match is None:
+            return "action_unavailable"
+        mode = match.get("target_mode")
+        if mode == "all" and target_index != -1:
+            return "invalid_target"
+        if mode == "none" and target_index != -2:
+            return "invalid_target"
+        if mode == "single" and target_index not in {
+            int(value) for value in match.get("valid_target_indices") or []
+        }:
+            return "invalid_target"
+        return None
+
+    def wait_for_battle_action_result(
+        self,
+        battle_generation: int,
+        command_generation: int,
+        start_time: float,
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = self.file_info(self.action_result_path)
+            if info.get("available") and float(info.get("mtime") or 0) >= start_time:
+                result = read_optional_json(self.action_result_path)
+                if (
+                    result.get("action") == "battle_action"
+                    and int(result.get("battle_generation") or 0) == battle_generation
+                    and int(result.get("command_generation") or 0) == command_generation
+                ):
+                    return result
+            time.sleep(0.02)
+        raise TimeoutError("battle action did not complete")
+
+    def write_battle_action(self, args: dict) -> dict:
+        start_time = time.time()
+        with self.action_lock:
+            state = self.read_live_state()
+            error = self.battle_action_validation_error(state, args)
+            if error is not None:
+                raise RuntimeError(error)
+            battle = state["battle"]
+            battle_generation = int(battle["generation"])
+            command_generation = int(battle["command_generation"])
+            player_index = int(battle.get("current_player_index") or 0)
+            action_type = str(args["action_type"])
+            object_id = int(args.get("object_id") or 0)
+            target_index = int(args.get("target_index", -2))
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            entry = {
+                "time": start_time,
+                "command": "battle_action",
+                "battle_generation": battle_generation,
+                "command_generation": command_generation,
+                "player_index": player_index,
+                "action_type": action_type,
+                "object_id": object_id,
+                "target_index": target_index,
+            }
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(
+                    self.action_path,
+                    (
+                        f"battle_action {battle_generation} {command_generation} "
+                        f"{player_index} {action_type} {object_id} {target_index}\n"
+                    ),
+                    encoding="ascii",
+                )
+            except Exception:
+                self.pending_written_action = None
+                raise
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+        result = self.wait_for_battle_action_result(
+            battle_generation, command_generation, start_time
+        )
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or result.get("status") or "battle_action_failed"))
+        return {**entry, "result": result}
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "PALPALDebug/0.1"
@@ -9340,8 +9929,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/navigation":
             state = self.server.state.read_live_state()
-            self.server.state.attach_logical_room_fields(state)
-            self.send_json(self.server.state.navigation(state))
+            control = self.server.state.control_state(
+                state,
+                self.server.state.live_info("state"),
+            )
+            if not control["navigation_ready"]:
+                self.send_json({
+                    "status": "waiting_for_control",
+                    "control_phase": control["phase"],
+                    "targets": [],
+                })
+            else:
+                self.send_json(self.server.state.navigation(state))
             return
         if parsed.path == "/navigation/transitions":
             state = self.server.state.read_live_state()
@@ -9369,6 +9968,18 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             target = int((query.get("id") or ["0"])[0])
             state = self.server.state.read_live_state()
+            control = self.server.state.control_state(
+                state,
+                self.server.state.live_info("state"),
+            )
+            if not control["navigation_ready"]:
+                self.send_json({
+                    "ok": True,
+                    "status": "waiting_for_control",
+                    "control": control,
+                    "target_id": target,
+                })
+                return
             self.server.state.attach_logical_room_fields(state)
             route = self.server.state.route_to_object(state, target, avoid_transitions=True)
             if route.get("status") == "unreachable_static":
@@ -9515,6 +10126,31 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "action": result})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path in {"/shop/buy", "/shop/leave"}:
+            if self.reject_if_agent_running():
+                return
+            try:
+                payload = self.read_body_json()
+                action = "shop_buy" if self.path == "/shop/buy" else "shop_leave"
+                result = self.server.state.write_shop_action(
+                    action,
+                    payload.get("item_id") if action == "shop_buy" else None,
+                )
+                self.send_json({"ok": True, "action": result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/battle/action":
+            if self.reject_if_agent_running():
+                return
+            try:
+                result = self.server.state.write_battle_action(self.read_body_json())
+                self.send_json({"ok": True, "action": result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
             return
 
         if self.path == "/dialog/advance":

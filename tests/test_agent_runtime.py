@@ -105,6 +105,352 @@ def test_runtime_start_feedback_has_no_permanent_macro_goal(tmp_path):
     assert "finish the game" not in feedback_seen[0].lower()
 
 
+def test_runtime_waits_for_game_control_without_consuming_a_turn(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    released = threading.Event()
+    controlled = {
+        **make_state(),
+        "control": {
+            "owner": "game",
+            "phase": "game_script",
+            "allowed_actions": [],
+            "navigation_ready": False,
+        },
+        "_debug": {"runtime_stale": False, "action_pending": False},
+    }
+    ready = {
+        **make_state(),
+        "control": {
+            "owner": "client",
+            "phase": "ready",
+            "allowed_actions": [
+                "press_buttons", "navigation_step", "use_item", "equip_item",
+            ],
+            "navigation_ready": True,
+        },
+        "_debug": {"runtime_stale": False, "action_pending": False},
+    }
+    debug.snapshot = lambda: ready if released.is_set() else controlled
+    runtime.decision_provider = lambda state, model, feedback: decision()
+
+    runtime.start(None, 1)
+    time.sleep(0.12)
+    assert runtime.snapshot()["run_turn"] == 0
+    assert runtime.snapshot()["status"] == "running"
+
+    released.set()
+    paused = wait_for_pause(runtime)
+    assert paused["run_turn"] == 1
+    assert paused["stop_reason"] == "agent_wait"
+
+
+def test_control_wait_is_interruptible_and_reports_timeout(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    controlled = {
+        **make_state(),
+        "control": {
+            "owner": "game",
+            "phase": "game_script",
+            "allowed_actions": [],
+            "navigation_ready": False,
+        },
+    }
+    debug.snapshot = lambda: controlled
+
+    with pytest.raises(RuntimeError, match="game_control_timeout"):
+        runtime._wait_for_control(timeout=0.01)
+
+    runtime.cancel_event.set()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        runtime._wait_for_control(timeout=1.0)
+
+
+def test_control_wait_timeout_resets_on_meaningful_progress(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+
+    def controlled(x):
+        return {
+            **make_state(),
+            "party_position": {"x": x, "y": 8},
+            "control": {
+                "owner": "game",
+                "phase": "game_script",
+                "allowed_actions": [],
+                "navigation_ready": False,
+            },
+        }
+
+    ready = {
+        **make_state(),
+        "control": {
+            "owner": "client",
+            "phase": "ready",
+            "allowed_actions": ["navigation_step"],
+            "navigation_ready": True,
+        },
+    }
+    snapshots = [controlled(16), controlled(32), controlled(48), ready]
+    debug.snapshot = lambda: snapshots.pop(0)
+
+    assert runtime._wait_for_control(timeout=0.06) is ready
+
+
+def test_battle_delegate_uses_child_budget_and_returns_one_summary(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    command = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "in_battle": True,
+        "battle": {
+            "generation": 5,
+            "command_generation": 9,
+            "phase": "command",
+            "result": "ongoing",
+            "is_boss": False,
+            "current_player_index": 0,
+            "players": [{"index": 0, "name": "李逍遥", "hp": 100, "max_hp": 100}],
+            "enemies": [{"slot_index": 0, "present": True, "name": "苗人", "hp": 20, "max_hp": 20}],
+            "available_actions": [{
+                "action_type": "attack",
+                "object_id": 0,
+                "target_mode": "single",
+                "valid_target_indices": [0],
+            }],
+        },
+        "control": {
+            "owner": "client",
+            "phase": "battle",
+            "allowed_actions": ["battle_action", "press_buttons"],
+            "navigation_ready": False,
+        },
+        "_debug": {"runtime_stale": False},
+    }
+    ended = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "battle": None,
+        "last_battle": {
+            "generation": 5,
+            "result": "won",
+            "is_boss": False,
+            "duration_ms": 1200,
+            "exp_gained": 12,
+            "cash_gained": 7,
+            "enemies": [{"object_id": 10, "name": "苗人"}],
+            "players": [{
+                "index": 0, "role_id": 0, "name": "李逍遥",
+                "hp_before": 100, "hp_after": 95,
+                "mp_before": 20, "mp_after": 20,
+                "level_before": 1, "level_after": 1,
+            }],
+        },
+        "control": {
+            "owner": "client",
+            "phase": "ready",
+            "allowed_actions": ["press_buttons", "navigation_step", "use_item", "equip_item"],
+            "navigation_ready": True,
+        },
+        "_debug": {"runtime_stale": False},
+    }
+    current = {"value": command}
+    debug.snapshot = lambda: current["value"]
+
+    def execute_battle(args):
+        assert args["battle_generation"] == 5
+        assert args["command_generation"] == 9
+        current["value"] = ended
+        return {
+            "battle_generation": 5,
+            "command_generation": 9,
+            "player_index": 0,
+            "action_type": "attack",
+            "object_id": 0,
+            "target_index": 0,
+        }
+
+    debug.write_battle_action = execute_battle
+    runtime.battle_decision_provider = lambda state, model, feedback: {
+        "action_type": "attack", "object_id": 0, "target_index": 0,
+    }
+    runtime.decision_provider = lambda state, model, feedback: decision()
+
+    runtime.start(None, 1)
+    paused = wait_for_pause(runtime)
+
+    assert paused["run_turn"] == 1
+    assert paused["battle_delegate"]["instruction_count"] == 1
+    assert paused["battle_delegate"]["status"] == "completed"
+    assert paused["battle_delegate"]["child_session_id"] != paused["session_id"]
+    battle_events = [event for event in runtime.events() if event["type"] == "battle"]
+    assert [event["phase"] for event in battle_events] == [
+        "started", "request", "tool_called", "tool_output", "completed",
+    ]
+    assert battle_events[-1]["details"]["summary"]["result"] == "won"
+    metadata = [event["details"]["battle_delegate"] for event in battle_events]
+    assert len({entry["group_id"] for entry in metadata}) == 1
+    assert {entry["depth"] for entry in metadata} == {1}
+    assert {entry["battle_generation"] for entry in metadata} == {5}
+    assert {event["turn"] for event in battle_events} == {0}
+    assert battle_events[2]["details"]["tool"] == "native_battle_action"
+    assert battle_events[3]["details"]["output"]["action_type"] == "attack"
+
+
+def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    battle = {
+        "generation": 5,
+        "command_generation": 9,
+        "phase": "command",
+        "current_player_index": 0,
+        "available_actions": [{
+            "action_type": "attack",
+            "object_id": 0,
+            "target_mode": "single",
+            "valid_target_indices": [0],
+        }],
+    }
+    state = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "in_battle": True,
+        "battle": battle,
+    }
+    debug.snapshot = lambda: state
+    debug.active_task_summary = lambda: []
+    debug.battle_action_validation_error = lambda _state, _args: None
+    debug.config_value = lambda key, default=None: "test-key" if key == "DEEPSEEK_API_KEY" else default
+    runtime.battle_delegate._begin(state)
+    captured = {}
+
+    class FunctionTool:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.kwargs = kwargs
+
+    class Agent:
+        def __init__(self, **kwargs):
+            captured["agent"] = self
+            self.tools = kwargs["tools"]
+            self.tool_use_behavior = kwargs["tool_use_behavior"]
+
+    class Stream:
+        async def stream_events(self):
+            tools = {tool.name: tool for tool in captured["agent"].tools}
+            get_output = await tools["get_battle"].kwargs["on_invoke_tool"](None, "{}")
+            assert json.loads(get_output)["battle"]["generation"] == 5
+            submit_output = await tools["submit_battle_action"].kwargs["on_invoke_tool"](
+                None,
+                json.dumps({"action_type": "attack", "object_id": 0, "target_index": 0}),
+            )
+            result = types.SimpleNamespace(tool=tools["submit_battle_action"], output=submit_output)
+            assert captured["agent"].tool_use_behavior(None, [result]).is_final_output is True
+            if False:
+                yield None
+
+        def cancel(self, _reason):
+            return None
+
+    class Runner:
+        @classmethod
+        def run_streamed(cls, _agent, _prompt, **_kwargs):
+            return Stream()
+
+    fake_agents = types.ModuleType("agents")
+    fake_agents.Agent = Agent
+    fake_agents.AsyncOpenAI = lambda **kwargs: object()
+    fake_agents.FunctionTool = FunctionTool
+    fake_agents.ModelSettings = lambda **kwargs: kwargs
+    fake_agents.OpenAIChatCompletionsModel = lambda **kwargs: object()
+    fake_agents.Runner = Runner
+    fake_agents.SQLiteSession = lambda *_args: object()
+    fake_agents.set_tracing_disabled = lambda **_kwargs: None
+    fake_agent_module = types.ModuleType("agents.agent")
+    fake_agent_module.ToolsToFinalOutputResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "agents", fake_agents)
+    monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
+
+    action = asyncio.run(runtime.battle_delegate._sdk_action(state, "Choose an action."))
+
+    assert action["action_type"] == "attack"
+    events = [event for event in runtime.events() if event["type"] == "battle"]
+    assert [event["phase"] for event in events] == [
+        "started", "tool_called", "tool_output", "tool_called", "tool_output",
+    ]
+    assert [event["details"].get("tool") for event in events[1:]] == [
+        "get_battle", "get_battle", "submit_battle_action", "submit_battle_action",
+    ]
+    assert events[2]["details"]["output"]["battle"]["generation"] == 5
+    assert events[3]["details"]["arguments"] == {
+        "action_type": "attack", "object_id": 0, "target_index": 0,
+    }
+    assert events[4]["details"]["output"] == {"ok": True, "accepted": True}
+
+
+def test_battle_delegate_failure_and_interrupt_emit_terminal_trace(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    command = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "in_battle": True,
+        "battle": {
+            "generation": 5,
+            "command_generation": 9,
+            "phase": "command",
+            "current_player_index": 0,
+            "available_actions": [{
+                "action_type": "attack", "object_id": 0,
+                "target_mode": "single", "valid_target_indices": [0],
+            }],
+        },
+        "control": {
+            "owner": "client", "phase": "battle",
+            "allowed_actions": ["battle_action", "press_buttons"],
+            "navigation_ready": False,
+        },
+        "_debug": {"runtime_stale": False},
+    }
+    debug.snapshot = lambda: command
+    debug.write_battle_action = lambda _args: (_ for _ in ()).throw(RuntimeError("stale_battle_command"))
+    runtime.battle_decision_provider = lambda _state, _model, _feedback: {
+        "action_type": "attack", "object_id": 0, "target_index": 0,
+    }
+
+    runtime.start(None, 1)
+    paused = wait_for_pause(runtime)
+
+    assert paused["battle_delegate"]["status"] == "failed"
+    battle_events = [event for event in runtime.events() if event["type"] == "battle"]
+    assert [event["phase"] for event in battle_events].count("retry") == 3
+    assert battle_events[-1]["phase"] == "failed"
+    assert battle_events[-1]["details"]["reason"] == "battle_replan_exhausted"
+
+    interrupted_root = tmp_path / "interrupted"
+    interrupted_root.mkdir()
+    interrupted_debug = make_debug_state(interrupted_root)
+    interrupted = interrupted_debug.agent_runtime
+    interrupted.state.update(status="running", phase="deciding")
+    interrupted.battle_delegate._begin(command)
+    interrupted.interrupt()
+    stopped = [event for event in interrupted.events() if event["type"] == "battle"]
+    assert stopped[-1]["phase"] == "stopped"
+    assert interrupted.snapshot()["battle_delegate"]["status"] == "stopped"
+
+
+def test_decide_once_is_disabled_in_battle(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    debug.snapshot = lambda: {**make_state(), "in_battle": True, "battle": {"generation": 1}}
+
+    with pytest.raises(RuntimeError, match="decide_once_unavailable_in_battle"):
+        runtime.start(None, 1, decide_only=True)
+
+
 def test_equipment_review_tracks_total_ownership_and_ignores_consumables(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -1007,6 +1353,40 @@ def test_execute_shop_buy_uses_structured_writer(tmp_path, monkeypatch):
     assert result['delta']['inventory_changes'] == [{'item_id': 201, 'before': 0, 'after': 1}]
 
 
+def test_execute_choice_uses_structured_writer(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    before = make_state()
+    before['choice'] = {
+        'active': True,
+        'generation': 5,
+        'selected_index': 0,
+        'options': [{'index': 0, 'text': '否'}, {'index': 1, 'text': '是'}],
+    }
+    after = json.loads(json.dumps(before))
+    after['choice'] = None
+    calls = []
+    debug.snapshot = lambda: before
+    debug.write_choice_action = lambda generation, option_index: calls.append((generation, option_index)) or {
+        'command': 'choice_select',
+        'generation': generation,
+        'option_index': option_index,
+        'result': {'ok': True, 'status': 'selected', 'selected_index': option_index},
+    }
+    monkeypatch.setattr(runtime, '_wait_action_and_stable', lambda **_kwargs: after)
+    recommendation = debug.attach_decision_context(
+        before,
+        decision('choice_select', {'generation': 5, 'option_index': 1}, 'select_choice'),
+    )
+
+    result = runtime._execute_decision(recommendation)
+
+    assert calls == [(5, 1)]
+    assert result['tool'] == 'choice_select'
+    assert result['delta']['choice']['before']['generation'] == 5
+    assert result['delta']['choice']['after'] is None
+
+
 def test_quiet_window_restarts_when_dialog_reappears(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -1059,6 +1439,33 @@ def test_navigation_waits_for_scene_transition_instead_of_failing(tmp_path):
     assert result["ok"]
     assert result["status"] == "transitioned"
     assert result["target_id"] == 4
+    assert result["steps"] == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("in_battle", "interrupted_by_battle"),
+        ("in_shop", "interrupted_by_shop"),
+    ],
+)
+def test_navigation_reports_game_requested_interactions_explicitly(
+    tmp_path, status, expected,
+):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state()
+    debug.snapshot = lambda: state
+    debug.navigation_step = lambda _state, target_id: {
+        "ok": False,
+        "status": status,
+        "target_id": target_id,
+    }
+
+    result = runtime._navigate(4)
+
+    assert result["ok"] is True
+    assert result["status"] == expected
     assert result["steps"] == 1
 
 
@@ -1191,6 +1598,59 @@ def test_navigation_treats_dialog_started_during_navigation_as_success(tmp_path)
     assert result["target_id"] == 57
     assert result["steps"] == 2
     assert [entry["status"] for entry in result["progress"]] == ["stepping", "in_dialog"]
+
+
+def test_dynamic_touch_transition_dialog_interrupt_does_not_fail_navigation(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    target = {
+        "id": 117,
+        "x": 32,
+        "y": 0,
+        "sprite_id": 21,
+        "state": 1,
+        "trigger_mode": 4,
+        "trigger_script": 5925,
+        "auto_script": 0,
+        "blocking": False,
+        "interactable": True,
+    }
+    source = make_state(objects=[target], frame=10)
+    write_state(debug, source)
+    debug.snapshot()
+    destination = make_state(objects=[], frame=11)
+    destination.update({"scene_id": 15, "map_id": 3, "room": {"key": "shore"}})
+    destination["dialog"] = {
+        "active": True,
+        "visible": True,
+        "latest_event": {"sequence": 1, "message_id": 605, "text": "靠岸"},
+    }
+    destination["trigger_observation"] = {
+        "generation": 7,
+        "event_object_id": 117,
+        "trigger_script": 5925,
+        "completed": True,
+        "source": {"scene_id": 3, "map_id": 10, "x": 32, "y": 0},
+        "destination": {"scene_id": 15, "map_id": 3, **destination["party_position"]},
+    }
+
+    def land_during_action_wait(**_kwargs):
+        debug.action_path.unlink()
+        debug.pending_written_action = None
+        write_state(debug, destination)
+        return debug.snapshot()
+
+    monkeypatch.setattr(runtime, "_wait_action_and_stable", land_during_action_wait)
+
+    result = runtime._navigate(117)
+
+    assert result["ok"] is True
+    assert result["status"] == "interrupted_by_dialog"
+    assert [entry["status"] for entry in result["progress"]] == ["stepping", "in_dialog"]
+    observation_id = debug.navigation_transition_requests[117]
+    assert debug.pending_transition_observation["observation_id"] == observation_id
+    assert debug.observations.get(observation_id)["status"] == "pending"
+    assert runtime.snapshot()["stop_reason"] != "execution_failed"
 
 
 def test_action_wait_accepts_direct_generation_completion_snapshot(tmp_path):

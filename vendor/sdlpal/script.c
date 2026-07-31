@@ -3377,7 +3377,11 @@ PAL_RunTriggerScript(
          //
          PAL_ClearDialog(FALSE);
 
-         if (!PAL_ConfirmMenu())
+         PALPAL_AgentBeginChoice(wEventObjectID, wScriptEntry);
+         i = PAL_ConfirmMenu() ? 1 : 0;
+         PALPAL_AgentEndChoice((WORD)i);
+
+         if (!i)
          {
             wScriptEntry = pScript->rgwOperand[0];
          }

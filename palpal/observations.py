@@ -58,7 +58,10 @@ class ObservationCoordinator:
         if request.get("status") != "pending":
             return False
         current = time.monotonic() if now is None else now
-        if current < float(request.get("deadline") or current):
+        deadline = request.get("deadline")
+        if deadline is None:
+            return False
+        if current < float(deadline):
             return False
         request["status"] = "timed_out"
         request["completed_at"] = current
@@ -128,6 +131,35 @@ class ObservationCoordinator:
             if updater is not None:
                 updater(payload)
             payload.update(updates)
+            self._condition.notify_all()
+            return self._view(request)
+
+    def reschedule(self, observation_id: str, timeout: float) -> dict | None:
+        """Give a pending observation a new deadline measured from now."""
+        with self._condition:
+            request = self._requests.get(str(observation_id))
+            if request is None:
+                return None
+            if self._expire_locked(request):
+                self._condition.notify_all()
+            if request.get("status") != "pending":
+                return self._view(request)
+            request["deadline"] = time.monotonic() + max(0.0, float(timeout))
+            request["retention"] = max(float(request.get("retention") or 0), float(timeout))
+            self._condition.notify_all()
+            return self._view(request)
+
+    def suspend_timeout(self, observation_id: str) -> dict | None:
+        """Suspend coordinator expiry while an external progress watchdog owns it."""
+        with self._condition:
+            request = self._requests.get(str(observation_id))
+            if request is None:
+                return None
+            if self._expire_locked(request):
+                self._condition.notify_all()
+            if request.get("status") != "pending":
+                return self._view(request)
+            request["deadline"] = None
             self._condition.notify_all()
             return self._view(request)
 
@@ -217,9 +249,13 @@ class ObservationCoordinator:
                 if cancel_event is not None and cancel_event.is_set():
                     return self.cancel(observation_id, "cancelled")
                 now = time.monotonic()
-                deadlines = [float(request.get("deadline") or now)]
+                deadline = request.get("deadline")
+                deadlines = [] if deadline is None else [float(deadline)]
                 if caller_deadline is not None:
                     deadlines.append(caller_deadline)
+                if not deadlines:
+                    self._condition.wait(timeout=0.1)
+                    continue
                 remaining = min(deadlines) - now
                 if remaining <= 0:
                     if caller_deadline is not None and now >= caller_deadline:

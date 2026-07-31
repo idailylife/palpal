@@ -316,8 +316,68 @@ def test_http_handler_exposes_agent_tasks(http_server):
     }]
 
 
+def test_http_handler_exposes_structured_shop_actions(http_server):
+    base_url, debug = http_server
+    calls = []
+    debug.write_shop_action = lambda action, item_id=None: (
+        calls.append((action, item_id)) or {"command": action, "item_id": item_id}
+    )
+
+    status, _, raw = http_request(
+        base_url,
+        "/shop/buy",
+        method="POST",
+        payload={"item_id": 201},
+    )
+    assert status == 200
+    assert json.loads(raw)["action"]["command"] == "shop_buy"
+
+    status, _, raw = http_request(
+        base_url,
+        "/shop/leave",
+        method="POST",
+        payload={},
+    )
+    assert status == 200
+    assert json.loads(raw)["action"]["command"] == "shop_leave"
+    assert calls == [("shop_buy", 201), ("shop_leave", None)]
+
+
+def test_http_handler_exposes_structured_battle_action(http_server):
+    base_url, debug = http_server
+    calls = []
+    debug.write_battle_action = lambda args: (
+        calls.append(args) or {"command": "battle_action", **args}
+    )
+
+    status, _, raw = http_request(
+        base_url,
+        "/battle/action",
+        method="POST",
+        payload={
+            "battle_generation": 3,
+            "command_generation": 6,
+            "action_type": "attack",
+            "object_id": 0,
+            "target_index": 0,
+        },
+    )
+    payload = json.loads(raw)
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert calls == [{
+        "battle_generation": 3,
+        "command_generation": 6,
+        "action_type": "attack",
+        "object_id": 0,
+        "target_index": 0,
+    }]
+
+
 def test_action_file_writers_validate_and_replace_results(tmp_path):
     debug = make_debug_state(tmp_path)
+    write_state(debug, make_state())
 
     with pytest.raises(ValueError, match="invalid buttons"):
         debug.write_action(["search", "bad"], 1)
@@ -376,7 +436,10 @@ def test_native_action_handshake_closes_consumed_file_race(tmp_path):
     assert debug.pending_written_action is None
     assert debug.action_pending() is True
     assert debug.snapshot()["_debug"]["action_pending"] is True
-    assert debug.navigation_step(state, 1)["status"] == "action_pending"
+    waiting = debug.navigation_step(state, 1)
+    assert waiting["ok"] is True
+    assert waiting["status"] == "waiting_for_control"
+    assert waiting["control"]["phase"] == "action_pending"
 
     state["agent_action"] = {
         "generation": 8,
@@ -386,6 +449,159 @@ def test_native_action_handshake_closes_consumed_file_race(tmp_path):
     }
     write_state(debug, state)
     assert debug.action_pending() is False
+
+
+@pytest.mark.parametrize(
+    ("updates", "phase", "owner", "allowed"),
+    [
+        ({"in_battle": True, "entering_scene": True}, "battle", "game", []),
+        ({"entering_scene": True}, "entering_scene", "game", []),
+        ({"dialog": {"active": True}}, "dialog", "client", ["advance_dialog"]),
+        (
+            {"choice": {"active": True, "generation": 3}},
+            "choice",
+            "client",
+            ["choice_select", "press_buttons"],
+        ),
+        (
+            {"shop": {"active": True, "mode": "buy"}},
+            "shop",
+            "client",
+            ["shop_buy", "shop_leave"],
+        ),
+    ],
+)
+def test_control_state_priority_and_allowed_actions(
+    tmp_path, updates, phase, owner, allowed,
+):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state.update(updates)
+    state["trigger_observation"] = {
+        "generation": 4,
+        "event_object_id": 52,
+        "trigger_script": 4631,
+        "completed": False,
+    }
+    write_state(debug, state)
+
+    control = debug.snapshot()["control"]
+
+    assert control["phase"] == phase
+    assert control["owner"] == owner
+    assert control["allowed_actions"] == allowed
+    assert control["navigation_ready"] is False
+
+
+def test_battle_control_exposes_only_command_windows(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {
+            "generation": 4,
+            "command_generation": 7,
+            "phase": "command",
+            "current_player_index": 1,
+            "available_actions": [],
+        },
+    }
+
+    control = debug.control_state(state)
+    assert control == {
+        "owner": "client",
+        "phase": "battle",
+        "allowed_actions": ["battle_action", "press_buttons"],
+        "navigation_ready": False,
+        "battle_state_available": True,
+    }
+
+    state["battle"]["phase"] = "resolving"
+    control = debug.control_state(state)
+    assert control["owner"] == "game"
+    assert control["allowed_actions"] == []
+
+
+def test_old_battle_state_rejects_controls_as_unavailable(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {**make_state(), "in_battle": True}
+
+    assert debug.action_control_error(state, "press_buttons") == "battle_state_unavailable"
+
+
+def test_battle_action_writer_injects_current_player_and_generations(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "in_battle": True,
+        "battle": {
+            "generation": 8,
+            "command_generation": 13,
+            "phase": "command",
+            "current_player_index": 1,
+            "available_actions": [{
+                "action_type": "attack",
+                "object_id": 0,
+                "target_mode": "single",
+                "valid_target_indices": [0, 2],
+            }],
+        },
+    }
+    write_state(debug, state)
+    monkeypatch.setattr(debug, "wait_for_battle_action_result", lambda *args, **kwargs: {
+        "ok": True,
+        "action": "battle_action",
+        "status": "submitted",
+    })
+
+    result = debug.write_battle_action({
+        "battle_generation": 8,
+        "command_generation": 13,
+        "action_type": "attack",
+        "object_id": 0,
+        "target_index": 2,
+    })
+
+    assert result["player_index"] == 1
+    assert debug.action_path.read_text(encoding="ascii") == (
+        "battle_action 8 13 1 attack 0 2\n"
+    )
+    with pytest.raises(RuntimeError, match="action_pending"):
+        debug.write_battle_action({
+            "battle_generation": 8,
+            "command_generation": 13,
+            "action_type": "attack",
+            "object_id": 0,
+            "target_index": 1,
+        })
+
+
+def test_pure_trigger_script_blocks_server_actions_and_exposes_metadata(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state["trigger_observation"] = {
+        "generation": 9,
+        "event_object_id": 57,
+        "trigger_script": 100,
+        "completed": False,
+    }
+    write_state(debug, state)
+
+    control = debug.snapshot()["control"]
+
+    assert control == {
+        "owner": "game",
+        "phase": "game_script",
+        "allowed_actions": [],
+        "navigation_ready": False,
+        "trigger_generation": 9,
+        "event_object_id": 57,
+    }
+    with pytest.raises(RuntimeError, match="game_controlled"):
+        debug.write_action(["up"], 1)
+    assert debug.use_item_validation_error(state, {"item_id": 1, "role_id": 0}) == "game_controlled"
+    assert debug.equip_item_validation_error(state, {"item_id": 1, "role_id": 0}) == "game_controlled"
 
 
 def test_missing_native_action_uses_legacy_file_compatibility(tmp_path):
@@ -589,7 +805,7 @@ def run_dialog_scenario(
     monkeypatch.setattr(
         debug,
         "write_action",
-        lambda buttons, frames: written.append((buttons, frames)) or {},
+        lambda buttons, frames, **_kwargs: written.append((buttons, frames)) or {},
     )
     monkeypatch.setattr(
         debug,
@@ -610,6 +826,85 @@ def test_advance_dialog_writes_search_and_stops_when_dialog_ends(tmp_path, monke
     assert result["status"] == "dialog_inactive"
     assert result["presses"] == 1
     assert written == [(["search"], 1)]
+
+
+def test_advance_dialog_stops_at_structured_choice_without_pressing(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    choice = {
+        **make_state(),
+        "dialog": {"active": False},
+        "choice": {
+            "active": True,
+            "generation": 4,
+            "selected_index": 0,
+            "options": [{"index": 0, "text": "否"}, {"index": 1, "text": "是"}],
+        },
+    }
+    result, written = run_dialog_scenario(
+        debug, monkeypatch, [choice], {"max_presses": 3, "delay_ms": 100},
+    )
+    assert result["ok"] is True
+    assert result["status"] == "choice_active"
+    assert result["presses"] == 0
+    assert written == []
+
+
+def test_advance_dialog_detects_choice_that_appears_after_press(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    choice = {
+        **make_state(),
+        "dialog": {"active": False},
+        "choice": {
+            "active": True,
+            "generation": 5,
+            "selected_index": 0,
+            "options": [{"index": 0, "text": "否"}, {"index": 1, "text": "是"}],
+        },
+    }
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        [active_dialog_state("要聽故事嗎？"), choice],
+        {"max_presses": 3, "delay_ms": 100},
+    )
+    assert result["ok"] is True
+    assert result["status"] == "choice_active"
+    assert result["presses"] == 1
+    assert written == [(["search"], 1)]
+
+
+def test_choice_writer_uses_generation_and_waits_for_native_result(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "game_instance_id": "choice-game",
+        "choice": {
+            "active": True,
+            "generation": 7,
+            "selected_index": 0,
+            "command_pending": False,
+            "prompt": {"text": "要聽故事嗎？"},
+            "options": [
+                {"index": 0, "semantic": "no", "text": "否"},
+                {"index": 1, "semantic": "yes", "text": "是"},
+            ],
+        },
+    }
+    write_state(debug, state)
+    monkeypatch.setattr(debug, "wait_for_choice_action_result", lambda generation, start_time: {
+        "ok": True,
+        "action": "choice_select",
+        "generation": generation,
+        "requested_index": 1,
+        "selected_index": 1,
+        "status": "selected",
+    })
+
+    result = debug.write_choice_action(7, 1)
+
+    assert debug.action_path.read_text(encoding="ascii") == "choice_select 7 1\n"
+    assert result["option"]["semantic"] == "yes"
+    assert result["result"]["status"] == "selected"
 
 
 def test_advance_dialog_continues_through_transient_inactive_gap(tmp_path, monkeypatch):
@@ -721,7 +1016,7 @@ def test_background_snapshots_do_not_confirm_dialog_inactive_for_owner(tmp_path)
 def test_advance_dialog_reports_pending_timeout_and_cancel(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     monkeypatch.setattr(debug, "snapshot", lambda: active_dialog_state())
-    monkeypatch.setattr(debug, "write_action", lambda buttons, frames: {})
+    monkeypatch.setattr(debug, "write_action", lambda buttons, frames, **_kwargs: {})
     monkeypatch.setattr(debug, "wait_for_action_clear", lambda: False)
 
     result = debug.advance_dialog({"max_presses": 2})
@@ -733,7 +1028,11 @@ def test_advance_dialog_reports_pending_timeout_and_cancel(tmp_path, monkeypatch
     cancel_root.mkdir()
     cancelled = make_debug_state(cancel_root)
     monkeypatch.setattr(cancelled, "snapshot", lambda: active_dialog_state())
-    monkeypatch.setattr(cancelled, "write_action", lambda buttons, frames: cancelled.dialog_advance_cancel.set() or {})
+    monkeypatch.setattr(
+        cancelled,
+        "write_action",
+        lambda buttons, frames, **_kwargs: cancelled.dialog_advance_cancel.set() or {},
+    )
     monkeypatch.setattr(cancelled, "wait_for_action_clear", lambda: True)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
     result = cancelled.advance_dialog({"max_presses": 2, "delay_ms": 100})

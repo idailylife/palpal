@@ -53,6 +53,46 @@ PALPAL_AgentAfterFrame(
 );
 
 VOID
+PALPAL_AgentBattleBegin(
+   VOID
+);
+
+VOID
+PALPAL_AgentBattleCommandReady(
+   WORD       wPlayerIndex
+);
+
+VOID
+PALPAL_AgentBattleRewardBegin(
+   VOID
+);
+
+VOID
+PALPAL_AgentBattleEnding(
+   VOID
+);
+
+VOID
+PALPAL_AgentBattleEnd(
+   INT        iResult
+);
+
+DWORD
+PALPAL_AgentBattleGeneration(
+   VOID
+);
+
+DWORD
+PALPAL_AgentBattleCommandGeneration(
+   VOID
+);
+
+BOOL
+PALPAL_AgentBattleAwaitingAck(
+   VOID
+);
+
+VOID
 PALPAL_AgentWriteState(
    VOID
 );
@@ -73,6 +113,10 @@ PALPAL_AgentObserveDialogText(
    WORD       wEventObjectID,
    LPCWSTR    lpszText
 );
+
+VOID PALPAL_AgentBeginChoice(WORD wEventObjectID, WORD wScriptEntry);
+VOID PALPAL_AgentObserveChoiceSelection(WORD wSelectedIndex);
+VOID PALPAL_AgentEndChoice(WORD wSelectedIndex);
 
 VOID
 PALPAL_AgentBeginBuyMenu(
