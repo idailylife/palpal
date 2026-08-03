@@ -5,6 +5,189 @@ from tests.support import make_debug_state, make_state, make_touch_object, write
 from palpal.debug_server import decode_nav_grid, nav_bit, pal_distance, trigger_radius, world_pos
 
 
+def approach_item(item_id=279, object_id=238, distance_level=1):
+    return {
+        'item_id': item_id,
+        'name': '破天鎚',
+        'amount': 1,
+        'amount_in_use': 0,
+        'usable': True,
+        'use_effect': {
+            'script_entry': 39645,
+            'preview_complete': True,
+            'requirements_complete': True,
+            'effects': [],
+            'requirements': [{
+                'kind': 'face_event_object',
+                'script_entry': 39645,
+                'conditional': False,
+                'event_object_id': object_id,
+                'distance_level': distance_level,
+                'distance_limit': distance_level * 32 + 16,
+                'failure_script_entry': 39647,
+            }],
+            'unparsed_effects': [],
+        },
+    }
+
+
+def approach_object(object_id=238, x=32, y=16):
+    return {
+        'id': object_id,
+        'x': x,
+        'y': y,
+        'sprite_id': 66,
+        'state': 2,
+        'trigger_mode': 0,
+        'trigger_script': 9433,
+        'auto_script': 0,
+        'blocking': True,
+        'interactable': True,
+    }
+
+
+def test_item_requirement_exposes_reachable_approach_without_interacting(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=8, height=8, start=(7, 7), objects=[approach_object()])
+    state['inventory'] = [approach_item()]
+    write_state(debug, state)
+
+    target = next(item for item in debug.navigation(state)['targets'] if item['id'] == 238)
+    assert target['kind'] == 'approach'
+    assert target['status'] == 'reachable'
+    assert target['steps'] > 0
+    assert target['approach']['item_id'] == 279
+    assert target['approach']['distance_limit'] == 48
+    assert target['affordances'][0]['kind'] == 'item_approach'
+    assert target['affordances'][0]['requirements_complete'] is True
+
+    route = debug.route_to_object(state, 238, approach_item_id=279)
+    assert route['status'] == 'reachable'
+    assert route['action'] == 'approach'
+    assert route['required_direction'] in {'up', 'right', 'down', 'left'}
+    step = debug.navigation_step(state, 238, approach_item_id=279)
+    assert step['status'] == 'stepping'
+    assert 'search' not in step['action']['buttons']
+
+
+def test_approach_faces_then_stops_without_using_item(tmp_path):
+    target = approach_object()
+    state = make_state(width=6, height=6, start=(4, 4), objects=[target])
+    state['inventory'] = [approach_item()]
+    state['party_direction'] = 3
+
+    facing_root = tmp_path / 'facing'
+    facing_root.mkdir()
+    facing_debug = make_debug_state(facing_root)
+    write_state(facing_debug, state)
+    facing = facing_debug.navigation_step(state, 238, approach_item_id=279)
+    assert facing['status'] == 'facing'
+    assert facing['action']['buttons'] == ['left']
+    assert facing['required_direction'] == 'left'
+
+    approached_root = tmp_path / 'approached'
+    approached_root.mkdir()
+    approached_debug = make_debug_state(approached_root)
+    approached_state = json.loads(json.dumps(state))
+    approached_state['party_direction'] = 1
+    write_state(approached_debug, approached_state)
+    approached = approached_debug.navigation_step(approached_state, 238, approach_item_id=279)
+    assert approached['status'] == 'approached'
+    assert approached['approach']['item_id'] == 279
+    assert not approached_debug.action_path.exists()
+
+
+def test_search_and_item_approach_affordances_coexist(tmp_path):
+    target = approach_object()
+    target['trigger_mode'] = 1
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=6, height=6, start=(4, 4), objects=[target])
+    state['party_direction'] = 1
+    state['inventory'] = [approach_item()]
+    write_state(debug, state)
+
+    summary = next(item for item in debug.navigation(state)['targets'] if item['id'] == 238)
+    assert summary['kind'] == 'search'
+    assert summary['affordances'][0]['kind'] == 'item_approach'
+    assert summary['affordances'][0]['item_id'] == 279
+
+    native = debug.route_to_object(state, 238)
+    item_route = debug.route_to_object(state, 238, approach_item_id=279)
+    assert native['kind'] == 'search'
+    assert item_route['kind'] == 'approach'
+    approached = debug.navigation_step(state, 238, approach_item_id=279)
+    assert approached['status'] == 'approached'
+    assert approached['affordance']['kind'] == 'item_approach'
+    assert not debug.action_path.exists()
+
+
+def test_multiple_item_requirements_for_one_object_are_preserved_and_sorted(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=6, height=6, start=(4, 4), objects=[approach_object()])
+    state['party_direction'] = 1
+    item = approach_item()
+    second = json.loads(json.dumps(item['use_effect']['requirements'][0]))
+    second['script_entry'] = 39655
+    item['use_effect']['requirements'].append(second)
+    state['inventory'] = [item, approach_item(item_id=300)]
+
+    target = next(entry for entry in debug.navigation(state)['targets'] if entry['id'] == 238)
+    assert [(entry['item_id'], entry['script_entry']) for entry in target['affordances']] == [
+        (279, 39645),
+        (279, 39655),
+        (300, 39645),
+    ]
+
+
+def test_item_effect_observation_uses_object_delta_not_script_success(tmp_path):
+    debug = make_debug_state(tmp_path)
+    before = make_state(objects=[approach_object()])
+    after = json.loads(json.dumps(before))
+    after['objects'][0]['state'] = 0
+    evidence = debug.item_object_effect_observation(
+        before,
+        after,
+        {'event_object_id': 238},
+    )
+
+    assert evidence['matched_event_object_id'] == 238
+    assert evidence['effect_observed'] is True
+    assert evidence['object_delta']['state'] == {'before': 2, 'after': 0}
+    assert debug.item_object_effect_observation(before, after, None)['effect_observed'] is None
+
+
+def test_approach_requires_matching_available_item_and_safe_route(tmp_path):
+    target = approach_object(x=96, y=0)
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=7, height=5, start=(0, 4), objects=[target], blocked={(3, y) for y in range(5)})
+    state['inventory'] = [approach_item()]
+
+    missing = debug.route_to_object(state, 238, approach_item_id=999)
+    assert missing['status'] == 'approach_requirement_missing'
+
+    target_summary = next(item for item in debug.navigation(state)['targets'] if item['id'] == 238)
+    assert target_summary['kind'] == 'approach'
+    assert target_summary['status'] == 'unreachable_static'
+    assert target_summary['affordances'][0]['status'] == 'unreachable_static'
+
+    unavailable_state = json.loads(json.dumps(state))
+    unavailable_state['inventory'][0]['amount'] = 0
+    unavailable = next(item for item in debug.navigation(unavailable_state)['targets'] if item['id'] == 238)
+    assert unavailable['kind'] == 'none'
+    assert unavailable['status'] == 'unreachable_static'
+
+
+def test_navigation_environment_key_tracks_approach_requirements(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[approach_object()])
+    state['inventory'] = [approach_item()]
+    before = debug.navigation(state)
+    changed = json.loads(json.dumps(state))
+    changed['inventory'][0]['amount'] = 0
+    after = debug.navigation(changed)
+    assert before['environment_key'] != after['environment_key']
+
+
 
 def test_navigation_step_sends_first_move_to_reachable_target(tmp_path):
     target = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 21, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
@@ -570,6 +753,129 @@ def test_dynamic_touch_native_trigger_is_handed_to_navigation_request(tmp_path):
     assert owner['expected_position'] == {'x': 96, 'y': 0}
     assert owner['source_position'] == {'x': 96, 'y': 0}
     assert owner['association_rejected_reason'] is None
+
+
+def test_dynamic_touch_delayed_trigger_keeps_final_route_for_navigation(tmp_path):
+    target = {
+        'id': 248, 'x': 64, 'y': 0, 'sprite_id': 84, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 8496, 'auto_script': 2,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=9, height=7, start=(0, 4), objects=[target], frame=10)
+    source.update({'scene_id': 17, 'map_id': 6, 'room': {'key': 'lotus'}})
+    write_state(debug, source)
+    debug.snapshot()
+
+    started = debug.navigation_step(source, target_id=248)
+    assert started['status'] == 'stepping'
+    assert started['remaining_steps'] == 0
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+
+    reached = make_state(width=9, height=7, start=(4, 0), objects=[target], frame=11)
+    reached.update({'scene_id': 17, 'map_id': 6, 'room': {'key': 'lotus'}})
+    write_state(debug, reached)
+    debug.snapshot()
+
+    identity = debug.room_identity(reached)
+    last_route = debug.read_exploration()['rooms'][identity['id']]['last_route']
+    assert last_route['pending'] is True
+    waiting = debug.navigation_step(reached, target_id=248)
+    assert waiting['status'] == 'transition_observing'
+    assert not debug.action_path.exists()
+
+    destination = make_state(width=9, height=7, start=(8, 2), objects=[target], frame=12)
+    destination.update({'scene_id': 17, 'map_id': 6, 'room': {'key': 'lotus'}})
+    destination['_logical_room'] = debug.logical_room_identity(reached)
+    destination['trigger_observation'] = {
+        'generation': 1,
+        'event_object_id': 248,
+        'trigger_script': 8496,
+        'completed': True,
+        'source': {'scene_id': 17, 'map_id': 6, 'x': 64, 'y': 0},
+        'destination': {'scene_id': 17, 'map_id': 6, **destination['party_position'], 'frame': 12},
+    }
+    write_state(debug, destination)
+    debug.snapshot()
+
+    observation_id = debug.navigation_transition_requests[248]
+    pending = debug.pending_transition_observation
+    assert pending is not None
+    assert pending['owner'] == 'navigation'
+    assert pending['observation_id'] == observation_id
+
+    destination['frame'] = 13
+    write_state(debug, destination)
+    transitioned = debug.navigation_step(destination, target_id=248)
+    assert transitioned['status'] == 'transitioned'
+    assert transitioned['transition']['confirmation'] == 'native_trigger'
+    assert transitioned['transition']['intra_room_transition'] is True
+    assert not debug.action_path.exists()
+
+    last_route = debug.read_exploration()['rooms'][identity['id']]['last_route']
+    assert last_route['pending'] is False
+    assert last_route['outcome'] == 'transitioned'
+
+    diagnostics = [
+        json.loads(line)
+        for line in debug.navigation_log_path.read_text(encoding='utf-8').splitlines()
+    ]
+    owner = next(entry for entry in diagnostics if entry['type'] == 'native_transition_owner')
+    assert owner['owner'] == 'navigation'
+    assert owner['association_rejected_reason'] is None
+
+
+def test_final_touch_route_expires_to_arrived_without_native_trigger(tmp_path):
+    target = make_touch_object(248, x=64, y=0, sprite_id=84)
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=5, height=5, start=(0, 4), objects=[target])
+    route = debug.route_to_object(source, target_id=248)
+    identity = debug.room_identity(source)
+    debug.remember_navigation_route(source, 248, route['route'], 4, 0, 'reachable')
+
+    reached = make_state(width=5, height=5, start=(4, 0), objects=[target])
+    data = debug.read_exploration()
+    data['rooms'][identity['id']]['last_route']['updated_at'] = time.time() - 10
+    debug.write_exploration(data)
+    write_state(debug, reached)
+    debug.update_exploration(reached)
+
+    result = debug.navigation_step(reached, target_id=248)
+    assert result['status'] == 'arrived'
+    last_route = debug.read_exploration()['rooms'][identity['id']]['last_route']
+    assert last_route['pending'] is False
+    assert last_route['outcome'] == 'confirmation_expired'
+
+
+def test_reached_non_touch_route_is_not_expired_by_touch_confirmation_window(tmp_path):
+    target = {
+        'id': 63, 'x': 64, 'y': 0, 'state': 1, 'trigger_mode': 1,
+        'trigger_script': 100, 'auto_script': 0, 'blocking': False,
+        'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=5, height=5, start=(0, 4), objects=[target])
+    route = debug.route_to_object(source, target_id=63)
+    identity = debug.room_identity(source)
+    steps = route['route']['steps']
+    debug.remember_navigation_route(source, 63, route['route'], steps, 0, 'reachable')
+
+    expected = route['route']['nodes'][-1]
+    reached = make_state(
+        width=5,
+        height=5,
+        start=(expected['x'] // 16, expected['y'] // 8),
+        objects=[target],
+    )
+    data = debug.read_exploration()
+    data['rooms'][identity['id']]['last_route']['updated_at'] = time.time() - 10
+    debug.write_exploration(data)
+    debug.update_exploration(reached)
+
+    last_route = debug.read_exploration()['rooms'][identity['id']]['last_route']
+    assert last_route['pending'] is False
+    assert last_route['outcome'] == 'expected_node_reached'
 
 
 def test_dynamic_touch_dialog_interrupt_preserves_navigation_transition_observer(tmp_path):
@@ -1525,6 +1831,40 @@ def test_agent_expands_navigation_submission_to_navigation_step(tmp_path):
     assert decision['recommended_action']['args'] == {'id': 10}
     assert decision['recommended_intent'] == 'inspect_target'
     assert not debug.action_path.exists()
+
+
+def test_agent_binds_approach_navigation_to_item_requirement(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=8, height=8, start=(7, 7), objects=[approach_object()])
+    state['inventory'] = [approach_item()]
+    write_state(debug, state)
+
+    decision = debug.normalize_agent_submission(
+        {'action': 'navigate', 'target_id': 238, 'item_id': 279, 'reason': 'Approach before using the hammer.'},
+        state,
+    )
+    assert decision['recommended_intent'] == 'approach_target'
+    assert decision['recommended_action']['args'] == {'id': 238, 'item_id': 279}
+    assert decision['evidence']['approach']['event_object_id'] == 238
+    assert debug.validate_agent_decision(decision)['recommended_action']['tool'] == 'navigation_step'
+
+
+def test_agent_keeps_explicit_item_for_search_target_affordance(tmp_path):
+    debug = make_debug_state(tmp_path)
+    target = approach_object()
+    target['trigger_mode'] = 1
+    state = make_state(width=8, height=8, start=(7, 7), objects=[target])
+    state['inventory'] = [approach_item()]
+
+    decision = debug.normalize_agent_submission(
+        {'action': 'navigate', 'target_id': 238, 'item_id': 279, 'reason': 'Use the item approach.'},
+        state,
+    )
+
+    assert decision['recommended_intent'] == 'approach_target'
+    assert decision['recommended_action']['args'] == {'id': 238, 'item_id': 279}
+    assert decision['evidence']['target']['kind'] == 'search'
+    assert decision['evidence']['affordances'][0]['item_id'] == 279
 
 
 

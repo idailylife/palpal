@@ -240,6 +240,24 @@ function navigationEnvironmentContext(state) {
       interactable: Boolean(obj.interactable),
     }))
     .sort((a, b) => a.id - b.id);
+  const approachRequirements = (state?.inventory || [])
+    .filter((item) => item?.usable === true && Number(item.amount || 0) - Number(item.amount_in_use || 0) > 0)
+    .flatMap((item) => (item.use_effect?.requirements || [])
+      .filter((requirement) => requirement?.kind === "face_event_object" && Number(requirement.event_object_id || 0) > 0)
+      .map((requirement) => ({
+        kind: "face_event_object",
+        item_id: Number(item.item_id || 0),
+        item_name: String(item.name || ""),
+        event_object_id: Number(requirement.event_object_id || 0),
+        distance_level: Number(requirement.distance_level || 0),
+        distance_limit: Number(requirement.distance_level || 0) * 32 + 16,
+        script_entry: Number(requirement.script_entry || 0),
+        failure_script_entry: Number(requirement.failure_script_entry || 0),
+        conditional: requirement.conditional === true,
+        requirements_complete: item.use_effect?.requirements_complete === true,
+      })))
+    .filter((requirement) => requirement.item_id > 0 && requirement.distance_level >= 0)
+    .sort((a, b) => a.event_object_id - b.event_object_id || a.item_id - b.item_id || a.script_entry - b.script_entry);
   return {
     room: {
       scene_id: state?.scene_id ?? null,
@@ -260,6 +278,7 @@ function navigationEnvironmentContext(state) {
       active: Boolean(dialog.active),
     },
     objects,
+    approach_requirements: approachRequirements,
   };
 }
 
@@ -332,7 +351,7 @@ function navigationFullReady(state) {
   );
 }
 
-function navigationTargetActionable(state, targetId) {
+function navigationTargetActionable(state, targetId, itemId = null) {
   if (
     !navigationFullReady(state)
     || state?.control?.navigation_ready !== true
@@ -345,7 +364,10 @@ function navigationTargetActionable(state, targetId) {
     return false;
   }
   const target = navigationTargets(state).get(targetId);
-  return Boolean(target && ![
+  const status = itemId == null
+    ? target?.status
+    : (target?.affordances || []).find((entry) => Number(entry.item_id || 0) === Number(itemId))?.status;
+  return Boolean(target && status && ![
     "pending",
     "unknown",
     "in_dialog",
@@ -354,7 +376,7 @@ function navigationTargetActionable(state, targetId) {
     "needs_direction",
     "no_nav_grid",
     "target_inactive",
-  ].includes(target.status));
+  ].includes(status));
 }
 
 function sendNavigationDiagnostic(type, details = {}) {
@@ -373,7 +395,10 @@ navigationEl.addEventListener("click", (event) => {
   const goButton = event.target.closest("[data-nav-go]");
   if (goButton && navigationEl.contains(goButton)) {
     event.stopPropagation();
-    navigateToTarget(Number(goButton.dataset.navGo));
+    navigateToTarget(
+      Number(goButton.dataset.navGo),
+      Number(goButton.dataset.navItem || 0) || null,
+    );
     return;
   }
 
@@ -1757,6 +1782,7 @@ function renderObjects(state) {
       nav?.status,
       nav?.kind,
       nav?.transition_candidate,
+      (nav?.affordances || []).map((entry) => [entry.item_id, entry.script_entry, entry.status, entry.steps]),
     ];
   }));
   objectsRenderKey = setPanelHtml(objectsEl, objects
@@ -1768,6 +1794,7 @@ function renderObjects(state) {
         obj.interactable ? `<span class="tag ${navKindClass(kind)}">${kind}</span>` : "",
         obj.blocking ? '<span class="tag">blocking</span>' : "",
         nav ? `<span class="tag ${statusClass(nav.status)}">${statusText(nav.status)}</span>` : "",
+        nav?.affordances?.length ? `<span class="tag">item ×${nav.affordances.length}</span>` : "",
       ]
         .filter(Boolean)
         .join("");
@@ -1826,6 +1853,7 @@ function renderNavigation(state) {
       target.steps,
       target.required_direction,
       target.blocker?.id ?? null,
+      (target.affordances || []).map((entry) => [entry.item_id, entry.script_entry, entry.status, entry.steps, entry.required_direction]),
     ]),
   });
   if (navigationRenderKey === renderKey) return;
@@ -1894,7 +1922,21 @@ function renderNavigation(state) {
         .filter(Boolean)
         .join(" · ");
       const goEnabled = navigationTargetActionable(state, target.id) && !activeNavigation;
-      const goLabel = isActive ? navigationRunText(activeNavigation.status) : displayStatus === "transition" ? "Enter" : "Go";
+      const goLabel = isActive
+        ? navigationRunText(activeNavigation.status)
+        : target.kind === "approach"
+          ? "Approach"
+          : displayStatus === "transition"
+            ? "Enter"
+            : "Go";
+      const itemButtons = (target.affordances || []).map((affordance) => {
+        const itemActive = isActive && activeNavigation?.approachItemId === Number(affordance.item_id || 0);
+        const label = itemActive
+          ? navigationRunText(activeNavigation.status)
+          : `Approach · ${escapeHtml(affordance.item_name || `#${affordance.item_id}`)}`;
+        const itemEnabled = navigationTargetActionable(state, target.id, affordance.item_id) && !activeNavigation;
+        return `<button class="navGo" data-nav-go="${target.id}" data-nav-item="${affordance.item_id}" ${itemEnabled ? "" : "disabled"}>${label}</button>`;
+      }).join("");
       return `<div class="navTarget ${selectedRoute?.target_id === target.id ? "is-selected" : ""}" data-nav-id="${target.id}" role="button" tabindex="0">
         <div class="navTargetSelect">
           <strong>#${target.id}</strong>
@@ -1903,7 +1945,8 @@ function renderNavigation(state) {
             ${detail ? `<small>${detail}</small>` : ""}
           </span>
         </div>
-        <button class="navGo" data-nav-go="${target.id}" ${goEnabled ? "" : "disabled"}>${goLabel}</button>
+        ${target.kind === "approach" ? "" : `<button class="navGo" data-nav-go="${target.id}" ${goEnabled ? "" : "disabled"}>${goLabel}</button>`}
+        ${itemButtons}
       </div>`;
     })
     .join("");
@@ -2042,6 +2085,7 @@ function navigationRunText(status) {
     facing: "Facing",
     interacting: "Action",
     arrived: "Arrived",
+    approached: "Ready",
     action_pending: "Pending",
     waiting_for_control: "Game",
   };
@@ -2592,7 +2636,7 @@ function renderAgentSession() {
     session.max_turns,
     usage.total_tokens,
     lastUsage.total_tokens,
-    session.context_estimate_tokens,
+    session.last_prompt_tokens,
     session.compactions,
     session.game_instance_id,
     session.parent_session_id,
@@ -2611,7 +2655,7 @@ function renderAgentSession() {
         <div><dt>Run</dt><dd>${Number(session.run_turn || 0)}/${Number(session.max_turns || agentMaxTurns)}</dd></div>
         <div><dt>Billed</dt><dd>${Number(usage.total_tokens || 0).toLocaleString()}</dd></div>
         <div><dt>Last run</dt><dd>${Number(lastUsage.total_tokens || 0).toLocaleString()}</dd></div>
-        <div><dt>Context est.</dt><dd>${Number(session.context_estimate_tokens || 0).toLocaleString()}</dd></div>
+        <div><dt>Last prompt</dt><dd>${session.last_prompt_tokens == null ? "-" : Number(session.last_prompt_tokens).toLocaleString()}</dd></div>
         <div><dt>Compactions</dt><dd>${Number(session.compactions || 0)}</dd></div>
         <div><dt>Lineage</dt><dd>${escapeHtml(session.checkpoint_id ? `checkpoint ${session.checkpoint_id}` : session.parent_session_id ? "session branch" : "game")}</dd></div>
         ${battleDelegate.child_session_id ? `<div><dt>Battle child</dt><dd>${escapeHtml(battleDelegate.status || "-")} · ${escapeHtml(battleDelegate.phase || "-")} · ${Number(battleDelegate.instruction_count || 0)}/${Number(battleDelegate.instruction_limit || 100)}</dd></div>` : ""}
@@ -3037,7 +3081,10 @@ async function selectNavigationTarget(targetId) {
   }
 
   try {
-    const response = await fetch(`/navigation/route?id=${encodeURIComponent(targetId)}`);
+    const target = navigationTargets(latestState).get(targetId);
+    const approachItemId = Number(target?.approach?.item_id || 0);
+    const itemQuery = approachItemId > 0 ? `&item_id=${encodeURIComponent(approachItemId)}` : "";
+    const response = await fetch(`/navigation/route?id=${encodeURIComponent(targetId)}${itemQuery}`);
     const route = await response.json();
     if (requestId !== navigationRouteRequestId) return;
     selectedRoute = route;
@@ -3309,11 +3356,13 @@ async function waitForNavigationProgress(stepResult, startKey) {
   return false;
 }
 
-async function navigationStep(targetId) {
+async function navigationStep(targetId, approachItemId = null) {
+  const payload = { id: targetId };
+  if (Number(approachItemId) > 0) payload.item_id = Number(approachItemId);
   const response = await fetch("/navigation/step", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: targetId }),
+    body: JSON.stringify(payload),
   });
   const result = await response.json();
   sendNavigationDiagnostic("navigation_step_result", {
@@ -3420,7 +3469,7 @@ async function playNavigationSegment(stepResult, startKey) {
   return waitForNavigationProgress(stepResult, startKey);
 }
 
-async function navigateToTarget(targetId) {
+async function navigateToTarget(targetId, requestedItemId = null) {
   if (activeNavigation) {
     sendNavigationDiagnostic("navigation_click_ignored", {
       ...navigationDiagnosticContext(latestState),
@@ -3429,7 +3478,7 @@ async function navigateToTarget(targetId) {
     });
     return;
   }
-  if (!navigationTargetActionable(latestState, targetId)) {
+  if (!navigationTargetActionable(latestState, targetId, requestedItemId)) {
     sendNavigationDiagnostic("navigation_click_ignored", {
       ...navigationDiagnosticContext(latestState),
       target_id: targetId,
@@ -3437,7 +3486,9 @@ async function navigateToTarget(targetId) {
     });
     return;
   }
-  activeNavigation = { targetId, status: "starting" };
+  const target = navigationTargets(latestState).get(targetId);
+  const approachItemId = Number(requestedItemId || (target?.kind === "approach" ? target?.approach?.item_id : 0) || 0) || null;
+  activeNavigation = { targetId, approachItemId, status: "starting" };
   sendNavigationDiagnostic("navigation_start", {
     ...navigationDiagnosticContext(latestState),
     target_id: targetId,
@@ -3459,7 +3510,7 @@ async function navigateToTarget(targetId) {
   try {
     for (let index = 0; index < 240; index += 1) {
       const startKey = partyPositionKey(latestState);
-      const result = await navigationStep(targetId);
+      const result = await navigationStep(targetId, activeNavigation.approachItemId);
       activeNavigation.status = result.status;
       if (result.route) selectedRoute = { ...result, target_id: targetId };
       if (latestState) {
@@ -3469,6 +3520,12 @@ async function navigateToTarget(targetId) {
 
       if (result.status === "arrived") {
         unlockNavigation("arrived");
+        await refreshState();
+        return;
+      }
+
+      if (result.status === "approached") {
+        unlockNavigation("approached");
         await refreshState();
         return;
       }

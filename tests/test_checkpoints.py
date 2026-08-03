@@ -271,6 +271,7 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
         turn=4,
         pending_decision=saved_decision,
         usage={'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110},
+        last_prompt_tokens=95,
         compactions=1,
         equipment_review={
             'ownership_counts': {'201': 1},
@@ -314,6 +315,7 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
     assert restored['run_turn'] == 0
     assert restored['pending_decision'] == saved_decision
     assert restored['usage']['total_tokens'] == 110
+    assert restored['last_prompt_tokens'] == 95
     assert restored['compactions'] == 1
     assert restored['equipment_review']['pending'][0]['item_id'] == 201
     transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)

@@ -179,6 +179,10 @@ static const char * const g_agent_equipment_slot_keys[MAX_PLAYER_EQUIPMENTS] = {
 #define PALPAL_AGENT_EQUIP_SCRIPT_LIMIT 64
 #define PALPAL_AGENT_EQUIP_SPECIAL_LIMIT 8
 #define PALPAL_AGENT_EQUIP_UNKNOWN_LIMIT 8
+#define PALPAL_AGENT_ITEM_SCRIPT_LIMIT 64
+#define PALPAL_AGENT_ITEM_EFFECT_LIMIT 16
+#define PALPAL_AGENT_ITEM_REQUIREMENT_LIMIT 8
+#define PALPAL_AGENT_ITEM_UNKNOWN_LIMIT 8
 
 typedef struct tagPALPALEQUIPMENTSPECIAL
 {
@@ -210,6 +214,70 @@ typedef struct tagPALPALEQUIPMENTPREVIEW
    PALPALEQUIPMENTSPECIAL unknown[PALPAL_AGENT_EQUIP_UNKNOWN_LIMIT];
    int unknown_count;
 } PALPALEQUIPMENTPREVIEW;
+
+typedef enum tagPALPALITEMEFFECTKIND
+{
+   kPalpalItemEffectRestoreHP = 0,
+   kPalpalItemEffectRestoreMP,
+   kPalpalItemEffectRestoreHPMP,
+   kPalpalItemEffectRevive,
+   kPalpalItemEffectApplyPoison,
+   kPalpalItemEffectCurePoison,
+   kPalpalItemEffectCurePoisonLevel,
+   kPalpalItemEffectApplyStatus,
+   kPalpalItemEffectRemoveStatus,
+   kPalpalItemEffectEnemyDamage,
+   kPalpalItemEffectDrainHP
+} PALPALITEMEFFECTKIND;
+
+typedef struct tagPALPALITEMEFFECT
+{
+   PALPALITEMEFFECTKIND kind;
+   WORD script_entry;
+   WORD operand0;
+   WORD operand1;
+   WORD operand2;
+   BOOL conditional;
+} PALPALITEMEFFECT;
+
+typedef struct tagPALPALITEMREQUIREMENT
+{
+   enum
+   {
+      kPalpalItemRequirementFaceEventObject = 0,
+      kPalpalItemRequirementPlaceEventObject
+   } kind;
+   WORD script_entry;
+   WORD event_object_id;
+   WORD distance_level;
+   WORD failure_script_entry;
+   BOOL conditional;
+} PALPALITEMREQUIREMENT;
+
+typedef struct tagPALPALITEMEFFECTPREVIEW
+{
+   BOOL complete;
+   BOOL requirements_complete;
+   WORD script_entry;
+   PALPALITEMEFFECT effects[PALPAL_AGENT_ITEM_EFFECT_LIMIT];
+   int effect_count;
+   PALPALITEMREQUIREMENT requirements[PALPAL_AGENT_ITEM_REQUIREMENT_LIMIT];
+   int requirement_count;
+   PALPALEQUIPMENTSPECIAL unknown[PALPAL_AGENT_ITEM_UNKNOWN_LIMIT];
+   WORD unknown_entries[PALPAL_AGENT_ITEM_UNKNOWN_LIMIT];
+   int unknown_count;
+} PALPALITEMEFFECTPREVIEW;
+
+typedef struct tagPALPALITEMPREVIEWCACHE
+{
+   BOOL valid;
+   WORD use_script_entry;
+   WORD throw_script_entry;
+   PALPALITEMEFFECTPREVIEW use_preview;
+   PALPALITEMEFFECTPREVIEW throw_preview;
+} PALPALITEMPREVIEWCACHE;
+
+static PALPALITEMPREVIEWCACHE g_agent_item_preview_cache[MAX_OBJECTS];
 
 typedef struct tagPALPALDIALOGEVENT
 {
@@ -619,6 +687,461 @@ PALPAL_AgentStatusKey(
    }
 }
 
+static const char *
+PALPAL_AgentItemEffectKind(
+   PALPALITEMEFFECTKIND kind
+)
+{
+   switch (kind)
+   {
+   case kPalpalItemEffectRestoreHP: return "restore_hp";
+   case kPalpalItemEffectRestoreMP: return "restore_mp";
+   case kPalpalItemEffectRestoreHPMP: return "restore_hp_mp";
+   case kPalpalItemEffectRevive: return "revive";
+   case kPalpalItemEffectApplyPoison: return "apply_poison";
+   case kPalpalItemEffectCurePoison: return "cure_poison";
+   case kPalpalItemEffectCurePoisonLevel: return "cure_poison_level";
+   case kPalpalItemEffectApplyStatus: return "apply_status";
+   case kPalpalItemEffectRemoveStatus: return "remove_status";
+   case kPalpalItemEffectEnemyDamage: return "enemy_damage";
+   case kPalpalItemEffectDrainHP: return "drain_hp";
+   default: return "unknown";
+   }
+}
+
+static VOID
+PALPAL_AgentRememberItemEffect(
+   PALPALITEMEFFECTPREVIEW *preview,
+   PALPALITEMEFFECTKIND kind,
+   WORD script_entry,
+   LPSCRIPTENTRY entry,
+   BOOL conditional
+)
+{
+   PALPALITEMEFFECT *effect;
+
+   if (preview->effect_count >= PALPAL_AGENT_ITEM_EFFECT_LIMIT)
+   {
+      preview->complete = FALSE;
+      return;
+   }
+   effect = &preview->effects[preview->effect_count++];
+   effect->kind = kind;
+   effect->script_entry = script_entry;
+   effect->operand0 = entry->rgwOperand[0];
+   effect->operand1 = entry->rgwOperand[1];
+   effect->operand2 = entry->rgwOperand[2];
+   effect->conditional = conditional;
+}
+
+static VOID
+PALPAL_AgentRememberItemRequirement(
+   PALPALITEMEFFECTPREVIEW *preview,
+   int kind,
+   WORD script_entry,
+   LPSCRIPTENTRY entry,
+   BOOL conditional
+)
+{
+   PALPALITEMREQUIREMENT *requirement;
+   int i;
+
+   for (i = 0; i < preview->requirement_count; i++)
+   {
+      requirement = &preview->requirements[i];
+      if (requirement->kind == kind &&
+         requirement->script_entry == script_entry &&
+         requirement->event_object_id == entry->rgwOperand[0])
+      {
+         return;
+      }
+   }
+
+   if (preview->requirement_count >= PALPAL_AGENT_ITEM_REQUIREMENT_LIMIT)
+   {
+      preview->requirements_complete = FALSE;
+      return;
+   }
+   requirement = &preview->requirements[preview->requirement_count++];
+   requirement->kind = kind;
+   requirement->script_entry = script_entry;
+   requirement->event_object_id = entry->rgwOperand[0];
+   requirement->distance_level = entry->rgwOperand[1];
+   requirement->failure_script_entry = entry->rgwOperand[2];
+   requirement->conditional = conditional;
+}
+
+static VOID
+PALPAL_AgentRememberUnknownItemEffect(
+   PALPALITEMEFFECTPREVIEW *preview,
+   WORD script_entry,
+   LPSCRIPTENTRY entry
+)
+{
+   PALPALEQUIPMENTSPECIAL *effect;
+
+   preview->complete = FALSE;
+   if (preview->unknown_count >= PALPAL_AGENT_ITEM_UNKNOWN_LIMIT)
+   {
+      return;
+   }
+   effect = &preview->unknown[preview->unknown_count];
+   preview->unknown_entries[preview->unknown_count] = script_entry;
+   effect->operation = entry->wOperation;
+   effect->operand0 = entry->rgwOperand[0];
+   effect->operand1 = entry->rgwOperand[1];
+   effect->operand2 = entry->rgwOperand[2];
+   preview->unknown_count++;
+}
+
+static PALPALITEMEFFECTPREVIEW
+PALPAL_AgentPreviewItemScript(
+   WORD script_entry
+)
+{
+   PALPALITEMEFFECTPREVIEW preview;
+   struct
+   {
+      WORD entry;
+      BOOL conditional;
+   } pending[PALPAL_AGENT_ITEM_SCRIPT_LIMIT];
+   WORD visited[PALPAL_AGENT_ITEM_SCRIPT_LIMIT];
+   int pending_count = 0;
+   int visited_count = 0;
+   int steps = 0;
+
+   memset(&preview, 0, sizeof(preview));
+   preview.complete = TRUE;
+   preview.requirements_complete = TRUE;
+   preview.script_entry = script_entry;
+   if (script_entry == 0)
+   {
+      return preview;
+   }
+   pending[pending_count].entry = script_entry;
+   pending[pending_count].conditional = FALSE;
+   pending_count++;
+
+   while (pending_count > 0 && steps < PALPAL_AGENT_ITEM_SCRIPT_LIMIT)
+   {
+      WORD current;
+      BOOL conditional;
+
+      pending_count--;
+      current = pending[pending_count].entry;
+      conditional = pending[pending_count].conditional;
+      while (current != 0 && steps < PALPAL_AGENT_ITEM_SCRIPT_LIMIT)
+      {
+         LPSCRIPTENTRY entry;
+         int i;
+         BOOL seen = FALSE;
+
+         if (current >= gpGlobals->g.nScriptEntry)
+         {
+            preview.complete = FALSE;
+            preview.requirements_complete = FALSE;
+            break;
+         }
+         for (i = 0; i < visited_count; i++)
+         {
+            if (visited[i] == current)
+            {
+               seen = TRUE;
+               break;
+            }
+         }
+         if (seen)
+         {
+            break;
+         }
+         visited[visited_count++] = current;
+         steps++;
+         entry = &gpGlobals->g.lprgScriptEntry[current];
+
+         switch (entry->wOperation)
+         {
+         case 0x0000:
+         case 0x0001:
+            current = 0;
+            break;
+
+         case 0x0003:
+            PALPAL_AgentRememberUnknownItemEffect(&preview, current, entry);
+            if (entry->rgwOperand[1] == 0)
+            {
+               current = entry->rgwOperand[0];
+            }
+            else
+            {
+               if (pending_count < PALPAL_AGENT_ITEM_SCRIPT_LIMIT)
+               {
+                  pending[pending_count].entry = entry->rgwOperand[0];
+                  pending[pending_count].conditional = TRUE;
+                  pending_count++;
+               }
+               else
+               {
+                  preview.requirements_complete = FALSE;
+               }
+               current++;
+               conditional = TRUE;
+            }
+            break;
+
+         case 0x0004:
+            if (pending_count < PALPAL_AGENT_ITEM_SCRIPT_LIMIT)
+            {
+               pending[pending_count].entry = entry->rgwOperand[0];
+               pending[pending_count].conditional = conditional;
+               pending_count++;
+            }
+            else
+            {
+               preview.complete = FALSE;
+               preview.requirements_complete = FALSE;
+            }
+            current++;
+            break;
+
+         case 0x0006:
+         case 0x000A:
+            PALPAL_AgentRememberUnknownItemEffect(&preview, current, entry);
+            if (pending_count < PALPAL_AGENT_ITEM_SCRIPT_LIMIT)
+            {
+               pending[pending_count].entry =
+                  entry->wOperation == 0x0006 ? entry->rgwOperand[1] : entry->rgwOperand[0];
+               pending[pending_count].conditional = TRUE;
+               pending_count++;
+            }
+            else
+            {
+               preview.requirements_complete = FALSE;
+            }
+            current++;
+            conditional = TRUE;
+            break;
+
+         case 0x001B:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectRestoreHP, current, entry, conditional);
+            current++;
+            break;
+         case 0x001C:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectRestoreMP, current, entry, conditional);
+            current++;
+            break;
+         case 0x001D:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectRestoreHPMP, current, entry, conditional);
+            current++;
+            break;
+         case 0x0021:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectEnemyDamage, current, entry, conditional);
+            current++;
+            break;
+         case 0x0022:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectRevive, current, entry, conditional);
+            current++;
+            break;
+         case 0x0029:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectApplyPoison, current, entry, conditional);
+            current++;
+            break;
+         case 0x002B:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectCurePoison, current, entry, conditional);
+            current++;
+            break;
+         case 0x002C:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectCurePoisonLevel, current, entry, conditional);
+            current++;
+            break;
+         case 0x002D:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectApplyStatus, current, entry, conditional);
+            current++;
+            break;
+         case 0x002F:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectRemoveStatus, current, entry, conditional);
+            current++;
+            break;
+         case 0x0039:
+            PALPAL_AgentRememberItemEffect(
+               &preview, kPalpalItemEffectDrainHP, current, entry, conditional);
+            current++;
+            break;
+
+         case 0x0081:
+            PALPAL_AgentRememberItemRequirement(
+               &preview, kPalpalItemRequirementFaceEventObject,
+               current, entry, conditional);
+            if (entry->rgwOperand[2] != 0)
+            {
+               if (pending_count < PALPAL_AGENT_ITEM_SCRIPT_LIMIT)
+               {
+                  pending[pending_count].entry = entry->rgwOperand[2];
+                  pending[pending_count].conditional = TRUE;
+                  pending_count++;
+               }
+               else
+               {
+                  preview.requirements_complete = FALSE;
+               }
+            }
+            current++;
+            conditional = TRUE;
+            break;
+
+         case 0x0084:
+            PALPAL_AgentRememberItemRequirement(
+               &preview, kPalpalItemRequirementPlaceEventObject,
+               current, entry, conditional);
+            if (entry->rgwOperand[2] != 0)
+            {
+               if (pending_count < PALPAL_AGENT_ITEM_SCRIPT_LIMIT)
+               {
+                  pending[pending_count].entry = entry->rgwOperand[2];
+                  pending[pending_count].conditional = TRUE;
+                  pending_count++;
+               }
+               else
+               {
+                  preview.requirements_complete = FALSE;
+               }
+            }
+            current++;
+            conditional = TRUE;
+            break;
+
+         default:
+            PALPAL_AgentRememberUnknownItemEffect(&preview, current, entry);
+            current++;
+            break;
+         }
+      }
+   }
+   if (pending_count > 0 || steps >= PALPAL_AGENT_ITEM_SCRIPT_LIMIT)
+   {
+      preview.complete = FALSE;
+      preview.requirements_complete = FALSE;
+   }
+   return preview;
+}
+
+static VOID
+PALPAL_AgentWriteItemEffectPreview(
+   FILE *fp,
+   PALPALITEMEFFECTPREVIEW *preview
+)
+{
+   int i;
+
+   fprintf(fp,
+      "{\"script_entry\":%u,\"preview_complete\":%s,"
+      "\"requirements_complete\":%s,\"effects\":[",
+      preview->script_entry, preview->complete ? "true" : "false",
+      preview->requirements_complete ? "true" : "false");
+   for (i = 0; i < preview->effect_count; i++)
+   {
+      PALPALITEMEFFECT *effect = &preview->effects[i];
+      if (i > 0) fprintf(fp, ",");
+      fprintf(fp,
+         "{\"kind\":\"%s\",\"script_entry\":%u,\"conditional\":%s",
+         PALPAL_AgentItemEffectKind(effect->kind), effect->script_entry,
+         effect->conditional ? "true" : "false");
+      switch (effect->kind)
+      {
+      case kPalpalItemEffectRestoreHP:
+      case kPalpalItemEffectRestoreMP:
+      case kPalpalItemEffectRestoreHPMP:
+         fprintf(fp, ",\"amount\":%d,\"apply_to_all\":%s",
+            (SHORT)effect->operand1, effect->operand0 ? "true" : "false");
+         break;
+      case kPalpalItemEffectRevive:
+         fprintf(fp, ",\"max_hp_percent\":%u,\"apply_to_all\":%s",
+            effect->operand1 * 10, effect->operand0 ? "true" : "false");
+         break;
+      case kPalpalItemEffectApplyPoison:
+      case kPalpalItemEffectCurePoison:
+         fprintf(fp, ",\"poison_id\":%u,\"poison_name\":",
+            effect->operand1);
+         PALPAL_AgentWriteJsonWideString(
+            fp, effect->operand1 < MAX_OBJECTS ? PAL_GetWord(effect->operand1) : L"");
+         fprintf(fp, ",\"apply_to_all\":%s", effect->operand0 ? "true" : "false");
+         break;
+      case kPalpalItemEffectCurePoisonLevel:
+         fprintf(fp, ",\"max_poison_level\":%u,\"apply_to_all\":%s",
+            effect->operand1, effect->operand0 ? "true" : "false");
+         break;
+      case kPalpalItemEffectApplyStatus:
+         fprintf(fp,
+            ",\"status_id\":%u,\"status\":\"%s\",\"duration\":%u",
+            effect->operand0, PALPAL_AgentStatusKey(effect->operand0), effect->operand1);
+         break;
+      case kPalpalItemEffectRemoveStatus:
+         fprintf(fp, ",\"status_id\":%u,\"status\":\"%s\"",
+            effect->operand0, PALPAL_AgentStatusKey(effect->operand0));
+         break;
+      case kPalpalItemEffectEnemyDamage:
+         fprintf(fp, ",\"amount\":%u,\"apply_to_all\":%s",
+            effect->operand1, effect->operand0 ? "true" : "false");
+         break;
+      case kPalpalItemEffectDrainHP:
+         fprintf(fp, ",\"amount\":%u", effect->operand0);
+         break;
+      }
+      fprintf(fp, "}");
+   }
+   fprintf(fp, "],\"requirements\":[");
+   for (i = 0; i < preview->requirement_count; i++)
+   {
+      PALPALITEMREQUIREMENT *requirement = &preview->requirements[i];
+      if (i > 0) fprintf(fp, ",");
+      if (requirement->kind == kPalpalItemRequirementFaceEventObject)
+      {
+         fprintf(fp,
+            "{\"kind\":\"face_event_object\",\"script_entry\":%u,"
+            "\"conditional\":%s,\"event_object_id\":%u,"
+            "\"distance_level\":%u,\"distance_limit\":%u,"
+            "\"failure_script_entry\":%u}",
+            requirement->script_entry,
+            requirement->conditional ? "true" : "false",
+            requirement->event_object_id,
+            requirement->distance_level,
+            (unsigned int)(requirement->distance_level * 32 + 16),
+            requirement->failure_script_entry);
+      }
+      else
+      {
+         fprintf(fp,
+            "{\"kind\":\"place_event_object\",\"script_entry\":%u,"
+            "\"conditional\":%s,\"event_object_id\":%u,"
+            "\"failure_script_entry\":%u}",
+            requirement->script_entry,
+            requirement->conditional ? "true" : "false",
+            requirement->event_object_id,
+            requirement->failure_script_entry);
+      }
+   }
+   fprintf(fp, "],\"unparsed_effects\":[");
+   for (i = 0; i < preview->unknown_count; i++)
+   {
+      PALPALEQUIPMENTSPECIAL *effect = &preview->unknown[i];
+      if (i > 0) fprintf(fp, ",");
+      fprintf(fp,
+         "{\"script_entry\":%u,\"operation\":%u,\"operands\":[%u,%u,%u]}",
+         preview->unknown_entries[i], effect->operation,
+         effect->operand0, effect->operand1, effect->operand2);
+   }
+   fprintf(fp, "]}");
+}
+
 static VOID
 PALPAL_AgentRememberEquipmentEffect(
    PALPALEQUIPMENTSPECIAL *effects,
@@ -923,6 +1446,7 @@ PALPAL_AgentWriteItemMetadata(
 )
 {
    OBJECT item;
+   PALPALITEMPREVIEWCACHE *cache = NULL;
 
    memset(&item, 0, sizeof(item));
    if (item_id != 0 && item_id < MAX_OBJECTS)
@@ -944,6 +1468,31 @@ PALPAL_AgentWriteItemMetadata(
       (unsigned int)item.item.wScriptOnEquip,
       (unsigned int)item.item.wScriptOnThrow);
    PALPAL_AgentWriteItemFlags(fp, item.item.wFlags);
+   if (item_id != 0 && item_id < MAX_OBJECTS &&
+      (item.item.wFlags & (kItemFlagUsable | kItemFlagThrowable)))
+   {
+      cache = &g_agent_item_preview_cache[item_id];
+      if (!cache->valid ||
+         cache->use_script_entry != item.item.wScriptOnUse ||
+         cache->throw_script_entry != item.item.wScriptOnThrow)
+      {
+         cache->valid = TRUE;
+         cache->use_script_entry = item.item.wScriptOnUse;
+         cache->throw_script_entry = item.item.wScriptOnThrow;
+         cache->use_preview = PALPAL_AgentPreviewItemScript(item.item.wScriptOnUse);
+         cache->throw_preview = PALPAL_AgentPreviewItemScript(item.item.wScriptOnThrow);
+      }
+      if (item.item.wFlags & kItemFlagUsable)
+      {
+         fprintf(fp, ",\"use_effect\":");
+         PALPAL_AgentWriteItemEffectPreview(fp, &cache->use_preview);
+      }
+      if (item.item.wFlags & kItemFlagThrowable)
+      {
+         fprintf(fp, ",\"throw_effect\":");
+         PALPAL_AgentWriteItemEffectPreview(fp, &cache->throw_preview);
+      }
+   }
    if (item.item.wFlags & kItemFlagEquipable)
    {
       int i;
@@ -3250,6 +3799,19 @@ PALPAL_AgentWriteBattleActionEntry(
    {
       PALPAL_AgentWriteBattleTargets(fp, strcmp(target_side, "enemy") == 0);
    }
+   fprintf(fp, ",\"submission_target_indices\":");
+   if (target_all)
+   {
+      fprintf(fp, "[-1]");
+   }
+   else if (strcmp(target_side, "none") == 0)
+   {
+      fprintf(fp, "[-2]");
+   }
+   else
+   {
+      PALPAL_AgentWriteBattleTargets(fp, strcmp(target_side, "enemy") == 0);
+   }
    if (object_id != 0)
    {
       fprintf(fp, ",\"name\":");
@@ -3345,9 +3907,10 @@ PALPAL_AgentWriteBattle(
    }
    for (i = 0; i <= g_Battle.wMaxEnemyIndex; i++)
    {
-      if (g_agent_battle.enemy_object_id[i] != g_Battle.rgEnemy[i].wObjectID)
+      WORD object_id = g_Battle.rgEnemy[i].wObjectID;
+      if (object_id != 0 && g_agent_battle.enemy_object_id[i] != object_id)
       {
-         g_agent_battle.enemy_object_id[i] = g_Battle.rgEnemy[i].wObjectID;
+         g_agent_battle.enemy_object_id[i] = object_id;
          g_agent_battle.enemy_max_hp[i] = g_Battle.rgEnemy[i].e.wHealth;
       }
    }

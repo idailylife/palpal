@@ -681,8 +681,39 @@ def test_agent_get_inventory_returns_current_items(tmp_path):
     assert result['ok']
     assert result['total'] == 2
     assert result['returned'] == 2
-    assert result['inventory'][0] == {'slot': 0, 'item_id': 91, 'name': '十里香', 'amount': 1, 'amount_in_use': 0, 'equipped_count': 0, 'usable': True, 'apply_to_all': True, 'target_mode': 'implicit_event_context', 'sellable': True, 'consuming': None, 'available_amount': 1, 'flags': ['usable', 'apply_to_all'], 'price': 640}
+    assert result['inventory'][0] == {'slot': 0, 'item_id': 91, 'name': '十里香', 'amount': 1, 'amount_in_use': 0, 'equipped_count': 0, 'usable': True, 'throwable': None, 'apply_to_all': True, 'target_mode': 'implicit_event_context', 'sellable': True, 'consuming': None, 'available_amount': 1, 'flags': ['usable', 'apply_to_all'], 'price': 640, 'effect_available': False}
     assert result['inventory'][1]['target_mode'] == 'party_role'
+
+
+def test_agent_get_inventory_item_returns_structured_effects(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state['inventory'] = [{
+        'slot': 0, 'item_id': 99, 'name': '止血草', 'price': 50,
+        'usable': True, 'throwable': False, 'consuming': True,
+        'apply_to_all': False, 'amount': 3, 'amount_in_use': 1,
+        'script_on_use': 39208,
+        'use_effect': {
+            'script_entry': 39208,
+            'preview_complete': True,
+            'effects': [{
+                'kind': 'restore_hp', 'script_entry': 39208,
+                'conditional': False, 'amount': 50, 'apply_to_all': False,
+            }],
+            'unparsed_effects': [],
+        },
+    }]
+
+    result = debug.run_agent_tool('get_inventory', {'item_id': 99}, state)
+
+    assert result['ok'] is True
+    assert result['item']['available_amount'] == 2
+    assert result['item']['effect_available'] is True
+    assert result['item']['use_effect']['effects'][0]['kind'] == 'restore_hp'
+    assert result['item']['use_effect']['effects'][0]['amount'] == 50
+
+    missing = debug.run_agent_tool('get_inventory', {'item_id': 105}, state)
+    assert missing == {'ok': False, 'error': 'item_not_in_inventory', 'item_id': 105}
 
 
 def test_agent_get_equipment_compares_candidate_for_eligible_roles(tmp_path):

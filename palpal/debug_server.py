@@ -237,6 +237,20 @@ def search_hits(node: tuple[int, int], direction: int, obj: dict) -> bool:
     return False
 
 
+def facing_event_object_hits(
+    position: tuple[int, int],
+    direction: int,
+    obj: dict,
+    distance_limit: int,
+) -> bool:
+    """Mirror script opcode 0x81's facing-object distance predicate."""
+    if int(obj.get("state") or 0) <= 0 or distance_limit <= 0:
+        return False
+    anchor_x = int(obj.get("x") or 0) + (16 if direction in {1, 0} else -16)
+    anchor_y = int(obj.get("y") or 0) + (8 if direction in {1, 2} else -8)
+    return pal_distance(position, (anchor_x, anchor_y)) < distance_limit
+
+
 def decode_nav_grid(state: dict) -> dict | None:
     grid = state.get("nav_grid") or {}
     origin = grid.get("origin") or {}
@@ -2590,6 +2604,240 @@ class DebugState:
             item.pop("_last_index", None)
         return {"speakers": ordered[:limit], "total": len(ordered), "returned": min(len(ordered), limit)}
 
+    @staticmethod
+    def item_approach_requirements(state: dict) -> list[dict]:
+        requirements = []
+        for item in state.get("inventory") or []:
+            if not isinstance(item, dict) or item.get("usable") is not True:
+                continue
+            try:
+                item_id = int(item.get("item_id") or 0)
+                available = int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0)
+            except (TypeError, ValueError):
+                continue
+            effect = item.get("use_effect") if isinstance(item.get("use_effect"), dict) else {}
+            if item_id <= 0 or available <= 0:
+                continue
+            for requirement in effect.get("requirements") or []:
+                if not isinstance(requirement, dict) or requirement.get("kind") != "face_event_object":
+                    continue
+                try:
+                    object_id = int(requirement.get("event_object_id") or 0)
+                    distance_level = int(requirement.get("distance_level") or 0)
+                    script_entry = int(requirement.get("script_entry") or 0)
+                    failure_script_entry = int(requirement.get("failure_script_entry") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if object_id <= 0 or distance_level < 0:
+                    continue
+                requirements.append({
+                    "kind": "face_event_object",
+                    "item_id": item_id,
+                    "item_name": str(item.get("name") or ""),
+                    "event_object_id": object_id,
+                    "distance_level": distance_level,
+                    "distance_limit": distance_level * 32 + 16,
+                    "script_entry": script_entry,
+                    "failure_script_entry": failure_script_entry,
+                    "conditional": requirement.get("conditional") is True,
+                    "requirements_complete": effect.get("requirements_complete") is True,
+                })
+        return sorted(
+            requirements,
+            key=lambda entry: (
+                entry["event_object_id"],
+                entry["item_id"],
+                entry["script_entry"],
+            ),
+        )
+
+    def approach_requirements_by_target(
+        self,
+        state: dict,
+        item_id: int | None = None,
+    ) -> dict[int, list[dict]]:
+        result: dict[int, list[dict]] = {}
+        for requirement in self.item_approach_requirements(state):
+            if item_id is not None and requirement["item_id"] != item_id:
+                continue
+            result.setdefault(requirement["event_object_id"], []).append(requirement)
+        return result
+
+    def item_approach_affordances(
+        self,
+        state: dict,
+        target_id: int,
+        requirements: list[dict] | None = None,
+        *,
+        grid: dict | None = None,
+        reachable_order: list[tuple[int, int]] | None = None,
+        reachable_distance: dict[tuple[int, int], int] | None = None,
+        fallback_order: list[tuple[int, int]] | None = None,
+    ) -> list[dict]:
+        candidates = requirements
+        if candidates is None:
+            candidates = self.approach_requirements_by_target(state).get(target_id, [])
+        affordances = []
+        target = self.target_object(state, target_id)
+        for requirement in candidates:
+            if (
+                grid is not None
+                and reachable_order is not None
+                and reachable_distance is not None
+                and target is not None
+            ):
+                goals, directions, _ = self.approach_goal_nodes(
+                    state,
+                    grid,
+                    target,
+                    [requirement],
+                )
+                goal = next((node for node in reachable_order if node in goals), None)
+                fallback_goal = (
+                    next((node for node in fallback_order if node in goals), None)
+                    if goal is None and fallback_order is not None
+                    else None
+                )
+                selected_goal = goal or fallback_goal
+                status = "reachable" if goal is not None else "blocked_by_transition" if fallback_goal is not None else "unreachable_static"
+                affordances.append({
+                    **dict(requirement),
+                    "kind": "item_approach",
+                    "status": status,
+                    "steps": int(reachable_distance[goal]) if goal is not None else None,
+                    "required_direction": (
+                        DIR_TO_BUTTON.get(
+                            directions.get(selected_goal, int(state.get("party_direction") or 0)),
+                            "down",
+                        )
+                        if selected_goal is not None
+                        else None
+                    ),
+                })
+            else:
+                route = self.route_to_object(
+                    state,
+                    target_id,
+                    avoid_transitions=True,
+                    approach_item_id=int(requirement.get("item_id") or 0),
+                    approach_requirement=requirement,
+                )
+                if route.get("status") != "reachable":
+                    continue
+                affordance = route.get("affordance")
+                if isinstance(affordance, dict):
+                    affordances.append(affordance)
+        return sorted(
+            affordances,
+            key=lambda entry: (
+                0 if entry.get("status") == "reachable" else 1,
+                int(entry.get("steps")) if entry.get("steps") is not None else 1 << 30,
+                int(entry.get("item_id") or 0),
+                int(entry.get("script_entry") or 0),
+            ),
+        )
+
+    def matched_item_event_object(self, state: dict, item_id: int) -> dict | None:
+        try:
+            normalized_item_id = int(item_id)
+        except (TypeError, ValueError):
+            return None
+        pos = state.get("party_position") or {}
+        position = (int(pos.get("x") or 0), int(pos.get("y") or 0))
+        direction = int(state.get("party_direction") or 0)
+        objects = {
+            int(obj.get("id") or 0): obj
+            for obj in state.get("objects") or []
+            if isinstance(obj, dict) and int(obj.get("state") or 0) > 0
+        }
+        matches = []
+        for requirement in self.item_approach_requirements(state):
+            if int(requirement.get("item_id") or 0) != normalized_item_id:
+                continue
+            object_id = int(requirement.get("event_object_id") or 0)
+            target = objects.get(object_id)
+            if target is None or not facing_event_object_hits(
+                position,
+                direction,
+                target,
+                int(requirement.get("distance_limit") or 0),
+            ):
+                continue
+            matches.append((int(requirement.get("script_entry") or 0), object_id, requirement))
+        if not matches:
+            return None
+        _, object_id, requirement = min(matches, key=lambda entry: (entry[0], entry[1]))
+        return {"event_object_id": object_id, "requirement": dict(requirement)}
+
+    @staticmethod
+    def item_object_effect_observation(
+        before: dict,
+        after: dict,
+        matched: dict | None,
+    ) -> dict:
+        if not isinstance(matched, dict):
+            return {
+                "matched_event_object_id": None,
+                "effect_observed": None,
+                "object_delta": None,
+            }
+        object_id = int(matched.get("event_object_id") or 0)
+
+        def object_snapshot(state: dict) -> dict | None:
+            obj = next(
+                (
+                    entry for entry in state.get("objects") or []
+                    if isinstance(entry, dict) and int(entry.get("id") or 0) == object_id
+                ),
+                None,
+            )
+            if obj is None:
+                return None
+            return {key: obj.get(key) for key in (
+                "state", "trigger_mode", "trigger_script", "auto_script",
+            )}
+
+        before_object = object_snapshot(before)
+        after_object = object_snapshot(after)
+        changed = {}
+        if before_object is None or after_object is None:
+            if before_object != after_object:
+                changed["existence"] = {
+                    "before": before_object is not None,
+                    "after": after_object is not None,
+                }
+        else:
+            for key in ("state", "trigger_mode", "trigger_script", "auto_script"):
+                if before_object.get(key) != after_object.get(key):
+                    changed[key] = {
+                        "before": before_object.get(key),
+                        "after": after_object.get(key),
+                    }
+
+        before_trigger = before.get("trigger_observation") if isinstance(before.get("trigger_observation"), dict) else None
+        after_trigger = after.get("trigger_observation") if isinstance(after.get("trigger_observation"), dict) else None
+        trigger_changed = (
+            isinstance(after_trigger, dict)
+            and int(after_trigger.get("event_object_id") or 0) == object_id
+            and after_trigger != before_trigger
+        )
+        if trigger_changed:
+            changed["trigger_observation"] = {
+                "before": before_trigger,
+                "after": after_trigger,
+            }
+
+        same_room = (
+            before.get("scene_id") == after.get("scene_id")
+            and before.get("map_id") == after.get("map_id")
+        )
+        effect_observed = True if changed else False if same_room and after_object is not None else None
+        return {
+            "matched_event_object_id": object_id,
+            "effect_observed": effect_observed,
+            "object_delta": changed or {},
+        }
+
     def navigation_environment(self, state: dict) -> dict:
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
@@ -2632,6 +2880,7 @@ class DebugState:
                 "active": bool(dialog.get("active")),
             },
             "objects": objects,
+            "approach_requirements": self.item_approach_requirements(state),
         }
 
     def navigation_environment_payload(self, state: dict) -> dict:
@@ -5032,6 +5281,54 @@ class DebugState:
             room["updated_at"] = last_route["completed_at"]
             self.write_exploration(data)
 
+    def pending_touch_route_confirmation(self, state: dict, target_id: int) -> dict | None:
+        """Return a final touch route that is still awaiting its native trigger."""
+        identity = self.room_identity(state)
+        grid = decode_nav_grid(state)
+        if identity is None or grid is None:
+            return None
+        pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        try:
+            current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
+        except (TypeError, ValueError):
+            return None
+        if current is None:
+            return None
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = (data.get("rooms") or {}).get(identity["id"])
+            last_route = room.get("last_route") if isinstance(room, dict) else None
+            if not isinstance(last_route, dict) or not last_route.get("pending"):
+                return None
+            try:
+                remembered_target_id = int(last_route.get("target_id") or 0)
+                remaining_steps = int(last_route.get("remaining_steps") or 0)
+                route_age = time.time() - float(last_route.get("updated_at") or 0)
+                expected = (
+                    last_route.get("expected_node")
+                    if isinstance(last_route.get("expected_node"), dict)
+                    else {}
+                )
+                expected_node = (int(expected.get("grid_x", -1)), int(expected.get("grid_y", -1)))
+            except (TypeError, ValueError):
+                return None
+            selection = (
+                last_route.get("target_selection")
+                if isinstance(last_route.get("target_selection"), dict)
+                else {}
+            )
+            if (
+                remembered_target_id != int(target_id)
+                or remaining_steps != 0
+                or selection.get("kind") != "touch"
+                or route_age < 0
+                or route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS
+                or current != expected_node
+            ):
+                return None
+            return dict(last_route)
+
     def exploration_safe_and_reachable(
         self,
         state: dict,
@@ -5073,41 +5370,52 @@ class DebugState:
             route_node_set = self.route_nodes_through(last_route, current) if current is not None else set()
             if route_node_set:
                 explored.update(node for node in route_node_set if node in reachable_safe)
+            pending_transition = self.pending_transition_observation
+            try:
+                pending_object_id = (
+                    int(pending_transition.get("object_id") or 0)
+                    if isinstance(pending_transition, dict)
+                    else 0
+                )
+                remembered_target_id = int(last_route.get("target_id") or 0)
+                remaining_steps = int(last_route.get("remaining_steps") or 0)
+                route_age = time.time() - float(last_route.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                pending_object_id = 0
+                remembered_target_id = -1
+                remaining_steps = -1
+                route_age = TRANSITION_OBSERVATION_TIMEOUT_SECONDS + 1
+            selection = (
+                last_route.get("target_selection")
+                if isinstance(last_route.get("target_selection"), dict)
+                else {}
+            )
+            final_touch_route = selection.get("kind") == "touch" and remaining_steps == 0
+            same_live_transition = (
+                isinstance(pending_transition, dict)
+                and pending_object_id == remembered_target_id
+                and isinstance(pending_transition.get("from_room"), dict)
+                and pending_transition["from_room"].get("id") == room.get("logical_room_id")
+            )
+            confirmation_expired = (
+                not self.action_pending(state)
+                and not same_live_transition
+                and route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS
+            )
             if current == expected_node:
                 explored.update(node for node in self.route_nodes_through(last_route, current) if node in reachable_safe)
-                last_route["pending"] = False
-                last_route["outcome"] = "expected_node_reached"
-                last_route["completed_at"] = time.time()
-            else:
-                pending_transition = self.pending_transition_observation
-                try:
-                    pending_object_id = (
-                        int(pending_transition.get("object_id") or 0)
-                        if isinstance(pending_transition, dict)
-                        else 0
-                    )
-                    remembered_target_id = int(last_route.get("target_id") or 0)
-                except (TypeError, ValueError):
-                    pending_object_id = 0
-                    remembered_target_id = -1
-                same_live_transition = (
-                    isinstance(pending_transition, dict)
-                    and pending_object_id == remembered_target_id
-                    and isinstance(pending_transition.get("from_room"), dict)
-                    and pending_transition["from_room"].get("id") == room.get("logical_room_id")
-                )
-                try:
-                    route_age = time.time() - float(last_route.get("updated_at") or 0)
-                except (TypeError, ValueError):
-                    route_age = TRANSITION_OBSERVATION_TIMEOUT_SECONDS + 1
-                if (
-                    not self.action_pending(state)
-                    and not same_live_transition
-                    and route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS
-                ):
+                if not final_touch_route:
+                    last_route["pending"] = False
+                    last_route["outcome"] = "expected_node_reached"
+                    last_route["completed_at"] = time.time()
+                elif confirmation_expired:
                     last_route["pending"] = False
                     last_route["outcome"] = "confirmation_expired"
                     last_route["completed_at"] = time.time()
+            elif confirmation_expired:
+                last_route["pending"] = False
+                last_route["outcome"] = "confirmation_expired"
+                last_route["completed_at"] = time.time()
 
         frontier: set[tuple[int, int]] = set()
         blocked_edges: set[str] = set()
@@ -5421,6 +5729,47 @@ class DebugState:
                         break
         return goals, search_dirs
 
+    def approach_goal_nodes(
+        self,
+        state: dict,
+        grid: dict,
+        target: dict,
+        requirements: list[dict],
+    ) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int], dict[tuple[int, int], dict]]:
+        goals: set[tuple[int, int]] = set()
+        directions: dict[tuple[int, int], int] = {}
+        details: dict[tuple[int, int], dict] = {}
+        if int(target.get("state") or 0) <= 0:
+            return goals, directions, details
+
+        current_direction = int(state.get("party_direction") or 0)
+        direction_order = [current_direction] + [direction for direction in (2, 3, 0, 1) if direction != current_direction]
+        for requirement in requirements:
+            distance_limit = int(requirement.get("distance_limit") or 0)
+            if distance_limit <= 0:
+                continue
+            target_pos = (int(target.get("x") or 0), int(target.get("y") or 0))
+            x_min, x_max, y_min, y_max = self.grid_window_for_world_margin(
+                grid,
+                target_pos,
+                distance_limit + 16,
+                (distance_limit + 16) // 2,
+            )
+            for y in range(y_min, y_max + 1):
+                for x in range(x_min, x_max + 1):
+                    node = (x, y)
+                    if not nav_bit(grid, node):
+                        continue
+                    position = world_pos(grid, node)
+                    for direction in direction_order:
+                        if not facing_event_object_hits(position, direction, target, distance_limit):
+                            continue
+                        goals.add(node)
+                        directions.setdefault(node, direction)
+                        details.setdefault(node, requirement)
+                        break
+        return goals, directions, details
+
     def route_between_nodes(
         self,
         grid: dict,
@@ -5505,6 +5854,8 @@ class DebugState:
         target_id: int,
         avoid_transitions: bool = True,
         context: dict | None = None,
+        approach_item_id: int | None = None,
+        approach_requirement: dict | None = None,
     ) -> dict:
         context = context if isinstance(context, dict) else None
         grid = context.get("grid") if context else decode_nav_grid(state)
@@ -5515,16 +5866,58 @@ class DebugState:
             return {"ok": False, "status": "no_nav_grid", "target_id": target_id}
         if target is None:
             return {"ok": False, "status": "unknown_target", "target_id": target_id}
-        if not target.get("interactable"):
-            return {"ok": False, "status": "target_inactive", "target_id": target_id}
+        if not target.get("interactable") or int(target.get("state") or 0) <= 0:
+            return {
+                "ok": approach_item_id is not None,
+                "status": "approach_requirement_missing" if approach_item_id is not None else "target_inactive",
+                "target_id": target_id,
+            }
         destination_payload = self.transition_destination_for_state(state, target_id) if transition_candidate(target) else {}
         start = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         if start is None or not nav_bit(grid, start):
             return {"ok": False, "status": "bad_start", "target_id": target_id}
 
-        kind = trigger_kind(int(target.get("trigger_mode") or 0))
+        native_kind = trigger_kind(int(target.get("trigger_mode") or 0))
+        kind = native_kind
+        approach_details_by_node: dict[tuple[int, int], dict] = {}
         touch_nodes_by_id = context.get("touch_nodes_by_id") if context else None
-        if kind == "touch" and isinstance(touch_nodes_by_id, dict):
+        if approach_item_id is not None or isinstance(approach_requirement, dict):
+            requirements = (
+                [approach_requirement]
+                if isinstance(approach_requirement, dict)
+                else self.approach_requirements_by_target(state, approach_item_id).get(target_id, [])
+            )
+            if not requirements:
+                return {
+                    "ok": True,
+                    "target_id": target_id,
+                    "status": "approach_requirement_missing",
+                    "kind": native_kind,
+                }
+            kind = "approach"
+            goals, search_dirs, approach_details_by_node = self.approach_goal_nodes(
+                state,
+                grid,
+                target,
+                requirements,
+            )
+        elif kind == "none":
+            requirements = self.approach_requirements_by_target(state).get(target_id, [])
+            if not requirements:
+                return {
+                    "ok": True,
+                    "target_id": target_id,
+                    "status": "unreachable_static",
+                    "kind": kind,
+                }
+            kind = "approach"
+            goals, search_dirs, approach_details_by_node = self.approach_goal_nodes(
+                state,
+                grid,
+                target,
+                requirements,
+            )
+        elif kind == "touch" and isinstance(touch_nodes_by_id, dict):
             goals = set(touch_nodes_by_id.get(target_id, set()))
             search_dirs = {}
         else:
@@ -5555,7 +5948,11 @@ class DebugState:
                 if int(obj.get("id") or 0) != target_id
             }
         else:
-            blocking_by_node = self.blocking_nodes_by_object(state, grid, target_id)
+            blocking_by_node = self.blocking_nodes_by_object(
+                state,
+                grid,
+                None if kind == "approach" else target_id,
+            )
         dynamic_blocked = set(blocking_by_node)
         blocked = set(transition_blocked) | dynamic_blocked
         route = self.route_between_nodes(grid, start, goals, blocked)
@@ -5596,16 +5993,16 @@ class DebugState:
                 **destination_payload,
             }
 
-        action = "touch" if kind == "touch" else "search"
+        action = "touch" if kind == "touch" else "approach" if kind == "approach" else "search"
         result = {
             "ok": True,
             "target_id": target_id,
-            "status": "transition" if transition_candidate(target) else "reachable",
+            "status": "transition" if kind != "approach" and transition_candidate(target) else "reachable",
             "kind": kind,
             "action": action,
             "route": route,
         }
-        if transition_candidate(target):
+        if kind != "approach" and transition_candidate(target):
             result["transition_candidate"] = True
             result.update(destination_payload)
         if kind == "search":
@@ -5615,9 +6012,30 @@ class DebugState:
                 route_goal = grid_node(grid, int(route_nodes[-1]["x"]), int(route_nodes[-1]["y"]))
             direction = search_dirs.get(route_goal, int(state.get("party_direction") or 0))
             result["required_direction"] = DIR_TO_BUTTON.get(direction, "down")
+        elif kind == "approach":
+            route_nodes = route.get("nodes") or []
+            route_goal = None
+            if route_nodes:
+                route_goal = grid_node(grid, int(route_nodes[-1]["x"]), int(route_nodes[-1]["y"]))
+            direction = search_dirs.get(route_goal, int(state.get("party_direction") or 0))
+            requirement = approach_details_by_node.get(route_goal, {})
+            result["required_direction"] = DIR_TO_BUTTON.get(direction, "down")
+            result["approach"] = dict(requirement)
+            result["affordance"] = {
+                **dict(requirement),
+                "kind": "item_approach",
+                "status": result["status"],
+                "steps": int(route.get("steps") or 0),
+                "required_direction": result["required_direction"],
+            }
         return result
 
-    def navigation_step(self, state: dict, target_id: int) -> dict:
+    def navigation_step(
+        self,
+        state: dict,
+        target_id: int,
+        approach_item_id: int | None = None,
+    ) -> dict:
         state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             return {"ok": False, "status": "state_stale", "state_file": state_info, "target_id": target_id}
@@ -5700,7 +6118,12 @@ class DebugState:
                         "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
                     }
 
-        route = self.route_to_object(state, target_id, avoid_transitions=True)
+        route = self.route_to_object(
+            state,
+            target_id,
+            avoid_transitions=True,
+            approach_item_id=approach_item_id,
+        )
         if route.get("status") == "blocked_by_interactable":
             interaction = route.get("interaction") or {}
             interaction_route = interaction.get("route") or {}
@@ -5790,6 +6213,51 @@ class DebugState:
 
         moves = route.get("route", {}).get("moves") or []
         if not moves:
+            if route.get("kind") == "approach":
+                target = self.target_object(state, target_id)
+                pos = state.get("party_position") or {}
+                current_pos = (int(pos.get("x") or 0), int(pos.get("y") or 0))
+                current_direction = int(state.get("party_direction") or 0)
+                approach = route.get("approach") if isinstance(route.get("approach"), dict) else {}
+                distance_limit = int(approach.get("distance_limit") or 0)
+                if target is not None and facing_event_object_hits(
+                    current_pos,
+                    current_direction,
+                    target,
+                    distance_limit,
+                ):
+                    return {
+                        "ok": True,
+                        "status": "approached",
+                        "target_id": target_id,
+                        "route": route.get("route"),
+                        "required_direction": DIR_TO_BUTTON.get(current_direction, "down"),
+                        "approach": approach,
+                        "affordance": route.get("affordance"),
+                    }
+                required_direction = route.get("required_direction")
+                current_direction_button = DIR_TO_BUTTON.get(current_direction, "down")
+                if required_direction and required_direction != current_direction_button:
+                    action = self.write_action([required_direction], 1)
+                    return {
+                        "ok": True,
+                        "status": "facing",
+                        "target_id": target_id,
+                        "action": action,
+                        "route": route.get("route"),
+                        "required_direction": required_direction,
+                        "approach": approach,
+                        "affordance": route.get("affordance"),
+                    }
+                return {
+                    "ok": False,
+                    "status": "needs_direction",
+                    "target_id": target_id,
+                    "route": route.get("route"),
+                    "required_direction": required_direction,
+                    "approach": approach,
+                    "affordance": route.get("affordance"),
+                }
             if route.get("kind") == "search":
                 target = self.target_object(state, target_id)
                 pos = state.get("party_position") or {}
@@ -5845,6 +6313,17 @@ class DebugState:
                     "route": route.get("route"),
                     "required_direction": required_direction,
                 }
+            if (
+                route.get("kind") == "touch"
+                and self.pending_touch_route_confirmation(state, target_id) is not None
+            ):
+                return {
+                    "ok": True,
+                    "status": "transition_observing",
+                    "target_id": target_id,
+                    "stable_snapshots": 0,
+                    "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
+                }
             return {"ok": True, "status": "arrived", "target_id": target_id, "route": route.get("route")}
 
         move = moves[0]
@@ -5894,6 +6373,10 @@ class DebugState:
             "remaining_steps": remaining_steps,
             "route": route.get("route"),
         }
+        if route.get("approach") is not None:
+            result["approach"] = route.get("approach")
+        if route.get("affordance") is not None:
+            result["affordance"] = route.get("affordance")
         if observation_id:
             result["observation_id"] = observation_id
         return result
@@ -6102,12 +6585,14 @@ class DebugState:
             start,
             dynamic_blocked,
         )
+        approach_requirements = self.approach_requirements_by_target(state)
         interaction_by_blocker_id: dict[int, dict | None] = {}
 
         targets = []
         for obj in interactables:
             target_id = int(obj.get("id") or 0)
-            kind = trigger_kind(int(obj.get("trigger_mode") or 0))
+            native_kind = trigger_kind(int(obj.get("trigger_mode") or 0))
+            kind = native_kind
             status = "unreachable_static"
             steps = None
             required_direction = None
@@ -6117,8 +6602,31 @@ class DebugState:
             relaxed_goal: tuple[int, int] | None = None
             relaxed_terminal_parent: tuple[int, int] | None = None
             no_touch_goal: tuple[int, int] | None = None
+            approach_details_by_node: dict[tuple[int, int], dict] = {}
+            approach = None
 
-            if kind == "search":
+            if kind == "none" and approach_requirements.get(target_id):
+                kind = "approach"
+                goals, approach_dirs, approach_details_by_node = self.approach_goal_nodes(
+                    state,
+                    grid,
+                    obj,
+                    approach_requirements[target_id],
+                )
+                strict_goal = next((node for node in safe_order if node in goals), None)
+                relaxed_goal = next((node for node in no_dynamic_order if node in goals), None)
+                no_touch_goal = next((node for node in no_touch_order if node in goals), None)
+                selected_goal = strict_goal or relaxed_goal or no_touch_goal
+                if selected_goal is not None:
+                    direction = approach_dirs.get(selected_goal, int(state.get("party_direction") or 0))
+                    required_direction = DIR_TO_BUTTON.get(direction, "down")
+                    approach = dict(approach_details_by_node.get(selected_goal) or {})
+                elif approach_requirements[target_id]:
+                    approach = dict(approach_requirements[target_id][0])
+                if strict_goal is not None:
+                    status = "reachable"
+                    steps = safe_distance[strict_goal]
+            elif kind == "search":
                 goals, search_dirs = self.goal_nodes(state, grid, obj)
                 strict_goal = next((node for node in safe_order if node in goals), None)
                 relaxed_goal = next((node for node in no_dynamic_order if node in goals), None)
@@ -6217,6 +6725,28 @@ class DebugState:
                 target.update(self.transition_destination_for_state(state, target_id, transition_context))
             if blocker is not None:
                 target["blocker"] = blocker
+            if approach is not None:
+                target["approach"] = approach
+            affordances = self.item_approach_affordances(
+                state,
+                target_id,
+                approach_requirements.get(target_id, []),
+                grid=grid,
+                reachable_order=safe_order,
+                reachable_distance=safe_distance,
+                fallback_order=no_touch_order,
+            )
+            if affordances:
+                target["affordances"] = affordances
+                if native_kind == "none":
+                    selected = affordances[0]
+                    target.update({
+                        "kind": "approach",
+                        "status": selected["status"],
+                        "steps": selected["steps"],
+                        "required_direction": selected["required_direction"],
+                        "approach": selected,
+                    })
             target = self.decorate_target_affordance(state, target, affordance_context)
             targets.append(target)
         return {
@@ -7672,37 +8202,70 @@ class DebugState:
             result["equipment_comparisons"] = self.equipment_comparisons(state, candidate)
         return result
 
-    def agent_inventory(self, state: dict, limit: int = 100) -> dict:
+    @staticmethod
+    def compact_inventory_item(item: dict) -> dict:
+        return {
+            "slot": item.get("slot"),
+            "item_id": item.get("item_id"),
+            "name": item.get("name"),
+            "amount": item.get("amount"),
+            "amount_in_use": item.get("amount_in_use"),
+            "equipped_count": item.get("equipped_count"),
+            "usable": item.get("usable"),
+            "throwable": item.get("throwable"),
+            "apply_to_all": item.get("apply_to_all"),
+            "target_mode": (
+                "implicit_event_context"
+                if item.get("apply_to_all") is True
+                else "party_role"
+            ),
+            "sellable": item.get("sellable"),
+            "consuming": item.get("consuming"),
+            "available_amount": max(
+                0,
+                int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
+            ),
+            "flags": item.get("flags"),
+            "price": item.get("price"),
+            "effect_available": bool(item.get("use_effect") or item.get("throw_effect")),
+        }
+
+    def agent_inventory(
+        self,
+        state: dict,
+        limit: int = 100,
+        item_id: int | None = None,
+    ) -> dict:
         inventory = state.get("inventory") if isinstance(state.get("inventory"), list) else []
+        if item_id is not None:
+            try:
+                normalized_item_id = int(item_id)
+            except (TypeError, ValueError):
+                normalized_item_id = 0
+            candidate = next(
+                (
+                    item for item in inventory
+                    if isinstance(item, dict)
+                    and int(item.get("item_id") or 0) == normalized_item_id
+                ),
+                None,
+            )
+            if normalized_item_id <= 0 or not isinstance(candidate, dict):
+                return {
+                    "ok": False,
+                    "error": "item_not_in_inventory",
+                    "item_id": normalized_item_id,
+                }
+            detail = self.compact_inventory_item(candidate)
+            for key in ("script_on_use", "script_on_throw", "use_effect", "throw_effect"):
+                if key in candidate:
+                    detail[key] = candidate.get(key)
+            return {"ok": True, "item": detail}
         items = []
         for item in inventory[:limit]:
             if not isinstance(item, dict):
                 continue
-            items.append(
-                {
-                    "slot": item.get("slot"),
-                    "item_id": item.get("item_id"),
-                    "name": item.get("name"),
-                    "amount": item.get("amount"),
-                    "amount_in_use": item.get("amount_in_use"),
-                    "equipped_count": item.get("equipped_count"),
-                    "usable": item.get("usable"),
-                    "apply_to_all": item.get("apply_to_all"),
-                    "target_mode": (
-                        "implicit_event_context"
-                        if item.get("apply_to_all") is True
-                        else "party_role"
-                    ),
-                    "sellable": item.get("sellable"),
-                    "consuming": item.get("consuming"),
-                    "available_amount": max(
-                        0,
-                        int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
-                    ),
-                    "flags": item.get("flags"),
-                    "price": item.get("price"),
-                }
-            )
+            items.append(self.compact_inventory_item(item))
         return {"inventory": items, "total": len(inventory), "returned": len(items)}
 
     @staticmethod
@@ -7997,7 +8560,11 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "get_navigation",
-                    "description": "返回紧凑的可交互候选、路线成本、交互状态和已知传送目的地。",
+                    "description": (
+                        "返回紧凑的可交互候选、路线成本、交互状态和已知传送目的地。"
+                        "affordances 中 kind=item_approach 表示物品脚本要求靠近该对象；"
+                        "选择该路线时提交 navigate 并携带对应 item_id。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 40, "default": 20}},
@@ -8070,12 +8637,18 @@ class DebugState:
                     "name": "get_inventory",
                     "description": (
                         "返回当前只读物品栏详情，包括可用数量、目标派发模式和是否消耗。"
+                        "指定 item_id 时返回脚本解析出的 use_effect/throw_effect；"
+                        "preview_complete=false 表示存在未解析或条件效果，不可把它当作完整描述。"
                         "target_mode=implicit_event_context 时用 target='all'，底层以 0xFFFF 沿用最近事件对象；"
-                        "兼容字段名 all 不一定表示全队效果。用途仍需根据名称与上下文谨慎推断。"
+                        "兼容字段名 all 不一定表示全队效果。"
                     ),
                     "parameters": {
                         "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 40}},
+                        "properties": {
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 40},
+                            "item_id": {"type": "integer", "minimum": 1},
+                        },
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -8195,6 +8768,7 @@ class DebugState:
             "to_logical_room_id", "dialog_feedback_state", "recent_dialog_feedback",
             "stale_dialog_feedback", "previous_interaction_outcome",
             "known_destination_room_id", "known_destination_room_key",
+            "approach", "affordances",
         )
         targets = [
             {key: target.get(key) for key in target_keys if target.get(key) is not None}
@@ -8256,12 +8830,13 @@ class DebugState:
             route = self.route_to_object(state, target_id, avoid_transitions=True)
             route.update(self.target_affordance(state, target_id))
             route_keys = (
-                "ok", "status", "steps", "remaining_steps", "segment_steps",
+                "ok", "kind", "status", "steps", "remaining_steps", "segment_steps",
                 "required_direction", "move", "blocker", "agent_priority",
                 "interaction_state", "known_destination", "known_destination_room_id",
                 "known_destination_observed_at", "destination_priority",
                 "destination_exploration", "transition_key", "to_room_id",
                 "to_semantic_room", "confidence", "returns_to_recent_room",
+                "approach",
             )
             return {
                 "ok": True,
@@ -8288,7 +8863,14 @@ class DebugState:
             return result
         if name == "get_inventory":
             limit = self.agent_tool_limit(arguments.get("limit"), 40, 100)
-            return {"ok": True, **self.agent_inventory(state, limit=limit)}
+            result = self.agent_inventory(
+                state,
+                limit=limit,
+                item_id=arguments.get("item_id"),
+            )
+            if "ok" in result:
+                return result
+            return {"ok": True, **result}
         if name == "get_shop":
             return self.agent_shop(state, arguments.get("item_id"))
         if name == "get_equipment":
@@ -8503,6 +9085,9 @@ class DebugState:
             "choice.active=true 时必须阅读 prompt 和 options，并提交 "
             "{action:'select_choice',option_index:<index>,reason:'...'}；不得依赖默认项。"
             "检查对象或进入传送时提交 {action:'navigate',target_id:<id>,reason:'...'}；服务端根据目标推导语义。"
+            "选择 affordances 中的 item_approach 时提交 "
+            "{action:'navigate',target_id:<id>,item_id:<affordance.item_id>,reason:'...'}；"
+            "该动作只移动到满足物品脚本距离的站位并调整朝向，完成后仍需另行提交 use_item。"
             "等待时提交 {action:'wait',reason:'...'}。"
             "shop.active=true 时先调用 get_shop；购买一件商品提交 "
             "{action:'buy_item',item_id:<id>,reason:'...'}，不购买并退出提交 "
@@ -8561,7 +9146,8 @@ class DebugState:
             "应优先考虑 submit_decision {action:'use_item',item_id:<id>,target:'all',reason:'...'}；这会让 0xFFFF 使用脚本沿用最近 NPC/事件对象上下文。"
             "不要因 target_object_id 被拒绝就推断剧情物品只能靠重复 NPC 交互自动使用。进程重启或载入存档不会恢复最近事件对象，"
             "因此应先重新与目标 NPC 交互，再使用这种物品。普通全局效果脚本可能忽略事件上下文，不要把所有 apply_to_all 物品都视为剧情物品。"
-            "对于任何明确的 search/touch 或 transition 目标，提交 navigate 和 target_id。"
+            "对于任何明确的 search/touch 或 transition 目标，提交 navigate 和 target_id；"
+            "若选择同一目标上的 item_approach affordance，必须同时提交该 affordance 的 item_id。"
             "不要建议无目标的房间探索；如果没有明确目标，提交 wait。"
             "使用 get_navigation 比较传送目的地；只对你认真考虑的一两个目标调用 inspect_target。"
             "解释所选目标背后的权衡，包括相关的陈旧反馈、重复/无效果交互风险、离开房间风险和回退风险。"
@@ -8624,9 +9210,37 @@ class DebugState:
             target_id = int(raw["target_id"])
             target = next((item for item in state.get("objects") or [] if str(item.get("id")) == str(target_id)), None)
             is_transition = bool(target and transition_candidate(target))
-            intent = "enter_transition" if is_transition else "inspect_target"
-            preview = self.action_preview("navigation_step", {"id": target_id})
-            evidence["target"] = {"id": target_id, "transition_candidate": is_transition}
+            navigation_target = next(
+                (
+                    item for item in self.navigation(state).get("targets") or []
+                    if int(item.get("id") or 0) == target_id
+                ),
+                {},
+            )
+            approach = navigation_target.get("approach") if isinstance(navigation_target.get("approach"), dict) else {}
+            affordances = navigation_target.get("affordances") if isinstance(navigation_target.get("affordances"), list) else []
+            args = {"id": target_id}
+            approach_item_id = int(raw.get("item_id") or 0)
+            if approach_item_id > 0:
+                args["item_id"] = approach_item_id
+            matching_affordance = next(
+                (
+                    entry for entry in affordances
+                    if isinstance(entry, dict) and int(entry.get("item_id") or 0) == approach_item_id
+                ),
+                None,
+            )
+            intent = "approach_target" if matching_affordance is not None else "enter_transition" if is_transition else "inspect_target"
+            preview = self.action_preview("navigation_step", args)
+            evidence["target"] = {
+                "id": target_id,
+                "transition_candidate": is_transition,
+                "kind": navigation_target.get("kind"),
+            }
+            if approach:
+                evidence["approach"] = approach
+            if affordances:
+                evidence["affordances"] = affordances
             risk = "May leave the current room." if is_transition else "The target and route will be revalidated before movement."
         elif action == "use_item":
             args = {"item_id": int(raw["item_id"])}
@@ -8713,6 +9327,8 @@ class DebugState:
 
         if action == "navigate" and positive_int("target_id") is None:
             issues.append({"field": "target_id", "code": "invalid_target_id", "message": "navigate requires a positive target_id"})
+        if action == "navigate" and "item_id" in raw and positive_int("item_id") is None:
+            issues.append({"field": "item_id", "code": "invalid_item_id", "message": "navigate approach item_id must be positive"})
         if action == "select_choice" and positive_int("option_index", allow_zero=True) is None:
             issues.append({"field": "option_index", "code": "invalid_option_index", "message": "select_choice requires a non-negative option_index"})
         if action == "use_item":
@@ -8733,7 +9349,7 @@ class DebugState:
             "wait": {"action", "reason"},
             "advance_dialog": {"action", "reason"},
             "select_choice": {"action", "option_index", "reason"},
-            "navigate": {"action", "target_id", "reason"},
+            "navigate": {"action", "target_id", "item_id", "reason"},
             "use_item": {"action", "item_id", "role_id", "target", "reason"},
             "equip_item": {"action", "item_id", "role_id", "reason"},
             "buy_item": {"action", "item_id", "reason"},
@@ -9059,13 +9675,20 @@ class DebugState:
         args = action.get("args") if isinstance(action.get("args"), dict) else {}
         try:
             target_id = int(args.get("id") or 0)
+            approach_item_id = int(args.get("item_id") or 0) or None
         except (TypeError, ValueError):
             target_id = 0
+            approach_item_id = None
         if target_id <= 0:
             return decision
 
         latest_state = self.read_live_state()
-        route = self.route_to_object(latest_state, target_id, avoid_transitions=True)
+        route = self.route_to_object(
+            latest_state,
+            target_id,
+            avoid_transitions=True,
+            approach_item_id=approach_item_id,
+        )
         route_status = route.get("status")
         if route_status in {"reachable", "transition", "blocked_by_interactable"}:
             return decision
@@ -9138,9 +9761,16 @@ class DebugState:
             return self.normalize_dialog_advance_args(args)
         if tool == "navigation_step":
             try:
-                return {"id": int(args.get("id") or args.get("target_id") or 0)}
+                result = {"id": int(args.get("id") or args.get("target_id") or 0)}
             except (TypeError, ValueError):
                 return {"id": 0}
+            try:
+                item_id = int(args.get("item_id") or 0)
+            except (TypeError, ValueError):
+                item_id = 0
+            if item_id > 0:
+                result["item_id"] = item_id
+            return result
         if tool == "use_item":
             try:
                 item_id = int(args.get("item_id") or 0)
@@ -9609,6 +10239,9 @@ class DebugState:
             time.sleep(0.03)
         raise TimeoutError(f"{action} {item_id} {role_id} did not complete")
 
+    def current_action_result(self) -> dict:
+        return read_optional_json(self.action_result_path)
+
     def write_equip_item_action(
         self,
         item_id: int,
@@ -9812,6 +10445,11 @@ class DebugState:
         try:
             battle_generation = int(args.get("battle_generation"))
             command_generation = int(args.get("command_generation"))
+            player_index = (
+                int(args["player_index"])
+                if args.get("player_index") is not None
+                else None
+            )
             object_id = int(args.get("object_id") or 0)
             target_index = int(args.get("target_index", -2))
         except (TypeError, ValueError):
@@ -9819,6 +10457,10 @@ class DebugState:
         if (
             battle_generation != int(battle.get("generation") or 0)
             or command_generation != int(battle.get("command_generation") or 0)
+            or (
+                player_index is not None
+                and player_index != int(battle.get("current_player_index") or 0)
+            )
         ):
             return "stale_battle_command"
         if self.action_pending(state):
@@ -9967,6 +10609,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/navigation/route":
             query = parse_qs(parsed.query)
             target = int((query.get("id") or ["0"])[0])
+            approach_item = int((query.get("item_id") or ["0"])[0]) or None
             state = self.server.state.read_live_state()
             control = self.server.state.control_state(
                 state,
@@ -9981,9 +10624,19 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
             self.server.state.attach_logical_room_fields(state)
-            route = self.server.state.route_to_object(state, target, avoid_transitions=True)
+            route = self.server.state.route_to_object(
+                state,
+                target,
+                avoid_transitions=True,
+                approach_item_id=approach_item,
+            )
             if route.get("status") == "unreachable_static":
-                relaxed = self.server.state.route_to_object(state, target, avoid_transitions=False)
+                relaxed = self.server.state.route_to_object(
+                    state,
+                    target,
+                    avoid_transitions=False,
+                    approach_item_id=approach_item,
+                )
                 if relaxed.get("status") == "reachable":
                     route["status"] = "blocked_by_transition"
                     route["blocked_route"] = relaxed.get("route")
@@ -10228,13 +10881,19 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self.read_body_json()
                 target = int(payload.get("id") or 0)
+                approach_item = int(payload.get("item_id") or 0) or None
                 state = self.server.state.read_live_state()
                 self.server.state.attach_logical_room_fields(state)
-                result = self.server.state.navigation_step(state, target)
+                result = self.server.state.navigation_step(
+                    state,
+                    target,
+                    approach_item_id=approach_item,
+                )
                 self.server.state.append_navigation_diagnostic(
                     "navigation_step",
                     {
                         "target_id": target,
+                        "approach_item_id": approach_item,
                         "ok": bool(result.get("ok")),
                         "status": result.get("status"),
                         "move": result.get("move"),

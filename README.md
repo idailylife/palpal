@@ -263,12 +263,13 @@ creates a new branch session from that exact save point, so decisions made after
 the checkpoint do not leak into the restored game. Only the current Agent bundle
 format is supported.
 
-Set `PALPAL_AGENT_COMPACT_AT_TOKENS` to change the conservative context
-compression threshold (default `128000` estimated tokens). Compression uses a DeepSeek
-summarizer and keeps the two most recent full decision cycles. The UI reports
-cumulative billed tokens, the latest agent-run usage, and a conservative
-estimate of the currently persisted context separately. Token estimates use
-UTF-8 byte size so Chinese output is not severely undercounted.
+Set `PALPAL_AGENT_COMPACT_AT_TOKENS` to change the context compression
+threshold (default `128000` tokens). After each Agent run, PALPAL records the
+exact input-token count returned by DeepSeek for the final model request. If it
+reaches the threshold, compression runs before the next model request, keeps the
+two most recent full decision cycles, and clears the observation until the next
+real request supplies a fresh count. The UI reports cumulative billed tokens,
+the latest agent-run usage, and this latest exact prompt count separately.
 
 The persistent model sees eleven tools: `upsert_task`, `get_tasks`,
 `get_navigation`, `inspect_target`, `get_observations`, `get_shop`,
@@ -282,9 +283,10 @@ archive in pages of at most 6000 characters.
 
 At 96000 estimated context tokens, older tool results are archived until the
 estimate is near 80000 while the six most recent complete tool results remain
-inline. This hysteresis happens before the 128k whole-session summary and avoids
-rewriting the transcript on every turn. There is no permanent macro goal in
-agent instructions or session metadata; an empty task ledger still permits normal exploration.
+inline. This tool-output pressure heuristic remains separate from the exact,
+next-request 128k whole-session compression trigger and avoids rewriting the
+transcript on every turn. There is no permanent macro goal in agent instructions
+or session metadata; an empty task ledger still permits normal exploration.
 After actions, the runtime requires a two-second quiet state before starting the
 next decision.
 

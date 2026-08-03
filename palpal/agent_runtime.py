@@ -88,6 +88,83 @@ class BattleDelegate:
         }
         return self.runtime.emit("battle", phase, summary, payload)
 
+    @staticmethod
+    def _encounter_enemies(battle: dict) -> list[dict]:
+        enemies = []
+        for entry in battle.get("enemies") or []:
+            if not isinstance(entry, dict) or entry.get("present") is False:
+                continue
+            try:
+                object_id = int(entry.get("object_id") or 0)
+                slot_index = int(entry.get("slot_index") or 0)
+            except (TypeError, ValueError):
+                continue
+            if object_id <= 0:
+                continue
+            enemies.append({
+                "slot_index": slot_index,
+                "object_id": object_id,
+                "name": str(entry.get("name") or ""),
+            })
+        return enemies
+
+    def _trigger_context(self, state: dict) -> dict | None:
+        observation = (
+            state.get("trigger_observation")
+            if isinstance(state.get("trigger_observation"), dict)
+            else None
+        )
+        if not observation or observation.get("completed") is not False:
+            return None
+        source = observation.get("source") if isinstance(observation.get("source"), dict) else {}
+        try:
+            generation = int(observation.get("generation") or 0)
+            object_id = int(observation.get("event_object_id") or 0)
+            trigger_script = int(observation.get("trigger_script") or 0)
+            source_scene = int(source.get("scene_id"))
+            source_map = int(source.get("map_id"))
+            state_scene = int(state.get("scene_id"))
+            state_map = int(state.get("map_id"))
+        except (TypeError, ValueError):
+            return None
+        if generation <= 0 or object_id <= 0 or source_scene != state_scene or source_map != state_map:
+            return None
+
+        context = {
+            "relationship": "active_trigger_at_battle_start",
+            "generation": generation,
+            "event_object_id": object_id,
+            "trigger_script": trigger_script,
+            "source": {
+                "scene_id": source_scene,
+                "map_id": source_map,
+                "x": source.get("x"),
+                "y": source.get("y"),
+            },
+        }
+        exploration = self.debug.agent_current_exploration(state)
+        last_route = (
+            exploration.get("last_route")
+            if isinstance(exploration, dict) and isinstance(exploration.get("last_route"), dict)
+            else {}
+        )
+        target = (
+            last_route.get("target_selection")
+            if isinstance(last_route.get("target_selection"), dict)
+            else None
+        )
+        try:
+            route_target_id = int((target or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            route_target_id = 0
+        if target is not None and route_target_id == object_id:
+            context["navigation_target"] = {
+                "id": route_target_id,
+                "kind": target.get("kind"),
+                "status": target.get("status"),
+            }
+        return context
+
     def _begin(self, state: dict) -> dict:
         battle = state["battle"]
         generation = int(battle["generation"])
@@ -102,6 +179,12 @@ class BattleDelegate:
         instruction_count = int(existing.get("instruction_count") or 0) if reusable else 0
         self.before = json.loads(json.dumps(battle, ensure_ascii=False))
         self.actions = list(existing.get("actions") or []) if reusable else []
+        encounter_enemies = (
+            list(existing.get("encounter_enemies") or [])
+            if reusable
+            else self._encounter_enemies(battle)
+        )
+        trigger_context = existing.get("trigger_context") if reusable else self._trigger_context(state)
         control = self._persist_control(
             child_session_id=child_id,
             parent_session_id=self.runtime.state.get("session_id"),
@@ -116,6 +199,8 @@ class BattleDelegate:
             ended_at=None,
             summary=None,
             actions=self.actions,
+            encounter_enemies=encounter_enemies,
+            trigger_context=trigger_context,
         )
         self._emit(
             "started",
@@ -128,23 +213,59 @@ class BattleDelegate:
     def _battle_from(state: dict) -> dict | None:
         return state.get("battle") if isinstance(state.get("battle"), dict) else None
 
-    def _wait_for_control_or_end(self, generation: int) -> dict:
+    @staticmethod
+    def _matching_last_battle(state: dict, generation: int) -> dict | None:
+        last = state.get("last_battle")
+        if not isinstance(last, dict):
+            return None
+        try:
+            return last if int(last.get("generation") or 0) == generation else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _command_window(state: dict) -> dict:
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+        return {
+            "game_instance_id": str(state.get("game_instance_id") or ""),
+            "battle_generation": int(battle.get("generation") or 0),
+            "command_generation": int(battle.get("command_generation") or 0),
+            "player_index": int(battle.get("current_player_index") or 0),
+        }
+
+    def _wait_for_control_or_end(
+        self,
+        generation: int,
+        after_command_generation: int | None = None,
+    ) -> dict:
         deadline = time.monotonic() + BATTLE_CONTROL_TIMEOUT_SECONDS
         while True:
             if self.runtime.cancel_event.is_set():
                 raise RuntimeError("interrupted")
             state = self.debug.snapshot()
+            expected_instance = str(self._control().get("game_instance_id") or "")
+            if (
+                expected_instance
+                and str(state.get("game_instance_id") or "") != expected_instance
+            ):
+                raise RuntimeError("game_instance_changed")
+            if self._matching_last_battle(state, generation) is not None:
+                return state
             battle = self._battle_from(state)
             if battle is None:
-                last = state.get("last_battle")
-                if isinstance(last, dict) and int(last.get("generation") or 0) == generation:
-                    return state
                 if not state.get("in_battle"):
                     return state
             elif int(battle.get("generation") or 0) != generation:
                 raise RuntimeError("battle_generation_changed")
-            elif battle.get("phase") in {"command", "reward"}:
+            elif battle.get("phase") == "reward":
                 return state
+            elif battle.get("phase") == "command":
+                command_generation = int(battle.get("command_generation") or 0)
+                if (
+                    after_command_generation is None
+                    or command_generation > after_command_generation
+                ):
+                    return state
             if time.monotonic() >= deadline:
                 raise RuntimeError("battle_control_timeout")
             time.sleep(0.05)
@@ -205,6 +326,7 @@ class BattleDelegate:
         set_tracing_disabled(disabled=True)
         submitted: dict | None = None
         runtime = self.runtime
+        frozen_window = self._command_window(state)
 
         async def get_battle(_context: Any, _raw: str) -> str:
             self._emit(
@@ -226,6 +348,58 @@ class BattleDelegate:
                 "tool_output",
                 "get_battle returned the latest battle state.",
                 {"tool": "get_battle", "output": output},
+            )
+            return json.dumps(output, ensure_ascii=False)
+
+        async def get_item_details(_context: Any, raw: str) -> str:
+            try:
+                args = runtime._parse_tool_arguments(raw)
+                item_id = int(args.get("item_id") or 0)
+            except (TypeError, ValueError):
+                self._emit(
+                    "tool_called",
+                    "Battle Agent called get_item_details.",
+                    {"tool": "get_item_details", "raw_arguments": raw},
+                )
+                output = {"ok": False, "error": "invalid_item_id"}
+                self._emit(
+                    "tool_output",
+                    "get_item_details rejected invalid arguments.",
+                    {"tool": "get_item_details", "output": output},
+                )
+                return json.dumps(output, ensure_ascii=False)
+            self._emit(
+                "tool_called",
+                "Battle Agent called get_item_details.",
+                {"tool": "get_item_details", "arguments": {"item_id": item_id}},
+            )
+            latest = self.debug.snapshot()
+            output = self.debug.agent_inventory(latest, item_id=item_id)
+            if output.get("ok"):
+                battle = latest.get("battle") if isinstance(latest.get("battle"), dict) else {}
+                legal_actions = [
+                    {
+                        key: action.get(key)
+                        for key in (
+                            "action_type", "object_id", "target_side", "target_mode",
+                            "valid_target_indices", "submission_target_indices",
+                        )
+                        if key in action
+                    }
+                    for action in battle.get("available_actions") or []
+                    if isinstance(action, dict)
+                    and int(action.get("object_id") or 0) == item_id
+                    and action.get("action_type") in {"use_item", "throw_item"}
+                ]
+                output["legal_battle_actions"] = legal_actions
+            self._emit(
+                "tool_output",
+                (
+                    "get_item_details returned structured item effects."
+                    if output.get("ok")
+                    else "get_item_details could not find the item."
+                ),
+                {"tool": "get_item_details", "output": output},
             )
             return json.dumps(output, ensure_ascii=False)
 
@@ -251,14 +425,11 @@ class BattleDelegate:
                 {"tool": "submit_battle_action", "arguments": args},
             )
             try:
-                latest = self.debug.snapshot()
-                battle = latest.get("battle") if isinstance(latest.get("battle"), dict) else {}
                 args = {
                     **args,
-                    "battle_generation": battle.get("generation"),
-                    "command_generation": battle.get("command_generation"),
+                    **frozen_window,
                 }
-                error = self.debug.battle_action_validation_error(latest, args)
+                error = self.debug.battle_action_validation_error(state, args)
             except Exception as exc:
                 self._emit(
                     "tool_output",
@@ -288,6 +459,22 @@ class BattleDelegate:
             description="Read the latest structured battle state and legal actions.",
             params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
             on_invoke_tool=get_battle,
+            strict_json_schema=False,
+        )
+        item_tool = FunctionTool(
+            name="get_item_details",
+            description=(
+                "Read current inventory count, legal battle uses, and structured use/throw "
+                "effects for one item_id. Query this before spending an item when its effect "
+                "is not already known. preview_complete=false means the effect is incomplete."
+            ),
+            params_json_schema={
+                "type": "object",
+                "properties": {"item_id": {"type": "integer", "minimum": 1}},
+                "required": ["item_id"],
+                "additionalProperties": False,
+            },
+            on_invoke_tool=get_item_details,
             strict_json_schema=False,
         )
         submit_tool = FunctionTool(
@@ -331,13 +518,15 @@ class BattleDelegate:
         agent = Agent(
             name="PALPAL battle child",
             instructions=(
-                "You control one PALPAL battle. You only have get_battle and "
-                "submit_battle_action. Preserve scarce MP and consumables when a normal "
+                "You control one PALPAL battle. You have get_battle, get_item_details, and "
+                "submit_battle_action. Query get_item_details before relying on an unfamiliar "
+                "consumable; never infer its effect from the name alone. Preserve scarce MP and consumables when a normal "
                 "attack is sufficient; use healing or stronger actions when survival needs it. "
-                "Never invent targets or actions. Submit exactly one current legal action."
+                "Never invent targets or actions. Choose target_index from the action's "
+                "submission_target_indices and submit exactly one current legal action."
             ),
             model=model,
-            tools=[get_tool, submit_tool],
+            tools=[get_tool, item_tool, submit_tool],
             tool_use_behavior=finish,
             model_settings=ModelSettings(temperature=0.1, include_usage=True),
         )
@@ -358,7 +547,14 @@ class BattleDelegate:
         return submitted
 
     def _summary(self, state: dict, instruction_count: int) -> dict:
-        last = state.get("last_battle") if isinstance(state.get("last_battle"), dict) else {}
+        control = self._control()
+        expected_generation = int(control.get("battle_generation") or 0)
+        candidate = state.get("last_battle") if isinstance(state.get("last_battle"), dict) else {}
+        try:
+            candidate_generation = int(candidate.get("generation") or 0)
+        except (TypeError, ValueError):
+            candidate_generation = 0
+        last = candidate if candidate_generation == expected_generation else {}
         result = str(last.get("result") or "terminated")
         players = []
         for player in last.get("players") or []:
@@ -376,11 +572,50 @@ class BattleDelegate:
             if action.get("action_type") in {"use_item", "throw_item"}:
                 key = str(int(action.get("object_id") or 0))
                 used_items[key] = used_items.get(key, 0) + 1
+        native_enemies = []
+        for entry in last.get("enemies") or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                object_id = int(entry.get("object_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if object_id <= 0:
+                continue
+            native_enemies.append({
+                "object_id": object_id,
+                "name": str(entry.get("name") or ""),
+            })
+        fallback_enemies = []
+        for entry in control.get("encounter_enemies") or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                object_id = int(entry.get("object_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if object_id <= 0:
+                continue
+            fallback_enemies.append({
+                "object_id": object_id,
+                "name": str(entry.get("name") or ""),
+            })
+        enemy_details = native_enemies or fallback_enemies
+        enemy_identity_source = (
+            "last_battle"
+            if native_enemies
+            else "battle_start_fallback"
+            if fallback_enemies
+            else "unavailable"
+        )
         return {
-            "battle_generation": last.get("generation") or self._control().get("battle_generation"),
+            "battle_generation": last.get("generation") or expected_generation,
             "result": result,
             "is_boss": bool(last.get("is_boss")),
-            "enemies": [entry.get("name") for entry in last.get("enemies") or [] if isinstance(entry, dict)],
+            "enemies": [entry["name"] for entry in enemy_details],
+            "enemy_details": enemy_details,
+            "enemy_identity_source": enemy_identity_source,
+            "trigger_context": control.get("trigger_context"),
             "instruction_count": instruction_count,
             "duration_ms": last.get("duration_ms"),
             "players": players,
@@ -427,7 +662,16 @@ class BattleDelegate:
         while True:
             state = await asyncio.to_thread(self._wait_for_control_or_end, generation)
             battle = self._battle_from(state)
-            if battle is None:
+            if (
+                battle is None
+                or int(battle.get("generation") or 0) != generation
+                or self._matching_last_battle(state, generation) is not None
+            ):
+                if (
+                    battle is not None
+                    and self._matching_last_battle(state, generation) is None
+                ):
+                    raise RuntimeError("battle_generation_changed")
                 summary = self._summary(state, int(self._control().get("instruction_count") or 0))
                 self._persist_control(
                     status="completed",
@@ -456,16 +700,37 @@ class BattleDelegate:
                 {"instruction": count + 1, "feedback": feedback},
             )
             native_action_started = False
+            frozen_window = self._command_window(state)
             try:
                 args = await self._provider_action(state, feedback)
                 latest = await asyncio.to_thread(self.debug.snapshot)
+                latest_window = self._command_window(latest)
+                if latest_window["game_instance_id"] != frozen_window["game_instance_id"]:
+                    raise RuntimeError("game_instance_changed")
                 latest_battle = self._battle_from(latest)
                 if latest_battle is None:
                     continue
+                if latest_window["battle_generation"] != frozen_window["battle_generation"]:
+                    if self._matching_last_battle(latest, generation) is not None:
+                        continue
+                    raise RuntimeError("battle_generation_changed")
+                if (
+                    latest_window["command_generation"] != frozen_window["command_generation"]
+                    or latest_window["player_index"] != frozen_window["player_index"]
+                ):
+                    self._emit(
+                        "resample",
+                        "Battle decision became stale before submission; sampling the current command window.",
+                        {"expected": frozen_window, "current": latest_window},
+                    )
+                    feedback = (
+                        "The command window advanced while deciding. Discard the old decision, "
+                        "reread the current battle, and submit one legal action."
+                    )
+                    continue
                 args = {
                     **args,
-                    "battle_generation": latest_battle.get("generation"),
-                    "command_generation": latest_battle.get("command_generation"),
+                    **frozen_window,
                 }
                 self._emit(
                     "tool_called",
@@ -476,21 +741,46 @@ class BattleDelegate:
                 result = await asyncio.to_thread(self.debug.write_battle_action, args)
                 self._emit(
                     "tool_output",
-                    "Native battle action completed.",
+                    "Native battle action accepted.",
                     {"tool": "native_battle_action", "output": result},
                 )
             except Exception as exc:
+                decision_failed = str(exc) == "submit_battle_action_not_called"
+                stale_command = str(exc) == "stale_battle_command"
                 if native_action_started:
                     self._emit(
                         "tool_output",
-                        "Native battle action failed.",
+                        (
+                            "Native battle action became stale before acceptance."
+                            if stale_command
+                            else "Native battle action failed."
+                        ),
                         {"tool": "native_battle_action", "output": {"ok": False, "error": str(exc)}},
                     )
+                if stale_command:
+                    self._emit(
+                        "resample",
+                        "The native command window advanced before the action write; no action was sent.",
+                        {"error": "stale_battle_command"},
+                    )
+                    feedback = (
+                        "The command window advanced before native acceptance. Reread the current "
+                        "battle and submit one legal action."
+                    )
+                    continue
                 invalid += 1
                 self._emit(
                     "retry",
-                    f"Battle action attempt {invalid} failed; replanning.",
-                    {"attempt": invalid, "error": str(exc)},
+                    (
+                        f"Battle decision attempt {invalid} did not submit an action; replanning."
+                        if decision_failed
+                        else f"Battle action attempt {invalid} failed; replanning."
+                    ),
+                    {
+                        "attempt": invalid,
+                        "error": str(exc),
+                        "failure_stage": "decision" if decision_failed else "execution",
+                    },
                 )
                 if invalid >= 3:
                     raise RuntimeError("battle_replan_exhausted") from exc
@@ -511,7 +801,15 @@ class BattleDelegate:
                 phase="resolving",
                 actions=self.actions,
             )
-            feedback = "The action was accepted. Wait for the next control window."
+            await asyncio.to_thread(
+                self._wait_for_control_or_end,
+                generation,
+                int(frozen_window["command_generation"]),
+            )
+            feedback = (
+                "The previous action was accepted. A new command window is ready now; "
+                "reread the current battle and submit exactly one legal action."
+            )
 
 
 class AgentRuntime:
@@ -573,7 +871,7 @@ class AgentRuntime:
             "last_execution": None,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "last_request_usage": {},
-            "context_estimate_tokens": 0,
+            "last_prompt_tokens": None,
             "compactions": 0,
             "stop_reason": reason,
             "created_at": now,
@@ -604,7 +902,10 @@ class AgentRuntime:
             self._persist(value)
             self._event_for(value, "pause", "paused", "Server restarted; automatic play did not resume.")
         value.setdefault("last_request_usage", {})
-        value.setdefault("context_estimate_tokens", 0)
+        value.setdefault("last_prompt_tokens", None)
+        # Older sessions exposed a local byte-size estimate as if it were context
+        # usage. Never migrate that approximation into the provider-observed field.
+        value.pop("context_estimate_tokens", None)
         value.setdefault("game_instance_id", None)
         value.setdefault("parent_session_id", None)
         value.setdefault("checkpoint_id", None)
@@ -762,7 +1063,7 @@ class AgentRuntime:
         compact = {key: state.get(key) for key in (
             "session_id", "model", "status", "phase", "turn", "run_turn",
             "max_turns", "stop_reason", "usage", "compactions", "last_event_seq",
-            "last_request_usage", "context_estimate_tokens", "game_instance_id",
+            "last_request_usage", "last_prompt_tokens", "game_instance_id",
             "parent_session_id", "checkpoint_id", "restored_from_session_id",
         )}
         compact["equipment_review"] = {
@@ -1249,7 +1550,7 @@ class AgentRuntime:
             )
             for key in (
                 "model", "turn", "max_turns", "pending_decision", "last_execution",
-                "usage", "last_request_usage", "context_estimate_tokens", "compactions",
+                "usage", "last_request_usage", "last_prompt_tokens", "compactions",
                 "equipment_review",
             ):
                 if key in control:
@@ -1517,7 +1818,10 @@ class AgentRuntime:
                         )
                         return
                     feedback = (
-                        "Battle completed; resume the story from this deterministic summary:\n"
+                        "Battle completed; resume the story from this deterministic summary. "
+                        "enemy_details/enemies are the authoritative enemy identities. "
+                        "trigger_context only identifies a map object or script active when the battle began; "
+                        "never describe that trigger object as an enemy unless enemy_details independently says so:\n"
                         + json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
                     )
                     continue
@@ -1799,6 +2103,10 @@ exploration value, and maintained local tasks to choose the next action.
             }
             output["usage"] = request_usage
             self.state["last_request_usage"] = request_usage
+            last_prompt_tokens = self._last_prompt_tokens_from_usage(usage)
+            if last_prompt_tokens is not None:
+                self.state["last_prompt_tokens"] = last_prompt_tokens
+            self._persist()
         await self._sanitize_sdk_session(session)
         output = self.debug.attach_decision_context(state, output)
         return output
@@ -1806,18 +2114,20 @@ exploration value, and maintained local tasks to choose the next action.
     async def _maybe_compact_sdk(self, session: Any, client: Any, next_prompt: str) -> None:
         await self._sanitize_sdk_session(session, next_prompt=next_prompt)
         threshold = self._compact_at_tokens()
-        items = await session.get_items()
-        fixed_overhead = self.debug.agent_system_prompt() + self.debug.agent_policy_prompt() + json.dumps(self.debug.agent_tool_specs(), ensure_ascii=False)
-        estimate = self._estimate_context_tokens(items, next_prompt + fixed_overhead)
-        self.state["context_estimate_tokens"] = estimate
-        self._persist()
-        if estimate < max(1000, threshold):
+        observed_tokens = self.state.get("last_prompt_tokens")
+        if not isinstance(observed_tokens, int) or observed_tokens < max(1000, threshold):
             return
+        items = await session.get_items()
         if len(items) < 6:
             return
         if self.cancel_event.is_set():
             raise RuntimeError("interrupted")
-        self.emit("compression", "starting", "Context compression started.", {"estimated_tokens": estimate, "items": len(items)})
+        self.emit(
+            "compression",
+            "starting",
+            "Context compression started.",
+            {"observed_prompt_tokens": observed_tokens, "items": len(items)},
+        )
         recent_start = self._recent_cycle_start(items, cycles=2)
         if recent_start <= 0:
             return
@@ -1856,7 +2166,9 @@ exploration value, and maintained local tasks to choose the next action.
             await session.add_items(items)
             raise
         self.state["compactions"] = int(self.state.get("compactions") or 0) + 1
-        self.state["context_estimate_tokens"] = self._estimate_context_tokens(replacement, next_prompt + fixed_overhead)
+        # The replacement has not been sent to DeepSeek yet, so its exact token
+        # count is intentionally unknown until the next real model request.
+        self.state["last_prompt_tokens"] = None
         self._persist()
         self.emit("compression", "completed", "Context compression completed.", {"kept_recent_items": len(items) - recent_start, "kept_recent_cycles": 2})
 
@@ -1882,6 +2194,20 @@ exploration value, and maintained local tasks to choose the next action.
                 normalized[key] = int(value)
         if normalized:
             self.state["last_request_usage"] = normalized
+
+    @staticmethod
+    def _last_prompt_tokens_from_usage(usage: Any) -> int | None:
+        """Return the provider count for the final model request in one Agent run."""
+        entries = getattr(usage, "request_usage_entries", None)
+        if isinstance(entries, list) and entries:
+            value = getattr(entries[-1], "input_tokens", None)
+        elif int(getattr(usage, "requests", 0) or 0) == 1:
+            value = getattr(usage, "input_tokens", None)
+        else:
+            return None
+        if not isinstance(value, (int, float)) or int(value) <= 0:
+            return None
+        return int(value)
 
     @staticmethod
     def _estimate_context_tokens(items: list[dict], next_prompt: str) -> int:
@@ -1976,8 +2302,6 @@ exploration value, and maintained local tasks to choose the next action.
                 estimate = self._estimate_context_tokens(replacement, next_prompt + fixed_overhead)
 
         if not changed:
-            self.state["context_estimate_tokens"] = estimate
-            self._persist()
             return
         try:
             await session.clear_session()
@@ -1986,11 +2310,6 @@ exploration value, and maintained local tasks to choose the next action.
             await session.clear_session()
             await session.add_items(items)
             raise
-        self.state["context_estimate_tokens"] = self._estimate_context_tokens(
-            replacement,
-            next_prompt + fixed_overhead,
-        )
-        self._persist()
 
     def _tool_output_needs_archive(self, output: str) -> bool:
         return (
@@ -2128,6 +2447,7 @@ exploration value, and maintained local tasks to choose the next action.
         if tool not in EXECUTABLE_TOOLS:
             raise RuntimeError(f"unsupported_action:{tool}")
         started = _now()
+        matched_item_object = None
         self.emit("action", "validating", f"Validated {tool}.", {"tool": tool, "args": args})
         if tool == "press_buttons":
             buttons = args.get("buttons") or []
@@ -2146,8 +2466,24 @@ exploration value, and maintained local tasks to choose the next action.
             )
             after = self._wait_action_and_stable(action=action_result)
         elif tool == "use_item":
+            matched_item_object = self.debug.matched_item_event_object(
+                before,
+                int(args.get("item_id") or 0),
+            )
             action_result = self.debug.write_use_item_action(args.get("item_id"), args.get("role_id"), args.get("target"))
             after = self._wait_action_and_stable(action=action_result)
+            native_result = self.debug.current_action_result()
+            try:
+                native_item_id = int(native_result.get("item_id") or 0)
+            except (TypeError, ValueError):
+                native_item_id = 0
+            if native_result.get("action") != "use_item" or native_item_id != int(args.get("item_id") or 0):
+                native_result = None
+            action_result = {
+                **action_result,
+                **self.debug.item_object_effect_observation(before, after, matched_item_object),
+                **({"result": native_result} if isinstance(native_result, dict) else {}),
+            }
         elif tool == "equip_item":
             action_result = self.debug.write_equip_item_action(
                 args.get("item_id"),
@@ -2162,7 +2498,10 @@ exploration value, and maintained local tasks to choose the next action.
             )
             after = self._wait_action_and_stable(action=action_result)
         else:
-            action_result = self._navigate(int(args.get("id") or 0))
+            action_result = self._navigate(
+                int(args.get("id") or 0),
+                int(args.get("item_id") or 0) or None,
+            )
             after = self._wait_state_quiet()
         observation_id = action_result.get("observation_id") if isinstance(action_result, dict) else None
         observation = self.debug.observations.consume(observation_id, owner="navigation")
@@ -2333,11 +2672,11 @@ exploration value, and maintained local tasks to choose the next action.
             time.sleep(0.1)
         raise RuntimeError("state_stability_timeout")
 
-    def _navigate(self, target_id: int) -> dict:
+    def _navigate(self, target_id: int, approach_item_id: int | None = None) -> dict:
         if target_id <= 0:
             raise RuntimeError("navigation_target_missing")
         progress = []
-        terminal = {"arrived", "transitioned", "interacting"}
+        terminal = {"arrived", "approached", "transitioned", "interacting"}
         observing = {"transition_observing", "waiting_for_control"}
         no_progress_key = None
         no_progress_count = 0
@@ -2345,7 +2684,14 @@ exploration value, and maintained local tasks to choose the next action.
             if self.cancel_event.is_set():
                 raise RuntimeError("interrupted")
             state = self.debug.snapshot()
-            result = self.debug.navigation_step(state, target_id)
+            if approach_item_id is None:
+                result = self.debug.navigation_step(state, target_id)
+            else:
+                result = self.debug.navigation_step(
+                    state,
+                    target_id,
+                    approach_item_id=approach_item_id,
+                )
             progress.append({key: result.get(key) for key in ("status", "move", "segment_steps", "remaining_steps", "required_direction", "observation_id")})
             self.emit("navigation", "progress", f"Navigation step {step}: {result.get('status')}.", {"step": step, "target_id": target_id, "result": progress[-1]})
             status = result.get("status")
@@ -2443,6 +2789,11 @@ exploration value, and maintained local tasks to choose the next action.
                 }
                 if result.get("observation_id"):
                     terminal_result["observation_id"] = result["observation_id"]
+                if status == "approached":
+                    if isinstance(result.get("approach"), dict):
+                        terminal_result["approach"] = result["approach"]
+                    if isinstance(result.get("affordance"), dict):
+                        terminal_result["affordance"] = result["affordance"]
                 return terminal_result
             if status in observing:
                 observation_id = result.get("observation_id")
@@ -2472,6 +2823,13 @@ exploration value, and maintained local tasks to choose the next action.
 
     @staticmethod
     def _state_signature(state: dict) -> tuple:
+        def vanish_phase(value: Any) -> int:
+            try:
+                countdown = int(value or 0)
+            except (TypeError, ValueError):
+                countdown = 0
+            return -1 if countdown < 0 else 1 if countdown > 0 else 0
+
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
         latest_dialog_event = dialog.get("latest_event")
@@ -2485,7 +2843,10 @@ exploration value, and maintained local tasks to choose the next action.
             for item in state.get("inventory") or [] if isinstance(item, dict)
         )
         objects = tuple(
-            (item.get("id"), item.get("state"), item.get("vanish_time"), item.get("interactable"), item.get("blocking"))
+            (
+                item.get("id"), item.get("state"), vanish_phase(item.get("vanish_time")),
+                item.get("interactable"), item.get("blocking"),
+            )
             for item in state.get("objects") or [] if isinstance(item, dict)
         )
         shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
@@ -2546,6 +2907,8 @@ exploration value, and maintained local tasks to choose the next action.
                 "buttons", "observation_id", "command", "item_id", "role_id",
                 "slot_id", "slot_key", "previous_item_id", "store_id",
                 "price", "cash_before", "cash_after", "owned_before", "owned_after",
+                "approach", "affordance", "matched_event_object_id",
+                "effect_observed", "object_delta",
             )
             if key in result
         }
@@ -2558,6 +2921,7 @@ exploration value, and maintained local tasks to choose the next action.
                     "slot_id", "slot_key", "previous_item_id", "store_id",
                     "price", "cash_before", "cash_after", "owned_before",
                     "owned_after", "error",
+                    "script_success",
                 )
                 if key in native_result
             }
