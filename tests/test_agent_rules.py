@@ -461,6 +461,21 @@ def test_agent_messages_put_stable_policy_before_dynamic_context(tmp_path):
     assert 'rules' not in dynamic
 
 
+def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
+    policy = make_debug_state(tmp_path).agent_policy_prompt()
+
+    assert 'fresh、reachable 的非传送 search 目标给予温和正向偏好' in policy
+    assert '准备离开当前房间或进入传送前' in policy
+    assert '交互后再根据新状态重新评估' in policy
+    assert '不要求扫空房间' in policy
+    assert '不设置固定步数或搜刮数量' in policy
+    assert 'active 任务本身不等于紧急' in policy
+    assert '明确的剧情时限、直接可执行的关键目标、明显绕路或风险可以压过顺路搜索' in policy
+    assert 'search 和 touch 只是引擎交互方式，不证明目标是物资、宝箱或 NPC' in policy
+    assert '在传送目标之间，非回退的 unknown 目的地具有最高探索价值' in policy
+    assert '不会自动压过路线成本较低的 fresh、reachable 非传送 search' in policy
+
+
 def test_agent_context_exposes_newly_unlocked_unknown_transition_signals(tmp_path):
     opened = {'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4520, 'auto_script': 0, 'blocking': False, 'interactable': True}
     debug = make_debug_state(tmp_path)
