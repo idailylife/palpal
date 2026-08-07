@@ -115,6 +115,33 @@ OBJECT_INTERACTION_COMPATIBILITY_FIELDS = (
     "trigger_mode",
     "trigger_script",
 )
+
+
+def vanish_time_phase(value: object) -> int:
+    try:
+        countdown = int(value or 0)
+    except (TypeError, ValueError):
+        countdown = 0
+    return -1 if countdown < 0 else 1 if countdown > 0 else 0
+
+
+def semantic_object_changes(changes: dict) -> dict:
+    semantic = {}
+    for key, change in changes.items():
+        if key == "auto_script":
+            continue
+        if (
+            key == "vanish_time"
+            and isinstance(change, dict)
+            and "from" in change
+            and "to" in change
+            and vanish_time_phase(change.get("from")) == vanish_time_phase(change.get("to"))
+        ):
+            continue
+        semantic[key] = change
+    return semantic
+
+
 TRANSITION_KEY_FIELDS = (
     "scene_id",
     "map_id",
@@ -604,6 +631,7 @@ class DebugState:
         self.pending_interaction_observation: dict | None = None
         self.observations = ObservationCoordinator()
         self.navigation_transition_requests: dict[int, str] = {}
+        self.navigation_action_lock = threading.RLock()
         self.dialog_advance_observation_id: str | None = None
         self.last_snapshot_frame: int | None = None
         self.logical_frame_offset = 0
@@ -1997,8 +2025,11 @@ class DebugState:
                 continue
             if event.get("type") == "object_changed":
                 changes = event.get("changes") if isinstance(event.get("changes"), dict) else {}
-                if changes and not any(key != "auto_script" for key in changes):
-                    continue
+                if changes:
+                    changes = semantic_object_changes(changes)
+                    if not changes:
+                        continue
+                    event = {**event, "changes": changes}
             cleaned.append(event)
         return cleaned[-200:]
 
@@ -2983,11 +3014,11 @@ class DebugState:
         for obj_id in sorted(object_ids):
             before = previous["objects"][obj_id]
             after = current["objects"][obj_id]
-            changes = {
+            changes = semantic_object_changes({
                 key: {"from": before.get(key), "to": after.get(key)}
                 for key in OBJECT_OBSERVATION_FIELDS
-                if key != "auto_script" and before.get(key) != after.get(key)
-            }
+                if before.get(key) != after.get(key)
+            })
             if changes:
                 self.append_event(state, "object_changed", {"object_id": obj_id, "changes": changes})
 
@@ -4644,17 +4675,55 @@ class DebugState:
             return None
         return observation if generation > 0 and object_id > 0 else None
 
+    def terminate_pending_transition_observation(
+        self,
+        pending: dict,
+        reason: str,
+        outcome: str,
+        *,
+        state: dict | None = None,
+        diagnostic_type: str | None = None,
+        diagnostic: dict | None = None,
+    ) -> bool:
+        """Atomically retire one pending transition and all of its ownership links."""
+        with self.state_lock:
+            observation_id = pending.get("observation_id")
+            current = self.pending_transition_observation
+            if not isinstance(current, dict) or current.get("observation_id") != observation_id:
+                return False
+            try:
+                object_id = int(pending.get("object_id") or 0)
+            except (TypeError, ValueError):
+                object_id = 0
+            owner = str(pending.get("owner") or "navigation")
+            self.observations.cancel(observation_id, reason)
+            if object_id > 0 and self.navigation_transition_requests.get(object_id) == observation_id:
+                self.navigation_transition_requests.pop(object_id, None)
+            self.observations.consume(observation_id, owner=owner)
+            self.finish_navigation_route(pending.get("from_room"), object_id, outcome)
+            self.pending_transition_observation = None
+            if diagnostic_type:
+                self.append_navigation_diagnostic(
+                    diagnostic_type,
+                    {
+                        "observation_id": observation_id,
+                        "target_id": object_id,
+                        "reason": reason,
+                        **(diagnostic or {}),
+                    },
+                    state,
+                )
+            return True
+
     def clear_pending_transition_observation(self, object_id: int | None = None) -> None:
         pending = self.pending_transition_observation
         if object_id is None or (isinstance(pending, dict) and pending.get("object_id") == object_id):
             if isinstance(pending, dict):
-                self.observations.cancel(pending.get("observation_id"), "transition_cleared")
-                self.finish_navigation_route(
-                    pending.get("from_room"),
-                    pending.get("object_id"),
+                self.terminate_pending_transition_observation(
+                    pending,
+                    "transition_cleared",
                     "transition_cleared",
                 )
-            self.pending_transition_observation = None
 
     def mark_pending_transition_observation(
         self,
@@ -4702,6 +4771,7 @@ class DebugState:
             previous_id = self.navigation_transition_requests.get(int(object_id))
             if previous_id and previous_id != observation_id:
                 self.observations.cancel(previous_id, "superseded")
+                self.observations.consume(previous_id, owner="navigation")
             self.navigation_transition_requests[int(object_id)] = observation_id
         return observation_id
 
@@ -4929,14 +4999,20 @@ class DebugState:
             sent_at = float(pending.get("sent_at") or 0)
             baseline_generation = int(pending.get("baseline_trigger_generation") or 0)
         except (TypeError, ValueError):
-            self.pending_transition_observation = None
+            self.terminate_pending_transition_observation(
+                pending,
+                "invalid_transition_observation",
+                "transition_invalid",
+            )
             return None
         now = time.time()
         from_identity = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
         if object_id <= 0 or from_identity is None:
-            self.observations.cancel(pending.get("observation_id"), "invalid_transition_observation")
-            self.finish_navigation_route(from_identity, object_id, "transition_invalid")
-            self.pending_transition_observation = None
+            self.terminate_pending_transition_observation(
+                pending,
+                "invalid_transition_observation",
+                "transition_invalid",
+            )
             return None
         native_generation = self.native_trigger_generation(state)
         if pending.get("trigger_generation") is None:
@@ -4947,16 +5023,11 @@ class DebugState:
                         {"reason": "trigger_confirmation_timeout", "object_id": object_id},
                         state,
                     )
-                    self.observations.cancel(
-                        pending.get("observation_id"),
+                    self.terminate_pending_transition_observation(
+                        pending,
                         "trigger_confirmation_timeout",
-                    )
-                    self.finish_navigation_route(
-                        pending.get("from_room"),
-                        object_id,
                         "transition_timeout",
                     )
-                    self.pending_transition_observation = None
                 return None
             try:
                 generation = int(native_generation.get("generation") or 0)
@@ -4976,12 +5047,48 @@ class DebugState:
             return None
         else:
             try:
-                if (
-                    int(native_generation.get("generation") or 0) != int(pending.get("trigger_generation") or 0)
-                    or int(native_generation.get("event_object_id") or 0) != object_id
-                ):
-                    return None
+                generation = int(native_generation.get("generation") or 0)
+                native_object_id = int(native_generation.get("event_object_id") or 0)
+                native_script = int(native_generation.get("trigger_script") or 0)
+                tracked_generation = int(pending.get("trigger_generation") or 0)
+                tracked_script = int((pending.get("object") or {}).get("trigger_script") or 0)
             except (TypeError, ValueError):
+                return None
+            if generation != tracked_generation:
+                self.terminate_pending_transition_observation(
+                    pending,
+                    "trigger_superseded",
+                    "trigger_superseded",
+                    state=state,
+                    diagnostic_type="native_transition_superseded",
+                    diagnostic={
+                        "tracked_generation": tracked_generation,
+                        "tracked_object_id": object_id,
+                        "tracked_script": tracked_script,
+                        "replacement_generation": generation,
+                        "replacement_object_id": native_object_id,
+                        "replacement_script": native_script,
+                        "replacement_completed": native_generation.get("completed") is True,
+                    },
+                )
+                return None
+            if native_object_id != object_id or native_script != tracked_script:
+                self.terminate_pending_transition_observation(
+                    pending,
+                    "trigger_identity_changed",
+                    "trigger_identity_changed",
+                    state=state,
+                    diagnostic_type="native_transition_superseded",
+                    diagnostic={
+                        "tracked_generation": tracked_generation,
+                        "tracked_object_id": object_id,
+                        "tracked_script": tracked_script,
+                        "replacement_generation": generation,
+                        "replacement_object_id": native_object_id,
+                        "replacement_script": native_script,
+                        "replacement_completed": native_generation.get("completed") is True,
+                    },
+                )
                 return None
         if native_generation.get("completed") is not True:
             progress_signature = self.game_control_progress_signature(state)
@@ -5010,11 +5117,11 @@ class DebugState:
                 },
                 state,
             )
-            self.observations.cancel(pending.get("observation_id"), "game_control_timeout")
-            self.finish_navigation_route(pending.get("from_room"), object_id, "game_control_timeout")
-            if self.navigation_transition_requests.get(object_id) == pending.get("observation_id"):
-                self.navigation_transition_requests.pop(object_id, None)
-            self.pending_transition_observation = None
+            self.terminate_pending_transition_observation(
+                pending,
+                "game_control_timeout",
+                "game_control_timeout",
+            )
             return None
         if pending.get("landing_started_at") is None:
             pending["landing_started_at"] = now
@@ -5028,9 +5135,11 @@ class DebugState:
                 {"reason": "destination_unstable_timeout", "object_id": object_id},
                 state,
             )
-            self.observations.cancel(pending.get("observation_id"), "destination_unstable_timeout")
-            self.finish_navigation_route(pending.get("from_room"), object_id, "transition_timeout")
-            self.pending_transition_observation = None
+            self.terminate_pending_transition_observation(
+                pending,
+                "destination_unstable_timeout",
+                "transition_timeout",
+            )
             return None
         native = native_generation
         destination = native.get("destination") if isinstance(native.get("destination"), dict) else None
@@ -5057,8 +5166,11 @@ class DebugState:
         position_changed = (from_pos.get("x"), from_pos.get("y")) != (to_pos.get("x"), to_pos.get("y"))
         same_room = to_identity["id"] == from_identity.get("id")
         if same_room and not position_changed:
-            self.observations.cancel(pending.get("observation_id"), "no_position_change")
-            self.pending_transition_observation = None
+            self.terminate_pending_transition_observation(
+                pending,
+                "no_position_change",
+                "no_position_change",
+            )
             return None
         frame = self.int_frame(state.get("logical_frame", state.get("frame")))
         if frame is None or frame == pending.get("last_frame"):
@@ -5580,6 +5692,11 @@ class DebugState:
         from_nav_room_id = self.transition_nav_room_id(from_room_id, state)
         if not from_nav_room_id:
             return {"from_room_id": from_room_id, "from_logical_room_id": None, "from_nav_room_id": None, "known_transitions": {}, "transitions": []}
+        current_identity = self.room_identity(state) if state is not None else None
+        validate_against_current_objects = bool(
+            current_identity is not None
+            and current_identity["id"] == from_nav_room_id
+        )
         with self.exploration_lock:
             data = self.read_exploration()
             transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
@@ -5604,17 +5721,16 @@ class DebugState:
             for object_key, record in sorted(by_transition.items(), key=transition_sort_key):
                 if not isinstance(record, dict):
                     continue
-                if state is not None:
+                if validate_against_current_objects:
                     try:
                         record_object_id = int(record.get("object_id") or 0)
                     except (TypeError, ValueError):
                         record_object_id = 0
                     current_object = self.target_object(state, record_object_id) if record_object_id > 0 else None
                     if current_object is not None:
-                        identity = self.room_identity(state)
                         current_key = self.transition_key_from_fields(
-                            self.transition_key_fields(identity, current_object, record_object_id)
-                        ) if identity is not None else None
+                            self.transition_key_fields(current_identity, current_object, record_object_id)
+                        )
                         recorded_key = record.get("transition_key") or str(object_key)
                         if current_key != recorded_key:
                             continue
@@ -5702,6 +5818,64 @@ class DebugState:
                 "known_transitions_by_object": by_object,
                 "transitions": rows,
             }
+
+    @staticmethod
+    def compact_room_exploration_summary(summary: dict) -> dict:
+        return {
+            key: summary.get(key)
+            for key in (
+                "known", "room_id", "scene_id", "map_id", "complete",
+                "explored", "explorable", "frontier", "updated_at",
+            )
+        }
+
+    def compact_room_transition(self, transition: dict) -> dict:
+        compact = {
+            key: transition.get(key)
+            for key in (
+                "transition_key", "object_id", "from_location_id", "to_room_id",
+                "to_location_id", "from_semantic_room", "to_semantic_room",
+                "confidence", "confirmation", "observed_at", "intra_room_transition",
+                "destination_priority", "returns_to_recent_room",
+            )
+        }
+        obj = transition.get("object") if isinstance(transition.get("object"), dict) else {}
+        compact["object"] = {
+            key: obj.get(key)
+            for key in ("x", "y", "trigger_mode", "trigger_script")
+        }
+        destination = (
+            transition.get("destination_exploration")
+            if isinstance(transition.get("destination_exploration"), dict)
+            else {}
+        )
+        compact["destination_exploration"] = self.compact_room_exploration_summary(destination)
+        for key in ("unconfirmed_destination", "agent_priority", "deprioritize_reason"):
+            if key in transition:
+                compact[key] = transition.get(key)
+        return compact
+
+    def agent_room_memory(self, room_id: str | None, state: dict) -> dict:
+        exploration = self.room_exploration_summary(room_id, state)
+        transitions = self.known_transitions_summary(room_id, state)
+        items = [
+            self.compact_room_transition(transition)
+            for transition in transitions.get("transitions") or []
+            if isinstance(transition, dict)
+        ]
+        return {
+            "ok": True,
+            "exploration": self.compact_room_exploration_summary(exploration),
+            "transitions": {
+                "from_room_id": (
+                    transitions.get("from_logical_room_id")
+                    or transitions.get("from_room_id")
+                    or exploration.get("room_id")
+                ),
+                "total": len(items),
+                "items": items,
+            },
+        }
 
     def goal_nodes(self, state: dict, grid: dict, target: dict) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int]]:
         goals: set[tuple[int, int]] = set()
@@ -6035,7 +6209,16 @@ class DebugState:
         state: dict,
         target_id: int,
         approach_item_id: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict:
+        def write_navigation_action(buttons: list[str], frames: int) -> dict | None:
+            with self.navigation_action_lock:
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
+                return self.write_action(buttons, frames)
+
+        if cancel_event is not None and cancel_event.is_set():
+            return {"ok": False, "status": "cancelled", "target_id": target_id}
         state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             return {"ok": False, "status": "state_stale", "state_file": state_info, "target_id": target_id}
@@ -6138,7 +6321,9 @@ class DebugState:
                         break
                     segment_steps += 1
                 segment_moves = moves[:segment_steps]
-                action = self.write_action(segment_moves, 1)
+                action = write_navigation_action(segment_moves, 1)
+                if action is None:
+                    return {"ok": False, "status": "cancelled", "target_id": target_id}
                 route_nodes = interaction_route.get("nodes") or []
                 expected_node = route_nodes[segment_steps] if len(route_nodes) > segment_steps else None
                 remaining_steps = max(0, len(moves) - segment_steps)
@@ -6177,7 +6362,9 @@ class DebugState:
                     status="interacting",
                 )
             try:
-                action = self.write_action(buttons, 1)
+                action = write_navigation_action(buttons, 1)
+                if action is None:
+                    return {"ok": False, "status": "cancelled", "target_id": target_id}
             except Exception:
                 self.observations.cancel(observation_id, "action_write_failed")
                 if (
@@ -6238,7 +6425,9 @@ class DebugState:
                 required_direction = route.get("required_direction")
                 current_direction_button = DIR_TO_BUTTON.get(current_direction, "down")
                 if required_direction and required_direction != current_direction_button:
-                    action = self.write_action([required_direction], 1)
+                    action = write_navigation_action([required_direction], 1)
+                    if action is None:
+                        return {"ok": False, "status": "cancelled", "target_id": target_id}
                     return {
                         "ok": True,
                         "status": "facing",
@@ -6272,7 +6461,9 @@ class DebugState:
                             status="interacting",
                         )
                     try:
-                        action = self.write_action(["search"], 1)
+                        action = write_navigation_action(["search"], 1)
+                        if action is None:
+                            return {"ok": False, "status": "cancelled", "target_id": target_id}
                     except Exception:
                         self.observations.cancel(observation_id, "action_write_failed")
                         if (
@@ -6297,7 +6488,9 @@ class DebugState:
                 required_direction = route.get("required_direction")
                 current_direction_button = DIR_TO_BUTTON.get(current_direction, "down")
                 if required_direction and required_direction != current_direction_button:
-                    action = self.write_action([required_direction], 1)
+                    action = write_navigation_action([required_direction], 1)
+                    if action is None:
+                        return {"ok": False, "status": "cancelled", "target_id": target_id}
                     return {
                         "ok": True,
                         "status": "facing",
@@ -6343,7 +6536,9 @@ class DebugState:
             with self.state_lock:
                 observation_id = self.mark_pending_transition_observation(state, target_id)
         try:
-            action = self.write_action(segment_moves, 1)
+            action = write_navigation_action(segment_moves, 1)
+            if action is None:
+                return {"ok": False, "status": "cancelled", "target_id": target_id}
         except Exception:
             if observation_id:
                 with self.state_lock:
@@ -8656,7 +8851,10 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "get_room_memory",
-                    "description": "返回当前或指定房间的探索摘要和已知传送目的地。",
+                    "description": (
+                        "返回当前或指定房间的紧凑探索摘要；"
+                        "transitions.items 是已知传送目的地的唯一列表。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {"room_id": {"type": "string"}},
@@ -8690,7 +8888,7 @@ class DebugState:
                             "action": {
                                 "type": "string",
                                 "enum": [
-                                    "wait", "advance_dialog", "select_choice", "navigate", "use_item",
+                                    "advance_dialog", "select_choice", "navigate", "use_item",
                                     "equip_item", "buy_item", "leave_shop",
                                 ],
                             },
@@ -8882,11 +9080,7 @@ class DebugState:
         if name == "get_room_memory":
             room_id = arguments.get("room_id")
             room_id = str(room_id) if room_id is not None else None
-            return {
-                "ok": True,
-                "exploration": self.room_exploration_summary(room_id, state),
-                "transitions": self.known_transitions_summary(room_id, state),
-            }
+            return self.agent_room_memory(room_id, state)
         if name == "get_tool_output":
             return self.agent_runtime.get_tool_output(
                 arguments.get("output_ref"),
@@ -9088,7 +9282,6 @@ class DebugState:
             "选择 affordances 中的 item_approach 时提交 "
             "{action:'navigate',target_id:<id>,item_id:<affordance.item_id>,reason:'...'}；"
             "该动作只移动到满足物品脚本距离的站位并调整朝向，完成后仍需另行提交 use_item。"
-            "等待时提交 {action:'wait',reason:'...'}。"
             "shop.active=true 时先调用 get_shop；购买一件商品提交 "
             "{action:'buy_item',item_id:<id>,reason:'...'}，不购买并退出提交 "
             "{action:'leave_shop',reason:'...'}。商店选择必须由模型根据现金、持有物和装备比较显式决定。"
@@ -9115,10 +9308,13 @@ class DebugState:
             "将 agent_priority、interaction_state、recent_dialog_feedback、对象历史、目的地探索状态、路线成本和最近决策作为决策信号；不要把任何单一信号变成无条件优先规则。"
             "距离是成本信号，不是优先级规则；当近处目标重复陈旧或无效果行为时，它仍可能比更远目标或传送更差。"
             "在没有明确剧情时限、直接关键目标、战斗或资源风险，且不会明显绕路时，对 fresh、reachable 的非传送 search 目标给予温和正向偏好。"
-            "准备离开当前房间或进入传送前，要认真比较这类目标；路线成本较低的目标可以先检查，交互后再根据新状态重新评估。"
+            "同样可以探索尚未尝试、fresh、reachable 且 transition_candidate=false 的 touch 目标，但优先处理仍有价值的 search，再一次只尝试一个 touch。"
+            "准备离开当前房间或进入传送前，要认真比较这类目标；路线成本较低的目标可以先检查，每次交互后都根据新状态重新评估。"
             "这不要求扫空房间，也不设置固定步数或搜刮数量；只有后续目标仍然顺路且有探索价值时才继续。"
             "active 任务本身不等于紧急；明确的剧情时限、直接可执行的关键目标、明显绕路或风险可以压过顺路搜索。"
-            "search 和 touch 只是引擎交互方式，不证明目标是物资、宝箱或 NPC；不要据此编造标签或预期掉落，也不要把普通 touch 目标统一当作搜刮目标。"
+            "search 和 touch 只是引擎交互方式，不证明目标是物资、宝箱或 NPC；不要据此编造标签或预期掉落，尝试 touch 属于探索而不是已确认的搜刮。"
+            "touch 可能触发战斗、控制接管或此前未知的房间切换；发生任一情况时停止当前房间的连续探索并重新决策。"
+            "transition_candidate=true 的 touch 应作为有意选择的离房路线，不要为了遍历 touch 而提前进入。"
             "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 inspect_target。"
             "若当前目标 transition_candidate=true、最近对象历史显示它由非传送目标变为传送目标、且 known_destination=false，"
             "应将它视为刚解锁的探索路线并优先建议 enter_transition；解锁动作本身产生的 previously_tried 或 avoid_repeat 不应降低它的优先级。"
@@ -9140,7 +9336,7 @@ class DebugState:
             "有人类确认的 to_semantic_room 时，优先用它理解房间连接；不要只根据 object id 推断目的地。"
             "将 returns_to_recent_room 和 agent_priority avoid_backtrack 视为回退风险信号；如果选择它们，需要明确说明理由。"
             "对话反馈可以创建或改变目标，但要从提供的对话和状态推断目标，不要匹配固定剧情短语。"
-            "如果 dialog.active 为 true，优先选择 advance_dialog。如果 runtime stale、waiting 或 parse-error，建议 wait_runtime。"
+            "如果 dialog.active 为 true，优先选择 advance_dialog。runtime stale、waiting 或 parse-error 由运行器内部等待，不是可提交动作。"
             "如果 choice.active=true，必须根据问题与选项文本显式选择 select_choice；此时不要推进对话或导航。"
             "如果 shop.active=true，先用 get_shop 查看商品；装备类候选要查看 equipment_comparisons，"
             "综合现金、已有数量、角色定位、属性差值、特殊效果和任务上下文后，显式选择买一件或退出。"
@@ -9154,7 +9350,7 @@ class DebugState:
             "因此应先重新与目标 NPC 交互，再使用这种物品。普通全局效果脚本可能忽略事件上下文，不要把所有 apply_to_all 物品都视为剧情物品。"
             "对于任何明确的 search/touch 或 transition 目标，提交 navigate 和 target_id；"
             "若选择同一目标上的 item_approach affordance，必须同时提交该 affordance 的 item_id。"
-            "不要建议无目标的房间探索；如果没有明确目标，提交 wait。"
+            "稳定且可操作时必须选择真实动作；没有明确目标时应根据当前可达对象或传送进行探索和试错。"
             "使用 get_navigation 比较传送目的地；只对你认真考虑的一两个目标调用 inspect_target。"
             "解释所选目标背后的权衡，包括相关的陈旧反馈、重复/无效果交互风险、离开房间风险和回退风险。"
         )
@@ -9192,10 +9388,7 @@ class DebugState:
         reason = str(raw["reason"]).strip()
         evidence: dict = {"submitted_action": action}
         risk = "Server validation will run again immediately before execution."
-        if action == "wait":
-            intent, preview = "wait_runtime", self.action_preview("no_op", {"reason": "agent_wait"})
-            risk = "No game action will be executed."
-        elif action == "advance_dialog":
+        if action == "advance_dialog":
             intent, preview = "advance_dialog", self.action_preview("advance_dialog", self.normalize_dialog_advance_args({}))
             risk = "Dialogue advancement uses the server safety limits and stable-state observer."
         elif action == "select_choice":
@@ -9307,7 +9500,7 @@ class DebugState:
                 issues.append({"field": key, "code": "unsupported_field", "message": f"{key} is not part of the minimal decision contract"})
         action = raw.get("action")
         allowed_actions = {
-            "wait", "advance_dialog", "select_choice", "navigate", "use_item", "equip_item",
+            "advance_dialog", "select_choice", "navigate", "use_item", "equip_item",
             "buy_item", "leave_shop",
         }
         if action not in allowed_actions:
@@ -9315,7 +9508,7 @@ class DebugState:
                 "field": "action",
                 "code": "invalid_action",
                 "message": (
-                    "action must be wait, advance_dialog, select_choice, navigate, use_item, "
+                    "action must be advance_dialog, select_choice, navigate, use_item, "
                     "equip_item, buy_item, or leave_shop"
                 ),
             })
@@ -9352,7 +9545,6 @@ class DebugState:
         if action == "buy_item" and positive_int("item_id") is None:
             issues.append({"field": "item_id", "code": "invalid_item_id", "message": "buy_item requires a positive item_id"})
         relevant_keys = {
-            "wait": {"action", "reason"},
             "advance_dialog": {"action", "reason"},
             "select_choice": {"action", "option_index", "reason"},
             "navigate": {"action", "target_id", "item_id", "reason"},
@@ -9367,7 +9559,13 @@ class DebugState:
                     issues.append({"field": key, "code": "irrelevant_field", "message": f"{key} is not used by action={action}"})
         if not issues:
             return None
-        return {"ok": False, "error": {"code": "invalid_decision_submission", "message": "submit_decision was not accepted. Correct the listed fields and call submit_decision again.", "issues": issues}}
+        error_code = (
+            "invalid_action"
+            if isinstance(action, str)
+            and any(issue.get("field") == "action" and issue.get("code") == "invalid_action" for issue in issues)
+            else "invalid_decision_submission"
+        )
+        return {"ok": False, "error": {"code": error_code, "message": "submit_decision was not accepted. Correct the listed fields and call submit_decision again.", "issues": issues}}
 
     def shop_action_validation_error(
         self,

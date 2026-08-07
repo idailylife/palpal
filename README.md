@@ -293,9 +293,10 @@ next decision.
 `submit_decision` accepts only a minimal action plus a short reason.
 `navigate` adds `target_id`; `use_item` adds `item_id` and exactly one of
 `role_id` and `target: "all"`; `equip_item` adds `item_id` and `role_id`;
-`buy_item` adds `item_id`; and `wait`, `advance_dialog`, and `leave_shop` need no
-additional fields. The server derives the internal intent, evidence, risk, and
-executable preview; the former nested decision payload is rejected.
+`buy_item` adds `item_id`; and `advance_dialog` and `leave_shop` need no additional
+fields. Runtime synchronization may still wait internally, but `wait` is not a
+model action. The server derives the internal intent, evidence, risk, and executable
+preview; the former nested decision payload is rejected.
 
 The checkpoint endpoints above are implemented. These separate root-level
 bridge endpoints remain reserved but are not implemented yet:

@@ -212,13 +212,17 @@ def test_agent_expands_choice_submission_with_current_generation(tmp_path):
     assert decision['evidence']['choice']['option']['semantic'] == 'yes'
 
 
-def test_agent_expands_minimal_wait_submission(tmp_path):
+def test_agent_rejects_removed_wait_submission(tmp_path):
     debug = make_debug_state(tmp_path)
-    decision = debug.normalize_agent_submission({'action': 'wait', 'reason': 'No clear target.'}, make_state())
-    assert decision['recommended_intent'] == 'wait_runtime'
-    assert decision['recommended_action']['tool'] == 'no_op'
-    assert decision['recommended_action']['args'] == {'reason': 'agent_wait'}
-    assert decision['summary'] == 'No clear target.'
+    result = debug.run_agent_tool(
+        'submit_decision',
+        {'action': 'wait', 'reason': 'No clear target.'},
+        make_state(),
+    )
+    assert not result['ok']
+    assert result['error']['code'] == 'invalid_action'
+    assert result['error']['issues'][0]['field'] == 'action'
+    assert result['error']['issues'][0]['code'] == 'invalid_action'
     assert not debug.action_path.exists()
 
 
@@ -465,13 +469,20 @@ def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
     policy = make_debug_state(tmp_path).agent_policy_prompt()
 
     assert 'fresh、reachable 的非传送 search 目标给予温和正向偏好' in policy
+    assert '尚未尝试、fresh、reachable 且 transition_candidate=false 的 touch 目标' in policy
+    assert '优先处理仍有价值的 search，再一次只尝试一个 touch' in policy
     assert '准备离开当前房间或进入传送前' in policy
-    assert '交互后再根据新状态重新评估' in policy
+    assert '每次交互后都根据新状态重新评估' in policy
     assert '不要求扫空房间' in policy
     assert '不设置固定步数或搜刮数量' in policy
     assert 'active 任务本身不等于紧急' in policy
     assert '明确的剧情时限、直接可执行的关键目标、明显绕路或风险可以压过顺路搜索' in policy
     assert 'search 和 touch 只是引擎交互方式，不证明目标是物资、宝箱或 NPC' in policy
+    assert '尝试 touch 属于探索而不是已确认的搜刮' in policy
+    assert 'touch 可能触发战斗、控制接管或此前未知的房间切换' in policy
+    assert '发生任一情况时停止当前房间的连续探索并重新决策' in policy
+    assert 'transition_candidate=true 的 touch 应作为有意选择的离房路线' in policy
+    assert '不要为了遍历 touch 而提前进入' in policy
     assert '在传送目标之间，非回退的 unknown 目的地具有最高探索价值' in policy
     assert '不会自动压过路线成本较低的 fresh、reachable 非传送 search' in policy
 
@@ -521,6 +532,7 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert set(object_history_properties) == {'id', 'limit'}
     assert '紧凑' in by_name['get_navigation']['function']['description']
     assert '最小 dry-run 动作' in by_name['submit_decision']['function']['description']
+    assert 'wait' not in by_name['submit_decision']['function']['parameters']['properties']['action']['enum']
     output_properties = by_name['get_tool_output']['function']['parameters']['properties']
     assert set(output_properties) == {'output_ref', 'offset'}
     task_query_properties = by_name['get_tasks']['function']['parameters']['properties']
@@ -532,6 +544,17 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert set(context) == {'state_summary', 'active_tasks', 'active_tasks_total', 'task_review'}
     assert context['task_review'] == {'required': False, 'tasks': []}
     assert names[-1] == 'submit_decision'
+
+
+def test_agent_prompts_require_real_actions_and_leave_waiting_to_runtime(tmp_path):
+    debug = make_debug_state(tmp_path)
+    system_prompt = debug.agent_system_prompt()
+    policy_prompt = debug.agent_policy_prompt()
+
+    assert "action:'wait'" not in system_prompt
+    assert '提交 wait' not in policy_prompt
+    assert '稳定且可操作时必须选择真实动作' in policy_prompt
+    assert '运行器内部等待' in policy_prompt
 
 
 def test_agent_get_shop_returns_offers_and_equipment_comparison(tmp_path):
@@ -879,7 +902,7 @@ def test_agent_tool_schema_explains_implicit_event_context_item_target(tmp_path)
     )
     properties = submit['parameters']['properties']
     assert properties['action']['enum'] == [
-        'wait', 'advance_dialog', 'select_choice', 'navigate', 'use_item', 'equip_item',
+        'advance_dialog', 'select_choice', 'navigate', 'use_item', 'equip_item',
         'buy_item', 'leave_shop',
     ]
     assert properties['target']['enum'] == ['all']
@@ -988,7 +1011,7 @@ def test_agent_tools_return_json_serializable_dicts(tmp_path):
     write_state(debug, state)
     debug.event_log = [{'type': 'inventory_changed'}]
     debug.dialog_history = [{'text': 'hello'}]
-    calls = [('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('get_tasks', {'include_closed': True, 'limit': 5}), ('get_navigation', {'limit': 5}), ('inspect_target', {'id': 48, 'limit': 1}), ('get_observations', {'kind': 'both', 'limit': 1}), ('get_observations', {'kind': 'speakers', 'limit': 1}), ('get_inventory', {'limit': 1}), ('get_shop', {}), ('get_room_memory', {'room_id': debug.room_identity(state)['id']}), ('get_tool_output', {'output_ref': 'tool-' + ('0' * 32) + '.txt'}), ('submit_decision', {'action': 'wait', 'reason': 'Wait.'})]
+    calls = [('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('get_tasks', {'include_closed': True, 'limit': 5}), ('get_navigation', {'limit': 5}), ('inspect_target', {'id': 48, 'limit': 1}), ('get_observations', {'kind': 'both', 'limit': 1}), ('get_observations', {'kind': 'speakers', 'limit': 1}), ('get_inventory', {'limit': 1}), ('get_shop', {}), ('get_room_memory', {'room_id': debug.room_identity(state)['id']}), ('get_tool_output', {'output_ref': 'tool-' + ('0' * 32) + '.txt'}), ('submit_decision', {'action': 'advance_dialog', 'reason': 'Continue.'})]
     for (name, arguments) in calls:
         result = debug.run_agent_tool(name, arguments, state)
         assert isinstance(result, dict)

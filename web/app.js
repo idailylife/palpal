@@ -2088,6 +2088,7 @@ function navigationRunText(status) {
     approached: "Ready",
     action_pending: "Pending",
     waiting_for_control: "Game",
+    transition_observing: "Observing",
   };
   return labels[status] || "Stop";
 }
@@ -3489,6 +3490,7 @@ async function navigateToTarget(targetId, requestedItemId = null) {
   const target = navigationTargets(latestState).get(targetId);
   const approachItemId = Number(requestedItemId || (target?.kind === "approach" ? target?.approach?.item_id : 0) || 0) || null;
   activeNavigation = { targetId, approachItemId, status: "starting" };
+  const navigationRun = activeNavigation;
   sendNavigationDiagnostic("navigation_start", {
     ...navigationDiagnosticContext(latestState),
     target_id: targetId,
@@ -3496,11 +3498,11 @@ async function navigateToTarget(targetId, requestedItemId = null) {
   if (latestState) renderNavigation(latestState);
 
   const unlockNavigation = (reason = "complete") => {
-    if (!activeNavigation) return;
+    if (activeNavigation !== navigationRun) return;
     sendNavigationDiagnostic("navigation_unlock", {
       ...navigationDiagnosticContext(latestState),
-      target_id: activeNavigation.targetId,
-      status: activeNavigation.status,
+      target_id: navigationRun.targetId,
+      status: navigationRun.status,
       reason,
     });
     activeNavigation = null;
@@ -3508,10 +3510,12 @@ async function navigateToTarget(targetId, requestedItemId = null) {
   };
 
   try {
-    for (let index = 0; index < 240; index += 1) {
+    let navigationSteps = 0;
+    while (activeNavigation === navigationRun && navigationSteps < 240) {
       const startKey = partyPositionKey(latestState);
-      const result = await navigationStep(targetId, activeNavigation.approachItemId);
-      activeNavigation.status = result.status;
+      const result = await navigationStep(targetId, navigationRun.approachItemId);
+      if (activeNavigation !== navigationRun) return;
+      navigationRun.status = result.status;
       if (result.route) selectedRoute = { ...result, target_id: targetId };
       if (latestState) {
         renderNavigation(latestState);
@@ -3531,7 +3535,7 @@ async function navigateToTarget(targetId, requestedItemId = null) {
       }
 
       if (result.ok && result.status === "transition_observing") {
-        await sleep(80);
+        await sleep(160);
         await refreshState();
         continue;
       }
@@ -3552,6 +3556,8 @@ async function navigateToTarget(targetId, requestedItemId = null) {
         await sleep(120);
         continue;
       }
+
+      navigationSteps += 1;
 
       if (!result.ok) {
         updateNavigationTarget(targetId, {

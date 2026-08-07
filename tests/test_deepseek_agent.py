@@ -70,7 +70,7 @@ def test_deepseek_timeout_applies_to_each_model_round(tmp_path):
     responses = [
         {'choices': [{'message': {'tool_calls': [{'id': 'call_obs', 'type': 'function', 'function': {'name': 'get_observations', 'arguments': '{"kind":"events","limit":1}'}}]}}]},
         {'choices': [{'message': {'tool_calls': [{'id': 'call_nav', 'type': 'function', 'function': {'name': 'get_navigation', 'arguments': '{"limit":5}'}}]}}]},
-        {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'wait', 'reason': 'Wait.'})}}]}}]},
+        {'choices': [{'message': {'tool_calls': [{'id': 'call_submit', 'type': 'function', 'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'advance_dialog', 'reason': 'Continue.'})}}]}}]},
     ]
     clock = [100.0]
 
@@ -83,7 +83,7 @@ def test_deepseek_timeout_applies_to_each_model_round(tmp_path):
         return FakeJSONResponse(responses.pop(0))
     with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key', 'DEEPSEEK_TIMEOUT': '3'}), patch('palpal.debug_server.time.monotonic', fake_monotonic), patch('urllib.request.urlopen', fake_urlopen):
         decision = debug.deepseek_decide_agent(state)
-    assert decision['recommended_intent'] == 'wait_runtime'
+    assert decision['recommended_intent'] == 'advance_dialog'
     assert timeouts == [3.0, 3.0, 3.0]
 
 
@@ -94,7 +94,7 @@ def test_deepseek_decide_agent_accepts_whitelisted_model(tmp_path):
     captured = []
     response = deepseek_tool_response(
         'submit_decision',
-        {'action': 'wait', 'reason': 'Wait.'},
+        {'action': 'advance_dialog', 'reason': 'Continue.'},
         call_id='call_submit',
     )
 
@@ -115,7 +115,7 @@ def test_deepseek_decide_agent_rejects_unknown_model_name(tmp_path):
     captured = []
     response = deepseek_tool_response(
         'submit_decision',
-        {'action': 'wait', 'reason': 'Wait.'},
+        {'action': 'advance_dialog', 'reason': 'Continue.'},
         call_id='call_submit',
     )
 
@@ -176,12 +176,12 @@ def test_deepseek_submit_decision_allowed_after_query_tool_budget(tmp_path):
         ] + [{
             'id': 'call_submit',
             'type': 'function',
-            'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'wait', 'reason': 'Wait after inspection.'})},
+            'function': {'name': 'submit_decision', 'arguments': json.dumps({'action': 'navigate', 'target_id': 10, 'reason': 'Inspect the reachable target.'})},
         }]}}],
     }
     with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', lambda request, timeout: FakeJSONResponse(response)):
         decision = debug.deepseek_decide_agent(state)
-    assert decision['recommended_intent'] == 'wait_runtime'
+    assert decision['recommended_intent'] == 'inspect_target'
     assert len(decision['tool_trace']) == 41
     assert decision['tool_trace'][-1]['name'] == 'submit_decision'
     assert not debug.action_path.exists()
@@ -237,10 +237,11 @@ def test_deepseek_submit_decision_downgrades_stale_navigation_target(tmp_path):
 @pytest.mark.parametrize(
     "invalid_submission",
     [
+        {'action': 'wait', 'reason': 'Wait.'},
         {'action': 'write_action', 'target_id': 10, 'reason': 'Inspect target.'},
         {'action': 'navigate', 'reason': 'Inspect target.'},
     ],
-    ids=["illegal-action", "missing-target"],
+    ids=["removed-wait", "illegal-action", "missing-target"],
 )
 def test_deepseek_submit_decision_repairs_invalid_submission(tmp_path, invalid_submission):
     debug = make_debug_state(tmp_path)
@@ -267,7 +268,8 @@ def test_deepseek_submit_decision_repairs_invalid_submission(tmp_path, invalid_s
     assert [entry['name'] for entry in decision['tool_trace']] == ['submit_decision', 'submit_decision']
     repair_message = captured[1]['messages'][-1]
     assert repair_message['role'] == 'tool'
-    assert json.loads(repair_message['content'])['error']['code'] == 'invalid_decision_submission'
+    expected_error = 'invalid_action' if invalid_submission.get('action') in {'wait', 'write_action'} else 'invalid_decision_submission'
+    assert json.loads(repair_message['content'])['error']['code'] == expected_error
     assert not debug.action_path.exists()
 
 

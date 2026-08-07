@@ -34,7 +34,11 @@ def decision(tool="no_op", args=None, intent="wait_runtime"):
     return {
         "summary": "test decision",
         "recommended_intent": intent,
-        "recommended_action": {"tool": tool, "args": args or {}, "dry_run": True},
+        "recommended_action": {
+            "tool": tool,
+            "args": ({"reason": "no_reachable_target"} if tool == "no_op" and args is None else args or {}),
+            "dry_run": True,
+        },
         "evidence": {},
         "risk": "test",
         "alternatives": [],
@@ -42,7 +46,7 @@ def decision(tool="no_op", args=None, intent="wait_runtime"):
     }
 
 
-def submission(action="wait", reason="test decision", **kwargs):
+def submission(action="advance_dialog", reason="test decision", **kwargs):
     return {"action": action, "reason": reason, **kwargs}
 
 
@@ -80,7 +84,7 @@ def test_runtime_counts_recommendations_and_can_resume(tmp_path):
     paused = wait_for_pause(runtime)
     assert paused["turn"] == 1
     assert paused["run_turn"] == 1
-    assert paused["stop_reason"] == "agent_wait"
+    assert paused["stop_reason"] == "no_reachable_target"
     assert paused["usage"]["total_tokens"] == 15
 
     runtime.start(None, 1)
@@ -142,7 +146,8 @@ def test_runtime_waits_for_game_control_without_consuming_a_turn(tmp_path):
     released.set()
     paused = wait_for_pause(runtime)
     assert paused["run_turn"] == 1
-    assert paused["stop_reason"] == "agent_wait"
+    assert paused["stop_reason"] == "no_reachable_target"
+    assert not any("agent requested wait" in event.get("summary", "") for event in runtime.events())
 
 
 def test_control_wait_is_interruptible_and_reports_timeout(tmp_path):
@@ -2135,16 +2140,57 @@ def test_state_signature_ignores_vanish_countdown_but_observes_phase_changes():
         "id": 233, "state": -1, "vanish_time": 752,
         "interactable": False, "blocking": False,
     }])
+    positive["_debug"] = {"recent_events": [{
+        "time": 1.0, "type": "object_changed", "object_id": 233,
+        "changes": {"vanish_time": {"from": 753, "to": 752}},
+    }]}
     positive_next = json.loads(json.dumps(positive))
     positive_next["objects"][0]["vanish_time"] = 751
+    positive_next["_debug"]["recent_events"][-1] = {
+        "time": 2.0, "type": "object_changed", "object_id": 233,
+        "changes": {"vanish_time": {"from": 752, "to": 751}},
+    }
     visible = json.loads(json.dumps(positive))
     visible["objects"][0]["vanish_time"] = 0
+    visible["_debug"]["recent_events"][-1] = {
+        "time": 3.0, "type": "object_changed", "object_id": 233,
+        "changes": {"vanish_time": {"from": 1, "to": 0}},
+    }
     negative = json.loads(json.dumps(positive))
     negative["objects"][0]["vanish_time"] = -15
+    negative["_debug"]["recent_events"][-1] = {
+        "time": 4.0, "type": "object_changed", "object_id": 233,
+        "changes": {"vanish_time": {"from": 0, "to": -15}},
+    }
 
     assert AgentRuntime._state_signature(positive) == AgentRuntime._state_signature(positive_next)
     assert AgentRuntime._state_signature(positive) != AgentRuntime._state_signature(visible)
     assert AgentRuntime._state_signature(positive) != AgentRuntime._state_signature(negative)
+
+
+def test_state_signature_uses_latest_semantic_event_before_vanish_noise():
+    state = make_state(objects=[{
+        "id": 233, "state": -1, "vanish_time": 752,
+        "interactable": False, "blocking": False,
+    }])
+    semantic_event = {
+        "time": 1.0, "type": "interaction_no_effect", "object_id": 233,
+    }
+    state["_debug"] = {"recent_events": [semantic_event]}
+    noisy = json.loads(json.dumps(state))
+    noisy["objects"][0]["vanish_time"] = 751
+    noisy["_debug"]["recent_events"].append({
+        "time": 2.0, "type": "object_changed", "object_id": 233,
+        "changes": {"vanish_time": {"from": 752, "to": 751}},
+    })
+    changed = json.loads(json.dumps(noisy))
+    changed["_debug"]["recent_events"].append({
+        "time": 3.0, "type": "object_changed", "object_id": 233,
+        "changes": {"blocking": {"from": False, "to": True}},
+    })
+
+    assert AgentRuntime._state_signature(state) == AgentRuntime._state_signature(noisy)
+    assert AgentRuntime._state_signature(noisy) != AgentRuntime._state_signature(changed)
 
 
 def test_quiet_window_accepts_monotonic_vanish_countdown(tmp_path):
@@ -2153,10 +2199,15 @@ def test_quiet_window_accepts_monotonic_vanish_countdown(tmp_path):
     countdown = {"value": 752}
 
     def snapshot():
+        current = countdown["value"]
         state = make_state(objects=[{
-            "id": 233, "state": -1, "vanish_time": countdown["value"],
+            "id": 233, "state": -1, "vanish_time": current,
             "interactable": False, "blocking": False,
         }])
+        state["_debug"] = {"recent_events": [{
+            "time": float(753 - current), "type": "object_changed", "object_id": 233,
+            "changes": {"vanish_time": {"from": current + 1, "to": current}},
+        }]}
         countdown["value"] -= 1
         return state
 
@@ -2173,10 +2224,15 @@ def test_completed_action_wait_accepts_monotonic_vanish_countdown(tmp_path, monk
     countdown = {"value": 752}
 
     def snapshot():
+        current = countdown["value"]
         state = make_state(objects=[{
-            "id": 233, "state": -1, "vanish_time": countdown["value"],
+            "id": 233, "state": -1, "vanish_time": current,
             "interactable": False, "blocking": False,
         }])
+        state["_debug"] = {"recent_events": [{
+            "time": float(753 - current), "type": "object_changed", "object_id": 233,
+            "changes": {"vanish_time": {"from": current + 1, "to": current}},
+        }]}
         countdown["value"] -= 1
         return state
 
@@ -2202,7 +2258,7 @@ def test_navigation_waits_for_scene_transition_instead_of_failing(tmp_path):
     snapshots = [entering, entering, stable]
 
     debug.snapshot = lambda: snapshots.pop(0) if snapshots else stable
-    debug.navigation_step = lambda state, target_id: {
+    debug.navigation_step = lambda state, target_id, **_kwargs: {
         "ok": False,
         "status": "entering_scene",
         "target_id": target_id,
@@ -2229,7 +2285,7 @@ def test_navigation_reports_game_requested_interactions_explicitly(
     runtime = debug.agent_runtime
     state = make_state()
     debug.snapshot = lambda: state
-    debug.navigation_step = lambda _state, target_id: {
+    debug.navigation_step = lambda _state, target_id, **_kwargs: {
         "ok": False,
         "status": status,
         "target_id": target_id,
@@ -2270,7 +2326,7 @@ def test_navigation_waits_for_pending_transition_observation(tmp_path, monkeypat
     ]
 
     debug.snapshot = lambda: state
-    debug.navigation_step = lambda current, target_id: results.pop(0)
+    debug.navigation_step = lambda current, target_id, **_kwargs: results.pop(0)
     monkeypatch.setattr("palpal.agent_runtime.time.sleep", lambda _seconds: None)
 
     result = runtime._navigate(48)
@@ -2282,6 +2338,97 @@ def test_navigation_waits_for_pending_transition_observation(tmp_path, monkeypat
         "transitioned",
     ]
     assert runtime.snapshot()["stop_reason"] != "execution_failed"
+
+
+def test_navigation_observation_polling_does_not_create_extra_steps(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state()
+    write_state(debug, state)
+    observation_id = debug.observations.register(
+        "transition",
+        owner="navigation",
+        timeout=4,
+        payload={},
+    )
+    debug.navigation_transition_requests[48] = observation_id
+    snapshots = {"count": 0}
+    calls = {"count": 0}
+
+    def snapshot():
+        snapshots["count"] += 1
+        if snapshots["count"] == 3:
+            debug.observations.complete(observation_id, {"transition": {"object_id": 48}})
+        return state
+
+    def navigation_step(_state, target_id, **_kwargs):
+        calls["count"] += 1
+        request = debug.observations.get(observation_id)
+        if request is not None and request["status"] == "pending":
+            return {
+                "ok": True,
+                "status": "transition_observing",
+                "target_id": target_id,
+                "observation_id": observation_id,
+            }
+        return {"ok": True, "status": "transitioned", "target_id": target_id}
+
+    debug.snapshot = snapshot
+    debug.navigation_step = navigation_step
+
+    result = runtime._navigate(48)
+
+    assert result["status"] == "transitioned"
+    assert result["steps"] == 2
+    assert calls["count"] == 2
+    assert [entry["status"] for entry in result["progress"]] == [
+        "transition_observing",
+        "transitioned",
+    ]
+    navigation_events = [
+        event for event in runtime.events()
+        if event.get("type") == "navigation"
+    ]
+    assert [event["details"]["result"]["status"] for event in navigation_events] == [
+        "transition_observing",
+        "transitioned",
+    ]
+
+
+def test_agent_interrupt_atomically_retires_navigation_observation(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    target = {
+        "id": 48,
+        "x": 32,
+        "y": 0,
+        "sprite_id": 0,
+        "state": 1,
+        "trigger_mode": 4,
+        "trigger_script": 4631,
+        "auto_script": 0,
+        "blocking": False,
+        "interactable": True,
+    }
+    state = make_state(objects=[target])
+    write_state(debug, state)
+    assert debug.navigation_step(state, target_id=48)["status"] == "stepping"
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+    pending = debug.pending_transition_observation
+    observation_id = pending["observation_id"]
+    runtime.state.update(status="running", phase="executing")
+
+    result = runtime.interrupt()
+
+    assert result["status"] == "interrupting"
+    assert runtime.cancel_event.is_set()
+    assert debug.pending_transition_observation is None
+    assert debug.navigation_transition_requests == {}
+    assert debug.observations.get(observation_id) is None
+    assert not debug.action_path.exists()
+    last_route = debug.read_exploration()["rooms"][debug.room_identity(state)["id"]]["last_route"]
+    assert last_route["outcome"] == "agent_interrupt"
 
 
 def test_navigation_receives_transition_confirmed_during_action_wait(tmp_path, monkeypatch):
@@ -2362,7 +2509,7 @@ def test_navigation_treats_dialog_started_during_navigation_as_success(tmp_path)
     ]
 
     debug.snapshot = lambda: snapshots.pop(0)
-    debug.navigation_step = lambda state, target_id: results.pop(0)
+    debug.navigation_step = lambda state, target_id, **_kwargs: results.pop(0)
     runtime._wait_action_and_stable = lambda **kwargs: dialog
 
     result = runtime._navigate(57)
@@ -2600,7 +2747,7 @@ def test_navigation_replans_after_partial_segment_execution(tmp_path, monkeypatc
     ]
 
     debug.snapshot = lambda: states.pop(0) if states else partial
-    debug.navigation_step = lambda state, target_id: results.pop(0)
+    debug.navigation_step = lambda state, target_id, **_kwargs: results.pop(0)
     monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: partial)
 
     result = runtime._navigate(95)
@@ -2617,7 +2764,7 @@ def test_navigation_approach_binds_item_and_finishes_without_item_use(tmp_path):
 
     debug.snapshot = lambda: state
 
-    def navigation_step(current, target_id, approach_item_id=None):
+    def navigation_step(current, target_id, approach_item_id=None, **_kwargs):
         calls.append((current, target_id, approach_item_id))
         return {
             "ok": True,
@@ -2654,7 +2801,7 @@ def test_navigation_stops_after_one_identical_no_progress_retry(tmp_path, monkey
 
     debug.snapshot = lambda: stationary
 
-    def navigation_step(state, target_id):
+    def navigation_step(state, target_id, **_kwargs):
         writes.append((result["move"], result["segment_steps"], result["remaining_steps"]))
         return result
 

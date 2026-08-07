@@ -303,13 +303,12 @@ def test_get_room_memory_returns_compact_known_and_unknown_status(tmp_path):
     assert known['room_id'] == identity['id']
     assert known['scene_id'] == 3
     assert known['map_id'] == 10
-    assert known['room_key'] == 'test-room'
-    assert known['region_key'] == 'test-room'
-    assert known['logical_room_id'] == identity['id']
-    assert known['nav_room_id'] == identity['id']
-    assert known['legacy_nav_room_id'] == '3/10/test-room'
     assert known['explored'] == 1
     assert known['frontier'] == 4
     assert 'explorable' in known
+    assert set(known) == {
+        'known', 'room_id', 'scene_id', 'map_id', 'complete',
+        'explored', 'explorable', 'frontier', 'updated_at',
+    }
     assert not unknown['known']
     assert unknown['room_id'] == '9/9/missing'

@@ -62,6 +62,84 @@ def test_state_events_ignore_auto_script_only_changes(tmp_path):
     assert debug.event_log == []
 
 
+def test_state_events_ignore_same_phase_vanish_countdown(tmp_path):
+    debug = make_debug_state(tmp_path)
+    hidden = make_state(objects=[
+        {
+            'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': -1,
+            'trigger_mode': 0, 'trigger_script': 0, 'auto_script': 0,
+            'vanish_time': 752, 'blocking': False, 'interactable': False,
+        },
+        {
+            'id': 11, 'x': 48, 'y': 8, 'sprite_id': 0, 'state': -1,
+            'trigger_mode': 0, 'trigger_script': 0, 'auto_script': 0,
+            'vanish_time': -15, 'blocking': False, 'interactable': False,
+        },
+    ])
+    counting_down = make_state(objects=[
+        {**hidden['objects'][0], 'vanish_time': 751},
+        {**hidden['objects'][1], 'vanish_time': -14},
+    ])
+
+    debug.record_state_events(hidden)
+    debug.record_state_events(counting_down)
+
+    assert debug.event_log == []
+
+
+def test_state_events_keep_vanish_phase_transition(tmp_path):
+    debug = make_debug_state(tmp_path)
+    hidden = make_state(objects=[{
+        'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': -1,
+        'trigger_mode': 0, 'trigger_script': 0, 'auto_script': 0,
+        'vanish_time': 1, 'blocking': False, 'interactable': False,
+    }])
+    visible = make_state(objects=[{
+        **hidden['objects'][0],
+        'state': 1, 'vanish_time': 0, 'interactable': True,
+    }])
+
+    debug.record_state_events(hidden)
+    debug.record_state_events(visible)
+
+    assert debug.event_log[-1]['changes'] == {
+        'state': {'from': -1, 'to': 1},
+        'interactable': {'from': False, 'to': True},
+        'vanish_time': {'from': 1, 'to': 0},
+    }
+
+
+def test_read_events_cleans_legacy_vanish_countdown_noise(tmp_path):
+    debug = make_debug_state(tmp_path)
+    countdown = {
+        'type': 'object_changed', 'object_id': 10, 'time': 1.0,
+        'changes': {'vanish_time': {'from': 752, 'to': 751}},
+    }
+    semantic = {
+        'type': 'object_changed', 'object_id': 10, 'time': 2.0,
+        'changes': {
+            'state': {'from': -1, 'to': 1},
+            'vanish_time': {'from': 751, 'to': 750},
+        },
+    }
+    phase_transition = {
+        'type': 'object_changed', 'object_id': 10, 'time': 3.0,
+        'changes': {'vanish_time': {'from': 1, 'to': 0}},
+    }
+    debug.events_path.write_text(
+        json.dumps([countdown, semantic, phase_transition]),
+        encoding='utf-8',
+    )
+
+    reloaded = make_debug_state(tmp_path)
+
+    assert reloaded.event_log == [
+        {**semantic, 'changes': {'state': {'from': -1, 'to': 1}}},
+        phase_transition,
+    ]
+    assert json.loads(reloaded.events_path.read_text(encoding='utf-8')) == reloaded.event_log
+
+
 def test_state_events_keep_semantic_changes_when_auto_script_also_changes(tmp_path):
     debug = make_debug_state(tmp_path)
     first = make_state(objects=[{'id': 10, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 1, 'trigger_script': 100, 'auto_script': 5014, 'blocking': False, 'interactable': True}])

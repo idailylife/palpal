@@ -1692,16 +1692,24 @@ class AgentRuntime:
             return self.snapshot()
 
     def interrupt(self) -> dict:
-        with self.lock:
-            if not self.is_running():
-                return self.snapshot()
-            self.cancel_event.set()
-            self.state.update(status="interrupting", phase="interrupting", stop_reason="interrupt_requested")
-            self._persist()
-            stream = self.active_stream
-            loop = self.loop
-        self.debug.cancel_dialog_advance()
-        self.debug.observations.cancel_all("agent_interrupt", owner="navigation")
+        with self.debug.navigation_action_lock:
+            with self.lock:
+                if not self.is_running():
+                    return self.snapshot()
+                self.cancel_event.set()
+                self.state.update(status="interrupting", phase="interrupting", stop_reason="interrupt_requested")
+                self._persist()
+                stream = self.active_stream
+                loop = self.loop
+            self.debug.cancel_dialog_advance()
+            pending = self.debug.pending_transition_observation
+            if isinstance(pending, dict) and pending.get("owner") == "navigation":
+                self.debug.terminate_pending_transition_observation(
+                    pending,
+                    "agent_interrupt",
+                    "agent_interrupt",
+                )
+            self.debug.observations.cancel_all("agent_interrupt", owner="navigation")
         delegate = self.state.get("battle_delegate")
         if isinstance(delegate, dict) and delegate.get("status") == "running":
             delegate.update(status="stopped", phase="stopped", stop_reason="interrupted", ended_at=_stamp())
@@ -1893,11 +1901,11 @@ class AgentRuntime:
                     return
                 action = decision.get("recommended_action") or {}
                 if action.get("tool") in {None, "no_op"} or decision.get("recommended_intent") == "wait_runtime":
-                    wait_reason = (action.get("args") or {}).get("reason") or "agent_wait"
+                    wait_reason = (action.get("args") or {}).get("reason") or "no_executable_action"
                     self._pause(
-                        "agent_wait",
+                        wait_reason,
                         details={"reason": wait_reason, "recommended_action": action},
-                        summary="Agent paused: agent requested wait.",
+                        summary=f"Agent paused: {wait_reason}.",
                     )
                     return
                 self.state["phase"] = "executing"
@@ -2672,26 +2680,61 @@ exploration value, and maintained local tasks to choose the next action.
             time.sleep(0.1)
         raise RuntimeError("state_stability_timeout")
 
+    def _wait_navigation_observation(self, target_id: int, observation_id: str) -> None:
+        """Drive one transition observation without turning polling into navigation steps."""
+        while True:
+            if self.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            state = self.debug.snapshot()
+            if self.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            control = self.debug.control_state(state)
+            if control.get("phase") in {
+                "action_pending", "game_script", "entering_scene", "dialog", "battle", "shop",
+            }:
+                return
+            request = self.debug.observations.get(observation_id)
+            mapped_id = self.debug.navigation_transition_requests.get(target_id)
+            if mapped_id != observation_id or request is None or request.get("status") != "pending":
+                return
+            waited = self.debug.observations.wait(
+                observation_id,
+                timeout=0.12,
+                cancel_event=self.cancel_event,
+            )
+            if self.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            if waited is None or waited.get("status") != "pending":
+                return
+
     def _navigate(self, target_id: int, approach_item_id: int | None = None) -> dict:
         if target_id <= 0:
             raise RuntimeError("navigation_target_missing")
         progress = []
         terminal = {"arrived", "approached", "transitioned", "interacting"}
-        observing = {"transition_observing", "waiting_for_control"}
         no_progress_key = None
         no_progress_count = 0
-        for step in range(1, 241):
+        step = 0
+        while step < 240:
             if self.cancel_event.is_set():
                 raise RuntimeError("interrupted")
             state = self.debug.snapshot()
             if approach_item_id is None:
-                result = self.debug.navigation_step(state, target_id)
+                result = self.debug.navigation_step(
+                    state,
+                    target_id,
+                    cancel_event=self.cancel_event,
+                )
             else:
                 result = self.debug.navigation_step(
                     state,
                     target_id,
                     approach_item_id=approach_item_id,
+                    cancel_event=self.cancel_event,
                 )
+            if self.cancel_event.is_set() or result.get("status") == "cancelled":
+                raise RuntimeError("interrupted")
+            step += 1
             progress.append({key: result.get(key) for key in ("status", "move", "segment_steps", "remaining_steps", "required_direction", "observation_id")})
             self.emit("navigation", "progress", f"Navigation step {step}: {result.get('status')}.", {"step": step, "target_id": target_id, "result": progress[-1]})
             status = result.get("status")
@@ -2795,14 +2838,10 @@ exploration value, and maintained local tasks to choose the next action.
                     if isinstance(result.get("affordance"), dict):
                         terminal_result["affordance"] = result["affordance"]
                 return terminal_result
-            if status in observing:
+            if status == "transition_observing":
                 observation_id = result.get("observation_id")
                 if observation_id:
-                    self.debug.observations.wait(
-                        observation_id,
-                        timeout=0.12,
-                        cancel_event=self.cancel_event,
-                    )
+                    self._wait_navigation_observation(target_id, observation_id)
                 else:
                     time.sleep(0.12)
                 continue
@@ -2837,7 +2876,31 @@ exploration value, and maintained local tasks to choose the next action.
             latest_dialog_event = {}
         debug = state.get("_debug") or {}
         recent_events = debug.get("recent_events") or []
-        latest_event = recent_events[-1] if recent_events and isinstance(recent_events[-1], dict) else {}
+        latest_event = {}
+        for event in reversed(recent_events):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "object_changed":
+                changes = event.get("changes") if isinstance(event.get("changes"), dict) else {}
+                if changes:
+                    semantic_change = False
+                    for key, change in changes.items():
+                        if key == "auto_script":
+                            continue
+                        if (
+                            key == "vanish_time"
+                            and isinstance(change, dict)
+                            and "from" in change
+                            and "to" in change
+                            and vanish_phase(change.get("from")) == vanish_phase(change.get("to"))
+                        ):
+                            continue
+                        semantic_change = True
+                        break
+                    if not semantic_change:
+                        continue
+            latest_event = event
+            break
         inventory = tuple(
             (item.get("item_id"), item.get("amount"), item.get("amount_in_use"))
             for item in state.get("inventory") or [] if isinstance(item, dict)
