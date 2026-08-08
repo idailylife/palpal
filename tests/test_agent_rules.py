@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from tests.support import make_debug_state, make_state, write_state
+from tests.support import create_agent_task, make_debug_state, make_state, write_state
 
 
 def equipment_item(
@@ -316,6 +316,174 @@ def test_interaction_no_effect_is_recorded_and_deprioritizes_target(tmp_path):
     assert completed['result']['type'] == 'interaction_no_effect'
 
 
+def test_old_no_effect_becomes_soft_avoid_after_new_observable_dialog(tmp_path):
+    target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target], frame=20)
+    snapshot = debug.object_snapshot_for_interaction(state, 75)
+    debug.append_event(state, 'interaction_no_effect', {
+        'object_id': 75,
+        'started_object': snapshot,
+        'finished_object': snapshot,
+        'reason': 'no_state_change',
+    })
+    debug.dialog_history.append({
+        'time': debug.event_log[-1]['time'] + 1,
+        'logical_room_id': 'S3/M10:OTHERROOM000',
+        'event_object_id': 25,
+        'speaker_hint': '李大娘',
+        'text': '去房里收拾东西。',
+    })
+
+    target_view = next(
+        item for item in debug.run_agent_tool('get_navigation', {}, state)['navigation']['targets']
+        if item['id'] == 75
+    )
+    assert target_view['interaction_state'] == 'stale_no_effect'
+    assert target_view['agent_priority'] == 'soft_avoid'
+    assert target_view['interaction_evidence']['same_context_no_effect_count'] == 0
+    assert target_view['interaction_evidence']['stale_context_no_effect_count'] == 1
+    assert target_view['interaction_evidence']['context_changes_since_latest'] == ['new_dialog_evidence']
+
+
+def test_repeated_dialog_and_task_rationale_do_not_decay_no_effect(tmp_path):
+    target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target], frame=20)
+    write_state(debug, state)
+    dialog = {
+        'time': 1.0,
+        'logical_room_id': debug.room_identity(state)['id'],
+        'event_object_id': 25,
+        'speaker_hint': '李大娘',
+        'text': '先去休息。',
+    }
+    debug.dialog_history = [dialog]
+    created = create_agent_task(debug, {
+        'id': 'task-rest',
+        'description': '回房休息',
+        'rationale': '李大娘要求休息',
+        'status': 'active',
+    })
+    assert created['ok']
+    snapshot = debug.object_snapshot_for_interaction(state, 75)
+    debug.append_event(state, 'interaction_no_effect', {
+        'object_id': 75,
+        'started_object': snapshot,
+        'finished_object': snapshot,
+    })
+
+    debug.dialog_history.append({**dialog, 'time': 2.0})
+    updated = debug.upsert_agent_task({'id': 'task-rest', 'rationale': '仍需回房休息'})
+    assert updated['ok']
+    affordance = debug.target_affordance(state, 75)
+    assert affordance['interaction_state'] == 'previously_tried'
+    assert affordance['interaction_evidence']['same_context_no_effect_count'] == 1
+
+    changed = debug.upsert_agent_task({'id': 'task-rest', 'description': '回房调查异常'})
+    assert changed['ok']
+    affordance = debug.target_affordance(state, 75)
+    assert affordance['interaction_state'] == 'stale_no_effect'
+    assert affordance['interaction_evidence']['context_changes_since_latest'] == ['task_structure_changed']
+
+
+def test_only_human_observable_object_changes_decay_no_effect(tmp_path):
+    target = {'id': 75, 'x': 16, 'y': 8, 'sprite_id': 75, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target], frame=20)
+    snapshot = debug.object_snapshot_for_interaction(state, 75)
+    debug.append_event(state, 'interaction_no_effect', {
+        'object_id': 75,
+        'started_object': snapshot,
+        'finished_object': snapshot,
+    })
+    debug.append_event(state, 'object_changed', {
+        'object_id': 80,
+        'changes': {'trigger_script': {'from': 100, 'to': 101}},
+    })
+    assert debug.target_affordance(state, 75)['interaction_state'] == 'previously_tried'
+
+    debug.append_event(state, 'object_changed', {
+        'object_id': 80,
+        'changes': {'sprite_id': {'from': 10, 'to': 11}},
+    })
+    affordance = debug.target_affordance(state, 75)
+    assert affordance['interaction_state'] == 'stale_no_effect'
+    assert affordance['interaction_evidence']['context_changes_since_latest'] == ['observable_state_changed']
+
+
+def test_failures_accumulate_across_contexts_without_retry_quota(tmp_path):
+    target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target], frame=20)
+    snapshot = debug.object_snapshot_for_interaction(state, 75)
+
+    def fail():
+        debug.append_event(state, 'interaction_no_effect', {
+            'object_id': 75,
+            'started_object': snapshot,
+            'finished_object': snapshot,
+        })
+
+    fail()
+    debug.dialog_history.append({'time': 2.0, 'speaker_hint': '甲', 'event_object_id': 25, 'room_id': 'room-a', 'text': '新线索'})
+    fail()
+    evidence = debug.target_affordance(state, 75)['interaction_evidence']
+    assert evidence['no_effect_count'] == 2
+    assert evidence['same_context_no_effect_count'] == 1
+    assert evidence['stale_context_no_effect_count'] == 1
+    assert evidence['failed_context_count'] == 2
+    assert debug.target_affordance(state, 75)['agent_priority'] == 'avoid_repeat'
+
+    debug.dialog_history.append({'time': 3.0, 'speaker_hint': '乙', 'event_object_id': 26, 'room_id': 'room-b', 'text': '另一条线索'})
+    affordance = debug.target_affordance(state, 75)
+    assert affordance['interaction_state'] == 'stale_no_effect'
+    assert affordance['interaction_evidence']['stale_context_no_effect_count'] == 2
+    assert affordance['interaction_evidence']['failed_context_count'] == 2
+
+
+def test_rules_compare_stale_failure_before_immediate_backtrack(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = make_state(frame=20)
+    write_state(debug, state)
+    navigation = {
+        'status': 'ok',
+        'targets': [
+            {
+                'id': 2,
+                'kind': 'touch',
+                'status': 'transition',
+                'steps': 1,
+                'transition_candidate': True,
+                'returns_to_recent_room': True,
+                'agent_priority': 'avoid_backtrack',
+                'destination_priority': 'complete',
+            },
+            {
+                'id': 8,
+                'kind': 'search',
+                'status': 'reachable',
+                'steps': 0,
+                'transition_candidate': False,
+                'interaction_state': 'stale_no_effect',
+                'agent_priority': 'soft_avoid',
+            },
+        ],
+    }
+    monkeypatch.setattr(debug, 'navigation', lambda _state: navigation)
+    monkeypatch.setattr(debug, 'route_to_object', lambda *_args, **_kwargs: {
+        'ok': True,
+        'kind': 'search',
+        'status': 'reachable',
+        'route': {'moves': [], 'steps': 0},
+    })
+
+    decision = debug.rules_decide_agent(state)
+    assert decision['recommended_intent'] == 'inspect_target'
+    assert decision['recommended_action']['args'] == {'id': 8}
+    assert decision['evidence']['target']['interaction_state'] == 'stale_no_effect'
+
+
 def test_interaction_effect_attributes_inventory_change_to_target(tmp_path):
     target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
     debug = make_debug_state(tmp_path)
@@ -523,7 +691,7 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert set(names) == {
         'upsert_task', 'get_tasks', 'get_navigation', 'inspect_target',
         'get_observations', 'get_inventory', 'get_shop', 'get_equipment',
-        'get_room_memory', 'get_tool_output', 'submit_decision',
+        'get_room_memory', 'get_tool_output', 'review_task_inbox', 'submit_decision',
     }
     dialog_properties = by_name['get_observations']['function']['parameters']['properties']
     assert 'speaker' in dialog_properties
@@ -536,13 +704,20 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     output_properties = by_name['get_tool_output']['function']['parameters']['properties']
     assert set(output_properties) == {'output_ref', 'offset'}
     task_query_properties = by_name['get_tasks']['function']['parameters']['properties']
-    assert set(task_query_properties) == {'include_closed', 'limit'}
+    assert set(task_query_properties) == {'include_closed', 'detail', 'offset', 'limit'}
     assert '未知自选 id' in by_name['upsert_task']['function']['description']
     context = debug.agent_tool_initial_context(make_state())
     assert context['active_tasks'] == []
     assert context['active_tasks_total'] == 0
-    assert set(context) == {'state_summary', 'active_tasks', 'active_tasks_total', 'task_review'}
+    assert set(context) == {
+        'state_summary', 'active_tasks', 'active_tasks_total', 'task_review', 'task_inbox',
+        'task_reconciliation',
+    }
+    assert context['task_reconciliation'] == {'pending': False, 'reason': None}
     assert context['task_review'] == {'required': False, 'tasks': []}
+    assert context['task_inbox'] == {
+        'pending_total': 0, 'batches': [], 'review_required': False, 'reasons': [],
+    }
     assert names[-1] == 'submit_decision'
 
 

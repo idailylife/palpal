@@ -164,6 +164,9 @@ def test_dialog_event_is_persisted_once(tmp_path):
     assert debug.dialog_history[0]['text'] == '我们走吧。'
     assert debug.dialog_history[0]['room_key'] == 'test-room'
     assert debug.dialogs_path.exists()
+    pending = debug.task_inbox_pending()
+    assert len(pending) == 1
+    assert pending[0]['dialogs'][0]['text'] == '我们走吧。'
 
 
 def test_dialog_history_write_is_safe_when_requests_overlap(tmp_path):

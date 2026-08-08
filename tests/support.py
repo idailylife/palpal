@@ -147,6 +147,24 @@ def fake_load_command(command, slot):
     }
 
 
+def create_agent_task(debug, arguments, state=None):
+    """Create through the production closed-ledger review contract."""
+    cycle = debug.new_agent_tool_cycle(state)
+    reviewed = debug.run_agent_tool(
+        "get_tasks",
+        {"include_closed": True, "detail": "summary", "offset": 0, "limit": 100},
+        state,
+        tool_cycle=cycle,
+    )
+    assert reviewed["complete"] is True
+    return debug.run_agent_tool(
+        "upsert_task",
+        {**arguments, "review_token": reviewed["review_token"]},
+        state,
+        tool_cycle=cycle,
+    )
+
+
 class FakeJSONResponse:
     def __init__(self, payload):
         self.payload = payload

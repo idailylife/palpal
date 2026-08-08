@@ -197,6 +197,33 @@ def test_checkpoint_load_keeps_history_and_continues_logical_frame_after_raw_rol
     clear_history.assert_not_called()
 
 
+def test_v11_checkpoint_lazily_adds_interaction_context_without_rewriting_checkpoint(tmp_path):
+    debug = make_debug_state(tmp_path)
+    write_state(debug, make_state())
+    checkpoint_dir = debug.checkpoint_dir('legacy-v11')
+    (checkpoint_dir / 'companion').mkdir(parents=True)
+    (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
+    (checkpoint_dir / 'manifest.json').write_text(json.dumps({
+        'version': 2,
+        'label': 'Legacy v11',
+        'created_at': '2026-01-01T00:00:00Z',
+        'companion_version': 11,
+    }), encoding='utf-8')
+    legacy_exploration = b'{"version":11,"rooms":{},"transitions":{},"object_interactions":{},"tasks":{}}'
+    checkpoint_exploration = checkpoint_dir / 'companion' / 'exploration.json'
+    checkpoint_exploration.write_bytes(legacy_exploration)
+    (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[]', encoding='utf-8')
+    (checkpoint_dir / 'companion' / 'events.json').write_text('[]', encoding='utf-8')
+
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        result = debug.load_checkpoint('legacy-v11')
+    assert result['ok']
+    context = debug.interaction_context_snapshot()
+    assert context['observable_revision'] == 0
+    assert isinstance(debug.read_exploration()['interaction_observable_context'], dict)
+    assert checkpoint_exploration.read_bytes() == legacy_exploration
+
+
 
 def test_checkpoint_load_from_startup_uses_companion_history_for_logical_frame_baseline(tmp_path):
     debug = make_debug_state(tmp_path)
@@ -318,6 +345,8 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
     assert restored['last_prompt_tokens'] == 95
     assert restored['compactions'] == 1
     assert restored['equipment_review']['pending'][0]['item_id'] == 201
+    assert restored['task_reconciliation_pending'] is True
+    assert restored['task_reconciliation_reason'] == 'checkpoint_restored'
     transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)
     assert [item['content'] for item in transcript] == ['checkpoint context', 'checkpoint response']
     assert runtime.get_tool_output(output_ref)['content'] == archived_output
@@ -375,6 +404,7 @@ def test_incompatible_agent_bundle_starts_an_empty_session(tmp_path, bundle_kind
     assert restored['stop_reason'] == 'checkpoint_agent_bundle_incompatible'
     assert restored['turn'] == 0
     assert restored['checkpoint_id'] == checkpoint_id
+    assert restored['task_reconciliation_pending'] is True
     assert 'goal' not in restored
 
 
@@ -403,6 +433,7 @@ def test_old_checkpoint_loads_with_a_new_empty_agent_session(tmp_path):
     assert restored['turn'] == 0
     assert restored['checkpoint_id'] == 'legacy'
     assert restored['stop_reason'] == 'checkpoint_loaded_without_agent_bundle'
+    assert restored['task_reconciliation_pending'] is True
 
 
 def test_delete_checkpoint_only_removes_target_directory(tmp_path):

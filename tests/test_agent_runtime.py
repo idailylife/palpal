@@ -1562,6 +1562,8 @@ def test_context_compression_replaces_history_and_keeps_recent_items(tmp_path, m
     assert session.items[-2:] == original[-2:]
     assert runtime.snapshot()["compactions"] == 1
     assert runtime.snapshot()["last_prompt_tokens"] is None
+    assert runtime.snapshot()["task_reconciliation_pending"] is True
+    assert runtime.snapshot()["task_reconciliation_reason"] == "context_compacted"
     compact_text = json.dumps(client.chat.completions.messages)
     assert "permanent goal" not in compact_text.lower()
     assert "finish the game" not in compact_text.lower()
@@ -1619,6 +1621,20 @@ def test_context_compaction_threshold_defaults_and_invalid_values(tmp_path, monk
     assert runtime._compact_at_tokens() == DEFAULT_COMPACT_AT_TOKENS
     monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "64000")
     assert runtime._compact_at_tokens() == 64_000
+
+
+def test_legacy_control_upgrade_schedules_one_task_reconciliation(tmp_path):
+    debug = make_debug_state(tmp_path)
+    control = debug.agent_runtime.snapshot()
+    control.pop("task_reconciliation_pending", None)
+    control.pop("task_reconciliation_reason", None)
+    debug.agent_runtime._atomic_json(debug.agent_runtime.control_path, control)
+
+    reloaded = make_debug_state(tmp_path).agent_runtime
+    assert reloaded.task_reconciliation_pending() is True
+    assert reloaded.task_reconciliation_reason() == "legacy_control_upgrade"
+    reloaded.clear_task_reconciliation()
+    assert reloaded.task_reconciliation_pending() is False
 
 
 def test_context_estimate_counts_utf8_bytes_for_chinese():
@@ -1842,6 +1858,78 @@ def test_sdk_rejected_submit_returns_to_model_and_recovers_in_same_tool_cycle(tm
     assert result["recommended_action"] == accepted_decision["recommended_action"]
 
 
+def test_sdk_parallel_task_query_and_create_cannot_bypass_review_result(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+
+    class FunctionTool:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.invoke = kwargs["on_invoke_tool"]
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self.tools = kwargs["tools"]
+            self.tool_use_behavior = kwargs["tool_use_behavior"]
+
+    class Session:
+        async def get_items(self): return []
+        async def clear_session(self): pass
+        async def add_items(self, items): pass
+
+    class Stream:
+        context_wrapper = None
+        final_output = None
+
+        def __init__(self, agent): self.agent = agent
+
+        async def stream_events(self):
+            tools = {tool.name: tool for tool in self.agent.tools}
+            audit_output = await tools["get_tasks"].invoke(None, json.dumps({
+                "include_closed": True, "detail": "summary",
+            }))
+            premature = await tools["upsert_task"].invoke(None, json.dumps({
+                "id": "new-sdk-task", "description": "Investigate clue",
+                "rationale": "It affects future action.",
+            }))
+            assert json.loads(premature)["error"]["code"] == "task_creation_review_required"
+            token = json.loads(audit_output)["review_token"]
+            created = await tools["upsert_task"].invoke(None, json.dumps({
+                "id": "new-sdk-task", "description": "Investigate clue",
+                "rationale": "It affects future action.", "review_token": token,
+            }))
+            assert json.loads(created)["operation"] == "created"
+            submitted = await tools["submit_decision"].invoke(None, json.dumps({
+                "action": "advance_dialog", "reason": "Continue.",
+            }))
+            self.final_output = submitted
+            if False:
+                yield None
+
+    class Runner:
+        @classmethod
+        def run_streamed(cls, agent, _prompt, **_kwargs): return Stream(agent)
+
+    fake_agents = types.ModuleType("agents")
+    fake_agents.Agent = Agent
+    fake_agents.AsyncOpenAI = lambda **kwargs: object()
+    fake_agents.FunctionTool = FunctionTool
+    fake_agents.ModelSettings = lambda **kwargs: kwargs
+    fake_agents.OpenAIChatCompletionsModel = lambda **kwargs: object()
+    fake_agents.Runner = Runner
+    fake_agents.SQLiteSession = lambda *_args: Session()
+    fake_agents.set_tracing_disabled = lambda **kwargs: None
+    fake_agent_module = types.ModuleType("agents.agent")
+    fake_agent_module.ToolsToFinalOutputResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "agents", fake_agents)
+    monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
+    monkeypatch.setattr(runtime, "_maybe_compact_sdk", lambda *args: asyncio.sleep(0))
+
+    result = asyncio.run(runtime._sdk_decide(make_state(), "feedback"))
+    assert result["recommended_intent"] == "advance_dialog"
+    assert [task["id"] for task in debug.task_ledger()] == ["new-sdk-task"]
+
+
 def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -1882,7 +1970,8 @@ def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeyp
     asyncio.run(runtime._sdk_decide(make_state(), "compact feedback"))
     assert set(captured["prompt"]) == {"feedback", "context"}
     assert set(captured["prompt"]["context"]) == {
-        "state_summary", "active_tasks", "active_tasks_total", "task_review",
+        "state_summary", "active_tasks", "active_tasks_total", "task_review", "task_inbox",
+        "task_reconciliation",
     }
 
 

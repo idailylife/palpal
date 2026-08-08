@@ -100,6 +100,60 @@ def test_persistent_attempts_are_room_scoped_and_reopen_after_material_change(tm
     assert debug.target_affordance(other_room, 75)["interaction_state"] == "fresh"
 
 
+def test_legacy_no_effect_uses_restored_observable_history_conservatively(tmp_path):
+    debug = make_debug_state(tmp_path)
+    target = search_object(75)
+    state = make_state(objects=[target], frame=20)
+    identity = debug.room_identity(state)
+    snapshot = debug.object_snapshot_for_interaction(state, 75)
+    legacy_event = {
+        "type": "interaction_no_effect",
+        "time": 10.0,
+        "scene_id": identity["scene_id"],
+        "map_id": identity["map_id"],
+        "logical_room_id": identity["id"],
+        "room_id": identity["id"],
+        "object_id": 75,
+        "started_object": snapshot,
+        "finished_object": snapshot,
+        "reason": "no_state_change",
+    }
+    data = debug.empty_exploration()
+    data["interaction_observable_context"] = None
+    data["object_interactions"] = {
+        identity["id"]: {
+            "75": {
+                "object_id": 75,
+                "room_id": identity["id"],
+                "attempt_count": 1,
+                "effect_count": 0,
+                "no_effect_count": 1,
+                "last_result": "no_effect",
+                "last_event": legacy_event,
+                "last_before": snapshot,
+                "last_after": snapshot,
+                "history": [legacy_event],
+            }
+        }
+    }
+    debug.write_exploration(data)
+
+    unknown = debug.target_affordance(state, 75)
+    assert unknown["interaction_state"] == "previously_tried"
+    assert unknown["interaction_evidence"]["unknown_context_no_effect_count"] == 1
+
+    debug.dialog_history.append({
+        "time": 20.0,
+        "speaker_hint": "李大娘",
+        "event_object_id": 25,
+        "room_id": "other-room",
+        "text": "去房里收拾东西。",
+    })
+    stale = debug.target_affordance(state, 75)
+    assert stale["interaction_state"] == "stale_no_effect"
+    assert stale["interaction_evidence"]["context_changes_since_latest"] == ["new_dialog_evidence"]
+
+
 def test_object_ledger_keeps_summary_and_only_twenty_details(tmp_path):
     debug = make_debug_state(tmp_path)
     target = search_object(75)

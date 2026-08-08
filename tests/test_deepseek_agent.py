@@ -62,6 +62,65 @@ def test_deepseek_tool_decision_records_usage_trace_and_no_action(tmp_path):
     assert timeouts[0] >= 89.0
 
 
+def test_deepseek_tool_round_cannot_create_before_review_result_is_visible(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    write_state(debug, state)
+    requests = []
+
+    def calls(*entries):
+        return {"choices": [{"message": {"tool_calls": list(entries)}}]}
+
+    def call(call_id, name, arguments):
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        }
+
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data.decode("utf-8"))
+        requests.append(payload)
+        round_number = len(requests)
+        if round_number == 1:
+            return FakeJSONResponse(calls(
+                call("audit", "get_tasks", {"include_closed": True, "detail": "summary"}),
+                call("premature", "upsert_task", {
+                    "id": "bag-clue", "description": "Investigate the cloth bag",
+                    "rationale": "The clue will affect later action.",
+                }),
+            ))
+        if round_number == 2:
+            token = None
+            for message in reversed(payload["messages"]):
+                if message.get("role") != "tool":
+                    continue
+                result = json.loads(message["content"])
+                if result.get("review_token"):
+                    token = result["review_token"]
+                    break
+            assert token
+            return FakeJSONResponse(calls(call("create", "upsert_task", {
+                "id": "bag-clue", "description": "Investigate the cloth bag",
+                "rationale": "The clue will affect later action.", "review_token": token,
+            })))
+        return FakeJSONResponse(calls(call(
+            "submit", "submit_decision", {"action": "advance_dialog", "reason": "Continue."},
+        )))
+
+    with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}), patch(
+        "urllib.request.urlopen", fake_urlopen
+    ):
+        decision = debug.deepseek_decide_agent(state)
+
+    assert decision["recommended_intent"] == "advance_dialog"
+    trace = decision["tool_trace"]
+    premature_result = json.loads(requests[1]["messages"][-1]["content"])
+    assert premature_result["error"]["code"] == "task_creation_review_required"
+    assert [entry["name"] for entry in trace] == ["get_tasks", "upsert_task", "upsert_task", "submit_decision"]
+    assert [task["id"] for task in debug.task_ledger()] == ["bag-clue"]
+
+
 
 def test_deepseek_timeout_applies_to_each_model_round(tmp_path):
     debug = make_debug_state(tmp_path)

@@ -52,9 +52,29 @@ STALE_AFTER_SECONDS = 2.0
 EXPLORATION_VERSION = 11
 LOGICAL_ROOM_ID_RE = re.compile(r"^S\d+/M\d+:[0-9A-F]{12}$")
 MAX_OBJECT_INTERACTION_HISTORY = 20
+MAX_INTERACTION_CONTEXT_EVIDENCE = 40
 MAX_TASK_HISTORY = 20
 MAX_ACTIVE_TASK_CONTEXT = 8
 MAX_ACTIVE_TASK_DESCRIPTION = 160
+MAX_TASK_INBOX_HISTORY = 100
+MAX_TASK_INBOX_CONTEXT = 3
+TASK_INBOX_MAX_PENDING_TURNS = 2
+TASK_INBOX_MAX_PENDING_BATCHES = 3
+TASK_INBOX_DIALOG_TEXT_LIMIT = 500
+TASK_INBOX_STRUCTURAL_EVENT_TYPES = frozenset({
+    "object_changed",
+    "inventory_changed",
+    "cash_changed",
+    "party_sprite_changed",
+    "equipment_changed",
+})
+OBSERVABLE_CONTEXT_OBJECT_FIELDS = frozenset({
+    "presence",
+    "state",
+    "sprite_id",
+    "blocking",
+    "interactable",
+})
 TRANSITION_OBSERVATION_TIMEOUT_SECONDS = 4.0
 GAME_CONTROL_TIMEOUT_SECONDS = 30.0
 TRANSITION_STABLE_SNAPSHOTS = 2
@@ -2055,6 +2075,10 @@ class DebugState:
         )
 
     def append_event(self, state: dict, event_type: str, payload: dict) -> dict:
+        if event_type in {"interaction_effect", "interaction_no_effect"} and not isinstance(
+            payload.get("interaction_context"), dict
+        ):
+            payload = {**payload, "interaction_context": self.interaction_context_snapshot()}
         identity = self.room_identity(state)
         event = {
             "time": time.time(),
@@ -2079,6 +2103,8 @@ class DebugState:
         self.write_events()
         if event_type in {"interaction_effect", "interaction_no_effect"} or self.object_change_cleared_blocker(event):
             self.record_persistent_object_event(event, state=state)
+        if event_type in TASK_INBOX_STRUCTURAL_EVENT_TYPES:
+            self.record_observable_context_event(event)
         return event
 
     def append_navigation_diagnostic(self, event_type: str, payload: dict | None = None, state: dict | None = None) -> None:
@@ -2357,6 +2383,7 @@ class DebugState:
             return
 
         changed = False
+        inbox_entries: list[dict] = []
         processed_source_keys: set[str] = set()
         for event in events:
             if not isinstance(event, dict) or not event.get("text"):
@@ -2374,8 +2401,10 @@ class DebugState:
                 continue
             if self.dialog_history and self.can_merge_dialog_turn(self.dialog_history[-1], entry):
                 self.merge_dialog_turn(self.dialog_history[-1], entry)
+                inbox_entries.append(self.dialog_history[-1])
             else:
                 self.dialog_history.append(entry)
+                inbox_entries.append(entry)
             self.dialog_source_keys.add(source_key)
             processed_source_keys.add(source_key)
             changed = True
@@ -2385,6 +2414,7 @@ class DebugState:
             self.dialog_source_keys = self.dialog_history_source_keys(self.dialog_history)
             self.dialog_source_keys.update(processed_source_keys)
             self.write_dialog_history()
+            self.record_task_inbox_entries(inbox_entries)
 
     def dialog_advance_source_keys(self, entry: dict | None) -> list[str]:
         if not isinstance(entry, dict):
@@ -2962,15 +2992,34 @@ class DebugState:
             }
         return observed
 
+    def observed_equipment(self, state: dict) -> dict[int, list[int]]:
+        observed: dict[int, list[int]] = {}
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            try:
+                role_id = int(role.get("role_id"))
+            except (TypeError, ValueError):
+                continue
+            observed[role_id] = [
+                int(item.get("item_id") or 0)
+                for item in role.get("equipment") or []
+                if isinstance(item, dict)
+            ]
+        return observed
+
     def record_state_events(self, state: dict) -> None:
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
             return
 
+        identity = self.room_identity(state)
         current = {
+            "logical_room_id": identity.get("id") if identity else None,
             "cash": int(state.get("cash") or 0),
             "inventory": self.observed_inventory(state),
             "objects": self.observed_objects(state),
             "party_sprites": self.observed_party_sprites(state),
+            "equipment": self.observed_equipment(state),
         }
         previous = self.last_observed_state
         self.last_observed_state = current
@@ -2998,6 +3047,21 @@ class DebugState:
                     },
                 )
 
+        equipment_roles = set(previous.get("equipment", {})) | set(current["equipment"])
+        for role_id in sorted(equipment_roles):
+            before_equipment = previous.get("equipment", {}).get(role_id, [])
+            after_equipment = current["equipment"].get(role_id, [])
+            if before_equipment != after_equipment:
+                self.append_event(
+                    state,
+                    "equipment_changed",
+                    {
+                        "role_id": role_id,
+                        "from_item_ids": before_equipment,
+                        "to_item_ids": after_equipment,
+                    },
+                )
+
         item_ids = set(previous["inventory"]) | set(current["inventory"])
         for item_id in sorted(item_ids):
             before = previous["inventory"].get(item_id, {}).get("amount", 0)
@@ -3021,6 +3085,19 @@ class DebugState:
             })
             if changes:
                 self.append_event(state, "object_changed", {"object_id": obj_id, "changes": changes})
+        if previous.get("logical_room_id") == current.get("logical_room_id"):
+            for obj_id in sorted(set(previous["objects"]) - set(current["objects"])):
+                self.append_event(
+                    state,
+                    "object_changed",
+                    {"object_id": obj_id, "changes": {"presence": {"from": True, "to": False}}},
+                )
+            for obj_id in sorted(set(current["objects"]) - set(previous["objects"])):
+                self.append_event(
+                    state,
+                    "object_changed",
+                    {"object_id": obj_id, "changes": {"presence": {"from": False, "to": True}}},
+                )
 
     def inventory_delta(self, before: dict[int, dict], after: dict[int, dict]) -> list[dict]:
         changes = []
@@ -3564,7 +3641,15 @@ class DebugState:
             "rooms": {},
             "transitions": {},
             "object_interactions": {},
+            "interaction_observable_context": {
+                "revision": 0,
+                "event_keys": [],
+                "evidence": [],
+            },
             "tasks": {},
+            "tasks_revision": 0,
+            "task_inbox": {},
+            "task_inbox_initialized": True,
         }
 
     def read_exploration(self) -> dict:
@@ -3583,11 +3668,23 @@ class DebugState:
         object_interactions = data.get("object_interactions")
         if not isinstance(object_interactions, dict):
             data["object_interactions"] = {}
+        observable_context = data.get("interaction_observable_context")
+        if not isinstance(observable_context, dict):
+            data["interaction_observable_context"] = None
         # Tasks are companion memory inferred by the agent, rather than game facts.
         # Keep current exploration files usable when the additive task ledger is absent.
         tasks = data.get("tasks")
         if not isinstance(tasks, dict):
             data["tasks"] = {}
+        try:
+            data["tasks_revision"] = max(0, int(data.get("tasks_revision") or 0))
+        except (TypeError, ValueError):
+            data["tasks_revision"] = 0
+        task_inbox = data.get("task_inbox")
+        if not isinstance(task_inbox, dict):
+            data["task_inbox"] = {}
+        if not isinstance(data.get("task_inbox_initialized"), bool):
+            data["task_inbox_initialized"] = False
         return data
 
     def write_exploration(self, data: dict) -> None:
@@ -3596,6 +3693,142 @@ class DebugState:
             json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def stable_digest(value) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def dialog_semantic_signature(self, entry: dict) -> str | None:
+        text = " ".join(str(entry.get("text") or "").split())
+        if not text:
+            return None
+        payload = {
+            "speaker": entry.get("speaker_hint"),
+            "event_object_id": entry.get("event_object_id"),
+            "room_id": entry.get("logical_room_id") or entry.get("room_id") or entry.get("room_key"),
+            "text": text,
+        }
+        return self.stable_digest(payload)
+
+    def narrative_context_digest(self) -> str:
+        signatures = {
+            signature
+            for entry in self.dialog_history
+            if isinstance(entry, dict)
+            if (signature := self.dialog_semantic_signature(entry)) is not None
+        }
+        return self.stable_digest(sorted(signatures))
+
+    def active_task_context_digest(self, data: dict) -> str:
+        tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+        payload = []
+        for task in tasks.values():
+            if not isinstance(task, dict) or task.get("status") != "active":
+                continue
+            payload.append({
+                key: task.get(key)
+                for key in ("id", "description", "object_id", "transition_key", "room_id")
+            })
+        payload.sort(key=lambda task: str(task.get("id") or ""))
+        return self.stable_digest(payload)
+
+    def observable_context_event_payload(self, event: dict) -> dict | None:
+        event_type = str(event.get("type") or "")
+        if event_type not in TASK_INBOX_STRUCTURAL_EVENT_TYPES:
+            return None
+        payload = {
+            "type": event_type,
+            "time": self.task_evidence_time(event),
+        }
+        if event_type == "object_changed":
+            changes = event.get("changes") if isinstance(event.get("changes"), dict) else {}
+            visible_changes = {
+                key: value for key, value in changes.items()
+                if key in OBSERVABLE_CONTEXT_OBJECT_FIELDS
+            }
+            if not visible_changes:
+                return None
+            payload.update({
+                "object_id": event.get("object_id"),
+                "room_id": event.get("logical_room_id") or event.get("room_id") or event.get("room_key"),
+                "fields": sorted(visible_changes),
+            })
+        elif event_type == "inventory_changed":
+            payload["item_id"] = event.get("item_id")
+        elif event_type in {"party_sprite_changed", "equipment_changed"}:
+            payload["role_id"] = event.get("role_id")
+        return payload
+
+    def _record_observable_context_event_locked(self, data: dict, event: dict) -> bool:
+        payload = self.observable_context_event_payload(event)
+        if payload is None:
+            return False
+        context = data.get("interaction_observable_context")
+        if not isinstance(context, dict):
+            context = {"revision": 0, "event_keys": [], "evidence": []}
+            data["interaction_observable_context"] = context
+        event_key = self.object_event_key(event)
+        event_keys = context.get("event_keys") if isinstance(context.get("event_keys"), list) else []
+        if event_key in event_keys:
+            return False
+        revision = max(0, int(context.get("revision") or 0)) + 1
+        evidence = context.get("evidence") if isinstance(context.get("evidence"), list) else []
+        evidence.append({**payload, "revision": revision})
+        context["revision"] = revision
+        context["updated_at"] = payload.get("time") or time.time()
+        context["event_keys"] = (event_keys + [event_key])[-200:]
+        context["evidence"] = evidence[-MAX_INTERACTION_CONTEXT_EVIDENCE:]
+        return True
+
+    def _ensure_observable_context_locked(self, data: dict) -> bool:
+        if isinstance(data.get("interaction_observable_context"), dict):
+            return False
+        data["interaction_observable_context"] = {
+            "revision": 0,
+            "event_keys": [],
+            "evidence": [],
+        }
+        for event in self.event_log:
+            if isinstance(event, dict):
+                self._record_observable_context_event_locked(data, event)
+        return True
+
+    def record_observable_context_event(self, event: dict) -> None:
+        if self.observable_context_event_payload(event) is None:
+            return
+        with self.exploration_lock:
+            data = self.read_exploration()
+            initialized = self._ensure_observable_context_locked(data)
+            changed = self._record_observable_context_event_locked(data, event)
+            if initialized or changed:
+                self.write_exploration(data)
+
+    def interaction_context_snapshot(self) -> dict:
+        with self.exploration_lock:
+            data = self.read_exploration()
+            initialized = self._ensure_observable_context_locked(data)
+            observable = data.get("interaction_observable_context") or {}
+            context = {
+                "observable_revision": max(0, int(observable.get("revision") or 0)),
+                "narrative_digest": self.narrative_context_digest(),
+                "task_digest": self.active_task_context_digest(data),
+                "captured_at": time.time(),
+            }
+            context["key"] = self.stable_digest({
+                key: context[key]
+                for key in ("observable_revision", "narrative_digest", "task_digest")
+            })
+            if initialized:
+                self.write_exploration(data)
+            return context
+
+    @staticmethod
+    def task_ledger_revision(data: dict) -> int:
+        try:
+            return max(0, int(data.get("tasks_revision") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def task_view(self, task: dict, *, include_history: bool = True) -> dict:
         """Return a compact, JSON-safe task record without treating it as engine state."""
@@ -3606,6 +3839,7 @@ class DebugState:
                 "transition_key", "room_id", "rationale", "created_at",
                 "updated_at", "created_agent_turn", "updated_agent_turn",
                 "last_reviewed_at", "last_reviewed_agent_turn",
+                "provenance",
             )
         }
         result["last_reviewed_at"] = task.get("last_reviewed_at", task.get("updated_at"))
@@ -3616,9 +3850,37 @@ class DebugState:
             result["history"] = list(task.get("history") or [])[-MAX_TASK_HISTORY:]
         return result
 
-    def task_ledger(self, *, include_closed: bool = False, limit: int | None = 20) -> list[dict]:
+    def task_summary_view(self, task: dict) -> dict:
+        description = " ".join(str(task.get("description") or "").split())
+        rationale = " ".join(str(task.get("rationale") or "").split())
+        if len(description) > MAX_ACTIVE_TASK_DESCRIPTION:
+            description = description[:MAX_ACTIVE_TASK_DESCRIPTION - 1] + "…"
+        if len(rationale) > MAX_ACTIVE_TASK_DESCRIPTION:
+            rationale = rationale[:MAX_ACTIVE_TASK_DESCRIPTION - 1] + "…"
+        return {
+            **{
+                key: task.get(key)
+                for key in (
+                    "id", "status", "object_id",
+                    "transition_key", "room_id",
+                )
+                if task.get(key) is not None
+            },
+            "description": description,
+            "rationale": rationale,
+        }
+
+    def task_ledger_page(
+        self,
+        *,
+        include_closed: bool,
+        detail: str,
+        offset: int,
+        limit: int,
+    ) -> dict:
         with self.exploration_lock:
             data = self.read_exploration()
+            revision = self.task_ledger_revision(data)
             tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
             records = [task for task in tasks.values() if isinstance(task, dict)]
         if not include_closed:
@@ -3634,8 +3896,32 @@ class DebugState:
                 updated_at = 0
             return (-priority, -updated_at, str(task.get("id") or ""))
         records.sort(key=sort_key)
-        selected = records if limit is None else records[:max(0, int(limit))]
-        return [self.task_view(task) for task in selected]
+        selected = records[offset:offset + limit]
+        complete = offset + len(selected) >= len(records)
+        view = self.task_summary_view if detail == "summary" else self.task_view
+        counts = {
+            status: sum(1 for task in records if task.get("status") == status)
+            for status in ("active", "completed", "abandoned")
+        }
+        return {
+            "revision": revision,
+            "tasks": [view(task) for task in selected],
+            "returned": len(selected),
+            "total": len(records),
+            "offset": offset,
+            "next_offset": None if complete else offset + len(selected),
+            "complete": complete,
+            "counts": counts,
+        }
+
+    def task_ledger(self, *, include_closed: bool = False, limit: int | None = 20) -> list[dict]:
+        page = self.task_ledger_page(
+            include_closed=include_closed,
+            detail="full",
+            offset=0,
+            limit=1_000_000 if limit is None else max(0, int(limit)),
+        )
+        return page["tasks"]
 
     def agent_tasks_view(self) -> dict:
         grouped = {status: [] for status in ("active", "completed", "abandoned")}
@@ -3831,16 +4117,364 @@ class DebugState:
         reviews.sort(key=lambda item: str(item.get("id") or ""))
         return {"required": bool(reviews), "tasks": reviews}
 
+    @staticmethod
+    def task_inbox_entry_time(entry: dict) -> float:
+        for key in ("updated_at", "time"):
+            value = entry.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    def task_inbox_dialog_payload(self, entry: dict) -> dict:
+        text = str(entry.get("text") or "")
+        if len(text) > TASK_INBOX_DIALOG_TEXT_LIMIT:
+            text = text[:TASK_INBOX_DIALOG_TEXT_LIMIT - 1] + "…"
+        return {
+            key: entry.get(key)
+            for key in (
+                "source_key", "speaker_hint", "event_object_id", "message_id",
+                "scene_id", "map_id", "room_id", "logical_room_id", "room_key",
+            )
+            if entry.get(key) is not None
+        } | {"text": text}
+
+    def task_inbox_batch_identity(self, entry: dict) -> tuple[str, str]:
+        try:
+            turn = max(0, int(entry.get("agent_turn") or 0))
+        except (TypeError, ValueError):
+            turn = 0
+        room_id = str(entry.get("logical_room_id") or entry.get("room_id") or entry.get("room_key") or "")
+        object_id = str(entry.get("event_object_id") or "")
+        identity = f"{turn}:{room_id}:{object_id}"
+        batch_id = "inbox-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        return batch_id, identity
+
+    def _prune_task_inbox_locked(self, data: dict) -> None:
+        inbox = data.setdefault("task_inbox", {})
+        resolved = sorted(
+            (
+                record for record in inbox.values()
+                if isinstance(record, dict) and record.get("status") != "pending"
+            ),
+            key=lambda record: (float(record.get("resolved_at") or 0), str(record.get("id") or "")),
+            reverse=True,
+        )
+        keep_resolved = {str(record.get("id")) for record in resolved[:MAX_TASK_INBOX_HISTORY]}
+        data["task_inbox"] = {
+            key: record
+            for key, record in inbox.items()
+            if isinstance(record, dict) and (record.get("status") == "pending" or key in keep_resolved)
+        }
+
+    def _record_task_inbox_entries_locked(self, data: dict, entries: list[dict]) -> bool:
+        inbox = data.setdefault("task_inbox", {})
+        changed = False
+        for entry in entries:
+            if not isinstance(entry, dict) or not str(entry.get("text") or "").strip():
+                continue
+            payload = self.task_inbox_dialog_payload(entry)
+            source_key = str(payload.get("source_key") or "")
+            batch_id, identity = self.task_inbox_batch_identity(entry)
+            record = inbox.get(batch_id)
+            if isinstance(record, dict) and record.get("status") != "pending":
+                resolved_source_keys = {
+                    str(item.get("source_key") or "")
+                    for item in record.get("dialogs") or []
+                    if isinstance(item, dict)
+                }
+                if source_key in resolved_source_keys:
+                    continue
+                batch_id = "inbox-" + hashlib.sha256(
+                    f"{identity}:{source_key}".encode("utf-8")
+                ).hexdigest()[:16]
+                record = inbox.get(batch_id)
+            if not isinstance(record, dict):
+                observed_at = self.task_inbox_entry_time(entry) or time.time()
+                try:
+                    created_turn = max(0, int(entry.get("agent_turn") or 0))
+                except (TypeError, ValueError):
+                    created_turn = 0
+                record = {
+                    "id": batch_id,
+                    "identity": identity,
+                    "status": "pending",
+                    "created_at": observed_at,
+                    "updated_at": observed_at,
+                    "created_agent_turn": created_turn,
+                    "room_id": entry.get("logical_room_id") or entry.get("room_id"),
+                    "event_object_id": entry.get("event_object_id"),
+                    "dialogs": [],
+                }
+                inbox[batch_id] = record
+                changed = True
+            if record.get("status") != "pending":
+                continue
+            dialogs = record.setdefault("dialogs", [])
+            existing_index = next(
+                (index for index, item in enumerate(dialogs) if str(item.get("source_key") or "") == source_key),
+                None,
+            )
+            if existing_index is None:
+                dialogs.append(payload)
+                changed = True
+            elif dialogs[existing_index] != payload:
+                dialogs[existing_index] = payload
+                changed = True
+            observed_at = self.task_inbox_entry_time(entry) or float(record.get("updated_at") or 0)
+            if observed_at > float(record.get("updated_at") or 0):
+                record["updated_at"] = observed_at
+                changed = True
+        if changed:
+            self._prune_task_inbox_locked(data)
+        return changed
+
+    def record_task_inbox_entries(self, entries: list[dict]) -> None:
+        if not entries:
+            return
+        with self.exploration_lock:
+            data = self.read_exploration()
+            data["task_inbox_initialized"] = True
+            if self._record_task_inbox_entries_locked(data, entries):
+                self.write_exploration(data)
+
+    def _ensure_task_inbox_initialized_locked(self, data: dict) -> bool:
+        if data.get("task_inbox_initialized") is True:
+            return False
+        latest = self.dialog_history[-1] if self.dialog_history else None
+        entries: list[dict] = []
+        if isinstance(latest, dict):
+            latest_turn = latest.get("agent_turn")
+            latest_object = latest.get("event_object_id")
+            latest_room = latest.get("logical_room_id") or latest.get("room_id") or latest.get("room_key")
+            for entry in reversed(self.dialog_history):
+                if entry.get("agent_turn") != latest_turn:
+                    break
+                if entry.get("event_object_id") != latest_object:
+                    break
+                if (entry.get("logical_room_id") or entry.get("room_id") or entry.get("room_key")) != latest_room:
+                    break
+                entries.append(entry)
+            entries.reverse()
+        data["task_inbox_initialized"] = True
+        self._record_task_inbox_entries_locked(data, entries)
+        return True
+
+    def task_inbox_pending(self) -> list[dict]:
+        with self.exploration_lock:
+            data = self.read_exploration()
+            initialized = self._ensure_task_inbox_initialized_locked(data)
+            if initialized:
+                self.write_exploration(data)
+            inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+            pending = [
+                copy.deepcopy(record)
+                for record in inbox.values()
+                if isinstance(record, dict) and record.get("status") == "pending"
+            ]
+        pending.sort(key=lambda record: (float(record.get("created_at") or 0), str(record.get("id") or "")))
+        return pending
+
+    def task_inbox_structural_changes(self, record: dict) -> list[str]:
+        try:
+            created_at = float(record.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        kinds = {
+            str(event.get("type"))
+            for event in self.event_log
+            if isinstance(event, dict)
+            and event.get("type") in TASK_INBOX_STRUCTURAL_EVENT_TYPES
+            and self.task_evidence_time(event) is not None
+            and float(self.task_evidence_time(event) or 0) >= created_at
+        }
+        return sorted(kinds)
+
+    def task_inbox_gate_context(self, state: dict | None = None, *, action: str | None = None, target_id=None) -> dict:
+        state = state if isinstance(state, dict) else self.read_live_state()
+        pending = self.task_inbox_pending()
+        reasons: list[dict] = []
+        current_turn = self.current_agent_turn()
+        aged_ids = [
+            str(record.get("id"))
+            for record in pending
+            if current_turn - int(record.get("created_agent_turn") or 0) >= TASK_INBOX_MAX_PENDING_TURNS
+        ]
+        if aged_ids:
+            reasons.append({"kind": "aged", "batch_ids": aged_ids, "turns": TASK_INBOX_MAX_PENDING_TURNS})
+        if len(pending) >= TASK_INBOX_MAX_PENDING_BATCHES:
+            reasons.append({"kind": "backlog", "pending_total": len(pending)})
+        structural = [
+            {"batch_id": str(record.get("id")), "event_types": changes}
+            for record in pending
+            if (changes := self.task_inbox_structural_changes(record))
+        ]
+        if structural:
+            reasons.append({"kind": "structural_change", "batches": structural})
+        if action == "navigate" and target_id is not None:
+            try:
+                requested_id = int(target_id)
+            except (TypeError, ValueError):
+                requested_id = 0
+            target = next(
+                (item for item in state.get("objects") or [] if int(item.get("id") or 0) == requested_id),
+                None,
+            )
+            if isinstance(target, dict) and transition_candidate(target):
+                reasons.append({"kind": "leaving_room", "target_id": requested_id})
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        required = bool(pending and reasons and not dialog.get("active"))
+        return {
+            "pending_total": len(pending),
+            "batches": [
+                {
+                    key: record.get(key)
+                    for key in ("id", "created_agent_turn", "room_id", "event_object_id", "dialogs")
+                }
+                for record in pending[:MAX_TASK_INBOX_CONTEXT]
+            ],
+            "review_required": required,
+            "reasons": reasons if required else [],
+        }
+
+    def review_agent_task_inbox(self, arguments: dict, state: dict, tool_cycle: dict | None) -> dict:
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        if dialog.get("active"):
+            return {"ok": False, "error": "finish the active dialog before reviewing task inbox evidence"}
+        batch_ids = arguments.get("batch_ids")
+        if not isinstance(batch_ids, list) or not batch_ids or any(not isinstance(item, str) or not item.strip() for item in batch_ids):
+            return {"ok": False, "error": "batch_ids must be a non-empty list of strings"}
+        batch_ids = list(dict.fromkeys(item.strip() for item in batch_ids))
+        disposition = arguments.get("disposition")
+        if disposition == "no_task":
+            disposition = "no_follow_up"
+        if disposition not in {"no_follow_up", "tasks_updated"}:
+            return {"ok": False, "error": "disposition must be no_follow_up or tasks_updated"}
+        rationale = arguments.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip():
+            return {"ok": False, "error": "rationale must be a non-empty string"}
+        task_ids = arguments.get("task_ids", [])
+        if not isinstance(task_ids, list) or any(not isinstance(item, str) or not item.strip() for item in task_ids):
+            return {"ok": False, "error": "task_ids must be a list of strings"}
+        task_ids = list(dict.fromkeys(item.strip() for item in task_ids))
+        if disposition == "no_follow_up" and task_ids:
+            return {"ok": False, "error": "no_follow_up disposition must not include task_ids"}
+        if disposition == "tasks_updated":
+            if not task_ids:
+                return {"ok": False, "error": "tasks_updated disposition requires task_ids"}
+            if not isinstance(tool_cycle, dict) or not tool_cycle.get("tasks_queried"):
+                return {"ok": False, "error": "call get_tasks before resolving inbox evidence with tasks_updated"}
+            upserted = set(tool_cycle.get("upserted_task_ids") or [])
+            missing = sorted(set(task_ids) - upserted)
+            if missing:
+                return {"ok": False, "error": "every referenced task must be upserted in this tool cycle", "missing_task_ids": missing}
+        now = time.time()
+        with self.exploration_lock:
+            data = self.read_exploration()
+            inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+            missing_batches = sorted(
+                batch_id for batch_id in batch_ids
+                if not isinstance(inbox.get(batch_id), dict) or inbox[batch_id].get("status") != "pending"
+            )
+            if missing_batches:
+                return {"ok": False, "error": "unknown or already resolved task inbox batch", "missing_batch_ids": missing_batches}
+            for batch_id in batch_ids:
+                record = inbox[batch_id]
+                record["status"] = "dismissed" if disposition == "no_follow_up" else "promoted"
+                record["resolved_at"] = now
+                record["resolved_agent_turn"] = self.current_agent_turn()
+                record["resolution"] = {
+                    "disposition": disposition,
+                    "rationale": rationale.strip(),
+                    "task_ids": task_ids,
+                }
+            if disposition == "tasks_updated":
+                tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+                for task_id in task_ids:
+                    task = tasks.get(task_id)
+                    if not isinstance(task, dict):
+                        continue
+                    provenance = task.setdefault("provenance", {})
+                    inbox_ids = provenance.setdefault("task_inbox_batch_ids", [])
+                    inbox_ids.extend(batch_id for batch_id in batch_ids if batch_id not in inbox_ids)
+                data["tasks_revision"] = self.task_ledger_revision(data) + 1
+            self._prune_task_inbox_locked(data)
+            self.write_exploration(data)
+        if isinstance(tool_cycle, dict):
+            resolved = tool_cycle.setdefault("resolved_inbox_batch_ids", [])
+            resolved.extend(batch_id for batch_id in batch_ids if batch_id not in resolved)
+        return {
+            "ok": True,
+            "disposition": disposition,
+            "resolved_batch_ids": batch_ids,
+            "task_ids": task_ids,
+            "pending_total": len(self.task_inbox_pending()),
+        }
+
     def new_agent_tool_cycle(self, state: dict | None = None) -> dict:
         review = self.task_review_context(state)
         return {
             "tasks_queried": False,
+            "task_query_audit": None,
+            "task_review_nonce": os.urandom(16).hex(),
             "required_task_ids": [str(item.get("id")) for item in review.get("tasks") or []],
             "reviewed_task_ids": [],
+            "reconciled_task_ids": [],
+            "upserted_task_ids": [],
+            "resolved_inbox_batch_ids": [],
             "equipment_review_item_id": None,
         }
 
-    def upsert_agent_task(self, arguments: dict) -> dict:
+    def task_creation_review_error(
+        self,
+        tool_cycle: dict | None,
+        review_token: object,
+        *,
+        current_revision: int | None = None,
+    ) -> dict | None:
+        audit = tool_cycle.get("task_query_audit") if isinstance(tool_cycle, dict) else None
+        if not isinstance(audit, dict) or audit.get("complete") is not True:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task_creation_review_required",
+                    "message": (
+                        "Creating a task requires a complete summary audit of active, completed, "
+                        "and abandoned tasks from a previous model batch. Call get_tasks with "
+                        "include_closed=true and detail=summary, following every page."
+                    ),
+                },
+            }
+        supplied = str(review_token or "")
+        if supplied != str(audit.get("review_token") or ""):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task_creation_review_required",
+                    "message": "Use the review_token returned by the completed get_tasks audit in a later model batch.",
+                },
+            }
+        if current_revision is None:
+            with self.exploration_lock:
+                revision = self.task_ledger_revision(self.read_exploration())
+        else:
+            revision = current_revision
+        if revision != audit.get("revision"):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task_creation_review_required",
+                    "message": "The task ledger changed after it was reviewed; repeat the complete closed-inclusive audit.",
+                    "reviewed_revision": audit.get("revision"),
+                    "current_revision": revision,
+                },
+            }
+        return None
+
+    def upsert_agent_task(self, arguments: dict, tool_cycle: dict | None = None) -> dict:
         task_id = str(arguments.get("id") or "").strip()
         status = arguments.get("status")
         if status is not None and status not in {"active", "completed", "abandoned"}:
@@ -3854,6 +4488,21 @@ class DebugState:
             if not isinstance(existing, dict):
                 existing = None
             if existing is None:
+                if self.agent_runtime.task_reconciliation_pending():
+                    return {
+                        "ok": False,
+                        "error": {
+                            "code": "task_reconciliation_required",
+                            "message": "Finish the pending full-ledger reconciliation before creating a task.",
+                        },
+                    }
+                review_error = self.task_creation_review_error(
+                    tool_cycle,
+                    arguments.get("review_token"),
+                    current_revision=self.task_ledger_revision(data),
+                )
+                if review_error is not None:
+                    return review_error
                 description = arguments.get("description")
                 rationale = arguments.get("rationale")
                 if (
@@ -3886,6 +4535,15 @@ class DebugState:
                 operation = "created"
             else:
                 operation = "updated"
+                if self.agent_runtime.task_reconciliation_pending():
+                    review_error = self.task_creation_review_error(
+                        tool_cycle,
+                        arguments.get("review_token"),
+                        current_revision=self.task_ledger_revision(data),
+                    )
+                    if review_error is not None:
+                        review_error["error"]["code"] = "task_reconciliation_required"
+                        return review_error
             changed = {}
             for key in ("description", "rationale", "status", "transition_key", "room_id"):
                 if key not in arguments:
@@ -3929,6 +4587,7 @@ class DebugState:
             })
             existing["history"] = existing["history"][-MAX_TASK_HISTORY:]
             tasks[task_id] = existing
+            data["tasks_revision"] = self.task_ledger_revision(data) + 1
             self.write_exploration(data)
             return {"ok": True, "operation": operation, "task": self.task_view(existing)}
 
@@ -3952,7 +4611,36 @@ class DebugState:
             "active_tasks": self.active_task_summary(),
             "active_tasks_total": len(self.task_ledger(limit=None)),
             "task_review": self.task_review_context(state),
+            "task_inbox": self.task_inbox_gate_context(state),
         }
+
+    def task_reconciliation_context(self, tool_cycle: dict | None = None) -> dict:
+        pending = self.agent_runtime.task_reconciliation_pending()
+        result = {
+            "pending": pending,
+            "reason": self.agent_runtime.task_reconciliation_reason() if pending else None,
+        }
+        if pending:
+            result["requirements"] = (
+                "Read every get_tasks page with include_closed=true and detail=summary, then in a later model "
+                "batch upsert every active task with the returned review_token. Preserve completed tasks; mark "
+                "semantic duplicates abandoned with their relationship. A successful submit_decision clears the audit."
+            )
+        if isinstance(tool_cycle, dict):
+            audit = tool_cycle.get("task_query_audit")
+            with self.exploration_lock:
+                revision = self.task_ledger_revision(self.read_exploration())
+            active_ids = {
+                str(task.get("id")) for task in self.task_ledger(limit=None) if task.get("id")
+            }
+            reconciled = set(tool_cycle.get("reconciled_task_ids") or [])
+            result["audit_complete"] = (
+                isinstance(audit, dict)
+                and audit.get("complete") is True
+                and audit.get("revision") == revision
+            )
+            result["missing_active_task_ids"] = sorted(active_ids - reconciled)
+        return result
 
     def object_event_key(self, event: dict) -> str:
         payload = {
@@ -4100,6 +4788,136 @@ class DebugState:
             if current.get(key) != recorded.get(key):
                 return False
         return compared
+
+    def task_structure_changed_after(self, data: dict, observed_at: float) -> bool:
+        tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+        structural_fields = {"created", "description", "status", "object_id", "transition_key", "room_id"}
+        for task in tasks.values():
+            if not isinstance(task, dict):
+                continue
+            try:
+                if float(task.get("created_at") or 0) > observed_at:
+                    return True
+            except (TypeError, ValueError):
+                pass
+            for change in task.get("history") or []:
+                if not isinstance(change, dict):
+                    continue
+                try:
+                    changed_at = float(change.get("time") or 0)
+                except (TypeError, ValueError):
+                    continue
+                fields = change.get("changes") if isinstance(change.get("changes"), dict) else {}
+                if changed_at > observed_at and structural_fields.intersection(fields):
+                    return True
+        return False
+
+    def legacy_interaction_context_changes(self, data: dict, event: dict) -> list[str]:
+        try:
+            observed_at = float(event.get("time") or event.get("started_at") or 0)
+        except (TypeError, ValueError):
+            observed_at = 0.0
+        if observed_at <= 0:
+            return []
+        changes: list[str] = []
+        observable = data.get("interaction_observable_context")
+        evidence = observable.get("evidence") if isinstance(observable, dict) else []
+        if any(
+            isinstance(item, dict) and float(item.get("time") or 0) > observed_at
+            for item in evidence or []
+        ):
+            changes.append("observable_state_changed")
+        if any(
+            isinstance(entry, dict)
+            and self.dialog_semantic_signature(entry) is not None
+            and self.task_inbox_entry_time(entry) > observed_at
+            for entry in self.dialog_history
+        ):
+            changes.append("new_dialog_evidence")
+        if self.task_structure_changed_after(data, observed_at):
+            changes.append("task_structure_changed")
+        return changes
+
+    def context_changes_since_interaction(
+        self,
+        data: dict,
+        recorded: dict | None,
+        current: dict,
+    ) -> tuple[str, list[str]]:
+        if not isinstance(recorded, dict) or not recorded.get("key"):
+            return "legacy", []
+        if recorded.get("key") == current.get("key"):
+            return "same", []
+        changes: list[str] = []
+        try:
+            old_revision = int(recorded.get("observable_revision") or 0)
+        except (TypeError, ValueError):
+            old_revision = 0
+        if old_revision != int(current.get("observable_revision") or 0):
+            changes.append("observable_state_changed")
+        if recorded.get("narrative_digest") != current.get("narrative_digest"):
+            changes.append("new_dialog_evidence")
+        if recorded.get("task_digest") != current.get("task_digest"):
+            changes.append("task_structure_changed")
+        return "stale", changes
+
+    def interaction_failure_evidence(
+        self,
+        state: dict,
+        entry: dict,
+        data: dict,
+        current_context: dict,
+    ) -> dict:
+        current_object = self.object_snapshot_for_interaction(state, int(entry.get("object_id") or 0))
+        attempts = []
+        for detail in entry.get("history") or []:
+            if not isinstance(detail, dict) or detail.get("type") != "interaction_no_effect":
+                continue
+            recorded_object = detail.get("finished_object") or detail.get("started_object")
+            if not self.object_snapshot_compatible(current_object, recorded_object):
+                continue
+            relation, changes = self.context_changes_since_interaction(
+                data,
+                detail.get("interaction_context"),
+                current_context,
+            )
+            legacy = relation == "legacy"
+            if relation == "legacy":
+                changes = self.legacy_interaction_context_changes(data, detail)
+                relation = "stale" if changes else "unknown"
+            attempts.append({
+                "time": detail.get("time"),
+                "relation": relation,
+                "legacy": legacy,
+                "context_changes": changes,
+                "reason": detail.get("reason"),
+            })
+        same_count = sum(1 for attempt in attempts if attempt["relation"] == "same")
+        stale_count = sum(1 for attempt in attempts if attempt["relation"] == "stale")
+        unknown_count = sum(1 for attempt in attempts if attempt["relation"] == "unknown")
+        context_keys = {
+            str(detail.get("interaction_context", {}).get("key"))
+            for detail in entry.get("history") or []
+            if isinstance(detail, dict)
+            and detail.get("type") == "interaction_no_effect"
+            and isinstance(detail.get("interaction_context"), dict)
+            and detail.get("interaction_context", {}).get("key")
+        }
+        if any(attempt["legacy"] and attempt["relation"] == "stale" for attempt in attempts):
+            context_keys.add("legacy-stale")
+        if any(attempt["legacy"] and attempt["relation"] == "unknown" for attempt in attempts):
+            context_keys.add("legacy-unknown")
+        latest = attempts[-1] if attempts else None
+        return {
+            "no_effect_count": int(entry.get("no_effect_count") or len(attempts)),
+            "compatible_no_effect_count": len(attempts),
+            "same_context_no_effect_count": same_count,
+            "stale_context_no_effect_count": stale_count,
+            "unknown_context_no_effect_count": unknown_count,
+            "failed_context_count": len(context_keys),
+            "context_changes_since_latest": list((latest or {}).get("context_changes") or []),
+            "recent_context_outcomes": attempts[-6:],
+        }
 
     def recover_object_interactions_from_agent_llm_log(self) -> int:
         try:
@@ -7610,6 +8428,22 @@ class DebugState:
             return (backtrack_rank, destination_rank, steps, int(target.get("id") or 0))
 
         transitions.sort(key=transition_sort_key)
+        if (
+            transitions
+            and (
+                transitions[0].get("returns_to_recent_room")
+                or transitions[0].get("agent_priority") == "avoid_backtrack"
+            )
+            and any(
+                target.get("interaction_state") == "stale_no_effect"
+                and target.get("agent_priority") == "soft_avoid"
+                for target in reachable
+            )
+        ):
+            # A stale failure remains negative evidence, but an immediate return
+            # should not make it a permanent dead end after the observable
+            # narrative or task context has changed.
+            transitions = []
         if transitions:
             target = transitions[0]
             route = self.route_to_object(state, int(target.get("id") or 0), avoid_transitions=True)
@@ -8126,6 +8960,7 @@ class DebugState:
     def recent_interaction_outcomes_by_target(self, state: dict, event_limit: int = 80) -> dict[int, dict]:
         outcomes: dict[int, dict] = {}
         identity = self.room_identity(state)
+        current_context = self.interaction_context_snapshot()
         data = self.read_exploration()
         interaction_rooms = data.get("object_interactions") if isinstance(data.get("object_interactions"), dict) else {}
         persistent_objects = (
@@ -8149,10 +8984,16 @@ class DebugState:
             if not self.object_snapshot_compatible(current, recorded):
                 continue
             last_event = entry.get("last_event") if isinstance(entry.get("last_event"), dict) else {}
+            failure_evidence = (
+                self.interaction_failure_evidence(state, entry, data, current_context)
+                if entry.get("last_result") == "no_effect"
+                else None
+            )
             outcomes[obj_id] = {
                 **last_event,
                 "type": "interaction_no_effect" if entry.get("last_result") == "no_effect" else "interaction_effect",
                 "persistent": True,
+                **({"interaction_evidence": failure_evidence} if failure_evidence is not None else {}),
             }
         for event in reversed(self.event_log[-event_limit:]):
             if event.get("type") not in {"interaction_effect", "interaction_no_effect"}:
@@ -8171,7 +9012,23 @@ class DebugState:
             recorded = event.get("finished_object") or event.get("started_object")
             if isinstance(recorded, dict) and not self.object_snapshot_compatible(current, recorded):
                 continue
-            outcomes[obj_id] = event
+            if event.get("type") == "interaction_no_effect":
+                ephemeral_entry = {
+                    "object_id": obj_id,
+                    "no_effect_count": 1,
+                    "history": [event],
+                }
+                outcomes[obj_id] = {
+                    **event,
+                    "interaction_evidence": self.interaction_failure_evidence(
+                        state,
+                        ephemeral_entry,
+                        data,
+                        current_context,
+                    ),
+                }
+            else:
+                outcomes[obj_id] = event
         return outcomes
 
     def target_affordance(self, state: dict, target_id: int, context: dict | None = None) -> dict:
@@ -8193,16 +9050,26 @@ class DebugState:
         outcome = outcomes.get(target_id)
         if outcome:
             no_effect = outcome.get("type") == "interaction_no_effect"
+            evidence = outcome.get("interaction_evidence") if isinstance(outcome.get("interaction_evidence"), dict) else {}
+            stale_only = (
+                no_effect
+                and int(evidence.get("compatible_no_effect_count") or 0) > 0
+                and int(evidence.get("same_context_no_effect_count") or 0) == 0
+                and int(evidence.get("unknown_context_no_effect_count") or 0) == 0
+            )
             return {
-                "interaction_state": "previously_tried",
-                "agent_priority": "avoid_repeat",
+                "interaction_state": "stale_no_effect" if stale_only else "previously_tried",
+                "agent_priority": "soft_avoid" if stale_only else "avoid_repeat",
                 "interaction_feedback_state": "no_effect" if no_effect else "effect",
                 "deprioritize_reason": (
-                    "该目标此前已尝试交互，但没有观察到状态、物品或房间变化。"
+                    "该目标只在旧的可观察上下文中失败过；失败仍是负面证据，但应结合新剧情、任务和路线价值重新判断。"
+                    if stale_only
+                    else "该目标此前已尝试交互，但没有观察到状态、物品或房间变化。"
                     if no_effect
                     else "该目标此前交互后已经产生了状态、物品或房间变化。"
                 ),
                 "previous_interaction_outcome": outcome,
+                **({"interaction_evidence": evidence} if no_effect else {}),
             }
         dialog_feedback = self.dialog_feedback_for_target(state, target_id, context)
         if dialog_feedback:
@@ -8718,8 +9585,8 @@ class DebugState:
                 "function": {
                     "name": "upsert_task",
                     "description": (
-                        "创建或更新本地 agent 任务记忆，不执行游戏动作。已有 id 会更新；未知自选 id 在同时提供 "
-                        "description 和 rationale 时按该 id 创建；省略 id 创建时自动生成 task-* id。更新前优先用 get_tasks 核对账本。"
+                        "创建或更新本地 agent 任务记忆，不执行游戏动作。已有 id 会更新；未知自选 id 或省略 id 的创建必须先完整读取 "
+                        "closed-inclusive summary 账本，并在后一模型批次提供最终页 review_token。省略 id 创建时自动生成 task-* id。"
                         "对已有 id 不提供变化字段表示明确确认继续，也会刷新该任务的证据审计快照。"
                     ),
                     "parameters": {
@@ -8731,6 +9598,7 @@ class DebugState:
                             "object_id": {"type": "integer", "minimum": 1},
                             "transition_key": {"type": "string"}, "room_id": {"type": "string"},
                             "rationale": {"type": "string", "minLength": 1},
+                            "review_token": {"type": "string", "minLength": 1},
                         },
                         "additionalProperties": False,
                     },
@@ -8740,13 +9608,45 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "get_tasks",
-                    "description": "查询任务账本的完整记录。默认只返回 active；include_closed=true 返回 completed 和 abandoned；写入前用它核对已有 id。",
+                    "description": (
+                        "分页查询任务账本。默认兼容旧行为：active、full、offset=0。创建任务或执行恢复/压缩后的全账本对账时，"
+                        "必须从 offset=0 开始用 include_closed=true、detail=summary 连续读取到 complete=true；最终页返回下一模型批次使用的 review_token。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "include_closed": {"type": "boolean", "default": False},
+                            "detail": {"type": "string", "enum": ["summary", "full"], "default": "full"},
+                            "offset": {"type": "integer", "minimum": 0, "default": 0},
                             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
                         },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "review_task_inbox",
+                    "description": (
+                        "归档已完成对话产生的 task_inbox 证据，不执行游戏动作。只有闲聊、重复台词、已自动完成或永不影响后续行动的证据才用 no_follow_up；"
+                        "需要创建、更新、完成或接续任务时，先 get_tasks，再 upsert_task，并用 tasks_updated 引用本轮写入的 task id。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "batch_ids": {
+                                "type": "array", "minItems": 1, "maxItems": 20,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "disposition": {"type": "string", "enum": ["no_follow_up", "tasks_updated"]},
+                            "task_ids": {
+                                "type": "array", "maxItems": 20,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "rationale": {"type": "string", "minLength": 1, "maxLength": 500},
+                        },
+                        "required": ["batch_ids", "disposition", "rationale"],
                         "additionalProperties": False,
                     },
                 },
@@ -8910,6 +9810,7 @@ class DebugState:
         context = {
             "state_summary": self.agent_state_summary(state),
             **self.active_task_context(state),
+            "task_reconciliation": self.task_reconciliation_context(),
         }
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         review = self.agent_runtime.pending_equipment_review()
@@ -8965,6 +9866,7 @@ class DebugState:
             "transition_key", "to_room_key", "to_region_key", "to_nav_room_id",
             "to_logical_room_id", "dialog_feedback_state", "recent_dialog_feedback",
             "stale_dialog_feedback", "previous_interaction_outcome",
+            "interaction_feedback_state", "interaction_evidence",
             "known_destination_room_id", "known_destination_room_key",
             "approach", "affordances",
         )
@@ -8991,28 +9893,98 @@ class DebugState:
         arguments = arguments if isinstance(arguments, dict) else {}
         state = state or self.read_live_state()
         if name == "upsert_task":
-            result = self.upsert_agent_task(arguments)
-            if result.get("ok") and isinstance(tool_cycle, dict) and tool_cycle.get("tasks_queried"):
+            reconciliation_pending = self.agent_runtime.task_reconciliation_pending()
+            result = self.upsert_agent_task(arguments, tool_cycle)
+            if result.get("ok") and isinstance(tool_cycle, dict):
                 task_id = str((result.get("task") or {}).get("id") or "")
-                if task_id in set(tool_cycle.get("required_task_ids") or []):
+                if tool_cycle.get("tasks_queried"):
+                    upserted = tool_cycle.setdefault("upserted_task_ids", [])
+                    if task_id and task_id not in upserted:
+                        upserted.append(task_id)
+                if tool_cycle.get("tasks_queried") and task_id in set(tool_cycle.get("required_task_ids") or []):
                     reviewed = tool_cycle.setdefault("reviewed_task_ids", [])
                     if task_id not in reviewed:
                         reviewed.append(task_id)
+                if reconciliation_pending:
+                    reconciled = tool_cycle.setdefault("reconciled_task_ids", [])
+                    if task_id and task_id not in reconciled:
+                        reconciled.append(task_id)
+                    audit = tool_cycle.get("task_query_audit")
+                    if isinstance(audit, dict):
+                        with self.exploration_lock:
+                            audit["revision"] = self.task_ledger_revision(self.read_exploration())
             return result
         if name == "get_tasks":
             if isinstance(tool_cycle, dict):
                 tool_cycle["tasks_queried"] = True
             include_closed = arguments.get("include_closed") is True
+            detail = arguments.get("detail", "full")
+            if detail not in {"summary", "full"}:
+                return {"ok": False, "error": "detail must be summary or full"}
+            try:
+                offset = int(arguments.get("offset") or 0)
+            except (TypeError, ValueError):
+                offset = -1
+            if offset < 0:
+                return {"ok": False, "error": "offset must be a non-negative integer"}
             limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
-            all_tasks = self.task_ledger(include_closed=include_closed, limit=None)
-            tasks = all_tasks[:limit]
-            return {
+            page = self.task_ledger_page(
+                include_closed=include_closed,
+                detail=detail,
+                offset=offset,
+                limit=limit,
+            )
+            result = {
                 "ok": True,
                 "include_closed": include_closed,
-                "tasks": tasks,
-                "returned": len(tasks),
-                "total": len(all_tasks),
+                "detail": detail,
+                **page,
             }
+            qualifying = include_closed and detail == "summary"
+            if qualifying and isinstance(tool_cycle, dict):
+                audit = tool_cycle.get("task_query_audit")
+                if offset == 0:
+                    audit = {
+                        "revision": page["revision"],
+                        "next_offset": page["next_offset"],
+                        "complete": False,
+                        "active_task_ids": [],
+                    }
+                    tool_cycle["task_query_audit"] = audit
+                elif (
+                    not isinstance(audit, dict)
+                    or audit.get("complete") is True
+                    or audit.get("revision") != page["revision"]
+                    or audit.get("next_offset") != offset
+                ):
+                    tool_cycle["task_query_audit"] = None
+                    result["audit_valid"] = False
+                    result["audit_error"] = "pagination must restart at offset 0 after a revision or page-order change"
+                    return result
+                active_ids = audit.setdefault("active_task_ids", [])
+                active_ids.extend(
+                    str(task.get("id"))
+                    for task in page["tasks"]
+                    if task.get("status") == "active" and str(task.get("id") or "") not in active_ids
+                )
+                audit["next_offset"] = page["next_offset"]
+                if page["complete"]:
+                    token = hashlib.sha256(
+                        f"{tool_cycle.get('task_review_nonce')}:{page['revision']}".encode("utf-8")
+                    ).hexdigest()
+                    audit["complete"] = True
+                    audit["review_token"] = token
+                    result["review_token"] = token
+                    result["audit_valid"] = True
+            return result
+        if name == "review_task_inbox":
+            result = self.review_agent_task_inbox(arguments, state, tool_cycle)
+            if result.get("ok") and isinstance(tool_cycle, dict):
+                audit = tool_cycle.get("task_query_audit")
+                if isinstance(audit, dict) and audit.get("complete") is True:
+                    with self.exploration_lock:
+                        audit["revision"] = self.task_ledger_revision(self.read_exploration())
+            return result
         if name == "get_navigation":
             limit = self.agent_tool_limit(arguments.get("limit"), 20, 40)
             return {"ok": True, "navigation": self.compact_agent_navigation(state, limit)}
@@ -9034,7 +10006,7 @@ class DebugState:
                 "known_destination_observed_at", "destination_priority",
                 "destination_exploration", "transition_key", "to_room_id",
                 "to_semantic_room", "confidence", "returns_to_recent_room",
-                "approach",
+                "approach", "interaction_feedback_state", "interaction_evidence",
             )
             return {
                 "ok": True,
@@ -9091,6 +10063,49 @@ class DebugState:
             if submission_error is not None:
                 return submission_error
             action = arguments.get("action")
+            reconciliation = self.task_reconciliation_context(tool_cycle)
+            if (
+                reconciliation.get("pending")
+                and action in {"navigate", "use_item"}
+                and (
+                    not reconciliation.get("audit_complete")
+                    or reconciliation.get("missing_active_task_ids")
+                )
+            ):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "task_reconciliation_required",
+                        "message": (
+                            "Restore/compaction reconciliation must finish before navigate or use_item. "
+                            "Read the complete closed-inclusive summary ledger, then confirm every active task "
+                            "with the returned review_token in a later model batch."
+                        ),
+                        "audit_complete": bool(reconciliation.get("audit_complete")),
+                        "missing_active_task_ids": reconciliation.get("missing_active_task_ids") or [],
+                    },
+                }
+            inbox = self.task_inbox_gate_context(
+                state,
+                action=action,
+                target_id=arguments.get("target_id"),
+            )
+            if inbox.get("review_required") and action not in {"advance_dialog", "select_choice"}:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "task_inbox_review_required",
+                        "message": (
+                            "Pending dialog evidence is at risk of being forgotten. "
+                            "Call review_task_inbox to dismiss it with a reason or promote it after get_tasks/upsert_task."
+                        ),
+                        "required_batch_ids": [
+                            str(batch.get("id")) for batch in inbox.get("batches") or [] if batch.get("id")
+                        ],
+                        "pending_total": inbox.get("pending_total"),
+                        "reasons": inbox.get("reasons") or [],
+                    },
+                }
             if action in {"navigate", "use_item"} and isinstance(tool_cycle, dict):
                 required = set(tool_cycle.get("required_task_ids") or [])
                 reviewed = set(tool_cycle.get("reviewed_task_ids") or [])
@@ -9113,6 +10128,13 @@ class DebugState:
             self.attach_decision_context(state, decision)
             self.validate_agent_decision(decision)
             validation = decision.get("validation") if isinstance(decision.get("validation"), dict) else {}
+            if (
+                reconciliation.get("pending")
+                and reconciliation.get("audit_complete")
+                and not reconciliation.get("missing_active_task_ids")
+                and validation.get("status") != "rejected"
+            ):
+                self.agent_runtime.clear_task_reconciliation()
             reviewed_item_id = tool_cycle.get("equipment_review_item_id") if isinstance(tool_cycle, dict) else None
             if (
                 reviewed_item_id
@@ -9305,6 +10327,10 @@ class DebugState:
             "最近对话历史是角色/对象时间线上下文；重复反馈只限定在逻辑房间和目标对象范围内。"
             "recent_dialog_feedback 表示该对象在此逻辑房间产生过对话；除非状态变化或其他具体进展使重试有意义，否则不要再次建议与同一目标交互。"
             "比较目标时，分别报告 recent_dialog、soft_avoid、previously_cleared 和 previously_tried。"
+            "interaction_evidence 将无效果尝试按可观察上下文分类；same_context_no_effect_count 是当前上下文中的强负面证据，"
+            "stale_context_no_effect_count 只表示旧上下文中的失败。不要因为 stale_no_effect 自动重试，也不要把一次旧失败当成永久事实；"
+            "结合 no_effect_count、failed_context_count、context_changes_since_latest、active task 和路线价值判断。"
+            "同一上下文连续失败或多个不同上下文均失败时，应比单次久远失败更谨慎。"
             "将 agent_priority、interaction_state、recent_dialog_feedback、对象历史、目的地探索状态、路线成本和最近决策作为决策信号；不要把任何单一信号变成无条件优先规则。"
             "距离是成本信号，不是优先级规则；当近处目标重复陈旧或无效果行为时，它仍可能比更远目标或传送更差。"
             "在没有明确剧情时限、直接关键目标、战斗或资源风险，且不会明显绕路时，对 fresh、reachable 的非传送 search 目标给予温和正向偏好。"
@@ -9321,10 +10347,17 @@ class DebugState:
             "一旦该传送已有 known destination，则停止使用刚解锁优先级，恢复目的地探索价值、任务和回退风险的正常比较。"
             "当最近建议看起来反复访问同一房间、目标或传送循环时，依据持久 session 中的最近决策和 get_room_memory 判断。"
             "传送目标包含 transition_key、to_semantic_room、confidence、destination_priority、destination_exploration 和 returns_to_recent_room。"
-            "任务是 agent 从对话和事件推断的记忆，不是引擎事实。自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
-            "NPC 的明确委托、剧情携带、交付和阶段性目标应创建细粒度 task；普通探索不必为每个对象创建 task，账本为空也要按探索价值行动。"
-            "发现、调整、完成或作废任务时调用 upsert_task；更新前先用 get_tasks 核对已有 id，不要仅凭时间自动关闭任务。"
-            "upsert_task 可用稳定自选 id：未知 id 需同时给出完整 description 和 rationale 才会按该 id 创建；省略 id 则自动生成 task-* id。"
+            "任务是 agent 从对话和事件推断的记忆，不是引擎事实；结构化任务账本是任务状态的唯一权威来源，压缩摘要不是。"
+            "自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
+            "任何尚未解决、将影响未来行动的委托、线索或自发调查目标都必须成为独立 task，不要求 NPC 明说请去做；普通且不会影响后续行动的探索不必为每个对象创建 task。"
+            "发现、调整、完成或作废任务时调用 upsert_task，不要仅凭时间自动关闭任务。创建未知 id 或无 id 任务前，必须在前一模型批次完整分页读取 include_closed=true、detail=summary 的账本，"
+            "并使用最终页 review_token；只查 active、漏页、账本 revision 变化或同批并行 get_tasks+upsert_task 都不能创建。"
+            "若审计发现语义等价的 completed/abandoned 任务，不得创建新 id；确有新证据要求重开则更新原 id，只有不同剧情阶段才创建后继任务并在 rationale 注明前序 id。"
+            "task_inbox 是尚未归档为任务结论的持久对话证据，不等于任务。review_required=false 时可继续同房间调查，但仍应在证据明确时主动归档。"
+            "task_inbox.review_required=true 时，必须先调用 review_task_inbox：只有闲聊、重复台词、已由剧情自动完成或永远不会用于后续行动的证据才用 no_follow_up 并说明理由；"
+            "需要后续行动的委托、线索或阶段目标先 get_tasks、upsert_task，再用 tasks_updated 引用本轮写入的 task id。"
+            "task_reconciliation.pending=true 表示 checkpoint 恢复、上下文压缩或旧状态升级后必须重建全账本可见性：完整读取 closed-inclusive summary 索引，"
+            "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。完成前不可 navigate、use_item 或创建任务；对话可继续。"
             "task_review.required=true 表示新剧情证据晚于相关 active task 的上次审计。对话仍可继续 advance_dialog；对话结束后若要 navigate 或 use_item，"
             "必须先调用 get_tasks，再对 task_review.tasks 中每个 id 调用 upsert_task，选择确认继续、改写、completed 或 abandoned。无字段变化的 upsert_task 表示确认继续。"
             "新证据改变对象身份或任务阶段时，应关闭或改写旧 task，并按需创建后继 task；把新对话与稳定状态变化写入 rationale，但不要把 sprite 数字硬编码成剧情语义。"

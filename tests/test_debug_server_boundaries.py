@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from tests.support import make_debug_state, make_state, write_state
+from tests.support import create_agent_task, make_debug_state, make_state, write_state
 from palpal.debug_server import Handler, Server
 
 
@@ -295,7 +295,7 @@ def test_agent_event_websocket_is_fixed_to_handshake_session(http_server):
 
 def test_http_handler_exposes_agent_tasks(http_server):
     base_url, debug = http_server
-    task = debug.run_agent_tool("upsert_task", {
+    task = create_agent_task(debug, {
         "id": "inspect-courtyard",
         "description": "Inspect the courtyard",
         "rationale": "The latest dialog points there.",

@@ -270,11 +270,26 @@ reaches the threshold, compression runs before the next model request, keeps the
 two most recent full decision cycles, and clears the observation until the next
 real request supplies a fresh count. The UI reports cumulative billed tokens,
 the latest agent-run usage, and this latest exact prompt count separately.
+The structured task ledger remains the sole authority for task status; a
+compression summary does not replace it. After compression or checkpoint
+restore, the next Agent run must reconcile a compact index of active,
+completed, and abandoned tasks before navigation or item use resumes.
 
-The persistent model sees eleven tools: `upsert_task`, `get_tasks`,
+The persistent model sees twelve tools: `upsert_task`, `get_tasks`,
 `get_navigation`, `inspect_target`, `get_observations`, `get_shop`,
-`get_equipment`, `get_inventory`, `get_room_memory`, `get_tool_output`, and
-`submit_decision`. Query outputs up to about 8000 estimated tokens stay
+`get_equipment`, `get_inventory`, `get_room_memory`, `get_tool_output`,
+`review_task_inbox`, and `submit_decision`. `get_tasks` remains backward
+compatible by defaulting to active tasks with full records, and also supports
+summary/full detail plus offset pagination. Creating a task requires a complete,
+fresh, closed-inclusive summary review; its final page returns a review token
+that cannot be used by a parallel write from the same model batch.
+
+Dialogue evidence that can affect later action is promoted to one or more tasks
+with `review_task_inbox(..., disposition="tasks_updated")`, which records the
+inbox batch in task provenance. Only chatter, repeated dialogue, automatically
+completed instructions, or evidence that will never affect later action uses
+`no_follow_up`; the backend still accepts legacy `no_task` calls. Query outputs
+up to about 8000 estimated tokens stay
 verbatim. Larger JSON or text outputs are atomically archived under the current
 session's `runtime/agent/tool_outputs/` directory; the transcript keeps a valid
 JSON preview with key fields, head/tail excerpts, original size, and a

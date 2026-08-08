@@ -886,6 +886,8 @@ class AgentRuntime:
                 "pending": [],
             },
             "battle_delegate": None,
+            "task_reconciliation_pending": False,
+            "task_reconciliation_reason": None,
         }
 
     def _load_or_create(self) -> dict:
@@ -901,6 +903,7 @@ class AgentRuntime:
             value.update(status="paused", phase="paused", stop_reason="server_restarted", ended_at=_stamp())
             self._persist(value)
             self._event_for(value, "pause", "paused", "Server restarted; automatic play did not resume.")
+        legacy_task_state = "task_reconciliation_pending" not in value
         value.setdefault("last_request_usage", {})
         value.setdefault("last_prompt_tokens", None)
         # Older sessions exposed a local byte-size estimate as if it were context
@@ -911,6 +914,12 @@ class AgentRuntime:
         value.setdefault("checkpoint_id", None)
         value.setdefault("restored_from_session_id", None)
         value.setdefault("pending_game_instance_id", None)
+        if legacy_task_state:
+            value["task_reconciliation_pending"] = True
+            value["task_reconciliation_reason"] = "legacy_control_upgrade"
+        else:
+            value["task_reconciliation_pending"] = value.get("task_reconciliation_pending") is True
+            value.setdefault("task_reconciliation_reason", None)
         review = value.setdefault("equipment_review", {})
         if not isinstance(review, dict):
             review = {}
@@ -1065,12 +1074,36 @@ class AgentRuntime:
             "max_turns", "stop_reason", "usage", "compactions", "last_event_seq",
             "last_request_usage", "last_prompt_tokens", "game_instance_id",
             "parent_session_id", "checkpoint_id", "restored_from_session_id",
+            "task_reconciliation_pending", "task_reconciliation_reason",
         )}
         compact["equipment_review"] = {
             "pending": len((state.get("equipment_review") or {}).get("pending") or []),
         }
         compact["battle_delegate"] = state.get("battle_delegate")
         return compact
+
+    def task_reconciliation_pending(self) -> bool:
+        with self.lock:
+            return self.state.get("task_reconciliation_pending") is True
+
+    def task_reconciliation_reason(self) -> str | None:
+        with self.lock:
+            value = self.state.get("task_reconciliation_reason")
+            return str(value) if value else None
+
+    def mark_task_reconciliation_pending(self, reason: str) -> None:
+        with self.lock:
+            self.state["task_reconciliation_pending"] = True
+            self.state["task_reconciliation_reason"] = str(reason)
+            self._persist()
+
+    def clear_task_reconciliation(self) -> None:
+        with self.lock:
+            if self.state.get("task_reconciliation_pending") is not True:
+                return
+            self.state["task_reconciliation_pending"] = False
+            self.state["task_reconciliation_reason"] = None
+            self._persist()
 
     @staticmethod
     def _equipment_ownership(state: dict) -> tuple[dict[str, int], dict[str, int], dict[str, str]]:
@@ -1556,6 +1589,8 @@ class AgentRuntime:
                 if key in control:
                     restored[key] = control[key]
             restored.update(status="paused", phase="paused", run_turn=0, stop_reason="checkpoint_restored", generation=self.generation)
+            restored["task_reconciliation_pending"] = True
+            restored["task_reconciliation_reason"] = "checkpoint_restored"
             self.state = restored
             self._persist()
             self._notify_session_changed()
@@ -1628,6 +1663,9 @@ class AgentRuntime:
                 checkpoint_id=checkpoint_id,
                 restored_from_session_id=restored_from_session_id,
             )
+            if checkpoint_id is not None or reason.startswith("checkpoint_"):
+                self.state["task_reconciliation_pending"] = True
+                self.state["task_reconciliation_reason"] = "checkpoint_restored"
             self.state["generation"] = self.generation
             self._persist()
             self._notify_session_changed()
@@ -2082,11 +2120,15 @@ exploration value, and maintained local tasks to choose the next action.
             model_settings=ModelSettings(temperature=0.2, include_usage=True),
         )
         session = SQLiteSession(self.state["session_id"], self.sqlite_path)
-        prompt = json.dumps({
-            "feedback": feedback,
-            "context": self.debug.agent_tool_initial_context(state),
-        }, ensure_ascii=False, separators=(",", ":"))
-        await self._maybe_compact_sdk(session, client, prompt)
+        def current_prompt() -> str:
+            return json.dumps({
+                "feedback": feedback,
+                "context": self.debug.agent_tool_initial_context(state),
+            }, ensure_ascii=False, separators=(",", ":"))
+
+        prompt = current_prompt()
+        if await self._maybe_compact_sdk(session, client, prompt):
+            prompt = current_prompt()
         stream = Runner.run_streamed(agent, prompt, session=session, max_turns=8)
         self.active_stream = stream
         async for event in stream.stream_events():
@@ -2119,15 +2161,15 @@ exploration value, and maintained local tasks to choose the next action.
         output = self.debug.attach_decision_context(state, output)
         return output
 
-    async def _maybe_compact_sdk(self, session: Any, client: Any, next_prompt: str) -> None:
+    async def _maybe_compact_sdk(self, session: Any, client: Any, next_prompt: str) -> bool:
         await self._sanitize_sdk_session(session, next_prompt=next_prompt)
         threshold = self._compact_at_tokens()
         observed_tokens = self.state.get("last_prompt_tokens")
         if not isinstance(observed_tokens, int) or observed_tokens < max(1000, threshold):
-            return
+            return False
         items = await session.get_items()
         if len(items) < 6:
-            return
+            return False
         if self.cancel_event.is_set():
             raise RuntimeError("interrupted")
         self.emit(
@@ -2138,7 +2180,7 @@ exploration value, and maintained local tasks to choose the next action.
         )
         recent_start = self._recent_cycle_start(items, cycles=2)
         if recent_start <= 0:
-            return
+            return False
         transcript = json.dumps(items[:recent_start], ensure_ascii=False)
         response = await client.chat.completions.create(
             model=self.state.get("model"),
@@ -2146,7 +2188,8 @@ exploration value, and maintained local tasks to choose the next action.
                 {
                     "role": "system",
                     "content": (
-                        "Summarize this PALPAL agent transcript compactly. Preserve maintained tasks, "
+                        "Summarize this PALPAL agent transcript compactly. The structured task ledger is the "
+                        "only authority for task status, so do not reconstruct task truth from this summary. Preserve "
                         "plot evidence, decisions and execution results, known routes, unresolved "
                         "risks, and latest stable state. Mark object semantics as inference or annotation."
                     ),
@@ -2177,8 +2220,11 @@ exploration value, and maintained local tasks to choose the next action.
         # The replacement has not been sent to DeepSeek yet, so its exact token
         # count is intentionally unknown until the next real model request.
         self.state["last_prompt_tokens"] = None
+        self.state["task_reconciliation_pending"] = True
+        self.state["task_reconciliation_reason"] = "context_compacted"
         self._persist()
         self.emit("compression", "completed", "Context compression completed.", {"kept_recent_items": len(items) - recent_start, "kept_recent_cycles": 2})
+        return True
 
     def _compact_at_tokens(self) -> int:
         raw = self.debug.config_value(
