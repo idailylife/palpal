@@ -189,6 +189,17 @@ GET  /navigation/transitions
 POST /navigation/step          {"id":123}
 ```
 
+Room exploration reports `visited`/`explored`, `explorable`, and `frontier`
+geometry under the stable `logical_room_id`. A zero `frontier` means only that
+no adjacent unvisited grid node is currently known; it is not a dead-end or
+story-completion signal. Directed transitions retain total traversal counts,
+last traversal time, recent-backtrack evidence, and up to 16 active-task
+structure contexts. Agent navigation derives `traversal_context.status` from
+that evidence instead of assigning a geometric destination priority. The
+context changes when active task identity, description, priority, status, or
+object/transition/room binding changes; rationale-only reviews and dismissed or
+duplicate dialog evidence do not reopen every route.
+
 Use or equip an inventory item:
 
 ```text

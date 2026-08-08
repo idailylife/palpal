@@ -657,7 +657,6 @@ function explorationStatusText(status) {
   const labels = {
     ok: "ready",
     stepping: "stepping",
-    complete: "complete",
     action_pending: "pending",
     waiting_for_control: "game control",
     no_nav_grid: "no grid",
@@ -2110,7 +2109,6 @@ function renderExploration(state) {
     return;
   }
 
-  const complete = exploration.complete ? '<span class="tag tagReachable">complete</span>' : "";
   const status = exploration.status;
   const coverage = explorationCoverage(exploration);
   const renderKey = JSON.stringify({
@@ -2120,7 +2118,6 @@ function renderExploration(state) {
     explorable: exploration.explorable,
     frontier: exploration.frontier,
     blocked: exploration.blocked_edges,
-    complete: exploration.complete,
     dialog: Boolean(state.dialog?.active),
     coveragePercent: coverage.percent,
   });
@@ -2142,7 +2139,6 @@ function renderExploration(state) {
     </div>
     <div class="explorationStatus">
       <span class="tag">${explorationStatusText(status)}</span>
-      ${complete}
     </div>
   `, renderKey, explorationRenderKey);
 }
@@ -2243,7 +2239,7 @@ function drawRoute(state) {
   ctx.restore();
 }
 
-function drawExploration(state) {
+function drawExplorationRoute(state) {
   const exploration = state._exploration;
   if (!exploration) return;
   const viewport = state.viewport || { x: 0, y: 0 };
@@ -2251,33 +2247,6 @@ function drawExploration(state) {
   const scaleY = overlay.height / 200;
 
   ctx.save();
-  for (const node of exploration.nodes?.explorable || []) {
-    const x = (node.x - viewport.x) * scaleX;
-    const y = (node.y - viewport.y) * scaleY;
-    if (x < -10 || y < -10 || x > overlay.width + 10 || y > overlay.height + 10) continue;
-    ctx.fillStyle = "rgba(102, 227, 255, 0.08)";
-    ctx.fillRect(x - 4, y - 4, 8, 8);
-  }
-
-  for (const node of exploration.nodes?.explored || exploration.nodes?.visited || []) {
-    const x = (node.x - viewport.x) * scaleX;
-    const y = (node.y - viewport.y) * scaleY;
-    if (x < -10 || y < -10 || x > overlay.width + 10 || y > overlay.height + 10) continue;
-    ctx.fillStyle = "rgba(126, 227, 174, 0.34)";
-    ctx.fillRect(x - 5, y - 5, 10, 10);
-  }
-
-  for (const node of exploration.nodes?.frontier || []) {
-    const x = (node.x - viewport.x) * scaleX;
-    const y = (node.y - viewport.y) * scaleY;
-    if (x < -10 || y < -10 || x > overlay.width + 10 || y > overlay.height + 10) continue;
-    ctx.strokeStyle = "rgba(255, 214, 102, 0.62)";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(x, y, 5, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
   const route = exploration.last_route;
   const nodes = route?.nodes || [];
   if (nodes.length >= 2) {
@@ -2306,7 +2275,7 @@ function drawOverlay(state) {
   const hideMapHints = Boolean(state.dialog?.active);
 
   if (!hideMapHints) {
-    drawExploration(state);
+    drawExplorationRoute(state);
     drawRoute(state);
 
     for (const obj of state.objects || []) {

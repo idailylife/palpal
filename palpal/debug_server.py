@@ -56,6 +56,7 @@ MAX_INTERACTION_CONTEXT_EVIDENCE = 40
 MAX_TASK_HISTORY = 20
 MAX_ACTIVE_TASK_CONTEXT = 8
 MAX_ACTIVE_TASK_DESCRIPTION = 160
+MAX_TRANSITION_TASK_CONTEXTS = 16
 MAX_TASK_INBOX_HISTORY = 100
 MAX_TASK_INBOX_CONTEXT = 3
 TASK_INBOX_MAX_PENDING_TURNS = 2
@@ -3662,6 +3663,13 @@ class DebugState:
         rooms = data.get("rooms")
         if not isinstance(rooms, dict):
             data["rooms"] = {}
+        else:
+            # Room coverage `complete` predates stable logical room identity and
+            # duplicates the visited/frontier geometry.  Ignore legacy values;
+            # the next ordinary write will naturally omit them.
+            for room in rooms.values():
+                if isinstance(room, dict):
+                    room.pop("complete", None)
         transitions = data.get("transitions")
         if not isinstance(transitions, dict):
             data["transitions"] = {}
@@ -3720,7 +3728,7 @@ class DebugState:
         }
         return self.stable_digest(sorted(signatures))
 
-    def active_task_context_digest(self, data: dict) -> str:
+    def active_task_structure(self, data: dict) -> list[dict]:
         tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
         payload = []
         for task in tasks.values():
@@ -3728,10 +3736,27 @@ class DebugState:
                 continue
             payload.append({
                 key: task.get(key)
-                for key in ("id", "description", "object_id", "transition_key", "room_id")
+                for key in (
+                    "id", "description", "priority", "object_id",
+                    "transition_key", "room_id", "route_context_revision",
+                )
             })
         payload.sort(key=lambda task: str(task.get("id") or ""))
-        return self.stable_digest(payload)
+        return payload
+
+    def active_task_context_digest(self, data: dict) -> str:
+        return self.stable_digest(self.active_task_structure(data))
+
+    def transition_task_context_snapshot(self, data: dict | None = None) -> dict:
+        if data is None:
+            with self.exploration_lock:
+                data = self.read_exploration()
+        tasks = self.active_task_structure(data)
+        return {
+            "digest": self.stable_digest(tasks),
+            "active_task_ids": [str(task.get("id")) for task in tasks],
+            "captured_at": time.time(),
+        }
 
     def observable_context_event_payload(self, event: dict) -> dict | None:
         event_type = str(event.get("type") or "")
@@ -4576,6 +4601,14 @@ class DebugState:
                     existing[key] = value
             if not existing.get("history"):
                 changed = {"created": True, **changed}
+            structural_changes = {
+                "created", "description", "priority", "status",
+                "object_id", "transition_key", "room_id",
+            }
+            if structural_changes.intersection(changed):
+                existing["route_context_revision"] = max(
+                    0, int(existing.get("route_context_revision") or 0)
+                ) + 1
             existing["updated_at"] = now
             existing["updated_agent_turn"] = turn
             existing["last_reviewed_at"] = now
@@ -5039,7 +5072,6 @@ class DebugState:
                 "nav_room_id": None,
                 "legacy_room_id": None,
                 "legacy_nav_room_id": None,
-                "complete": False,
                 "explored": 0,
                 "explorable": 0,
                 "frontier": 0,
@@ -5060,7 +5092,6 @@ class DebugState:
                 "nav_room_id": None,
                 "legacy_room_id": None,
                 "legacy_nav_room_id": None,
-                "complete": False,
                 "explored": 0,
                 "explorable": 0,
                 "frontier": 0,
@@ -5078,21 +5109,11 @@ class DebugState:
             "nav_room_id": room.get("nav_room_id"),
             "legacy_room_id": room.get("legacy_room_id"),
             "legacy_nav_room_id": room.get("legacy_nav_room_id"),
-            "complete": bool(room.get("complete")),
             "explored": len(room.get("visited") or []),
             "explorable": int(room.get("explorable") or 0),
             "frontier": len(room.get("frontier") or []),
             "updated_at": room.get("updated_at"),
         }
-
-    def destination_priority(self, summary: dict) -> str:
-        if not summary.get("known"):
-            return "unknown"
-        if summary.get("complete"):
-            return "complete"
-        if int(summary.get("explored") or 0) <= 0:
-            return "unexplored"
-        return "partial"
 
     def transition_object_payload(self, obj: dict | None, object_id: int) -> dict:
         obj = obj if isinstance(obj, dict) else {}
@@ -5246,6 +5267,63 @@ class DebugState:
             recent.append(room_id)
         return recent
 
+    def transition_traversal_context(self, record: dict | None, data: dict) -> dict:
+        snapshot = self.transition_task_context_snapshot(data)
+        active_task_ids = snapshot["active_task_ids"]
+        record = record if isinstance(record, dict) else {}
+        contexts = record.get("traversal_contexts") if isinstance(record.get("traversal_contexts"), list) else []
+        current = next((
+            item for item in contexts
+            if isinstance(item, dict) and item.get("digest") == snapshot["digest"]
+        ), None)
+        if active_task_ids:
+            status = "traversed_current_context" if current else "untraversed_current_context"
+        elif record and record.get("traversal_context_version") is None:
+            status = "legacy_observed"
+        else:
+            status = "no_active_tasks"
+        try:
+            total_count = int(record.get("traversal_count"))
+        except (TypeError, ValueError):
+            total_count = 1 if record.get("observed") else 0
+        return {
+            "status": status,
+            "context_digest": snapshot["digest"],
+            "active_task_ids": active_task_ids,
+            "current_context_count": int(current.get("count") or 0) if current else 0,
+            "current_context_last_traversed_at": current.get("last_traversed_at") if current else None,
+            "total_count": max(0, total_count),
+            "last_traversed_at": record.get("last_traversed_at") or record.get("observed_at"),
+        }
+
+    @staticmethod
+    def record_transition_traversal(record: dict, snapshot: dict, traversed_at: float) -> None:
+        try:
+            previous_count = (
+                int(record.get("traversal_count"))
+                if record.get("traversal_count") is not None
+                else (1 if record.get("observed") else 0)
+            )
+            record["traversal_count"] = max(0, previous_count) + 1
+        except (TypeError, ValueError):
+            record["traversal_count"] = 1
+        record["last_traversed_at"] = traversed_at
+        record["traversal_context_version"] = 1
+        active_task_ids = snapshot.get("active_task_ids") if isinstance(snapshot.get("active_task_ids"), list) else []
+        if not active_task_ids:
+            return
+        contexts = record.get("traversal_contexts") if isinstance(record.get("traversal_contexts"), list) else []
+        digest = str(snapshot.get("digest") or "")
+        current = next((item for item in contexts if isinstance(item, dict) and item.get("digest") == digest), None)
+        if current is None:
+            current = {"digest": digest, "active_task_ids": list(active_task_ids), "count": 0}
+            contexts.append(current)
+        current["active_task_ids"] = list(active_task_ids)
+        current["count"] = max(0, int(current.get("count") or 0)) + 1
+        current["last_traversed_at"] = traversed_at
+        contexts.sort(key=lambda item: float(item.get("last_traversed_at") or 0))
+        record["traversal_contexts"] = contexts[-MAX_TRANSITION_TASK_CONTEXTS:]
+
     def transition_destination_payload(
         self,
         data: dict,
@@ -5263,14 +5341,15 @@ class DebugState:
             "known_destination_observed_at": None,
             "known_destination_transition_key": None,
             "destination_exploration": self.room_exploration_summary_from_data(data, None),
-            "destination_priority": "unknown",
             "returns_to_recent_room": False,
+            "traversal_context": self.transition_traversal_context(None, data),
         }
         if not from_logical_room_id:
             return payload
         record = self.transition_record_for_object(data, from_logical_room_id, object_id, state, transition_key)
         if not isinstance(record, dict) or not record.get("to_room_id"):
             return payload
+        payload["traversal_context"] = self.transition_traversal_context(record, data)
         if record.get("confirmation") not in {"native_trigger", "human_confirmed"}:
             payload["unconfirmed_destination"] = True
             return payload
@@ -5293,8 +5372,8 @@ class DebugState:
                 "known_destination_observed_at": record.get("observed_at"),
                 "known_destination_transition_key": record.get("transition_key"),
                 "destination_exploration": destination,
-                "destination_priority": self.destination_priority(destination),
                 "returns_to_recent_room": returns_to_recent_room,
+                "traversal_context": self.transition_traversal_context(record, data),
                 "transition_key": record.get("transition_key"),
                 "transition_key_fields": record.get("transition_key_fields"),
                 "from_semantic_room": record.get("from_semantic_room"),
@@ -5366,6 +5445,7 @@ class DebugState:
         confirmation: str = "human_confirmed",
         intra_room_transition: bool = False,
         native_destination: dict | None = None,
+        traversal_context_snapshot: dict | None = None,
     ) -> dict:
         observed_at = time.time()
         transition_key_fields = transition_key_fields or self.transition_key_fields(from_identity, from_object, object_id)
@@ -5407,6 +5487,14 @@ class DebugState:
                 "intra_room_transition": bool(intra_room_transition),
                 "native_destination": native_destination,
             }
+            snapshot = (
+                traversal_context_snapshot
+                if isinstance(traversal_context_snapshot, dict)
+                else self.transition_task_context_snapshot(data)
+            )
+            if not existing:
+                record["traversal_count"] = 0
+            self.record_transition_traversal(record, snapshot, observed_at)
             if intra_room_transition:
                 from_subregion_id = f".{int(object_id)}"
                 nearest = self.nearest_transition_candidate(to_state or {}, native_destination)
@@ -5563,6 +5651,7 @@ class DebugState:
         payload = {
             **observation,
             "frozen_source_state": state,
+            "traversal_context_snapshot": self.transition_task_context_snapshot(),
             "game_instance_id": str(state.get("game_instance_id") or ""),
             "object_id": int(object_id),
             "sent_at": time.time(),
@@ -6013,6 +6102,11 @@ class DebugState:
             confirmation="native_trigger",
             intra_room_transition=same_room,
             native_destination=destination,
+            traversal_context_snapshot=(
+                pending.get("traversal_context_snapshot")
+                if isinstance(pending.get("traversal_context_snapshot"), dict)
+                else None
+            ),
         )
         self.append_navigation_diagnostic(
             "native_transition_confirmed",
@@ -6053,7 +6147,6 @@ class DebugState:
                 "blocked_edges": [],
                 "failed_nodes": [],
                 "last_route": None,
-                "complete": False,
                 "updated_at": None,
             }
             rooms[identity["id"]] = room
@@ -6283,7 +6376,6 @@ class DebugState:
             tuple(room.get("blocked_edges") or []),
             tuple(room.get("failed_nodes") or []),
             json.dumps(room.get("last_route"), sort_keys=True),
-            bool(room.get("complete")),
         )
 
         safe, reachable_safe, failed_nodes = self.exploration_safe_and_reachable(state, grid, room, current)
@@ -6365,7 +6457,6 @@ class DebugState:
         room["explorable"] = len(reachable_safe)
         room["blocked_edges"] = sorted(blocked_edges)
         room["failed_nodes"] = sorted(node_key(node) for node in failed_nodes)
-        room["complete"] = bool(explored) and not frontier
 
         new = (
             tuple(room.get("visited") or []),
@@ -6374,7 +6465,6 @@ class DebugState:
             tuple(room.get("blocked_edges") or []),
             tuple(room.get("failed_nodes") or []),
             json.dumps(room.get("last_route"), sort_keys=True),
-            bool(room.get("complete")),
         )
         if new != old:
             room["updated_at"] = time.time()
@@ -6385,9 +6475,9 @@ class DebugState:
         grid = decode_nav_grid(state)
         identity = self.room_identity(state)
         if grid is None:
-            return {"status": "no_nav_grid", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0, "complete": False}
+            return {"status": "no_nav_grid", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0}
         if identity is None:
-            return {"status": "no_room", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0, "complete": False}
+            return {"status": "no_room", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0}
 
         pos = state.get("party_position") or {}
         current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
@@ -6440,7 +6530,6 @@ class DebugState:
             "frontier": len(room.get("frontier") or []),
             "blocked_edges": len(room.get("blocked_edges") or []),
             "failed_nodes": len(room.get("failed_nodes") or []),
-            "complete": bool(room.get("complete")),
             "updated_at": room.get("updated_at"),
             "current": current,
             "nodes": {
@@ -6457,9 +6546,9 @@ class DebugState:
         grid = decode_nav_grid(state)
         identity = self.room_identity(state)
         if grid is None:
-            return {"status": "no_nav_grid", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0, "complete": False}
+            return {"status": "no_nav_grid", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0}
         if identity is None:
-            return {"status": "no_room", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0, "complete": False}
+            return {"status": "no_room", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0}
         with self.exploration_lock:
             data = self.read_exploration()
             room = self.exploration_room(data, identity)
@@ -6482,7 +6571,6 @@ class DebugState:
                 "nav_room_id": None,
                 "legacy_room_id": None,
                 "legacy_nav_room_id": None,
-                "complete": False,
                 "explored": 0,
                 "explorable": 0,
                 "frontier": 0,
@@ -6581,6 +6669,9 @@ class DebugState:
                     "confirmation": record.get("confirmation"),
                     "observed": bool(record.get("observed")),
                     "observed_at": record.get("observed_at"),
+                    "traversal_count": record.get("traversal_count"),
+                    "last_traversed_at": record.get("last_traversed_at"),
+                    "traversal_contexts": record.get("traversal_contexts"),
                     "observed_from_state": record.get("observed_from_state"),
                     "observed_to_state": record.get("observed_to_state"),
                     "intra_room_transition": bool(record.get("intra_room_transition")),
@@ -6616,8 +6707,8 @@ class DebugState:
                             else None
                         ),
                         "destination_exploration": destination,
-                        "destination_priority": self.destination_priority(destination),
                         "returns_to_recent_room": returns_to_recent_room,
+                        "traversal_context": self.transition_traversal_context(record, data),
                     }
                 )
                 if not confirmed:
@@ -6642,7 +6733,7 @@ class DebugState:
         return {
             key: summary.get(key)
             for key in (
-                "known", "room_id", "scene_id", "map_id", "complete",
+                "known", "room_id", "scene_id", "map_id",
                 "explored", "explorable", "frontier", "updated_at",
             )
         }
@@ -6654,7 +6745,7 @@ class DebugState:
                 "transition_key", "object_id", "from_location_id", "to_room_id",
                 "to_location_id", "from_semantic_room", "to_semantic_room",
                 "confidence", "confirmation", "observed_at", "intra_room_transition",
-                "destination_priority", "returns_to_recent_room",
+                "returns_to_recent_room", "traversal_context",
             )
         }
         obj = transition.get("object") if isinstance(transition.get("object"), dict) else {}
@@ -8413,19 +8504,27 @@ class DebugState:
             target for target in targets
             if target.get("status") in {"reachable", "transition"} and target.get("transition_candidate")
         ]
-        def transition_sort_key(target: dict) -> tuple[int, int, int, int]:
-            destination_rank = {
-                "unknown": 0,
-                "unexplored": 1,
-                "partial": 2,
-                "complete": 3,
-            }.get(str(target.get("destination_priority") or "unknown"), 0)
+        def transition_sort_key(target: dict) -> tuple[int, int, int, int, int, int, int, int]:
+            unknown_rank = 0 if not target.get("known_destination") else 1
+            traversal = target.get("traversal_context") if isinstance(target.get("traversal_context"), dict) else {}
+            context_rank = 0 if traversal.get("status") == "untraversed_current_context" else 1
             backtrack_rank = 1 if target.get("returns_to_recent_room") or target.get("agent_priority") == "avoid_backtrack" else 0
+            destination = target.get("destination_exploration") if isinstance(target.get("destination_exploration"), dict) else {}
+            frontier_rank = 0 if int(destination.get("frontier") or 0) > 0 else 1
             try:
                 steps = int(target.get("steps"))
             except (TypeError, ValueError):
                 steps = 999999
-            return (backtrack_rank, destination_rank, steps, int(target.get("id") or 0))
+            return (
+                unknown_rank,
+                context_rank,
+                backtrack_rank,
+                frontier_rank,
+                int(traversal.get("current_context_count") or 0),
+                int(traversal.get("total_count") or 0),
+                steps,
+                int(target.get("id") or 0),
+            )
 
         transitions.sort(key=transition_sort_key)
         if (
@@ -8461,8 +8560,8 @@ class DebugState:
                             "status": target.get("status"),
                             "steps": target.get("steps"),
                             "known_destination_room_id": target.get("known_destination_room_id"),
-                            "destination_priority": target.get("destination_priority"),
                             "destination_exploration": target.get("destination_exploration"),
+                            "traversal_context": target.get("traversal_context"),
                             "returns_to_recent_room": target.get("returns_to_recent_room"),
                             "agent_priority": target.get("agent_priority"),
                             "route_steps": (route.get("route") or {}).get("steps"),
@@ -9569,8 +9668,8 @@ class DebugState:
             "legacy_nav_room_id": exploration.get("legacy_nav_room_id"),
             "explored": exploration.get("explored", exploration.get("visited")),
             "visited": exploration.get("visited"),
+            "explorable": exploration.get("explorable"),
             "frontier": exploration.get("frontier"),
-            "complete": exploration.get("complete"),
             "last_route": {
                 "segment_steps": last_route.get("segment_steps"),
                 "remaining_steps": last_route.get("remaining_steps"),
@@ -9859,22 +9958,26 @@ class DebugState:
         target_keys = (
             "id", "kind", "status", "steps", "remaining_steps", "segment_steps",
             "required_direction", "transition_candidate", "known_destination",
-            "to_room_id", "to_semantic_room", "confidence", "destination_priority",
+            "to_room_id", "to_semantic_room", "confidence", "traversal_context",
             "destination_exploration", "returns_to_recent_room", "agent_priority",
             "interaction_state", "previously_tried", "previously_cleared",
             "soft_avoid", "deprioritize_reason", "blocker",
-            "transition_key", "to_room_key", "to_region_key", "to_nav_room_id",
-            "to_logical_room_id", "dialog_feedback_state", "recent_dialog_feedback",
+            "transition_key", "dialog_feedback_state", "recent_dialog_feedback",
             "stale_dialog_feedback", "previous_interaction_outcome",
             "interaction_feedback_state", "interaction_evidence",
-            "known_destination_room_id", "known_destination_room_key",
+            "known_destination_room_id", "known_destination_observed_at",
             "approach", "affordances",
         )
-        targets = [
-            {key: target.get(key) for key in target_keys if target.get(key) is not None}
-            for target in (navigation.get("targets") or [])[:limit]
-            if isinstance(target, dict)
-        ]
+        targets = []
+        for target in (navigation.get("targets") or [])[:limit]:
+            if not isinstance(target, dict):
+                continue
+            compact = {key: target.get(key) for key in target_keys if target.get(key) is not None}
+            if isinstance(compact.get("destination_exploration"), dict):
+                compact["destination_exploration"] = self.compact_room_exploration_summary(
+                    compact["destination_exploration"]
+                )
+            targets.append(compact)
         return {
             "status": navigation.get("status"),
             "targets": targets,
@@ -10003,11 +10106,16 @@ class DebugState:
                 "ok", "kind", "status", "steps", "remaining_steps", "segment_steps",
                 "required_direction", "move", "blocker", "agent_priority",
                 "interaction_state", "known_destination", "known_destination_room_id",
-                "known_destination_observed_at", "destination_priority",
+                "known_destination_observed_at", "traversal_context",
                 "destination_exploration", "transition_key", "to_room_id",
                 "to_semantic_room", "confidence", "returns_to_recent_room",
                 "approach", "interaction_feedback_state", "interaction_evidence",
             )
+            compact_route = {key: route.get(key) for key in route_keys if key in route}
+            if isinstance(compact_route.get("destination_exploration"), dict):
+                compact_route["destination_exploration"] = self.compact_room_exploration_summary(
+                    compact_route["destination_exploration"]
+                )
             return {
                 "ok": True,
                 "id": target_id,
@@ -10015,7 +10123,7 @@ class DebugState:
                 "history": (history.get("history") or [])[-limit:],
                 "history_total": history.get("total", len(history.get("history") or [])),
                 "interaction_summary": history.get("interaction_summary"),
-                "route": {key: route.get(key) for key in route_keys if key in route},
+                "route": compact_route,
             }
         if name == "get_observations":
             kind = arguments.get("kind") if arguments.get("kind") in {"both", "dialogs", "events", "speakers"} else "both"
@@ -10346,7 +10454,8 @@ class DebugState:
             "应将它视为刚解锁的探索路线并优先建议 enter_transition；解锁动作本身产生的 previously_tried 或 avoid_repeat 不应降低它的优先级。"
             "一旦该传送已有 known destination，则停止使用刚解锁优先级，恢复目的地探索价值、任务和回退风险的正常比较。"
             "当最近建议看起来反复访问同一房间、目标或传送循环时，依据持久 session 中的最近决策和 get_room_memory 判断。"
-            "传送目标包含 transition_key、to_semantic_room、confidence、destination_priority、destination_exploration 和 returns_to_recent_room。"
+            "传送目标包含稳定 transition_key、to_semantic_room、confidence、destination_exploration、traversal_context 和 returns_to_recent_room。"
+            "frontier>0 只提供温和的正向探索价值；frontier=0 仅表示当前没有未走邻格，不能据此声称目的地是死路、噪音或剧情已经耗尽。"
             "任务是 agent 从对话和事件推断的记忆，不是引擎事实；结构化任务账本是任务状态的唯一权威来源，压缩摘要不是。"
             "自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
             "任何尚未解决、将影响未来行动的委托、线索或自发调查目标都必须成为独立 task，不要求 NPC 明说请去做；普通且不会影响后续行动的探索不必为每个对象创建 task。"
@@ -10363,9 +10472,10 @@ class DebugState:
             "新证据改变对象身份或任务阶段时，应关闭或改写旧 task，并按需创建后继 task；把新对话与稳定状态变化写入 rationale，但不要把 sprite 数字硬编码成剧情语义。"
             "背包里没有对应道具，不能否定由相邻对话和稳定 scene_sprite_id 净变化共同证明的剧情携带状态；短暂 sprite 动画若恢复原值则不算阶段变化。"
             "只有 active 任务明确关联到当前可执行对象、当前可达传送，或可达且已知通往任务 room_id 的传送时，才可压过探索策略；不可执行任务不得阻塞探索。"
-            "没有可执行 active 任务时，在传送目标之间，非回退的 unknown 目的地具有最高探索价值，其后是 unexplored、partial、complete；unknown 不代表独立风险，"
-            "但它不会自动压过路线成本较低的 fresh、reachable 非传送 search。"
-            "比较传送时，要在这些目的地探索价值、循环风险、当前房间剩余有用目标之间权衡。"
+            "比较传送时依次考虑：显式 task 绑定、未知目的地、当前 active task 结构下尚未穿越、非近期回退、目的地 frontier>0，"
+            "然后比较当前上下文次数、总穿越次数、距离和对象 ID。无 active task 时按总次数与近期回退比较；legacy_observed 不要求为了补字段重走旧路线。"
+            "未知目的地不代表独立风险，也不会自动压过路线成本较低的 fresh、reachable 非传送 search。"
+            "当前任务上下文由 active task 的 id、描述、优先级及对象/transition/房间绑定构成；rationale、审计时间、重复确认、no_follow_up 和重复台词不重开路线评估。"
             "有人类确认的 to_semantic_room 时，优先用它理解房间连接；不要只根据 object id 推断目的地。"
             "将 returns_to_recent_room 和 agent_priority avoid_backtrack 视为回退风险信号；如果选择它们，需要明确说明理由。"
             "对话反馈可以创建或改变目标，但要从提供的对话和状态推断目标，不要匹配固定剧情短语。"

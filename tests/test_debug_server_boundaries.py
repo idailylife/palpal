@@ -175,6 +175,9 @@ def test_http_handler_serves_only_confirmed_current_room_transitions(http_server
     assert [row["object_id"] for row in payload["transitions"]] == [52]
     assert payload["transitions"][0]["to_logical_room_id"] == debug.room_identity(destination)["id"]
     assert payload["transitions"][0]["to_logical_room_label"] == debug.room_identity(destination)["logical_room_label"]
+    assert payload["transitions"][0]["traversal_context"]["total_count"] == 1
+    assert "destination_priority" not in payload["transitions"][0]
+    assert "complete" not in payload["transitions"][0]["destination_exploration"]
 
     data = debug.read_exploration()
     data["transitions"][debug.room_identity(state)["nav_room_id"]][record["transition_key"]].pop("confirmation")

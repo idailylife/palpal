@@ -2,7 +2,7 @@ import json
 import threading
 import time
 
-from tests.support import make_debug_state, make_state, make_touch_object, write_state
+from tests.support import create_agent_task, make_debug_state, make_state, make_touch_object, write_state
 from palpal.debug_server import decode_nav_grid, nav_bit, pal_distance, trigger_radius, world_pos
 
 
@@ -1690,7 +1690,6 @@ def test_navigation_and_route_include_known_transition_destination(tmp_path):
     room['visited'] = ['1,1', '2,2']
     room['frontier'] = ['3,3']
     room['explorable'] = 10
-    room['complete'] = False
     debug.write_exploration(data)
     navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
     target_status = {target['id']: target for target in navigation['targets']}
@@ -1699,16 +1698,132 @@ def test_navigation_and_route_include_known_transition_destination(tmp_path):
     known_by_key = {item['transition_key']: item for item in known['items']}
     assert target_status[52]['known_destination']
     assert target_status[52]['known_destination_room_id'] == to_identity['id']
-    assert target_status[52]['destination_priority'] == 'partial'
     assert target_status[52]['destination_exploration']['frontier'] == 1
+    assert set(target_status[52]['destination_exploration']) == {
+        'known', 'room_id', 'scene_id', 'map_id',
+        'explored', 'explorable', 'frontier', 'updated_at',
+    }
+    assert target_status[52]['traversal_context']['status'] == 'no_active_tasks'
+    assert target_status[52]['traversal_context']['total_count'] == 1
     assert route['known_destination']
     assert route['known_destination_room_id'] == to_identity['id']
-    assert route['destination_priority'] == 'partial'
+    assert route['traversal_context']['status'] == 'no_active_tasks'
+    assert set(route['destination_exploration']) == set(target_status[52]['destination_exploration'])
     assert known['from_room_id'] == from_identity['nav_room_id']
     assert known['total'] == 1
     assert known_by_key[transition_key]['to_room_id'] == to_identity['id']
-    assert known_by_key[transition_key]['destination_priority'] == 'partial'
     assert known_by_key[transition_key]['destination_exploration']['explored'] == 2
+    assert known_by_key[transition_key]['traversal_context']['total_count'] == 1
+
+
+def test_transition_task_context_reopens_only_for_structural_task_changes(tmp_path):
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target])
+    destination = make_state(objects=[])
+    destination['scene_id'] = 4
+    destination['map_id'] = 11
+    from_identity = debug.room_identity(state)
+    to_identity = debug.room_identity(destination)
+    created = create_agent_task(debug, {
+        'id': 'follow-clue', 'description': 'Follow the clue', 'rationale': 'Initial evidence.',
+        'priority': 4,
+    })['task']
+
+    initial = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']
+    assert initial['status'] == 'untraversed_current_context'
+    frozen = debug.transition_task_context_snapshot()
+    debug.record_transition_destination(
+        from_identity, 52, to_identity, from_object=target, from_state=state,
+        to_state=destination, traversal_context_snapshot=frozen,
+    )
+    traversed = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']
+    assert traversed['status'] == 'traversed_current_context'
+    assert traversed['current_context_count'] == 1
+
+    debug.run_agent_tool('upsert_task', {'id': created['id'], 'rationale': 'Same task, clearer rationale.'})
+    rationale_only = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']
+    assert rationale_only['context_digest'] == traversed['context_digest']
+    assert rationale_only['status'] == 'traversed_current_context'
+
+    debug.run_agent_tool('upsert_task', {'id': created['id'], 'description': 'Follow the rewritten clue'})
+    rewritten = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']
+    assert rewritten['status'] == 'untraversed_current_context'
+
+    debug.run_agent_tool('upsert_task', {'id': created['id'], 'status': 'completed'})
+    assert debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']['status'] == 'no_active_tasks'
+    debug.run_agent_tool('upsert_task', {'id': created['id'], 'status': 'active'})
+    reopened = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']
+    assert reopened['status'] == 'untraversed_current_context'
+
+
+def test_single_node_destination_with_zero_frontier_remains_normal_transition(tmp_path):
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target])
+    destination = make_state(width=1, height=1, objects=[])
+    destination['scene_id'] = 4
+    destination['map_id'] = 11
+    destination_identity = debug.room_identity(destination)
+    debug.record_transition_destination(
+        debug.room_identity(state), 52, destination_identity,
+        from_object=target, from_state=state, to_state=destination,
+    )
+    data = debug.read_exploration()
+    room = debug.exploration_room(data, destination_identity)
+    room.update({'visited': ['0,0'], 'explorable': 1, 'frontier': []})
+    debug.write_exploration(data)
+
+    route = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']
+
+    assert route['known_destination']
+    assert route['destination_exploration']['explored'] == 1
+    assert route['destination_exploration']['explorable'] == 1
+    assert route['destination_exploration']['frontier'] == 0
+    assert 'complete' not in route['destination_exploration']
+    assert 'destination_priority' not in route
+
+
+def test_transition_uses_frozen_pre_trigger_task_context(tmp_path):
+    target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target])
+    destination = make_state(objects=[])
+    destination['scene_id'] = 4
+    destination['map_id'] = 11
+    task = create_agent_task(debug, {
+        'id': 'route-task', 'description': 'Use the old route context', 'rationale': 'Evidence.',
+    })['task']
+    frozen = debug.transition_task_context_snapshot()
+    debug.run_agent_tool('upsert_task', {'id': task['id'], 'room_id': 'S4/M11:000000000001'})
+
+    debug.record_transition_destination(
+        debug.room_identity(state), 52, debug.room_identity(destination),
+        from_object=target, from_state=state, to_state=destination,
+        traversal_context_snapshot=frozen,
+    )
+
+    evidence = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']
+    assert evidence['status'] == 'untraversed_current_context'
+    stored = next(iter(debug.read_exploration()['transitions'][debug.room_identity(state)['id']].values()))
+    assert stored['traversal_count'] == 1
+    assert stored['traversal_contexts'][0]['digest'] == frozen['digest']
+
+
+def test_transition_keeps_only_sixteen_recent_task_contexts(tmp_path):
+    debug = make_debug_state(tmp_path)
+    record = {'observed': True, 'traversal_count': 0}
+    for index in range(18):
+        debug.record_transition_traversal(
+            record,
+            {'digest': f'context-{index}', 'active_task_ids': [f'task-{index}']},
+            float(index + 1),
+        )
+
+    assert record['traversal_count'] == 18
+    assert len(record['traversal_contexts']) == 16
+    assert record['traversal_contexts'][0]['digest'] == 'context-2'
+    assert record['traversal_contexts'][-1]['digest'] == 'context-17'
 
 
 def test_get_room_memory_compacts_transition_evidence_for_agent(tmp_path):
@@ -1885,8 +2000,9 @@ def test_unknown_transition_destination_is_explicit(tmp_path):
     assert not route['known_destination']
     assert route['known_destination_room_id'] is None
     assert route['known_destination_observed_at'] is None
-    assert route['destination_priority'] == 'unknown'
     assert not route['destination_exploration']['known']
+    assert route['traversal_context']['status'] == 'no_active_tasks'
+    assert route['traversal_context']['total_count'] == 0
 
 
 def test_legacy_transition_record_is_read_but_not_used_as_a_known_destination(tmp_path):
@@ -1901,15 +2017,19 @@ def test_legacy_transition_record_is_read_but_not_used_as_a_known_destination(tm
         from_object=target, from_state=state, to_state=destination,
     )
     data = debug.read_exploration()
-    data['transitions'][debug.room_identity(state)['id']][record['transition_key']].pop('confirmation')
+    legacy = data['transitions'][debug.room_identity(state)['id']][record['transition_key']]
+    legacy.pop('confirmation')
+    legacy.pop('traversal_count')
+    legacy.pop('last_traversed_at')
+    legacy.pop('traversal_context_version')
     debug.write_exploration(data)
     route = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']
     known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
     known_by_key = {item['transition_key']: item for item in known['items']}
     assert not route['known_destination']
-    assert route['destination_priority'] == 'unknown'
     assert known_by_key[record['transition_key']]['unconfirmed_destination']
-    assert known_by_key[record['transition_key']]['destination_priority'] == 'unknown'
+    assert route['traversal_context']['total_count'] == 1
+    assert route['traversal_context']['status'] == 'legacy_observed'
 
 
 
@@ -1952,7 +2072,8 @@ def test_rules_prefer_unknown_transition_over_recent_backtrack(tmp_path):
     decision = debug.rules_decide_agent(state)
     assert decision['recommended_intent'] == 'enter_transition'
     assert decision['recommended_action']['args']['id'] == 53
-    assert decision['evidence']['target']['destination_priority'] == 'unknown'
+    assert not decision['evidence']['target']['destination_exploration']['known']
+    assert decision['evidence']['target']['traversal_context']['total_count'] == 0
 
 
 

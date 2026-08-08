@@ -661,7 +661,7 @@ def test_executable_task_overrides_unknown_transition_but_unmatched_task_does_no
     state = make_checkpoint_state()
     write_state(debug, state)
     unknown = {"id": 10, "status": "reachable", "transition_candidate": True,
-               "destination_priority": "unknown", "steps": 1, "kind": "touch"}
+               "known_destination": False, "steps": 1, "kind": "touch"}
     task_object = {"id": 20, "status": "reachable", "transition_candidate": False,
                    "steps": 4, "kind": "search", "agent_priority": "normal"}
     debug.navigation = mock.Mock(return_value={"status": "ok", "targets": [unknown, task_object]})
@@ -683,7 +683,7 @@ def test_rules_ignores_pending_review_task_and_empty_ledger_still_explores(tmp_p
     state = review_state(cash=10)
     write_state(debug, state)
     unknown = {"id": 10, "status": "reachable", "transition_candidate": True,
-               "destination_priority": "unknown", "steps": 1, "kind": "touch"}
+               "known_destination": False, "steps": 1, "kind": "touch"}
     task_object = {"id": 20, "status": "reachable", "transition_candidate": False,
                    "steps": 4, "kind": "search", "agent_priority": "normal"}
     debug.navigation = mock.Mock(return_value={"status": "ok", "targets": [unknown, task_object]})

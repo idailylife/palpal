@@ -457,7 +457,7 @@ def test_rules_compare_stale_failure_before_immediate_backtrack(tmp_path, monkey
                 'transition_candidate': True,
                 'returns_to_recent_room': True,
                 'agent_priority': 'avoid_backtrack',
-                'destination_priority': 'complete',
+                'traversal_context': {'status': 'traversed_current_context', 'current_context_count': 1, 'total_count': 2},
             },
             {
                 'id': 8,
@@ -651,7 +651,9 @@ def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
     assert '发生任一情况时停止当前房间的连续探索并重新决策' in policy
     assert 'transition_candidate=true 的 touch 应作为有意选择的离房路线' in policy
     assert '不要为了遍历 touch 而提前进入' in policy
-    assert '在传送目标之间，非回退的 unknown 目的地具有最高探索价值' in policy
+    assert '显式 task 绑定、未知目的地、当前 active task 结构下尚未穿越、非近期回退、目的地 frontier>0' in policy
+    assert 'frontier=0 仅表示当前没有未走邻格' in policy
+    assert '不能据此声称目的地是死路、噪音或剧情已经耗尽' in policy
     assert '不会自动压过路线成本较低的 fresh、reachable 非传送 search' in policy
 
 
@@ -1129,6 +1131,49 @@ def test_agent_rejects_item_target_that_disagrees_with_inventory_metadata(tmp_pa
         'error': 'target_must_use_implicit_context',
     }
     assert not debug.action_path.exists()
+
+
+def test_rules_avoid_repeating_traversed_backtrack_when_fresh_context_edge_exists(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = make_state(frame=20)
+    write_state(debug, state)
+    navigation = {
+        'status': 'ok',
+        'targets': [
+            {
+                'id': 3, 'kind': 'touch', 'status': 'transition', 'steps': 1,
+                'transition_candidate': True, 'known_destination': True,
+                'returns_to_recent_room': True, 'agent_priority': 'avoid_backtrack',
+                'destination_exploration': {'known': True, 'frontier': 0},
+                'traversal_context': {
+                    'status': 'traversed_current_context',
+                    'current_context_count': 1,
+                    'total_count': 2,
+                },
+            },
+            {
+                'id': 4, 'kind': 'touch', 'status': 'transition', 'steps': 3,
+                'transition_candidate': True, 'known_destination': True,
+                'returns_to_recent_room': False,
+                'destination_exploration': {'known': True, 'frontier': 0},
+                'traversal_context': {
+                    'status': 'untraversed_current_context',
+                    'current_context_count': 0,
+                    'total_count': 4,
+                },
+            },
+        ],
+    }
+    monkeypatch.setattr(debug, 'navigation', lambda _state: navigation)
+    monkeypatch.setattr(debug, 'route_to_object', lambda *_args, **_kwargs: {
+        'ok': True, 'route': {'moves': ['right'], 'steps': 1},
+    })
+
+    decision = debug.rules_decide_agent(state)
+
+    assert decision['recommended_intent'] == 'enter_transition'
+    assert decision['recommended_action']['args']['id'] == 4
+    assert decision['evidence']['target']['traversal_context']['status'] == 'untraversed_current_context'
 
 
 def test_agent_accepts_implicit_event_context_item_recommendation(tmp_path):

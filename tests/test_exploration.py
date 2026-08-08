@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -126,7 +127,7 @@ def test_update_marks_current_and_frontier(tmp_path):
     assert summary['status'] == 'ok'
     assert summary['visited'] == 1
     assert summary['frontier'] == 4
-    assert not summary['complete']
+    assert 'complete' not in summary
 
 
 
@@ -144,7 +145,7 @@ def test_update_marks_visible_reachable_nodes_explorable_not_visited(tmp_path):
     assert summary['explorable'] > summary['visited']
     assert (1, 1) in frontier
     assert (3, 1) in frontier
-    assert not summary['complete']
+    assert 'complete' not in summary
 
 
 
@@ -307,8 +308,29 @@ def test_get_room_memory_returns_compact_known_and_unknown_status(tmp_path):
     assert known['frontier'] == 4
     assert 'explorable' in known
     assert set(known) == {
-        'known', 'room_id', 'scene_id', 'map_id', 'complete',
+        'known', 'room_id', 'scene_id', 'map_id',
         'explored', 'explorable', 'frontier', 'updated_at',
     }
     assert not unknown['known']
     assert unknown['room_id'] == '9/9/missing'
+
+
+def test_legacy_room_complete_is_ignored_without_schema_migration(tmp_path):
+    debug = make_debug_state(tmp_path)
+    data = debug.empty_exploration()
+    data['rooms']['legacy-room'] = {
+        'logical_room_id': 'legacy-room',
+        'visited': ['1,1'],
+        'frontier': [],
+        'explorable': 1,
+        'complete': True,
+    }
+    original = json.dumps(data)
+    debug.exploration_path.write_text(original, encoding='utf-8')
+
+    loaded = debug.read_exploration()
+
+    assert 'complete' not in loaded['rooms']['legacy-room']
+    assert debug.exploration_path.read_text(encoding='utf-8') == original
+    debug.write_exploration(loaded)
+    assert 'complete' not in json.loads(debug.exploration_path.read_text(encoding='utf-8'))['rooms']['legacy-room']
