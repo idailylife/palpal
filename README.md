@@ -134,7 +134,7 @@ data under `runtime/`:
 - `action_result.json`: native completion details for item, equipment, shop, and
   checkpoint actions.
 - `exploration.json`, `events.json`, and `dialog_history.json`: learned map,
-  state-event, and dialog history.
+  room-scoped Agent memos, state-event, and dialog history.
 - `logs/`: game, debug-server, and navigation diagnostics.
 - `agent/`: persistent Agent session metadata, activity events, SDK transcript,
   and archived tool outputs.
@@ -275,25 +275,43 @@ the checkpoint do not leak into the restored game. Only the current Agent bundle
 format is supported.
 
 Set `PALPAL_AGENT_COMPACT_AT_TOKENS` to change the context compression
-threshold (default `128000` tokens). After each Agent run, PALPAL records the
+threshold (default `200000` tokens). After each Agent run, PALPAL records the
 exact input-token count returned by DeepSeek for the final model request. If it
-reaches the threshold, compression runs before the next model request, keeps the
-two most recent full decision cycles, and clears the observation until the next
-real request supplies a fresh count. The UI reports cumulative billed tokens,
-the latest agent-run usage, and this latest exact prompt count separately.
+reaches the threshold, compression runs before the next model request and clears
+the observation until the next real request supplies a fresh count. The newest
+complete user-message cycle is always retained. A second complete cycle is also
+retained when both cycles fit within `PALPAL_AGENT_COMPACT_RETAIN_TOKENS`
+(default `24000` estimated tokens); otherwise it is summarized with older
+history. Calls and outputs are never split within a retained cycle, so the newest
+cycle may exceed the budget. The UI reports cumulative billed tokens, the latest
+agent-run usage, the latest exact prompt count, and the last compression's
+before/after estimates and retained-cycle decision separately. Timeline details
+include the estimate composition and budget decision.
 The structured task ledger remains the sole authority for task status; a
 compression summary does not replace it. After compression or checkpoint
 restore, the next Agent run must reconcile a compact index of active,
 completed, and abandoned tasks before navigation or item use resumes.
 
-The persistent model sees twelve tools: `upsert_task`, `get_tasks`,
+The persistent model sees thirteen tools: `upsert_task`, `upsert_room_memo`, `get_tasks`,
 `get_navigation`, `inspect_target`, `get_observations`, `get_shop`,
 `get_equipment`, `get_inventory`, `get_room_memory`, `get_tool_output`,
 `review_task_inbox`, and `submit_decision`. `get_tasks` remains backward
 compatible by defaulting to active tasks with full records, and also supports
 summary/full detail plus offset pagination. Creating a task requires a complete,
 fresh, closed-inclusive summary review; its final page returns a review token
-that cannot be used by a parallel write from the same model batch.
+that cannot be used by a parallel write from the same model batch. A transition
+to `completed` records its wall-clock time, Agent turn, logical frame, and raw
+native frame when available; completed records are returned newest-completion
+first regardless of task priority.
+
+`upsert_room_memo` keeps at most one 800-character Agent-written semantic note
+per stable `logical_room_id`. The current room's memo (or `null`) is included in
+each turn's initial context; `get_room_memory` returns it for explicitly queried
+historical rooms. These notes are fallible location annotations, not substitutes
+for exploration evidence, inventory state, temporary coordinates, or actionable
+leads, which still belong in independent tasks. They survive Agent session reset,
+follow checkpoint companion branches, and are cleared by Start New Game. The
+Agent tab exposes the current room's memo through a read-only `Room Memo` dialog.
 
 Dialogue evidence that can affect later action is promoted to one or more tasks
 with `review_task_inbox(..., disposition="tasks_updated")`, which records the
@@ -310,7 +328,7 @@ archive in pages of at most 6000 characters.
 At 96000 estimated context tokens, older tool results are archived until the
 estimate is near 80000 while the six most recent complete tool results remain
 inline. This tool-output pressure heuristic remains separate from the exact,
-next-request 128k whole-session compression trigger and avoids rewriting the
+next-request 200k whole-session compression trigger and avoids rewriting the
 transcript on every turn. There is no permanent macro goal in agent instructions
 or session metadata; an empty task ledger still permits normal exploration.
 After actions, the runtime requires a two-second quiet state before starting the

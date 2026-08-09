@@ -28,14 +28,68 @@ def test_task_ledger_create_update_close_and_filtering(tmp_path):
     task_id = created["task"]["id"]
     assert task_id.startswith("task-")
     assert created["task"]["status"] == "active"
-    updated = debug.run_agent_tool("upsert_task", {"id": task_id, "status": "completed"})
+    completion_state = review_state()
+    completion_state.update({"logical_frame": 321, "raw_frame": 123})
+    updated = debug.run_agent_tool(
+        "upsert_task",
+        {"id": task_id, "status": "completed"},
+        completion_state,
+    )
     assert updated["ok"]
     assert updated["operation"] == "updated"
     assert updated["task"]["history"][-1]["changes"]["status"]["to"] == "completed"
+    assert updated["task"]["completed_at"] is not None
+    assert updated["task"]["completed_frame"] == 321
+    assert updated["task"]["completed_raw_frame"] == 123
+    assert updated["task"]["completed_agent_turn"] == 0
     assert debug.task_ledger() == []
     history = debug.task_ledger(include_closed=True)
     assert history[0]["id"] == task_id
     assert not debug.run_agent_tool("upsert_task", {"description": "missing reason"})["ok"]
+
+
+def test_completed_tasks_return_most_recent_completion_first_and_recompletion_refreshes_frame(tmp_path):
+    debug = make_debug_state(tmp_path)
+    older = create_agent_task(debug, {
+        "id": "older-completion",
+        "description": "Older completion",
+        "rationale": "This finishes first.",
+        "priority": 100,
+    })["task"]
+    newer = create_agent_task(debug, {
+        "id": "newer-completion",
+        "description": "Newer completion",
+        "rationale": "This finishes second.",
+        "priority": 0,
+    })["task"]
+
+    debug.run_agent_tool(
+        "upsert_task", {"id": older["id"], "status": "completed"},
+        {"frame": 10, "logical_frame": 110, "raw_frame": 10},
+    )
+    debug.run_agent_tool(
+        "upsert_task", {"id": newer["id"], "status": "completed"},
+        {"frame": 20, "logical_frame": 120, "raw_frame": 20},
+    )
+
+    completed = debug.run_agent_tool(
+        "get_tasks", {"include_closed": True, "detail": "summary", "limit": 100},
+    )["tasks"]
+    assert [task["id"] for task in completed] == [newer["id"], older["id"]]
+    assert [task["completed_frame"] for task in completed] == [120, 110]
+    assert [task["id"] for task in debug.agent_tasks_view()["tasks"]] == [newer["id"], older["id"]]
+
+    reopened = debug.run_agent_tool("upsert_task", {"id": older["id"], "status": "active"})["task"]
+    assert reopened["completed_at"] is None
+    assert reopened["completed_frame"] is None
+    recompleted = debug.run_agent_tool(
+        "upsert_task", {"id": older["id"], "status": "completed"},
+        {"frame": 30, "logical_frame": 130, "raw_frame": 30},
+    )["task"]
+    assert recompleted["completed_frame"] == 130
+    assert [
+        task["id"] for task in debug.agent_tasks_view()["tasks"]
+    ] == [older["id"], newer["id"]]
 
 
 def test_task_upsert_accepts_stable_custom_id_and_does_not_duplicate_on_update(tmp_path):

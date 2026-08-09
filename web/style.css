@@ -599,6 +599,30 @@ button.is-active {
 .agentSessionButtons button { min-height: 34px; padding: 5px 6px; }
 .agentSessionButtons button:first-child { background: #2f4a38; border-color: #5f896c; }
 .agentSessionButtons button:nth-child(2) { background: #4b2828; border-color: #895353; }
+.agentSessionButtons .roomMemoButton { grid-column: 1 / -1; }
+
+.roomMemoContent { gap: 0; }
+
+.roomMemoCard {
+  background: #101419;
+  border: 1px solid #303840;
+  border-radius: 6px;
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+}
+
+.roomMemoCard p {
+  line-height: 1.55;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.roomMemoCard dl { display: grid; gap: 5px; margin: 0; }
+.roomMemoCard dl div { display: flex; gap: 8px; justify-content: space-between; }
+.roomMemoCard dt { color: #8fa0af; }
+.roomMemoCard dd { margin: 0; }
 
 .agentTimeline {
   display: grid;

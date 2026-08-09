@@ -6,6 +6,113 @@ import pytest
 from tests.support import make_debug_state, make_object, make_state, write_state
 
 
+def test_room_memo_defaults_to_current_room_and_old_exploration_is_compatible(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    room_id = debug.room_identity(state)['id']
+    debug.exploration_path.write_text(
+        '{"version":11,"rooms":{},"transitions":{}}',
+        encoding='utf-8',
+    )
+    assert debug.read_exploration()['room_memos'] == {}
+    assert debug.agent_tool_initial_context(state)['room_memo'] is None
+
+    result = debug.run_agent_tool('upsert_room_memo', {'text': '  客栈楼上的安静房间。  '}, state)
+    assert result['ok']
+    assert result['operation'] == 'created'
+    assert result['room_id'] == room_id
+    assert result['memo']['text'] == '客栈楼上的安静房间。'
+    assert result['memo']['source'] == 'agent_annotation'
+    assert result['memo']['created_at'] == result['memo']['updated_at']
+    assert result['memo']['created_agent_turn'] == result['memo']['updated_agent_turn'] == 0
+    assert debug.agent_tool_initial_context(state)['room_memo'] == result['memo']
+
+
+def test_room_memo_supports_historical_room_update_idempotence_and_clear(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    historical_room_id = 'S1/M12:0123456789AB'
+
+    created = debug.run_agent_tool(
+        'upsert_room_memo',
+        {'room_id': historical_room_id, 'operation': 'set', 'text': '曾在这里见过上锁的门。'},
+        state,
+    )
+    unchanged = debug.run_agent_tool(
+        'upsert_room_memo',
+        {'room_id': historical_room_id, 'text': '曾在这里见过上锁的门。'},
+        state,
+    )
+    assert created['operation'] == 'created'
+    assert unchanged['operation'] == 'unchanged'
+    assert unchanged['memo'] == created['memo']
+
+    updated = debug.run_agent_tool(
+        'upsert_room_memo',
+        {'room_id': historical_room_id, 'text': '门已经打开；原注释已过期。'},
+        state,
+    )
+    assert updated['operation'] == 'updated'
+    assert updated['memo']['created_at'] == created['memo']['created_at']
+    assert updated['memo']['text'] == '门已经打开；原注释已过期。'
+    memory = debug.run_agent_tool('get_room_memory', {'room_id': historical_room_id}, state)
+    assert memory['memo'] == updated['memo']
+
+    cleared = debug.run_agent_tool(
+        'upsert_room_memo',
+        {'room_id': historical_room_id, 'operation': 'clear'},
+        state,
+    )
+    cleared_again = debug.run_agent_tool(
+        'upsert_room_memo',
+        {'room_id': historical_room_id, 'operation': 'clear'},
+        state,
+    )
+    assert cleared == {'ok': True, 'operation': 'cleared', 'room_id': historical_room_id, 'memo': None}
+    assert cleared_again == {'ok': True, 'operation': 'unchanged', 'room_id': historical_room_id, 'memo': None}
+    assert debug.run_agent_tool('get_room_memory', {'room_id': historical_room_id}, state)['memo'] is None
+
+
+@pytest.mark.parametrize('room_id', ['', '3/10/test-room', 'S3/M10:abcdef123456', 'S3/M10:TOO-SHORT'])
+def test_room_memo_rejects_invalid_explicit_room_id(tmp_path, room_id):
+    debug = make_debug_state(tmp_path)
+    result = debug.run_agent_tool(
+        'upsert_room_memo',
+        {'room_id': room_id, 'text': 'memo'},
+        make_state(),
+    )
+    assert not result['ok']
+    assert 'logical_room_id' in result['error']
+    assert not debug.exploration_path.exists()
+
+
+def test_room_memo_requires_bounded_nonempty_text(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    empty = debug.run_agent_tool('upsert_room_memo', {'text': '  '}, state)
+    too_long = debug.run_agent_tool('upsert_room_memo', {'text': '界' * 801}, state)
+    exact = debug.run_agent_tool('upsert_room_memo', {'text': '界' * 800}, state)
+    assert not empty['ok']
+    assert not too_long['ok']
+    assert too_long['max_length'] == 800
+    assert exact['ok']
+    assert len(exact['memo']['text']) == 800
+
+
+def test_room_memo_requires_stable_default_room_but_not_task_reconciliation(tmp_path):
+    debug = make_debug_state(tmp_path)
+    unstable = {**make_state(), 'entering_scene': True}
+    unavailable = debug.run_agent_tool('upsert_room_memo', {'text': 'memo'}, unstable)
+    assert not unavailable['ok']
+    assert unavailable['error'] == 'current stable logical_room_id is unavailable'
+
+    state = make_state()
+    debug.agent_runtime.mark_task_reconciliation_pending('checkpoint_restored')
+    created = debug.run_agent_tool('upsert_room_memo', {'text': '地点注释仍可修正。'}, state)
+    assert created['operation'] == 'created'
+    assert debug.agent_runtime.task_reconciliation_pending() is True
+
+
 
 def test_room_identity_uses_stable_logical_room_and_keeps_legacy_fields(tmp_path):
     debug = make_debug_state(tmp_path)

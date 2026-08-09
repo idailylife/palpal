@@ -102,13 +102,6 @@
           <section>
             <div id="checkpoints" class="checkpoints"></div>
           </section>
-          <section>
-            <div class="sectionHeader">
-              <h2>Agent</h2>
-              <span class="agentMode">single step</span>
-            </div>
-            <div id="agent" class="agent"></div>
-          </section>
           <section id="battleSection" hidden>
             <h2>Battle</h2>
             <div id="battleStatus" class="battleStatus"></div>
@@ -176,6 +169,16 @@
         <button id="goalsClose" class="goalsClose" type="button" aria-label="Close agent goals">Close</button>
       </div>
       <div id="goalsContent" class="goalsContent" aria-live="polite"></div>
+    </dialog>
+    <dialog id="roomMemoDialog" class="goalsDialog roomMemoDialog" aria-labelledby="roomMemoTitle">
+      <div class="goalsDialogHeader">
+        <div>
+          <h2 id="roomMemoTitle">Room Memo</h2>
+          <div id="roomMemoRoom" class="goalsSummary"></div>
+        </div>
+        <button id="roomMemoClose" class="goalsClose" type="button" aria-label="Close room memo">Close</button>
+      </div>
+      <div id="roomMemoContent" class="goalsContent roomMemoContent" aria-live="polite"></div>
     </dialog>
     <script src="/app.js"></script>
   </body>

@@ -34,6 +34,10 @@ const goalsDialog = document.getElementById("goalsDialog");
 const goalsClose = document.getElementById("goalsClose");
 const goalsSummary = document.getElementById("goalsSummary");
 const goalsContent = document.getElementById("goalsContent");
+const roomMemoDialog = document.getElementById("roomMemoDialog");
+const roomMemoClose = document.getElementById("roomMemoClose");
+const roomMemoRoom = document.getElementById("roomMemoRoom");
+const roomMemoContent = document.getElementById("roomMemoContent");
 const statusChipEls = Object.fromEntries(
   [...document.querySelectorAll("[data-status-kind]")]
     .map((element) => [element.dataset.statusKind, element]),
@@ -105,6 +109,12 @@ let agentTasksLoading = false;
 let agentTasksError = null;
 let agentTasksRequestId = 0;
 let goalsDialogTrigger = null;
+let roomMemo = null;
+let roomMemoRoomId = null;
+let roomMemoLoading = false;
+let roomMemoError = null;
+let roomMemoRequestId = 0;
+let roomMemoDialogTrigger = null;
 let selectedStateTab = localStorage.getItem("palpal.stateTab") === "agent" ? "agent" : "normal";
 let agentMaxTurns = Math.max(1, Math.min(Number(localStorage.getItem("palpal.agentMaxTurns") || 10), 100));
 let checkpoints = [];
@@ -454,7 +464,7 @@ inventoryEl.addEventListener("click", (event) => {
     });
 });
 
-agentEl.addEventListener("click", (event) => {
+agentEl?.addEventListener("click", (event) => {
   const actionEl = event.target.closest("[data-agent-action]");
   if (!actionEl || !agentEl.contains(actionEl)) return;
   if (actionEl.dataset.agentAction === "decide") {
@@ -466,13 +476,13 @@ agentEl.addEventListener("click", (event) => {
   }
 });
 
-agentEl.addEventListener("change", (event) => {
+agentEl?.addEventListener("change", (event) => {
   const modelEl = event.target.closest("[data-agent-model]");
   if (!modelEl || !agentEl.contains(modelEl)) return;
   selectedAgentModel = modelEl.value;
 });
 
-agentEl.addEventListener("focusout", (event) => {
+agentEl?.addEventListener("focusout", (event) => {
   if (!event.target.closest("[data-agent-model]") || !agentRenderDeferred) return;
   setTimeout(() => {
     if (agentRenderDeferred && latestState && agentEl.querySelector("[data-agent-model]") !== document.activeElement) {
@@ -697,12 +707,14 @@ const serverControlSelector = [
   "[data-agent-action]",
   "[data-session-action]",
   "[data-goals-open]",
+  "[data-room-memo-open]",
   "[data-agent-load-earlier]",
   "[data-checkpoint-action]",
   "#fastDialog",
   "#transitionsButton",
   "#transitionsRetry",
   "[data-goals-retry]",
+  "[data-room-memo-retry]",
 ].join(",");
 
 function refreshRequired() {
@@ -1589,6 +1601,7 @@ function currentAgentModel(state) {
 }
 
 function renderAgent(state) {
+  if (!agentEl) return;
   const log = state._debug?.recent_agent_decisions || [];
   const agentStatus = state._debug?.agent_status || {};
   const persistentSession = state._debug?.agent_session || agentSession || {};
@@ -2593,6 +2606,7 @@ function renderAgentSession() {
   const session = agentSession || latestState?._debug?.agent_session || {};
   const usage = session.usage || {};
   const lastUsage = session.last_request_usage || {};
+  const lastCompaction = session.last_compaction || null;
   const running = ["running", "interrupting"].includes(session.status);
   const pending = Boolean(session.pending_decision);
   const battleDelegate = session.battle_delegate || {};
@@ -2607,6 +2621,7 @@ function renderAgentSession() {
     usage.total_tokens,
     lastUsage.total_tokens,
     session.last_prompt_tokens,
+    lastCompaction,
     session.compactions,
     session.game_instance_id,
     session.parent_session_id,
@@ -2626,6 +2641,7 @@ function renderAgentSession() {
         <div><dt>Billed</dt><dd>${Number(usage.total_tokens || 0).toLocaleString()}</dd></div>
         <div><dt>Last run</dt><dd>${Number(lastUsage.total_tokens || 0).toLocaleString()}</dd></div>
         <div><dt>Last prompt</dt><dd>${session.last_prompt_tokens == null ? "-" : Number(session.last_prompt_tokens).toLocaleString()}</dd></div>
+        <div><dt>Last compact</dt><dd>${lastCompaction ? `${Number(lastCompaction.trigger_prompt_tokens || 0).toLocaleString()} → ~${Number(lastCompaction.replacement_estimated_tokens || 0).toLocaleString()} · ${Number(lastCompaction.retained_cycles || 0)} cycle${Number(lastCompaction.retained_cycles || 0) === 1 ? "" : "s"}` : "-"}</dd></div>
         <div><dt>Compactions</dt><dd>${Number(session.compactions || 0)}</dd></div>
         <div><dt>Lineage</dt><dd>${escapeHtml(session.checkpoint_id ? `checkpoint ${session.checkpoint_id}` : session.parent_session_id ? "session branch" : "game")}</dd></div>
         ${battleDelegate.child_session_id ? `<div><dt>Battle child</dt><dd>${escapeHtml(battleDelegate.status || "-")} · ${escapeHtml(battleDelegate.phase || "-")} · ${Number(battleDelegate.instruction_count || 0)}/${Number(battleDelegate.instruction_limit || 100)}</dd></div>` : ""}
@@ -2647,6 +2663,7 @@ function renderAgentSession() {
         <button data-session-action="execute" ${running || !pending ? "disabled" : ""}>Execute</button>
         <button data-session-action="reset" ${running ? "disabled" : ""}>Reset Session</button>
         <button data-goals-open>Goals (<span data-goals-count>…</span>)</button>
+        <button class="roomMemoButton" data-room-memo-open>Room Memo</button>
       </div>`;
     agentSessionControlsRenderKey = controlsRenderKey;
   }
@@ -2724,6 +2741,66 @@ function openGoalsDialog(trigger) {
 
 function closeGoalsDialog() {
   if (goalsDialog?.open) goalsDialog.close();
+}
+
+function renderRoomMemoDialog() {
+  if (!roomMemoRoom || !roomMemoContent) return;
+  roomMemoRoom.textContent = roomMemoRoomId || "Current room unavailable";
+  if (roomMemoLoading) {
+    roomMemoContent.innerHTML = '<div class="goalsMessage">Loading room memo…</div>';
+    return;
+  }
+  if (roomMemoError) {
+    roomMemoContent.innerHTML = `<div class="goalsError">${escapeHtml(roomMemoError)}<br><button class="goalsRetry" type="button" data-room-memo-retry>Retry</button></div>`;
+    return;
+  }
+  if (!roomMemoRoomId) {
+    roomMemoContent.innerHTML = '<div class="goalsEmpty">A stable logical room is not available yet.</div>';
+    return;
+  }
+  if (!roomMemo) {
+    roomMemoContent.innerHTML = '<div class="goalsEmpty">The Agent has not written a memo for this room.</div>';
+    return;
+  }
+  roomMemoContent.innerHTML = `<article class="roomMemoCard">
+    <p>${escapeHtml(roomMemo.text || "")}</p>
+    <dl>
+      <div><dt>Source</dt><dd>${escapeHtml(roomMemo.source || "agent_annotation")}</dd></div>
+      <div><dt>Updated turn</dt><dd>${Number(roomMemo.updated_agent_turn || 0)}</dd></div>
+    </dl>
+  </article>`;
+}
+
+async function refreshRoomMemo() {
+  const requestId = ++roomMemoRequestId;
+  roomMemoLoading = true;
+  roomMemoError = null;
+  renderRoomMemoDialog();
+  try {
+    const response = await fetch("/agent/room-memo");
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) throw new Error(result.error || `room memo unavailable: ${response.status}`);
+    if (requestId !== roomMemoRequestId) return;
+    roomMemoRoomId = result.room_id || null;
+    roomMemo = result.memo || null;
+  } catch (error) {
+    if (requestId !== roomMemoRequestId) return;
+    roomMemoError = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (requestId !== roomMemoRequestId) return;
+    roomMemoLoading = false;
+    renderRoomMemoDialog();
+  }
+}
+
+function openRoomMemoDialog(trigger) {
+  roomMemoDialogTrigger = trigger || document.activeElement;
+  if (!roomMemoDialog?.open) roomMemoDialog?.showModal();
+  refreshRoomMemo();
+}
+
+function closeRoomMemoDialog() {
+  if (roomMemoDialog?.open) roomMemoDialog.close();
 }
 
 function eventIcon(event) {
@@ -2884,6 +2961,11 @@ async function agentSessionRequest(action) {
 }
 
 agentSessionControlsEl?.addEventListener("click", (event) => {
+  const roomMemoButton = event.target.closest("[data-room-memo-open]");
+  if (roomMemoButton) {
+    openRoomMemoDialog(roomMemoButton);
+    return;
+  }
   const goalsButton = event.target.closest("[data-goals-open]");
   if (goalsButton) {
     openGoalsDialog(goalsButton);
@@ -2909,6 +2991,19 @@ goalsDialog?.addEventListener("click", (event) => {
 goalsDialog?.addEventListener("close", () => {
   const trigger = goalsDialogTrigger;
   goalsDialogTrigger = null;
+  trigger?.focus?.();
+});
+
+roomMemoClose?.addEventListener("click", closeRoomMemoDialog);
+roomMemoContent?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-room-memo-retry]")) refreshRoomMemo();
+});
+roomMemoDialog?.addEventListener("click", (event) => {
+  if (event.target === roomMemoDialog) closeRoomMemoDialog();
+});
+roomMemoDialog?.addEventListener("close", () => {
+  const trigger = roomMemoDialogTrigger;
+  roomMemoDialogTrigger = null;
   trigger?.focus?.();
 });
 
@@ -3748,6 +3843,7 @@ function shouldIgnoreGameKeydown(event) {
   if (checkpointMenuActive()) return true;
   if (transitionsDialog?.open) return true;
   if (goalsDialog?.open) return true;
+  if (roomMemoDialog?.open) return true;
   return false;
 }
 

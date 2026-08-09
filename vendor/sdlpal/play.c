@@ -499,7 +499,9 @@ PAL_Search(
          //
          // Execute the script
          //
+         PALPAL_AgentBeginTriggerScript(k + 1, p->wTriggerScript);
          p->wTriggerScript = PAL_RunTriggerScript(p->wTriggerScript, k + 1);
+         PALPAL_AgentEndTriggerScript(k + 1);
 
          //
          // Clear inputs and delay for a short time

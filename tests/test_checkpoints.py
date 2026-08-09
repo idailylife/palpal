@@ -89,6 +89,39 @@ def test_start_new_game_is_allowed_while_a_dialog_is_active(tmp_path):
     run.assert_called_once_with('start_slot', 0)
 
 
+def test_room_memo_follows_checkpoint_branch_survives_session_reset_and_clears_on_new_game(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state(frame=100)
+    write_state(debug, state)
+    state = debug.snapshot()
+    room_id = 'S3/M10:0123456789AB'
+    saved = debug.run_agent_tool(
+        'upsert_room_memo',
+        {'room_id': room_id, 'text': 'checkpoint memo'},
+        state,
+    )
+
+    with patch.object(debug, 'run_slot_command', side_effect=fake_save_command(debug)):
+        debug.save_checkpoint('memo-cp', 'Memo CP')
+
+    changed = debug.run_agent_tool(
+        'upsert_room_memo',
+        {'room_id': room_id, 'text': 'later branch memo'},
+        state,
+    )
+    debug.agent_runtime.reset('user_reset')
+    assert debug.room_memo(room_id) == changed['memo']
+
+    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
+        debug.load_checkpoint('memo-cp')
+    assert debug.room_memo(room_id) == saved['memo']
+
+    with patch.object(debug, 'run_slot_command', return_value={'result': {'ok': True}}):
+        debug.start_new_game()
+    assert not debug.exploration_path.exists()
+    assert debug.room_memo(room_id) is None
+
+
 
 def test_wait_for_slot_result_accepts_slot_zero(tmp_path):
     debug = make_debug_state(tmp_path)
@@ -262,7 +295,10 @@ def test_load_checkpoint_discards_incompatible_companion_files(tmp_path):
     debug.dialogs_path.write_text('[{"source_key":"live","text":"live"}]', encoding='utf-8')
     debug.events_path.write_text('[{"type":"live"}]', encoding='utf-8')
     debug.agent_log_path.write_text('{"turn":99}\n', encoding='utf-8')
-    debug.exploration_path.write_text('{"version":11,"rooms":{"live":{}},"transitions":{}}', encoding='utf-8')
+    debug.exploration_path.write_text(
+        '{"version":11,"rooms":{"live":{}},"room_memos":{"S1/M1:0123456789AB":{"room_id":"S1/M1:0123456789AB","text":"live memo","source":"agent_annotation"}},"transitions":{}}',
+        encoding='utf-8',
+    )
     with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
         result = debug.load_checkpoint('old-cp')
     assert result['ok']
@@ -299,6 +335,21 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
         pending_decision=saved_decision,
         usage={'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110},
         last_prompt_tokens=95,
+        last_compaction={
+            'time': '2026-08-09T00:00:00Z',
+            'trigger_prompt_tokens': 200001,
+            'compact_at_tokens': 200000,
+            'retain_tokens': 24000,
+            'before_estimated_tokens': 190000,
+            'before_composition': {'user': 1000},
+            'retained_cycles': 1,
+            'retained_items': 4,
+            'retained_estimated_tokens': 25000,
+            'retained_budget_exceeded': True,
+            'summary_estimated_tokens': 900,
+            'replacement_estimated_tokens': 31000,
+            'replacement_composition': {'user': 1000},
+        },
         compactions=1,
         equipment_review={
             'ownership_counts': {'201': 1},
@@ -343,6 +394,9 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
     assert restored['pending_decision'] == saved_decision
     assert restored['usage']['total_tokens'] == 110
     assert restored['last_prompt_tokens'] == 95
+    assert restored['last_compaction']['trigger_prompt_tokens'] == 200001
+    assert restored['last_compaction']['retained_cycles'] == 1
+    assert restored['last_compaction']['retained_budget_exceeded'] is True
     assert restored['compactions'] == 1
     assert restored['equipment_review']['pending'][0]['item_id'] == 201
     assert restored['task_reconciliation_pending'] is True

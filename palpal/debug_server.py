@@ -56,6 +56,7 @@ MAX_INTERACTION_CONTEXT_EVIDENCE = 40
 MAX_TASK_HISTORY = 20
 MAX_ACTIVE_TASK_CONTEXT = 8
 MAX_ACTIVE_TASK_DESCRIPTION = 160
+MAX_ROOM_MEMO_TEXT = 800
 MAX_TRANSITION_TASK_CONTEXTS = 16
 MAX_TASK_INBOX_HISTORY = 100
 MAX_TASK_INBOX_CONTEXT = 3
@@ -3164,6 +3165,7 @@ class DebugState:
             "nav_room_id": identity.get("nav_room_id") if identity else None,
             "legacy_room_id": identity.get("legacy_room_id") if identity else None,
             "legacy_nav_room_id": identity.get("legacy_nav_room_id") if identity else None,
+            "game_instance_id": str(state.get("game_instance_id") or ""),
             "inventory": self.observed_inventory(state),
             "object": self.object_snapshot_for_interaction(state, int(object_id)),
             "action": action,
@@ -3219,6 +3221,11 @@ class DebugState:
             or state.get("map_id") != pending.get("map_id")
             or (self.room_identity(state) or {}).get("id") != pending.get("room_id")
         )
+        transition = self.pending_transition_observation
+        linked_transition = (
+            isinstance(transition, dict)
+            and transition.get("linked_interaction_observation_id") == pending.get("observation_id")
+        )
 
         base_payload = {
             "object_id": object_id,
@@ -3233,6 +3240,8 @@ class DebugState:
             "finished_object": finished_object,
             "action": pending.get("action"),
         }
+        if linked_transition and (room_changed or state.get("entering_scene")):
+            return None
         if inventory_changes or object_changes or room_changed:
             payload = {
                 **base_payload,
@@ -3247,6 +3256,12 @@ class DebugState:
             )
             self.pending_interaction_observation = None
             return payload
+
+        if linked_transition:
+            # A matching native event-object script is authoritative while it is
+            # running.  In particular, a delayed search teleport must not lose
+            # its interaction observation to the short no-effect window.
+            return None
 
         elapsed_frames = (current_frame - start_frame) if current_frame is not None and start_frame is not None else None
         elapsed_time = time.time() - float(pending.get("sent_at") or time.time())
@@ -3287,7 +3302,12 @@ class DebugState:
                 )
             }
             current_payload["kind"] = trigger_kind(int(current.get("trigger_mode") or 0))
-            current_payload["transition_candidate"] = transition_candidate(current)
+            destination = self.transition_destination_for_state(state, object_id)
+            current_payload["transition_candidate"] = (
+                transition_candidate(current) or bool(destination.get("known_destination"))
+            )
+            if current_payload["transition_candidate"]:
+                current_payload.update(destination)
 
         persistent = self.persistent_object_entry(state, object_id)
         history = []
@@ -3640,6 +3660,7 @@ class DebugState:
         return {
             "version": EXPLORATION_VERSION,
             "rooms": {},
+            "room_memos": {},
             "transitions": {},
             "object_interactions": {},
             "interaction_observable_context": {
@@ -3670,6 +3691,30 @@ class DebugState:
             for room in rooms.values():
                 if isinstance(room, dict):
                     room.pop("complete", None)
+        room_memos = data.get("room_memos")
+        if not isinstance(room_memos, dict):
+            data["room_memos"] = {}
+        else:
+            data["room_memos"] = {
+                room_id: memo
+                for room_id, memo in room_memos.items()
+                if (
+                    is_logical_room_id(room_id)
+                    and isinstance(memo, dict)
+                    and memo.get("room_id") == room_id
+                    and memo.get("source") == "agent_annotation"
+                    and isinstance(memo.get("text"), str)
+                    and 0 < len(memo["text"]) <= MAX_ROOM_MEMO_TEXT
+                    and isinstance(memo.get("created_at"), (int, float))
+                    and not isinstance(memo.get("created_at"), bool)
+                    and isinstance(memo.get("updated_at"), (int, float))
+                    and not isinstance(memo.get("updated_at"), bool)
+                    and isinstance(memo.get("created_agent_turn"), int)
+                    and not isinstance(memo.get("created_agent_turn"), bool)
+                    and isinstance(memo.get("updated_agent_turn"), int)
+                    and not isinstance(memo.get("updated_agent_turn"), bool)
+                )
+            }
         transitions = data.get("transitions")
         if not isinstance(transitions, dict):
             data["transitions"] = {}
@@ -3701,6 +3746,81 @@ class DebugState:
             json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    def room_memo(self, room_id: str | None, data: dict | None = None) -> dict | None:
+        if not is_logical_room_id(room_id):
+            return None
+        if data is None:
+            with self.exploration_lock:
+                data = self.read_exploration()
+        room_memos = data.get("room_memos") if isinstance(data, dict) else None
+        memo = room_memos.get(room_id) if isinstance(room_memos, dict) else None
+        return dict(memo) if isinstance(memo, dict) else None
+
+    def upsert_room_memo(self, arguments: dict, state: dict) -> dict:
+        operation = arguments.get("operation", "set")
+        if operation not in {"set", "clear"}:
+            return {"ok": False, "error": "operation must be set or clear"}
+
+        if "room_id" in arguments:
+            room_id = arguments.get("room_id")
+            if not is_logical_room_id(room_id):
+                return {"ok": False, "error": "room_id must be a stable logical_room_id"}
+        else:
+            identity = self.room_identity(state)
+            room_id = identity.get("id") if isinstance(identity, dict) else None
+            if not is_logical_room_id(room_id):
+                return {"ok": False, "error": "current stable logical_room_id is unavailable"}
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room_memos = data.setdefault("room_memos", {})
+            existing = room_memos.get(room_id)
+            if operation == "clear":
+                if not isinstance(existing, dict):
+                    return {"ok": True, "operation": "unchanged", "room_id": room_id, "memo": None}
+                room_memos.pop(room_id, None)
+                self.write_exploration(data)
+                return {"ok": True, "operation": "cleared", "room_id": room_id, "memo": None}
+
+            text = arguments.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return {"ok": False, "error": "text must be a non-empty string for operation=set"}
+            text = text.strip()
+            if len(text) > MAX_ROOM_MEMO_TEXT:
+                return {
+                    "ok": False,
+                    "error": f"text must be at most {MAX_ROOM_MEMO_TEXT} characters",
+                    "max_length": MAX_ROOM_MEMO_TEXT,
+                }
+            if isinstance(existing, dict) and existing.get("text") == text:
+                return {
+                    "ok": True,
+                    "operation": "unchanged",
+                    "room_id": room_id,
+                    "memo": dict(existing),
+                }
+
+            now = time.time()
+            turn = self.current_agent_turn()
+            created = not isinstance(existing, dict)
+            memo = {
+                "room_id": room_id,
+                "text": text,
+                "source": "agent_annotation",
+                "created_at": now if created else existing.get("created_at"),
+                "updated_at": now,
+                "created_agent_turn": turn if created else existing.get("created_agent_turn"),
+                "updated_agent_turn": turn,
+            }
+            room_memos[room_id] = memo
+            self.write_exploration(data)
+            return {
+                "ok": True,
+                "operation": "created" if created else "updated",
+                "room_id": room_id,
+                "memo": dict(memo),
+            }
 
     @staticmethod
     def stable_digest(value) -> str:
@@ -3863,6 +3983,8 @@ class DebugState:
                 "id", "description", "priority", "status", "object_id",
                 "transition_key", "room_id", "rationale", "created_at",
                 "updated_at", "created_agent_turn", "updated_agent_turn",
+                "completed_at", "completed_frame", "completed_raw_frame",
+                "completed_agent_turn",
                 "last_reviewed_at", "last_reviewed_agent_turn",
                 "provenance",
             )
@@ -3888,6 +4010,8 @@ class DebugState:
                 for key in (
                     "id", "status", "object_id",
                     "transition_key", "room_id",
+                    "completed_at", "completed_frame", "completed_raw_frame",
+                    "completed_agent_turn",
                 )
                 if task.get(key) is not None
             },
@@ -3920,7 +4044,18 @@ class DebugState:
             except (TypeError, ValueError):
                 updated_at = 0
             return (-priority, -updated_at, str(task.get("id") or ""))
+        def completed_sort_key(task: dict) -> tuple[float, str]:
+            try:
+                completed_at = float(task.get("completed_at") or task.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                completed_at = 0
+            return (-completed_at, str(task.get("id") or ""))
         records.sort(key=sort_key)
+        completed = iter(sorted(
+            (task for task in records if task.get("status") == "completed"),
+            key=completed_sort_key,
+        ))
+        records = [next(completed) if task.get("status") == "completed" else task for task in records]
         selected = records[offset:offset + limit]
         complete = offset + len(selected) >= len(records)
         view = self.task_summary_view if detail == "summary" else self.task_view
@@ -3956,7 +4091,12 @@ class DebugState:
                 continue
             grouped[status].append({
                 key: task.get(key)
-                for key in ("id", "description", "priority", "status")
+                for key in (
+                    "id", "description", "priority", "status",
+                    "completed_at", "completed_frame", "completed_raw_frame",
+                    "completed_agent_turn",
+                )
+                if key in {"id", "description", "priority", "status"} or task.get(key) is not None
             })
         tasks = [
             task
@@ -4499,7 +4639,12 @@ class DebugState:
             }
         return None
 
-    def upsert_agent_task(self, arguments: dict, tool_cycle: dict | None = None) -> dict:
+    def upsert_agent_task(
+        self,
+        arguments: dict,
+        tool_cycle: dict | None = None,
+        state: dict | None = None,
+    ) -> dict:
         task_id = str(arguments.get("id") or "").strip()
         status = arguments.get("status")
         if status is not None and status not in {"active", "completed", "abandoned"}:
@@ -4558,8 +4703,10 @@ class DebugState:
                     "created_agent_turn": turn, "history": [],
                 }
                 operation = "created"
+                previous_status = None
             else:
                 operation = "updated"
+                previous_status = existing.get("status")
                 if self.agent_runtime.task_reconciliation_pending():
                     review_error = self.task_creation_review_error(
                         tool_cycle,
@@ -4585,6 +4732,20 @@ class DebugState:
                 if existing.get(key) != value:
                     changed[key] = {"from": existing.get(key), "to": value}
                     existing[key] = value
+            if existing.get("status") == "completed" and previous_status != "completed":
+                state = state if isinstance(state, dict) else self.read_live_state()
+                existing["completed_at"] = now
+                existing["completed_frame"] = self.int_frame(
+                    state.get("logical_frame", state.get("frame"))
+                )
+                existing["completed_raw_frame"] = self.int_frame(state.get("raw_frame"))
+                existing["completed_agent_turn"] = turn
+            elif previous_status == "completed" and existing.get("status") != "completed":
+                for key in (
+                    "completed_at", "completed_frame", "completed_raw_frame",
+                    "completed_agent_turn",
+                ):
+                    existing.pop(key, None)
             for key in ("priority", "object_id"):
                 if key not in arguments:
                     continue
@@ -5420,7 +5581,7 @@ class DebugState:
                 data = self.read_exploration()
         if recent_room_ids is None:
             recent_room_ids = self.recent_room_ids(state)
-        return self.transition_destination_payload(
+        payload = self.transition_destination_payload(
             data,
             identity["id"] if identity else None,
             object_id,
@@ -5429,6 +5590,26 @@ class DebugState:
             transition_key,
             recent_semantic_room_keys,
         )
+        if (
+            not payload.get("known_destination")
+            and isinstance(obj, dict)
+            and trigger_kind(int(obj.get("trigger_mode") or 0)) == "search"
+        ):
+            # Search scripts may replace their own trigger entry.  A single
+            # confirmed record for this object in the same logical room remains
+            # authoritative even when the current script id has advanced.
+            fallback = self.transition_destination_payload(
+                data,
+                identity["id"] if identity else None,
+                object_id,
+                recent_room_ids,
+                None,
+                None,
+                recent_semantic_room_keys,
+            )
+            if fallback.get("known_destination"):
+                return fallback
+        return payload
 
     def record_transition_destination(
         self,
@@ -5602,6 +5783,19 @@ class DebugState:
             except (TypeError, ValueError):
                 object_id = 0
             owner = str(pending.get("owner") or "navigation")
+            linked_interaction_id = pending.get("linked_interaction_observation_id")
+            linked_interaction = self.pending_interaction_observation
+            if (
+                linked_interaction_id
+                and isinstance(linked_interaction, dict)
+                and linked_interaction.get("observation_id") == linked_interaction_id
+                and linked_interaction.get("transition_observation_id") == observation_id
+            ):
+                linked_interaction.pop("transition_observation_id", None)
+                self.observations.update_payload(
+                    linked_interaction_id,
+                    transition_observation_id=None,
+                )
             self.observations.cancel(observation_id, reason)
             if object_id > 0 and self.navigation_transition_requests.get(object_id) == observation_id:
                 self.navigation_transition_requests.pop(object_id, None)
@@ -5637,6 +5831,7 @@ class DebugState:
         object_id: int,
         *,
         owner: str = "navigation",
+        linked_interaction: dict | None = None,
     ) -> str | None:
         observation = self.transition_observation_from_state(state, object_id)
         if observation is None:
@@ -5664,6 +5859,11 @@ class DebugState:
             "candidate_room_id": None,
             "stable_snapshots": 0,
             "last_frame": None,
+            "linked_interaction_observation_id": (
+                linked_interaction.get("observation_id")
+                if isinstance(linked_interaction, dict)
+                else None
+            ),
         }
         observation_id = self.observations.register(
             "transition",
@@ -5674,6 +5874,12 @@ class DebugState:
         payload["observation_id"] = observation_id
         payload["owner"] = owner
         self.pending_transition_observation = payload
+        if isinstance(linked_interaction, dict):
+            linked_interaction["transition_observation_id"] = observation_id
+            self.observations.update_payload(
+                linked_interaction.get("observation_id"),
+                transition_observation_id=observation_id,
+            )
         if owner == "navigation":
             previous_id = self.navigation_transition_requests.get(int(object_id))
             if previous_id and previous_id != observation_id:
@@ -5681,6 +5887,78 @@ class DebugState:
                 self.observations.consume(previous_id, owner="navigation")
             self.navigation_transition_requests[int(object_id)] = observation_id
         return observation_id
+
+    def matching_pending_search_interaction(
+        self,
+        state: dict,
+        object_id: int,
+        trigger_script: int,
+        source: dict,
+    ) -> dict | None:
+        pending = self.pending_interaction_observation
+        if not isinstance(pending, dict) or not pending.get("armed"):
+            return None
+        try:
+            action_buttons = (pending.get("action") or {}).get("buttons") or []
+            matches = (
+                int(pending.get("object_id") or 0) == object_id
+                and int((pending.get("object") or {}).get("trigger_script") or 0) == trigger_script
+                and "search" in action_buttons
+                and int(pending.get("scene_id")) == int(source.get("scene_id"))
+                and int(pending.get("map_id")) == int(source.get("map_id"))
+                and str(pending.get("game_instance_id") or "") == str(state.get("game_instance_id") or "")
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return pending if matches else None
+
+    def complete_linked_transition_interaction(
+        self,
+        pending_transition: dict,
+        state: dict,
+        transition: dict,
+    ) -> dict | None:
+        observation_id = pending_transition.get("linked_interaction_observation_id")
+        pending = self.pending_interaction_observation
+        if (
+            not observation_id
+            or not isinstance(pending, dict)
+            or pending.get("observation_id") != observation_id
+        ):
+            return None
+        object_id = int(pending.get("object_id") or 0)
+        finished_object = self.object_snapshot_for_interaction(state, object_id)
+        payload = {
+            "object_id": object_id,
+            "target_id": object_id,
+            "via_target_id": pending.get("via_target_id"),
+            "started_frame": pending.get("frame"),
+            "started_logical_frame": pending.get("logical_frame"),
+            "started_at": pending.get("sent_at"),
+            "started_room_id": pending.get("room_id"),
+            "started_nav_room_id": pending.get("nav_room_id"),
+            "started_object": pending.get("object"),
+            "finished_object": finished_object,
+            "action": pending.get("action"),
+            "inventory_changes": self.inventory_delta(
+                pending.get("inventory") or {},
+                self.observed_inventory(state),
+            ),
+            "object_changes": self.object_snapshot_delta(
+                pending.get("object") if isinstance(pending.get("object"), dict) else None,
+                finished_object,
+            ),
+            "room_changed": transition.get("from_room_id") != transition.get("to_room_id"),
+            "transition_key": transition.get("transition_key"),
+            "to_room_id": transition.get("to_room_id"),
+        }
+        self.append_event(state, "interaction_effect", payload)
+        self.observations.complete(
+            observation_id,
+            {"type": "interaction_effect", "event": payload, "transition": transition},
+        )
+        self.pending_interaction_observation = None
+        return payload
 
     def native_transition_observation_owner(
         self,
@@ -5821,6 +6099,21 @@ class DebugState:
         if from_identity is None:
             return
         owner, owner_details = self.native_transition_observation_owner(previous, object_id, source)
+        linked_interaction = self.matching_pending_search_interaction(
+            state,
+            object_id,
+            trigger_script,
+            source,
+        )
+        if linked_interaction is not None:
+            owner = "navigation"
+            owner_details = {
+                **owner_details,
+                "owner": owner,
+                "association_rejected_reason": None,
+                "association": "search_interaction",
+                "interaction_observation_id": linked_interaction.get("observation_id"),
+            }
         self.append_navigation_diagnostic(
             "native_transition_owner",
             {
@@ -5830,7 +6123,12 @@ class DebugState:
             },
             state,
         )
-        self.mark_pending_transition_observation(previous, object_id, owner=owner)
+        self.mark_pending_transition_observation(
+            previous,
+            object_id,
+            owner=owner,
+            linked_interaction=linked_interaction,
+        )
         pending = self.pending_transition_observation
         if not isinstance(pending, dict):
             return
@@ -5920,6 +6218,22 @@ class DebugState:
                 "invalid_transition_observation",
                 "transition_invalid",
             )
+            return None
+        if str(state.get("game_instance_id") or "") != str(pending.get("game_instance_id") or ""):
+            linked_interaction_id = pending.get("linked_interaction_observation_id")
+            self.terminate_pending_transition_observation(
+                pending,
+                "game_instance_changed",
+                "game_instance_changed",
+            )
+            interaction = self.pending_interaction_observation
+            if (
+                linked_interaction_id
+                and isinstance(interaction, dict)
+                and interaction.get("observation_id") == linked_interaction_id
+            ):
+                self.observations.cancel(interaction.get("observation_id"), "game_instance_changed")
+                self.pending_interaction_observation = None
             return None
         native_generation = self.native_trigger_generation(state)
         if pending.get("trigger_generation") is None:
@@ -6108,6 +6422,7 @@ class DebugState:
                 else None
             ),
         )
+        self.complete_linked_transition_interaction(pending, state, record)
         self.append_navigation_diagnostic(
             "native_transition_confirmed",
             {
@@ -6639,7 +6954,19 @@ class DebugState:
                         )
                         recorded_key = record.get("transition_key") or str(object_key)
                         if current_key != recorded_key:
-                            continue
+                            matching_records = [
+                                candidate
+                                for candidate in by_transition.values()
+                                if isinstance(candidate, dict)
+                                and int(candidate.get("object_id") or 0) == record_object_id
+                            ]
+                            stable_search_record = (
+                                trigger_kind(int(current_object.get("trigger_mode") or 0)) == "search"
+                                and record.get("confirmation") in {"native_trigger", "human_confirmed"}
+                                and len(matching_records) == 1
+                            )
+                            if not stable_search_record:
+                                continue
                 payload = {
                     "transition_key": record.get("transition_key") or str(object_key),
                     "transition_key_fields": record.get("transition_key_fields"),
@@ -6767,6 +7094,11 @@ class DebugState:
     def agent_room_memory(self, room_id: str | None, state: dict) -> dict:
         exploration = self.room_exploration_summary(room_id, state)
         transitions = self.known_transitions_summary(room_id, state)
+        resolved_room_id = (
+            transitions.get("from_logical_room_id")
+            or transitions.get("from_room_id")
+            or exploration.get("room_id")
+        )
         items = [
             self.compact_room_transition(transition)
             for transition in transitions.get("transitions") or []
@@ -6774,16 +7106,24 @@ class DebugState:
         ]
         return {
             "ok": True,
+            "memo": self.room_memo(resolved_room_id),
             "exploration": self.compact_room_exploration_summary(exploration),
             "transitions": {
-                "from_room_id": (
-                    transitions.get("from_logical_room_id")
-                    or transitions.get("from_room_id")
-                    or exploration.get("room_id")
-                ),
+                "from_room_id": resolved_room_id,
                 "total": len(items),
                 "items": items,
             },
+        }
+
+    def current_room_memo_view(self) -> dict:
+        state = self.read_live_state()
+        self.attach_logical_room_fields(state)
+        identity = self.room_identity(state)
+        room_id = identity.get("id") if isinstance(identity, dict) else None
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "memo": self.room_memo(room_id),
         }
 
     def goal_nodes(self, state: dict, grid: dict, target: dict) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int]]:
@@ -6955,7 +7295,9 @@ class DebugState:
                 "status": "approach_requirement_missing" if approach_item_id is not None else "target_inactive",
                 "target_id": target_id,
             }
-        destination_payload = self.transition_destination_for_state(state, target_id) if transition_candidate(target) else {}
+        destination_payload = self.transition_destination_for_state(state, target_id)
+        confirmed_transition = bool(destination_payload.get("known_destination"))
+        is_transition = transition_candidate(target) or confirmed_transition
         start = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         if start is None or not nav_bit(grid, start):
             return {"ok": False, "status": "bad_start", "target_id": target_id}
@@ -7080,12 +7422,12 @@ class DebugState:
         result = {
             "ok": True,
             "target_id": target_id,
-            "status": "transition" if kind != "approach" and transition_candidate(target) else "reachable",
+            "status": "transition" if kind != "approach" and is_transition else "reachable",
             "kind": kind,
             "action": action,
             "route": route,
         }
-        if kind != "approach" and transition_candidate(target):
+        if kind != "approach" and is_transition:
             result["transition_candidate"] = True
             result.update(destination_payload)
         if kind == "search":
@@ -7441,7 +7783,11 @@ class DebugState:
         expected_node = route_nodes[segment_steps] if len(route_nodes) > segment_steps else None
         remaining_steps = max(0, len(moves) - segment_steps)
         observation_id = None
-        if route.get("status") == "transition" and segment_steps >= len(moves):
+        if (
+            route.get("status") == "transition"
+            and route.get("kind") == "touch"
+            and segment_steps >= len(moves)
+        ):
             with self.state_lock:
                 observation_id = self.mark_pending_transition_observation(state, target_id)
         try:
@@ -7697,6 +8043,12 @@ class DebugState:
             target_id = int(obj.get("id") or 0)
             native_kind = trigger_kind(int(obj.get("trigger_mode") or 0))
             kind = native_kind
+            destination_payload = self.transition_destination_for_state(
+                state,
+                target_id,
+                transition_context,
+            )
+            is_transition = transition_candidate(obj) or bool(destination_payload.get("known_destination"))
             status = "unreachable_static"
             steps = None
             required_direction = None
@@ -7737,7 +8089,7 @@ class DebugState:
                 no_touch_goal = next((node for node in no_touch_order if node in goals), None)
                 if strict_goal is not None:
                     direction = search_dirs.get(strict_goal, int(state.get("party_direction") or 0))
-                    status = "reachable"
+                    status = "transition" if is_transition else "reachable"
                     steps = safe_distance[strict_goal]
                     required_direction = DIR_TO_BUTTON.get(direction, "down")
             elif kind == "touch":
@@ -7772,7 +8124,7 @@ class DebugState:
                 )
                 if strict_terminal is not None:
                     strict_goal, _, steps = strict_terminal
-                    status = "transition" if transition_candidate(obj) else "reachable"
+                    status = "transition" if is_transition else "reachable"
                 if relaxed_terminal is not None:
                     relaxed_goal, relaxed_terminal_parent, _ = relaxed_terminal
                 if no_touch_terminal is not None:
@@ -7824,9 +8176,9 @@ class DebugState:
                 "steps": steps,
                 "required_direction": required_direction,
             }
-            if transition_candidate(obj):
+            if is_transition:
                 target["transition_candidate"] = True
-                target.update(self.transition_destination_for_state(state, target_id, transition_context))
+                target.update(destination_payload)
             if blocker is not None:
                 target["blocker"] = blocker
             if approach is not None:
@@ -7884,13 +8236,15 @@ class DebugState:
         for obj in state.get("objects") or []:
             if not obj.get("interactable"):
                 continue
+            object_id = int(obj.get("id") or 0)
+            is_transition = transition_candidate(obj)
             target = {
-                "id": int(obj.get("id") or 0),
+                "id": object_id,
                 "kind": trigger_kind(int(obj.get("trigger_mode") or 0)),
-                "status": "transition" if transition_candidate(obj) else "unknown",
+                "status": "transition" if is_transition else "unknown",
                 "steps": None,
                 "required_direction": None,
-                **({"transition_candidate": True} if transition_candidate(obj) else {}),
+                **({"transition_candidate": True} if is_transition else {}),
             }
             targets.append({**target, **self.target_affordance(state, target["id"], affordance_context)})
         return {
@@ -9849,10 +10203,31 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
+                    "name": "upsert_room_memo",
+                    "description": (
+                        "为当前或指定稳定 logical_room_id 写入、整体更新或清除一条地点语义注释。"
+                        "memo 是可能过期的 Agent annotation，不替代结构化探索证据或 task；"
+                        "行动相关线索必须另建独立 task。operation=set 需要 text，clear 幂等。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "room_id": {"type": "string", "pattern": LOGICAL_ROOM_ID_RE.pattern},
+                            "operation": {"type": "string", "enum": ["set", "clear"], "default": "set"},
+                            "text": {"type": "string", "minLength": 1, "maxLength": MAX_ROOM_MEMO_TEXT},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_room_memory",
                     "description": (
-                        "返回当前或指定房间的紧凑探索摘要；"
-                        "transitions.items 是已知传送目的地的唯一列表。"
+                        "返回当前或指定房间的 memo 和紧凑探索摘要；"
+                        "room_id 接受任意稳定 logical_room_id，transitions.items 只列该房间已确认的有向出边。"
+                        "从目标房间看到的出边不得伪造成反向可走路线，只能作为相邻房间的调查线索。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -9906,8 +10281,11 @@ class DebugState:
         ]
 
     def agent_tool_initial_context(self, state: dict) -> dict:
+        identity = self.room_identity(state)
+        room_id = identity.get("id") if isinstance(identity, dict) else None
         context = {
             "state_summary": self.agent_state_summary(state),
+            "room_memo": self.room_memo(room_id),
             **self.active_task_context(state),
             "task_reconciliation": self.task_reconciliation_context(),
         }
@@ -9953,6 +10331,48 @@ class DebugState:
             parsed = default
         return max(1, min(parsed, upper))
 
+    def compact_interaction_outcome(self, outcome: dict) -> dict:
+        """Project durable interaction evidence for the navigation hot path."""
+        compact = {
+            key: outcome.get(key)
+            for key in ("type", "time", "reason")
+            if outcome.get(key) is not None
+        }
+        changes = (
+            outcome.get("object_changes")
+            if isinstance(outcome.get("object_changes"), dict)
+            else {}
+        )
+        if not changes:
+            before = outcome.get("started_object")
+            after = outcome.get("finished_object")
+            if isinstance(before, dict) or isinstance(after, dict):
+                changes = self.object_snapshot_delta(
+                    before if isinstance(before, dict) else None,
+                    after if isinstance(after, dict) else None,
+                )
+        changes = semantic_object_changes(changes)
+        if changes:
+            compact["object_changes"] = changes
+
+        inventory_changes = outcome.get("inventory_changes")
+        if isinstance(inventory_changes, list):
+            projected_inventory = [
+                {
+                    key: change.get(key)
+                    for key in ("item_id", "delta", "amount")
+                    if change.get(key) is not None
+                }
+                for change in inventory_changes
+                if isinstance(change, dict)
+            ]
+            projected_inventory = [change for change in projected_inventory if change]
+            if projected_inventory:
+                compact["inventory_changes"] = projected_inventory
+        if outcome.get("room_changed") is True:
+            compact["room_changed"] = True
+        return compact
+
     def compact_agent_navigation(self, state: dict, limit: int = 20) -> dict:
         navigation = self.navigation(state)
         target_keys = (
@@ -9973,6 +10393,9 @@ class DebugState:
             if not isinstance(target, dict):
                 continue
             compact = {key: target.get(key) for key in target_keys if target.get(key) is not None}
+            outcome = compact.get("previous_interaction_outcome")
+            if isinstance(outcome, dict):
+                compact["previous_interaction_outcome"] = self.compact_interaction_outcome(outcome)
             if isinstance(compact.get("destination_exploration"), dict):
                 compact["destination_exploration"] = self.compact_room_exploration_summary(
                     compact["destination_exploration"]
@@ -9997,7 +10420,7 @@ class DebugState:
         state = state or self.read_live_state()
         if name == "upsert_task":
             reconciliation_pending = self.agent_runtime.task_reconciliation_pending()
-            result = self.upsert_agent_task(arguments, tool_cycle)
+            result = self.upsert_agent_task(arguments, tool_cycle, state)
             if result.get("ok") and isinstance(tool_cycle, dict):
                 task_id = str((result.get("task") or {}).get("id") or "")
                 if tool_cycle.get("tasks_queried"):
@@ -10157,6 +10580,8 @@ class DebugState:
             if result.get("ok") and isinstance(tool_cycle, dict) and candidate.get("item_id"):
                 tool_cycle["equipment_review_item_id"] = int(candidate["item_id"])
             return result
+        if name == "upsert_room_memo":
+            return self.upsert_room_memo(arguments, state)
         if name == "get_room_memory":
             room_id = arguments.get("room_id")
             room_id = str(room_id) if room_id is not None else None
@@ -10459,6 +10884,8 @@ class DebugState:
             "任务是 agent 从对话和事件推断的记忆，不是引擎事实；结构化任务账本是任务状态的唯一权威来源，压缩摘要不是。"
             "自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
             "任何尚未解决、将影响未来行动的委托、线索或自发调查目标都必须成为独立 task，不要求 NPC 明说请去做；普通且不会影响后续行动的探索不必为每个对象创建 task。"
+            "room_memo 只是可能过期的地点语义注释和普通 companion 数据，不是引擎事实；发现冲突时用 upsert_room_memo 更新或清除。"
+            "不要在 memo 重复结构化探索、背包内容或临时坐标，也不要用 memo 代替行动相关线索的独立 task、task inbox 审查或 task reconciliation。"
             "发现、调整、完成或作废任务时调用 upsert_task，不要仅凭时间自动关闭任务。创建未知 id 或无 id 任务前，必须在前一模型批次完整分页读取 include_closed=true、detail=summary 的账本，"
             "并使用最终页 review_token；只查 active、漏页、账本 revision 变化或同批并行 get_tasks+upsert_task 都不能创建。"
             "若审计发现语义等价的 completed/abandoned 任务，不得创建新 id；确有新证据要求重开则更新原 id，只有不同剧情阶段才创建后继任务并在 rationale 注明前序 id。"
@@ -10472,6 +10899,10 @@ class DebugState:
             "新证据改变对象身份或任务阶段时，应关闭或改写旧 task，并按需创建后继 task；把新对话与稳定状态变化写入 rationale，但不要把 sprite 数字硬编码成剧情语义。"
             "背包里没有对应道具，不能否定由相邻对话和稳定 scene_sprite_id 净变化共同证明的剧情携带状态；短暂 sprite 动画若恢复原值则不算阶段变化。"
             "只有 active 任务明确关联到当前可执行对象、当前可达传送，或可达且已知通往任务 room_id 的传送时，才可压过探索策略；不可执行任务不得阻塞探索。"
+            "若 active 任务绑定 goal room_id，但当前没有可达且已确认直达该房间的入口，先调用 get_room_memory(goal_room_id)。"
+            "目标房间的有向出边只能说明它曾到达哪些相邻房间，是调查替代入口的空间线索；绝不能据此声称反向边存在或可走。"
+            "可沿当前房间已经确认的正向 transition 前往这些相关邻接房间，再检查其中 fresh、reachable 的 search 或 touch 目标；"
+            "只有实际 native trigger 和稳定落点证据才能学习真正的反向有向边。不要为此执行自动多跳 BFS，也不要把规则后端改造成剧情寻路器。"
             "比较传送时依次考虑：显式 task 绑定、未知目的地、当前 active task 结构下尚未穿越、非近期回退、目的地 frontier>0，"
             "然后比较当前上下文次数、总穿越次数、距离和对象 ID。无 active task 时按总次数与近期回退比较；legacy_observed 不要求为了补字段重走旧路线。"
             "未知目的地不代表独立风险，也不会自动压过路线成本较低的 fresh、reachable 非传送 search。"
@@ -12022,6 +12453,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/agent/tasks":
             self.send_json(self.server.state.agent_tasks_view())
+            return
+        if parsed.path == "/agent/room-memo":
+            self.send_json(self.server.state.current_room_memo_view())
             return
         if parsed.path == "/agent/llm-log":
             query = parse_qs(parsed.query)

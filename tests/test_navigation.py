@@ -47,6 +47,125 @@ def approach_object(object_id=238, x=32, y=16):
     }
 
 
+def test_compact_navigation_projects_interaction_outcomes_without_duplicate_evidence(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    outcome = {
+        'type': 'interaction_effect',
+        'time': 0,
+        'reason': 'native completion',
+        'action': {'buttons': ['search'], 'frames': 1},
+        'elapsed': 0.7,
+        'frame': 100,
+        'logical_room_id': 'S1/M2:0123456789AB',
+        'event_key': 'digest',
+        'started_object': {
+            'state': 1, 'trigger_mode': 1, 'trigger_script': 100,
+            'auto_script': 200, 'vanish_time': 10, 'interactable': True,
+        },
+        'finished_object': {
+            'state': 1, 'trigger_mode': 4, 'trigger_script': 101,
+            'auto_script': 201, 'vanish_time': 9, 'interactable': True,
+        },
+        'inventory_changes': [{'item_id': 7, 'delta': 1, 'amount': 2, 'name': 'item'}],
+        'room_changed': False,
+        'interaction_evidence': {'same_context_no_effect_count': 9},
+    }
+    top_evidence = {'same_context_no_effect_count': 1, 'context_changes_since_latest': []}
+    debug.navigation = lambda _state: {
+        'status': 'ready',
+        'targets': [{
+            'id': 75,
+            'kind': 'search',
+            'status': 'transition',
+            'steps': 1,
+            'transition_candidate': True,
+            'previous_interaction_outcome': outcome,
+            'interaction_evidence': top_evidence,
+        }],
+    }
+
+    target = debug.compact_agent_navigation(state)['targets'][0]
+
+    assert target['transition_candidate'] is True
+    assert target['interaction_evidence'] == top_evidence
+    assert target['previous_interaction_outcome'] == {
+        'type': 'interaction_effect',
+        'time': 0,
+        'reason': 'native completion',
+        'object_changes': {
+            'trigger_mode': {'from': 1, 'to': 4},
+            'trigger_script': {'from': 100, 'to': 101},
+        },
+        'inventory_changes': [{'item_id': 7, 'delta': 1, 'amount': 2}],
+    }
+    projected = target['previous_interaction_outcome']
+    for forbidden in ('action', 'frame', 'frames', 'logical_room_id', 'event_key', 'started_object', 'finished_object'):
+        assert forbidden not in projected
+    assert 'interaction_evidence' not in projected
+
+
+def test_compact_navigation_preserves_no_effect_and_true_room_change_only(tmp_path):
+    debug = make_debug_state(tmp_path)
+    no_effect = debug.compact_interaction_outcome({
+        'type': 'interaction_no_effect',
+        'time': 5,
+        'reason': 'quiet state',
+        'object_changes': {},
+        'inventory_changes': [],
+        'room_changed': False,
+    })
+    changed_room = debug.compact_interaction_outcome({
+        'type': 'interaction_effect',
+        'room_changed': True,
+    })
+    assert no_effect == {
+        'type': 'interaction_no_effect',
+        'time': 5,
+        'reason': 'quiet state',
+    }
+    assert changed_room == {'type': 'interaction_effect', 'room_changed': True}
+
+
+def test_compact_navigation_representative_history_stays_under_ten_kb_and_halves_payload(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    targets = []
+    for target_id in range(1, 21):
+        history = [
+            {
+                'type': 'interaction_effect',
+                'time': event_id,
+                'frame': event_id * 10,
+                'action': {'buttons': ['search'], 'frames': 1},
+                'logical_room_id': 'S1/M2:0123456789AB',
+                'event_key': f'digest-{target_id}-{event_id}',
+                'started_object': {'trigger_mode': 1, 'auto_script': event_id, 'vanish_time': 10},
+                'finished_object': {'trigger_mode': 4, 'auto_script': event_id + 1, 'vanish_time': 9},
+                'metadata': 'x' * 120,
+            }
+            for event_id in range(7)
+        ]
+        targets.append({
+            'id': target_id,
+            'kind': 'search',
+            'status': 'reachable',
+            'steps': target_id,
+            'previous_interaction_outcome': {**history[-1], 'history': history},
+            'interaction_evidence': {'same_context_no_effect_count': target_id % 2},
+        })
+    unprojected = {'status': 'ready', 'targets': targets}
+    debug.navigation = lambda _state: unprojected
+
+    compact = debug.compact_agent_navigation(state, limit=20)
+    raw_size = len(json.dumps(unprojected, ensure_ascii=False).encode('utf-8'))
+    compact_size = len(json.dumps(compact, ensure_ascii=False).encode('utf-8'))
+
+    assert compact_size <= 10_000
+    assert compact_size <= raw_size * 0.5
+    assert all('history' not in target['previous_interaction_outcome'] for target in compact['targets'])
+
+
 def test_item_requirement_exposes_reachable_approach_without_interacting(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state(width=8, height=8, start=(7, 7), objects=[approach_object()])
@@ -1275,6 +1394,143 @@ def test_transition_observation_requires_matching_native_object_and_stable_desti
     assert debug.read_exploration()['transitions']
 
 
+def test_delayed_search_trigger_hands_interaction_to_transition_observer(tmp_path):
+    target = {
+        'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[target], frame=20)
+    debug.last_stable_room_state = source
+    interaction_id = debug.mark_pending_interaction_observation(
+        source, 75, action={'buttons': ['search'], 'frames': 1},
+    )
+    debug.pending_interaction_observation['sent_at'] -= 1.0
+
+    running = dict(source)
+    running['frame'] = 30
+    running['trigger_observation'] = {
+        'generation': 1, 'event_object_id': 75, 'trigger_script': 8149,
+        'completed': False,
+        'source': {'scene_id': 3, 'map_id': 10, **source['party_position']},
+    }
+    debug.discover_native_transition_observation(running)
+    transition_id = debug.pending_transition_observation['observation_id']
+
+    assert debug.pending_transition_observation['linked_interaction_observation_id'] == interaction_id
+    assert debug.navigation_transition_requests[75] == transition_id
+    assert debug.observe_pending_interaction_outcome(running) is None
+    assert not [event for event in debug.event_log if event['type'] == 'interaction_no_effect']
+
+    destination = make_state(objects=[], frame=31)
+    destination.update({'scene_id': 4, 'map_id': 11, 'room': {'key': 'destination'}})
+    destination['trigger_observation'] = {
+        **running['trigger_observation'],
+        'completed': True,
+        'destination': {'scene_id': 4, 'map_id': 11, **destination['party_position'], 'frame': 31},
+    }
+    debug.observe_pending_transition_destination(destination)
+    destination['frame'] = 32
+    record = debug.observe_pending_transition_destination(destination)
+
+    assert record['from_room_id'] == debug.room_identity(source)['id']
+    assert record['to_room_id'] == debug.room_identity(destination)['id']
+    assert debug.pending_interaction_observation is None
+    assert [event['type'] for event in debug.event_log] == ['interaction_effect']
+    assert debug.event_log[-1]['room_changed'] is True
+    assert debug.observations.get(interaction_id)['result']['transition']['transition_key'] == record['transition_key']
+    assert debug.observations.get(transition_id)['status'] == 'completed'
+
+
+def test_completed_search_trigger_without_change_resumes_no_effect(tmp_path):
+    target = {
+        'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[target], frame=20)
+    debug.last_stable_room_state = source
+    interaction_id = debug.mark_pending_interaction_observation(
+        source, 75, action={'buttons': ['search'], 'frames': 1},
+    )
+    debug.pending_interaction_observation['sent_at'] -= 1.0
+    completed = make_state(objects=[target], frame=30)
+    completed['trigger_observation'] = {
+        'generation': 1, 'event_object_id': 75, 'trigger_script': 8149,
+        'completed': True,
+        'source': {'scene_id': 3, 'map_id': 10, **source['party_position']},
+        'destination': {'scene_id': 3, 'map_id': 10, **source['party_position'], 'frame': 30},
+    }
+
+    debug.discover_native_transition_observation(completed)
+    debug.observe_pending_transition_destination(completed)
+    outcome = debug.observe_pending_interaction_outcome(completed)
+
+    assert debug.pending_transition_observation is None
+    assert debug.navigation_transition_requests == {}
+    assert outcome['reason'] == 'no_state_change'
+    assert debug.event_log[-1]['type'] == 'interaction_no_effect'
+    assert debug.observations.get(interaction_id)['status'] == 'completed'
+
+
+def test_linked_search_transition_timeout_clears_link_and_resumes_no_effect(tmp_path):
+    target = {
+        'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[target], frame=20)
+    interaction_id = debug.mark_pending_interaction_observation(
+        source, 75, action={'buttons': ['search'], 'frames': 1},
+    )
+    debug.mark_pending_transition_observation(
+        source, 75, owner='navigation',
+        linked_interaction=debug.pending_interaction_observation,
+    )
+    debug.pending_transition_observation['sent_at'] -= 100.0
+    debug.pending_interaction_observation['sent_at'] -= 100.0
+    later = make_state(objects=[target], frame=30)
+
+    debug.observe_pending_transition_destination(later)
+    outcome = debug.observe_pending_interaction_outcome(later)
+
+    assert debug.pending_transition_observation is None
+    assert debug.navigation_transition_requests == {}
+    assert outcome['reason'] == 'no_state_change'
+    assert debug.observations.get(interaction_id)['status'] == 'completed'
+
+
+def test_linked_search_transition_game_instance_change_cancels_both_observations(tmp_path):
+    target = {
+        'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[target], frame=20)
+    source['game_instance_id'] = 'game-a'
+    interaction_id = debug.mark_pending_interaction_observation(
+        source, 75, action={'buttons': ['search'], 'frames': 1},
+    )
+    transition_id = debug.mark_pending_transition_observation(
+        source, 75, owner='navigation',
+        linked_interaction=debug.pending_interaction_observation,
+    )
+    replacement = make_state(objects=[target], frame=21)
+    replacement['game_instance_id'] = 'game-b'
+
+    debug.observe_pending_transition_destination(replacement)
+
+    assert debug.pending_transition_observation is None
+    assert debug.pending_interaction_observation is None
+    assert debug.navigation_transition_requests == {}
+    assert debug.observations.get(transition_id) is None
+    assert debug.observations.get(interaction_id)['status'] == 'cancelled'
+
+
 def test_bound_transition_observation_is_retired_when_native_trigger_is_superseded(tmp_path):
     portal = {
         'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1,
@@ -1395,6 +1651,37 @@ def test_manual_movement_records_native_transition_after_stable_destination(tmp_
     assert record['to_room_id'] == debug.room_identity(destination)['id']
     assert record['confirmation'] == 'native_trigger'
     assert record['observed_from_state']['party_position'] == {'x': 48, 'y': -8}
+
+
+def test_background_search_trigger_records_objective_transition(tmp_path):
+    target = {
+        'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(objects=[target], frame=10)
+    debug.last_stable_room_state = source
+    destination = make_state(objects=[], frame=11)
+    destination.update({'scene_id': 4, 'map_id': 11, 'room': {'key': 'destination'}})
+    destination['trigger_observation'] = {
+        'generation': 1, 'event_object_id': 75, 'trigger_script': 8149,
+        'completed': True,
+        'source': {'scene_id': 3, 'map_id': 10, **source['party_position']},
+        'destination': {'scene_id': 4, 'map_id': 11, **destination['party_position'], 'frame': 11},
+    }
+
+    debug.discover_native_transition_observation(destination)
+    assert debug.pending_transition_observation['owner'] == 'background'
+    debug.observe_pending_transition_destination(destination)
+    destination['frame'] = 12
+    record = debug.observe_pending_transition_destination(destination)
+
+    assert record['object_id'] == 75
+    assert record['from_room_id'] == debug.room_identity(source)['id']
+    assert record['to_room_id'] == debug.room_identity(destination)['id']
+    assert debug.pending_transition_observation is None
+    assert debug.navigation_transition_requests == {}
 
 
 def test_manual_movement_ignores_native_trigger_with_mismatched_source_scene(tmp_path):
@@ -1714,6 +2001,128 @@ def test_navigation_and_route_include_known_transition_destination(tmp_path):
     assert known_by_key[transition_key]['to_room_id'] == to_identity['id']
     assert known_by_key[transition_key]['destination_exploration']['explored'] == 2
     assert known_by_key[transition_key]['traversal_context']['total_count'] == 1
+
+
+def test_confirmed_search_transition_stays_search_across_agent_tools(tmp_path):
+    target = {
+        'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target])
+    destination = make_state(objects=[])
+    destination.update({'scene_id': 4, 'map_id': 11, 'room': {'key': 'goal-room'}})
+    record = debug.record_transition_destination(
+        debug.room_identity(state), 75, debug.room_identity(destination),
+        from_object=target, from_state=state, to_state=destination,
+        confirmation='native_trigger',
+    )
+    advanced = dict(state)
+    advanced['objects'] = [{**target, 'trigger_script': 8150}]
+
+    navigation = debug.run_agent_tool('get_navigation', {}, advanced)['navigation']
+    target_view = next(item for item in navigation['targets'] if item['id'] == 75)
+    route = debug.run_agent_tool('inspect_target', {'id': 75}, advanced)['route']
+    executable_route = debug.route_to_object(advanced, 75)
+    memory = debug.run_agent_tool(
+        'get_room_memory', {'room_id': debug.room_identity(state)['id']}, advanced,
+    )['transitions']
+
+    assert target_view['kind'] == 'search'
+    assert target_view['status'] == 'transition'
+    assert target_view['transition_candidate'] is True
+    assert target_view['known_destination_room_id'] == debug.room_identity(destination)['id']
+    assert route['kind'] == 'search'
+    assert route['status'] == 'transition'
+    assert route['transition_key'] == record['transition_key']
+    assert executable_route['action'] == 'search'
+    assert executable_route['status'] == 'transition'
+    assert memory['items'][0]['transition_key'] == record['transition_key']
+
+
+def test_confirmed_search_transition_moves_before_starting_native_observer(tmp_path):
+    target = {
+        'id': 75, 'x': 48, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=6, height=4, start=(0, 3), objects=[target])
+    destination = make_state(objects=[])
+    destination.update({'scene_id': 4, 'map_id': 11, 'room': {'key': 'goal-room'}})
+    debug.record_transition_destination(
+        debug.room_identity(state), 75, debug.room_identity(destination),
+        from_object=target, from_state=state, to_state=destination,
+        confirmation='native_trigger',
+    )
+    write_state(debug, state)
+
+    result = debug.navigation_step(state, target_id=75)
+
+    assert result['status'] == 'stepping'
+    assert result['action']['buttons'] == ['up', 'up']
+    assert result.get('observation_id') is None
+    assert debug.pending_transition_observation is None
+    assert debug.navigation_transition_requests == {}
+
+
+def test_generic_alternative_entrance_graph_learns_only_observed_directions(tmp_path):
+    forward = make_touch_object(10, x=16, y=8, sprite_id=1)
+    search = {
+        'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    outward = make_touch_object(20, x=16, y=8, sprite_id=1)
+    debug = make_debug_state(tmp_path)
+    room_a = make_state(objects=[forward])
+    room_b = make_state(objects=[search])
+    room_b.update({'scene_id': 4, 'map_id': 11, 'room': {'key': 'room-b'}})
+    goal = make_state(objects=[outward])
+    goal.update({'scene_id': 5, 'map_id': 12, 'room': {'key': 'goal'}})
+    a_id = debug.room_identity(room_a)['id']
+    b_id = debug.room_identity(room_b)['id']
+    goal_id = debug.room_identity(goal)['id']
+    debug.record_transition_destination(
+        debug.room_identity(room_a), 10, debug.room_identity(room_b),
+        from_object=forward, from_state=room_a, to_state=room_b,
+        confirmation='native_trigger',
+    )
+    debug.record_transition_destination(
+        debug.room_identity(goal), 20, debug.room_identity(room_b),
+        from_object=outward, from_state=goal, to_state=room_b,
+        confirmation='native_trigger',
+    )
+
+    goal_memory = debug.run_agent_tool('get_room_memory', {'room_id': goal_id}, room_a)
+    b_memory_before = debug.run_agent_tool('get_room_memory', {'room_id': b_id}, room_b)
+    search_before = next(
+        item for item in debug.run_agent_tool('get_navigation', {}, room_b)['navigation']['targets']
+        if item['id'] == 75
+    )
+
+    assert goal_memory['transitions']['items'][0]['to_room_id'] == b_id
+    assert b_memory_before['transitions']['items'] == []
+    assert search_before['status'] == 'reachable'
+    assert not search_before.get('transition_candidate', False)
+
+    debug.record_transition_destination(
+        debug.room_identity(room_b), 75, debug.room_identity(goal),
+        from_object=search, from_state=room_b, to_state=goal,
+        confirmation='native_trigger',
+    )
+    search_after = next(
+        item for item in debug.run_agent_tool('get_navigation', {}, room_b)['navigation']['targets']
+        if item['id'] == 75
+    )
+    b_memory_after = debug.run_agent_tool('get_room_memory', {'room_id': b_id}, room_b)
+
+    assert a_id != b_id != goal_id
+    assert search_after['kind'] == 'search'
+    assert search_after['status'] == 'transition'
+    assert search_after['known_destination_room_id'] == goal_id
+    assert b_memory_after['transitions']['items'][0]['to_room_id'] == goal_id
 
 
 def test_transition_task_context_reopens_only_for_structural_task_changes(tmp_path):

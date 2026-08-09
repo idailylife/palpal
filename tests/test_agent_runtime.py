@@ -10,6 +10,7 @@ import pytest
 from tests.support import make_debug_state, make_state, write_state
 from palpal.agent_runtime import (
     DEFAULT_COMPACT_AT_TOKENS,
+    DEFAULT_COMPACT_RETAIN_TOKENS,
     TOOL_OUTPUT_PRESSURE_TARGET_TOKENS,
     AgentRuntime,
     ReplanRequired,
@@ -1572,6 +1573,152 @@ def test_context_compression_replaces_history_and_keeps_recent_items(tmp_path, m
     assert events[-1]["phase"] == "completed"
 
 
+def test_context_compression_retains_two_complete_cycles_within_budget(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_RETAIN_TOKENS", "24000")
+    first = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old answer"}]
+    second = [
+        {"role": "user", "content": "second"},
+        {"type": "reasoning", "summary": [{"text": "reason"}]},
+        {"type": "function_call", "name": "get_navigation", "arguments": "{}"},
+        {"type": "function_call_output", "output": '{"ok":true}'},
+        {"role": "assistant", "content": "second answer"},
+    ]
+    latest = [{"role": "user", "content": "latest"}, {"role": "assistant", "content": "latest answer"}]
+    session = MemorySession(first + second + latest)
+
+    class Completions:
+        async def create(self, **_kwargs):
+            message = type("Message", (), {"content": "summary"})()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    runtime.state["last_prompt_tokens"] = 1000
+    asyncio.run(runtime._maybe_compact_sdk(session, client, "next prompt"))
+
+    assert session.items[-len(second + latest):] == second + latest
+    compact = runtime.snapshot()["last_compaction"]
+    assert compact["trigger_prompt_tokens"] == 1000
+    assert compact["compact_at_tokens"] == 1000
+    assert compact["retain_tokens"] == 24000
+    assert compact["retained_cycles"] == 2
+    assert compact["retained_items"] == len(second + latest)
+    assert compact["retained_budget_exceeded"] is False
+    assert sum(compact["before_composition"].values()) == compact["before_estimated_tokens"]
+    assert set(compact["before_composition"]) == {
+        "user", "assistant", "reasoning", "function_call", "function_output",
+        "fixed_prompt", "next_prompt",
+    }
+    completed = [
+        event for event in runtime.events()
+        if event["type"] == "compression" and event["phase"] == "completed"
+    ][-1]
+    assert completed["details"] == compact
+
+
+def test_context_compression_summarizes_second_cycle_when_retention_exceeds_budget(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_RETAIN_TOKENS", "250")
+    second = [
+        {"role": "user", "content": "second"},
+        {"type": "function_call", "name": "get_navigation", "arguments": "{}"},
+        {"type": "function_call_output", "output": "x" * 600},
+        {"role": "assistant", "content": "second answer"},
+    ]
+    latest = [
+        {"role": "user", "content": "latest"},
+        {"type": "function_call", "name": "submit_decision", "arguments": "{}"},
+        {"type": "function_call_output", "output": '{"ok":true}'},
+        {"role": "assistant", "content": "latest answer"},
+    ]
+    original = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old"}] + second + latest
+    session = MemorySession(original)
+
+    class Completions:
+        async def create(self, **_kwargs):
+            message = type("Message", (), {"content": "summary"})()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    runtime.state["last_prompt_tokens"] = 1000
+    asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
+
+    assert session.items[-len(latest):] == latest
+    assert not any(item == second[1] for item in session.items)
+    compact = runtime.snapshot()["last_compaction"]
+    assert compact["retained_cycles"] == 1
+    assert compact["retained_items"] == len(latest)
+    assert compact["retained_budget_exceeded"] is False
+
+
+def test_context_compression_keeps_latest_cycle_even_when_it_alone_exceeds_budget(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_RETAIN_TOKENS", "50")
+    latest = [
+        {"role": "user", "content": "latest"},
+        {"type": "function_call", "name": "get_navigation", "arguments": "{}"},
+        {"type": "function_call_output", "output": "z" * 900},
+        {"role": "assistant", "content": "latest answer"},
+    ]
+    session = MemorySession([
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second"},
+        *latest,
+    ])
+
+    class Completions:
+        async def create(self, **_kwargs):
+            message = type("Message", (), {"content": "summary"})()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    runtime.state["last_prompt_tokens"] = 1000
+    asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
+
+    assert session.items[-len(latest):] == latest
+    compact = runtime.snapshot()["last_compaction"]
+    assert compact["retained_cycles"] == 1
+    assert compact["retained_budget_exceeded"] is True
+    assert compact["retained_estimated_tokens"] > 50
+
+
+def test_context_compression_replacement_failure_restores_transcript_and_state(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    original = [{"role": "user", "content": str(index)} for index in range(8)]
+
+    class FailingSession(MemorySession):
+        def __init__(self, items):
+            super().__init__(items)
+            self.add_calls = 0
+
+        async def add_items(self, items):
+            self.add_calls += 1
+            if self.add_calls == 1:
+                raise RuntimeError("replacement failed")
+            self.items.extend(items)
+
+    class Completions:
+        async def create(self, **_kwargs):
+            message = type("Message", (), {"content": "summary"})()
+            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+
+    session = FailingSession(original)
+    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    runtime.state["last_prompt_tokens"] = 1000
+    with pytest.raises(RuntimeError, match="replacement failed"):
+        asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
+    assert session.items == original
+    assert runtime.snapshot()["last_prompt_tokens"] == 1000
+    assert runtime.snapshot()["last_compaction"] is None
+    assert runtime.snapshot()["task_reconciliation_pending"] is False
+
+
 def test_context_compression_waits_for_next_turn_exact_prompt_threshold(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -1613,14 +1760,24 @@ def test_context_compression_waits_for_next_turn_exact_prompt_threshold(tmp_path
 
 def test_context_compaction_threshold_defaults_and_invalid_values(tmp_path, monkeypatch):
     runtime = make_debug_state(tmp_path).agent_runtime
+    assert runtime.snapshot()["last_compaction"] is None
+    assert runtime.compact_snapshot()["last_compaction"] is None
     monkeypatch.delenv("PALPAL_AGENT_COMPACT_AT_TOKENS", raising=False)
-    assert runtime._compact_at_tokens() == DEFAULT_COMPACT_AT_TOKENS == 128_000
+    assert runtime._compact_at_tokens() == DEFAULT_COMPACT_AT_TOKENS == 200_000
     monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "invalid")
     assert runtime._compact_at_tokens() == DEFAULT_COMPACT_AT_TOKENS
     monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "0")
     assert runtime._compact_at_tokens() == DEFAULT_COMPACT_AT_TOKENS
     monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "64000")
     assert runtime._compact_at_tokens() == 64_000
+    monkeypatch.delenv("PALPAL_AGENT_COMPACT_RETAIN_TOKENS", raising=False)
+    assert runtime._compact_retain_tokens() == DEFAULT_COMPACT_RETAIN_TOKENS == 24_000
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_RETAIN_TOKENS", "invalid")
+    assert runtime._compact_retain_tokens() == DEFAULT_COMPACT_RETAIN_TOKENS
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_RETAIN_TOKENS", "0")
+    assert runtime._compact_retain_tokens() == DEFAULT_COMPACT_RETAIN_TOKENS
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_RETAIN_TOKENS", "12000")
+    assert runtime._compact_retain_tokens() == 12_000
 
 
 def test_legacy_control_upgrade_schedules_one_task_reconciliation(tmp_path):
@@ -1970,7 +2127,7 @@ def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeyp
     asyncio.run(runtime._sdk_decide(make_state(), "compact feedback"))
     assert set(captured["prompt"]) == {"feedback", "context"}
     assert set(captured["prompt"]["context"]) == {
-        "state_summary", "active_tasks", "active_tasks_total", "task_review", "task_inbox",
+        "state_summary", "room_memo", "active_tasks", "active_tasks_total", "task_review", "task_inbox",
         "task_reconciliation",
     }
 
@@ -2429,6 +2586,42 @@ def test_navigation_waits_for_pending_transition_observation(tmp_path, monkeypat
     assert runtime.snapshot()["stop_reason"] != "execution_failed"
 
 
+def test_navigation_search_interaction_continues_when_native_transition_is_bound(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state()
+    observation_id = debug.observations.register(
+        "transition", owner="navigation", timeout=4, payload={},
+    )
+    debug.navigation_transition_requests[75] = observation_id
+    results = [
+        {
+            "ok": True,
+            "status": "interacting",
+            "target_id": 75,
+            "observation_id": "interaction-observation",
+            "action": {"buttons": ["search"], "frames": 1},
+        },
+        {
+            "ok": True,
+            "status": "transitioned",
+            "target_id": 75,
+            "observation_id": observation_id,
+        },
+    ]
+    debug.snapshot = lambda: state
+    debug.navigation_step = lambda _state, target_id, **_kwargs: results.pop(0)
+    monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: state)
+    monkeypatch.setattr(runtime, "_wait_navigation_observation", lambda *_args: None)
+
+    result = runtime._navigate(75)
+
+    assert result["status"] == "transitioned"
+    assert [entry["status"] for entry in result["progress"]] == [
+        "interacting", "transitioned",
+    ]
+
+
 def test_navigation_observation_polling_does_not_create_extra_steps(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -2518,6 +2711,33 @@ def test_agent_interrupt_atomically_retires_navigation_observation(tmp_path):
     assert not debug.action_path.exists()
     last_route = debug.read_exploration()["rooms"][debug.room_identity(state)["id"]]["last_route"]
     assert last_route["outcome"] == "agent_interrupt"
+
+
+def test_agent_interrupt_clears_linked_search_interaction(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    target = {
+        "id": 75, "x": 16, "y": 8, "sprite_id": 1, "state": 1,
+        "trigger_mode": 1, "trigger_script": 8149, "auto_script": 0,
+        "blocking": False, "interactable": True,
+    }
+    state = make_state(objects=[target])
+    interaction_id = debug.mark_pending_interaction_observation(
+        state, 75, action={"buttons": ["search"], "frames": 1},
+    )
+    transition_id = debug.mark_pending_transition_observation(
+        state, 75, owner="navigation",
+        linked_interaction=debug.pending_interaction_observation,
+    )
+    runtime.state.update(status="running", phase="executing")
+
+    runtime.interrupt()
+
+    assert debug.pending_transition_observation is None
+    assert debug.pending_interaction_observation is None
+    assert debug.navigation_transition_requests == {}
+    assert debug.observations.get(transition_id) is None
+    assert debug.observations.get(interaction_id)['status'] == 'cancelled'
 
 
 def test_navigation_receives_transition_confirmed_during_action_wait(tmp_path, monkeypatch):

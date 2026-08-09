@@ -20,7 +20,8 @@ EXECUTABLE_TOOLS = {
     "equip_item", "shop_buy", "shop_leave",
 }
 CHECKPOINT_BUNDLE_VERSION = 2
-DEFAULT_COMPACT_AT_TOKENS = 128_000
+DEFAULT_COMPACT_AT_TOKENS = 200_000
+DEFAULT_COMPACT_RETAIN_TOKENS = 24_000
 TOOL_OUTPUT_FULL_TOKENS = 8_000
 TOOL_OUTPUT_PRESSURE_TOKENS = 96_000
 TOOL_OUTPUT_PRESSURE_TARGET_TOKENS = 80_000
@@ -872,6 +873,7 @@ class AgentRuntime:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "last_request_usage": {},
             "last_prompt_tokens": None,
+            "last_compaction": None,
             "compactions": 0,
             "stop_reason": reason,
             "created_at": now,
@@ -906,6 +908,7 @@ class AgentRuntime:
         legacy_task_state = "task_reconciliation_pending" not in value
         value.setdefault("last_request_usage", {})
         value.setdefault("last_prompt_tokens", None)
+        value.setdefault("last_compaction", None)
         # Older sessions exposed a local byte-size estimate as if it were context
         # usage. Never migrate that approximation into the provider-observed field.
         value.pop("context_estimate_tokens", None)
@@ -1073,6 +1076,7 @@ class AgentRuntime:
             "session_id", "model", "status", "phase", "turn", "run_turn",
             "max_turns", "stop_reason", "usage", "compactions", "last_event_seq",
             "last_request_usage", "last_prompt_tokens", "game_instance_id",
+            "last_compaction",
             "parent_session_id", "checkpoint_id", "restored_from_session_id",
             "task_reconciliation_pending", "task_reconciliation_reason",
         )}
@@ -1584,6 +1588,7 @@ class AgentRuntime:
             for key in (
                 "model", "turn", "max_turns", "pending_decision", "last_execution",
                 "usage", "last_request_usage", "last_prompt_tokens", "compactions",
+                "last_compaction",
                 "equipment_review",
             ):
                 if key in control:
@@ -1748,6 +1753,7 @@ class AgentRuntime:
                     "agent_interrupt",
                 )
             self.debug.observations.cancel_all("agent_interrupt", owner="navigation")
+            self.debug.pending_interaction_observation = None
         delegate = self.state.get("battle_delegate")
         if isinstance(delegate, dict) and delegate.get("status") == "running":
             delegate.update(status="stopped", phase="stopped", stop_reason="interrupted", ended_at=_stamp())
@@ -2164,6 +2170,7 @@ exploration value, and maintained local tasks to choose the next action.
     async def _maybe_compact_sdk(self, session: Any, client: Any, next_prompt: str) -> bool:
         await self._sanitize_sdk_session(session, next_prompt=next_prompt)
         threshold = self._compact_at_tokens()
+        retain_budget = self._compact_retain_tokens()
         observed_tokens = self.state.get("last_prompt_tokens")
         if not isinstance(observed_tokens, int) or observed_tokens < max(1000, threshold):
             return False
@@ -2176,11 +2183,20 @@ exploration value, and maintained local tasks to choose the next action.
             "compression",
             "starting",
             "Context compression started.",
-            {"observed_prompt_tokens": observed_tokens, "items": len(items)},
+            {
+                "observed_prompt_tokens": observed_tokens,
+                "compact_at_tokens": threshold,
+                "retain_tokens": retain_budget,
+                "items": len(items),
+            },
         )
-        recent_start = self._recent_cycle_start(items, cycles=2)
+        recent_start, retained_cycles = self._compaction_retained_start(items, retain_budget)
         if recent_start <= 0:
             return False
+        retained_items = items[recent_start:]
+        before = self._context_estimate_breakdown(items, next_prompt)
+        retained_estimated_tokens = self._estimate_items_tokens(retained_items)
+        retained_budget_exceeded = retained_estimated_tokens > retain_budget
         transcript = json.dumps(items[:recent_start], ensure_ascii=False)
         response = await client.chat.completions.create(
             model=self.state.get("model"),
@@ -2206,8 +2222,10 @@ exploration value, and maintained local tasks to choose the next action.
         replacement = [
             {"role": "user", "content": "Persistent context summary:\n" + summary},
             {"role": "assistant", "content": "I will preserve this context while choosing useful local actions."},
-            *items[recent_start:],
+            *retained_items,
         ]
+        summary_estimated_tokens = self._estimate_text_tokens(summary)
+        replacement_breakdown = self._context_estimate_breakdown(replacement, next_prompt)
         try:
             await session.clear_session()
             await session.add_items(replacement)
@@ -2222,8 +2240,29 @@ exploration value, and maintained local tasks to choose the next action.
         self.state["last_prompt_tokens"] = None
         self.state["task_reconciliation_pending"] = True
         self.state["task_reconciliation_reason"] = "context_compacted"
+        last_compaction = {
+            "time": _stamp(),
+            "trigger_prompt_tokens": observed_tokens,
+            "compact_at_tokens": threshold,
+            "retain_tokens": retain_budget,
+            "before_estimated_tokens": before["estimated_tokens"],
+            "before_composition": before["composition"],
+            "retained_cycles": retained_cycles,
+            "retained_items": len(retained_items),
+            "retained_estimated_tokens": retained_estimated_tokens,
+            "retained_budget_exceeded": retained_budget_exceeded,
+            "summary_estimated_tokens": summary_estimated_tokens,
+            "replacement_estimated_tokens": replacement_breakdown["estimated_tokens"],
+            "replacement_composition": replacement_breakdown["composition"],
+        }
+        self.state["last_compaction"] = last_compaction
         self._persist()
-        self.emit("compression", "completed", "Context compression completed.", {"kept_recent_items": len(items) - recent_start, "kept_recent_cycles": 2})
+        self.emit(
+            "compression",
+            "completed",
+            "Context compression completed.",
+            last_compaction,
+        )
         return True
 
     def _compact_at_tokens(self) -> int:
@@ -2236,6 +2275,17 @@ exploration value, and maintained local tasks to choose the next action.
         except (TypeError, ValueError):
             return DEFAULT_COMPACT_AT_TOKENS
         return threshold if threshold > 0 else DEFAULT_COMPACT_AT_TOKENS
+
+    def _compact_retain_tokens(self) -> int:
+        raw = self.debug.config_value(
+            "PALPAL_AGENT_COMPACT_RETAIN_TOKENS",
+            str(DEFAULT_COMPACT_RETAIN_TOKENS),
+        )
+        try:
+            budget = int(raw or DEFAULT_COMPACT_RETAIN_TOKENS)
+        except (TypeError, ValueError):
+            return DEFAULT_COMPACT_RETAIN_TOKENS
+        return budget if budget > 0 else DEFAULT_COMPACT_RETAIN_TOKENS
 
     def _merge_usage(self, usage: dict) -> None:
         normalized: dict[str, int] = {}
@@ -2276,14 +2326,66 @@ exploration value, and maintained local tasks to choose the next action.
         return max(1, (len(value.encode("utf-8")) + 2) // 3)
 
     @staticmethod
-    def _recent_cycle_start(items: list[dict], cycles: int = 2) -> int:
+    def _item_estimate_category(item: dict) -> str:
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            return "reasoning"
+        if item_type == "function_call":
+            return "function_call"
+        if item_type == "function_call_output":
+            return "function_output"
+        return "user" if item.get("role") == "user" else "assistant"
+
+    @classmethod
+    def _item_estimate_composition(cls, items: list[dict]) -> dict[str, int]:
+        composition = {
+            "user": 0,
+            "assistant": 0,
+            "reasoning": 0,
+            "function_call": 0,
+            "function_output": 0,
+        }
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            serialized = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            composition[cls._item_estimate_category(item)] += cls._estimate_text_tokens(serialized)
+        return composition
+
+    @classmethod
+    def _estimate_items_tokens(cls, items: list[dict]) -> int:
+        return sum(cls._item_estimate_composition(items).values())
+
+    def _context_estimate_breakdown(self, items: list[dict], next_prompt: str) -> dict:
+        composition = self._item_estimate_composition(items)
+        fixed_prompt = (
+            self.debug.agent_system_prompt()
+            + self.debug.agent_policy_prompt()
+            + json.dumps(self.debug.agent_tool_specs(), ensure_ascii=False, separators=(",", ":"))
+        )
+        composition["fixed_prompt"] = self._estimate_text_tokens(fixed_prompt)
+        composition["next_prompt"] = self._estimate_text_tokens(next_prompt)
+        return {
+            "estimated_tokens": sum(composition.values()),
+            "composition": composition,
+        }
+
+    @classmethod
+    def _compaction_retained_start(cls, items: list[dict], retain_budget: int) -> tuple[int, int]:
         user_indices = [
             index for index, item in enumerate(items)
-            if item.get("role") == "user" or (item.get("type") == "message" and item.get("role") == "user")
+            if isinstance(item, dict)
+            and (item.get("role") == "user" or (item.get("type") == "message" and item.get("role") == "user"))
         ]
-        if len(user_indices) < cycles:
-            return max(0, len(items) - 4)
-        return user_indices[-cycles]
+        if not user_indices:
+            return max(0, len(items) - 4), 1
+        latest_start = user_indices[-1]
+        if len(user_indices) < 2:
+            return latest_start, 1
+        second_start = user_indices[-2]
+        if cls._estimate_items_tokens(items[second_start:]) <= retain_budget:
+            return second_start, 2
+        return latest_start, 1
 
     @staticmethod
     def _parse_tool_arguments(raw_arguments: str | None) -> dict:
@@ -2868,6 +2970,11 @@ exploration value, and maintained local tasks to choose the next action.
                         )
                         if no_progress_count > 1:
                             raise RuntimeError("navigation_no_progress")
+            if status == "interacting":
+                transition_observation_id = self.debug.navigation_transition_requests.get(target_id)
+                if transition_observation_id:
+                    self._wait_navigation_observation(target_id, transition_observation_id)
+                    continue
             if status in terminal:
                 terminal_result = {
                     "ok": True,

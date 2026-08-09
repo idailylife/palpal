@@ -509,6 +509,23 @@ def test_interaction_effect_attributes_inventory_change_to_target(tmp_path):
     assert route['agent_priority'] == 'avoid_repeat'
 
 
+def test_interaction_effect_attributes_object_change_to_search_target(tmp_path):
+    target = {'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target], frame=20)
+    observation_id = debug.mark_pending_interaction_observation(
+        state, 75, action={'buttons': ['search'], 'frames': 1},
+    )
+    changed = make_state(objects=[{**target, 'state': 0, 'interactable': False}], frame=22)
+
+    outcome = debug.observe_pending_interaction_outcome(changed)
+
+    assert outcome['object_changes']['state'] == {'from': 1, 'to': 0}
+    assert outcome['object_changes']['interactable'] == {'from': True, 'to': False}
+    assert debug.event_log[-1]['type'] == 'interaction_effect'
+    assert debug.observations.get(observation_id)['status'] == 'completed'
+
+
 def test_interaction_observation_does_not_finish_before_action_is_armed(tmp_path):
     target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
     debug = make_debug_state(tmp_path)
@@ -655,6 +672,17 @@ def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
     assert 'frontier=0 仅表示当前没有未走邻格' in policy
     assert '不能据此声称目的地是死路、噪音或剧情已经耗尽' in policy
     assert '不会自动压过路线成本较低的 fresh、reachable 非传送 search' in policy
+    assert '先调用 get_room_memory(goal_room_id)' in policy
+    assert '只能说明它曾到达哪些相邻房间，是调查替代入口的空间线索' in policy
+    assert '绝不能据此声称反向边存在或可走' in policy
+    assert 'fresh、reachable 的 search 或 touch 目标' in policy
+    assert '只有实际 native trigger 和稳定落点证据才能学习真正的反向有向边' in policy
+    assert '不要为此执行自动多跳 BFS' in policy
+    assert 'room_memo 只是可能过期的地点语义注释' in policy
+    assert '发现冲突时用 upsert_room_memo 更新或清除' in policy
+    assert '不要在 memo 重复结构化探索、背包内容或临时坐标' in policy
+    assert '不要用 memo 代替行动相关线索的独立 task' in policy
+    assert 'task inbox 审查或 task reconciliation' in policy
 
 
 def test_agent_context_exposes_newly_unlocked_unknown_transition_signals(tmp_path):
@@ -683,6 +711,21 @@ def test_agent_context_exposes_newly_unlocked_unknown_transition_signals(tmp_pat
     assert target['previous_interaction_outcome']['started_object']['trigger_mode'] == 2
     assert target['previous_interaction_outcome']['finished_object']['trigger_mode'] == 4
 
+    compact_target = next(
+        target for target in debug.run_agent_tool('get_navigation', {}, state)['navigation']['targets']
+        if target['id'] == 10
+    )
+    assert compact_target['transition_candidate'] is True
+    assert compact_target['previous_interaction_outcome']['object_changes']['trigger_mode'] == {
+        'from': 2,
+        'to': 4,
+    }
+    assert 'started_object' not in compact_target['previous_interaction_outcome']
+    inspected = debug.run_agent_tool('inspect_target', {'id': 10}, state)
+    full_event = next(entry for entry in inspected['history'] if entry.get('type') == 'interaction_effect')
+    assert full_event['started_object']['trigger_mode'] == 2
+    assert full_event['finished_object']['trigger_mode'] == 4
+
 
 
 def test_agent_tool_specs_include_queries_and_submit(tmp_path):
@@ -691,7 +734,7 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     names = [tool['function']['name'] for tool in tools]
     by_name = {tool['function']['name']: tool for tool in tools}
     assert set(names) == {
-        'upsert_task', 'get_tasks', 'get_navigation', 'inspect_target',
+        'upsert_task', 'upsert_room_memo', 'get_tasks', 'get_navigation', 'inspect_target',
         'get_observations', 'get_inventory', 'get_shop', 'get_equipment',
         'get_room_memory', 'get_tool_output', 'review_task_inbox', 'submit_decision',
     }
@@ -702,6 +745,14 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert set(object_history_properties) == {'id', 'limit'}
     assert '紧凑' in by_name['get_navigation']['function']['description']
     assert '最小 dry-run 动作' in by_name['submit_decision']['function']['description']
+    room_memory_description = by_name['get_room_memory']['function']['description']
+    assert '任意稳定 logical_room_id' in room_memory_description
+    assert '已确认的有向出边' in room_memory_description
+    assert '不得伪造成反向可走路线' in room_memory_description
+    memo = by_name['upsert_room_memo']['function']
+    assert memo['parameters']['properties']['text']['maxLength'] == 800
+    assert memo['parameters']['properties']['room_id']['pattern'].startswith('^S')
+    assert '行动相关线索必须另建独立 task' in memo['description']
     assert 'wait' not in by_name['submit_decision']['function']['parameters']['properties']['action']['enum']
     output_properties = by_name['get_tool_output']['function']['parameters']['properties']
     assert set(output_properties) == {'output_ref', 'offset'}
@@ -712,9 +763,10 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert context['active_tasks'] == []
     assert context['active_tasks_total'] == 0
     assert set(context) == {
-        'state_summary', 'active_tasks', 'active_tasks_total', 'task_review', 'task_inbox',
+        'state_summary', 'room_memo', 'active_tasks', 'active_tasks_total', 'task_review', 'task_inbox',
         'task_reconciliation',
     }
+    assert context['room_memo'] is None
     assert context['task_reconciliation'] == {'pending': False, 'reason': None}
     assert context['task_review'] == {'required': False, 'tasks': []}
     assert context['task_inbox'] == {
@@ -1231,7 +1283,7 @@ def test_agent_tools_return_json_serializable_dicts(tmp_path):
     write_state(debug, state)
     debug.event_log = [{'type': 'inventory_changed'}]
     debug.dialog_history = [{'text': 'hello'}]
-    calls = [('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('get_tasks', {'include_closed': True, 'limit': 5}), ('get_navigation', {'limit': 5}), ('inspect_target', {'id': 48, 'limit': 1}), ('get_observations', {'kind': 'both', 'limit': 1}), ('get_observations', {'kind': 'speakers', 'limit': 1}), ('get_inventory', {'limit': 1}), ('get_shop', {}), ('get_room_memory', {'room_id': debug.room_identity(state)['id']}), ('get_tool_output', {'output_ref': 'tool-' + ('0' * 32) + '.txt'}), ('submit_decision', {'action': 'advance_dialog', 'reason': 'Continue.'})]
+    calls = [('upsert_task', {'description': 'Inspect object 48', 'rationale': 'Observed in local event history.', 'object_id': 48}), ('upsert_room_memo', {'text': 'Current room annotation.'}), ('get_tasks', {'include_closed': True, 'limit': 5}), ('get_navigation', {'limit': 5}), ('inspect_target', {'id': 48, 'limit': 1}), ('get_observations', {'kind': 'both', 'limit': 1}), ('get_observations', {'kind': 'speakers', 'limit': 1}), ('get_inventory', {'limit': 1}), ('get_shop', {}), ('get_room_memory', {'room_id': debug.room_identity(state)['id']}), ('get_tool_output', {'output_ref': 'tool-' + ('0' * 32) + '.txt'}), ('submit_decision', {'action': 'advance_dialog', 'reason': 'Continue.'})]
     for (name, arguments) in calls:
         result = debug.run_agent_tool(name, arguments, state)
         assert isinstance(result, dict)

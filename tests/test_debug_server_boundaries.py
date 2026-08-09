@@ -319,6 +319,28 @@ def test_http_handler_exposes_agent_tasks(http_server):
     }]
 
 
+def test_http_handler_exposes_current_room_memo_read_only(http_server):
+    base_url, debug = http_server
+    state = debug.read_live_state()
+    debug.attach_logical_room_fields(state)
+    room_id = debug.room_identity(state)["id"]
+    created = debug.run_agent_tool(
+        "upsert_room_memo",
+        {"room_id": room_id, "text": "A quiet room above the inn."},
+        state,
+    )
+
+    status, _, raw = http_request(base_url, "/agent/room-memo")
+    payload = json.loads(raw)
+
+    assert status == 200
+    assert payload == {
+        "ok": True,
+        "room_id": room_id,
+        "memo": created["memo"],
+    }
+
+
 def test_http_handler_exposes_structured_shop_actions(http_server):
     base_url, debug = http_server
     calls = []
