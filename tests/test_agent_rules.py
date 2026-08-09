@@ -759,6 +759,14 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     task_query_properties = by_name['get_tasks']['function']['parameters']['properties']
     assert set(task_query_properties) == {'include_closed', 'detail', 'offset', 'limit'}
     assert '未知自选 id' in by_name['upsert_task']['function']['description']
+    assert by_name['upsert_task']['function']['parameters']['properties']['source_inbox_ids']['type'] == 'array'
+    inbox_spec = by_name['review_task_inbox']['function']['parameters']
+    assert inbox_spec['required'] == ['resolutions']
+    resolution_properties = inbox_spec['properties']['resolutions']['items']['properties']
+    assert resolution_properties['outcome']['enum'] == ['new_task', 'task_updated', 'no_follow_up']
+    assert resolution_properties['reason_code']['enum'] == [
+        'chatter', 'duplicate_evidence', 'already_completed',
+    ]
     context = debug.agent_tool_initial_context(make_state())
     assert context['active_tasks'] == []
     assert context['active_tasks_total'] == 0
@@ -784,6 +792,8 @@ def test_agent_prompts_require_real_actions_and_leave_waiting_to_runtime(tmp_pat
     assert '提交 wait' not in policy_prompt
     assert '稳定且可操作时必须选择真实动作' in policy_prompt
     assert '运行器内部等待' in policy_prompt
+    assert '明确召唤即使准备立刻执行，也必须先建立可恢复的短期 active task' in policy_prompt
+    assert 'source_inbox_ids' in policy_prompt
 
 
 def test_agent_get_shop_returns_offers_and_equipment_comparison(tmp_path):

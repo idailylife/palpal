@@ -60,9 +60,15 @@ MAX_ROOM_MEMO_TEXT = 800
 MAX_TRANSITION_TASK_CONTEXTS = 16
 MAX_TASK_INBOX_HISTORY = 100
 MAX_TASK_INBOX_CONTEXT = 3
+TASK_INBOX_SCHEMA_VERSION = 2
 TASK_INBOX_MAX_PENDING_TURNS = 2
 TASK_INBOX_MAX_PENDING_BATCHES = 3
 TASK_INBOX_DIALOG_TEXT_LIMIT = 500
+TASK_INBOX_NO_FOLLOW_UP_REASONS = frozenset({
+    "chatter",
+    "duplicate_evidence",
+    "already_completed",
+})
 TASK_INBOX_STRUCTURAL_EVENT_TYPES = frozenset({
     "object_changed",
     "inventory_changed",
@@ -3671,6 +3677,7 @@ class DebugState:
             "tasks": {},
             "tasks_revision": 0,
             "task_inbox": {},
+            "task_inbox_version": TASK_INBOX_SCHEMA_VERSION,
             "task_inbox_initialized": True,
         }
 
@@ -3736,6 +3743,7 @@ class DebugState:
         task_inbox = data.get("task_inbox")
         if not isinstance(task_inbox, dict):
             data["task_inbox"] = {}
+        self._migrate_task_inbox(data)
         if not isinstance(data.get("task_inbox_initialized"), bool):
             data["task_inbox_initialized"] = False
         return data
@@ -4298,7 +4306,7 @@ class DebugState:
         text = str(entry.get("text") or "")
         if len(text) > TASK_INBOX_DIALOG_TEXT_LIMIT:
             text = text[:TASK_INBOX_DIALOG_TEXT_LIMIT - 1] + "…"
-        return {
+        payload = {
             key: entry.get(key)
             for key in (
                 "source_key", "speaker_hint", "event_object_id", "message_id",
@@ -4306,17 +4314,71 @@ class DebugState:
             )
             if entry.get(key) is not None
         } | {"text": text}
+        if payload.get("event_object_id") is not None:
+            payload["source_event_object_id"] = payload["event_object_id"]
+        return payload
 
     def task_inbox_batch_identity(self, entry: dict) -> tuple[str, str]:
-        try:
-            turn = max(0, int(entry.get("agent_turn") or 0))
-        except (TypeError, ValueError):
-            turn = 0
-        room_id = str(entry.get("logical_room_id") or entry.get("room_id") or entry.get("room_key") or "")
-        object_id = str(entry.get("event_object_id") or "")
-        identity = f"{turn}:{room_id}:{object_id}"
+        source_key = str(entry.get("source_key") or "").strip()
+        if source_key:
+            identity = f"dialog:{source_key}"
+        else:
+            try:
+                turn = max(0, int(entry.get("agent_turn") or 0))
+            except (TypeError, ValueError):
+                turn = 0
+            room_id = str(entry.get("logical_room_id") or entry.get("room_id") or entry.get("room_key") or "")
+            speaker = str(entry.get("speaker_hint") or "")
+            object_id = str(entry.get("event_object_id") or "")
+            text = str(entry.get("text") or "")
+            identity = f"fallback:{turn}:{room_id}:{object_id}:{speaker}:{text}"
         batch_id = "inbox-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
         return batch_id, identity
+
+    def _migrate_task_inbox(self, data: dict) -> bool:
+        try:
+            version = int(data.get("task_inbox_version") or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version >= TASK_INBOX_SCHEMA_VERSION:
+            return False
+        inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+        migrated: dict[str, dict] = {}
+        for legacy_id, legacy in inbox.items():
+            if not isinstance(legacy, dict) or legacy.get("status") != "pending":
+                if isinstance(legacy, dict):
+                    migrated[str(legacy_id)] = legacy
+                continue
+            dialogs = [item for item in legacy.get("dialogs") or [] if isinstance(item, dict)]
+            if not dialogs:
+                migrated[str(legacy_id)] = legacy
+                continue
+            for dialog in dialogs:
+                entry = {
+                    **dialog,
+                    "agent_turn": legacy.get("created_agent_turn"),
+                    "time": legacy.get("created_at"),
+                    "updated_at": legacy.get("updated_at"),
+                }
+                batch_id, identity = self.task_inbox_batch_identity(entry)
+                payload = self.task_inbox_dialog_payload(entry)
+                record = {
+                    "id": batch_id,
+                    "identity": identity,
+                    "status": "pending",
+                    "created_at": legacy.get("created_at"),
+                    "updated_at": legacy.get("updated_at"),
+                    "created_agent_turn": legacy.get("created_agent_turn"),
+                    "room_id": dialog.get("logical_room_id") or dialog.get("room_id") or legacy.get("room_id"),
+                    "event_object_id": dialog.get("event_object_id", legacy.get("event_object_id")),
+                    "source_event_object_id": dialog.get("event_object_id", legacy.get("event_object_id")),
+                    "dialogs": [payload],
+                    "migrated_from_batch_id": str(legacy_id),
+                }
+                migrated[batch_id] = record
+        data["task_inbox"] = migrated
+        data["task_inbox_version"] = TASK_INBOX_SCHEMA_VERSION
+        return True
 
     def _prune_task_inbox_locked(self, data: dict) -> None:
         inbox = data.setdefault("task_inbox", {})
@@ -4346,17 +4408,7 @@ class DebugState:
             batch_id, identity = self.task_inbox_batch_identity(entry)
             record = inbox.get(batch_id)
             if isinstance(record, dict) and record.get("status") != "pending":
-                resolved_source_keys = {
-                    str(item.get("source_key") or "")
-                    for item in record.get("dialogs") or []
-                    if isinstance(item, dict)
-                }
-                if source_key in resolved_source_keys:
-                    continue
-                batch_id = "inbox-" + hashlib.sha256(
-                    f"{identity}:{source_key}".encode("utf-8")
-                ).hexdigest()[:16]
-                record = inbox.get(batch_id)
+                continue
             if not isinstance(record, dict):
                 observed_at = self.task_inbox_entry_time(entry) or time.time()
                 try:
@@ -4372,6 +4424,7 @@ class DebugState:
                     "created_agent_turn": created_turn,
                     "room_id": entry.get("logical_room_id") or entry.get("room_id"),
                     "event_object_id": entry.get("event_object_id"),
+                    "source_event_object_id": entry.get("event_object_id"),
                     "dialogs": [],
                 }
                 inbox[batch_id] = record
@@ -4462,6 +4515,11 @@ class DebugState:
         state = state if isinstance(state, dict) else self.read_live_state()
         pending = self.task_inbox_pending()
         reasons: list[dict] = []
+        if pending:
+            reasons.append({
+                "kind": "pending_dialog_evidence",
+                "batch_ids": [str(record.get("id")) for record in pending if record.get("id")],
+            })
         current_turn = self.current_agent_turn()
         aged_ids = [
             str(record.get("id"))
@@ -4491,13 +4549,16 @@ class DebugState:
             if isinstance(target, dict) and transition_candidate(target):
                 reasons.append({"kind": "leaving_room", "target_id": requested_id})
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
-        required = bool(pending and reasons and not dialog.get("active"))
+        required = bool(pending and not dialog.get("active"))
         return {
             "pending_total": len(pending),
             "batches": [
                 {
                     key: record.get(key)
-                    for key in ("id", "created_agent_turn", "room_id", "event_object_id", "dialogs")
+                    for key in (
+                        "id", "created_agent_turn", "room_id", "event_object_id",
+                        "source_event_object_id", "dialogs",
+                    )
                 }
                 for record in pending[:MAX_TASK_INBOX_CONTEXT]
             ],
@@ -4509,75 +4570,142 @@ class DebugState:
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         if dialog.get("active"):
             return {"ok": False, "error": "finish the active dialog before reviewing task inbox evidence"}
-        batch_ids = arguments.get("batch_ids")
-        if not isinstance(batch_ids, list) or not batch_ids or any(not isinstance(item, str) or not item.strip() for item in batch_ids):
-            return {"ok": False, "error": "batch_ids must be a non-empty list of strings"}
-        batch_ids = list(dict.fromkeys(item.strip() for item in batch_ids))
-        disposition = arguments.get("disposition")
-        if disposition == "no_task":
-            disposition = "no_follow_up"
-        if disposition not in {"no_follow_up", "tasks_updated"}:
-            return {"ok": False, "error": "disposition must be no_follow_up or tasks_updated"}
-        rationale = arguments.get("rationale")
-        if not isinstance(rationale, str) or not rationale.strip():
-            return {"ok": False, "error": "rationale must be a non-empty string"}
-        task_ids = arguments.get("task_ids", [])
-        if not isinstance(task_ids, list) or any(not isinstance(item, str) or not item.strip() for item in task_ids):
-            return {"ok": False, "error": "task_ids must be a list of strings"}
-        task_ids = list(dict.fromkeys(item.strip() for item in task_ids))
-        if disposition == "no_follow_up" and task_ids:
-            return {"ok": False, "error": "no_follow_up disposition must not include task_ids"}
-        if disposition == "tasks_updated":
-            if not task_ids:
-                return {"ok": False, "error": "tasks_updated disposition requires task_ids"}
-            if not isinstance(tool_cycle, dict) or not tool_cycle.get("tasks_queried"):
-                return {"ok": False, "error": "call get_tasks before resolving inbox evidence with tasks_updated"}
-            upserted = set(tool_cycle.get("upserted_task_ids") or [])
-            missing = sorted(set(task_ids) - upserted)
-            if missing:
-                return {"ok": False, "error": "every referenced task must be upserted in this tool cycle", "missing_task_ids": missing}
+        resolutions = arguments.get("resolutions")
+        legacy = resolutions is None
+        if legacy:
+            batch_ids = arguments.get("batch_ids")
+            if not isinstance(batch_ids, list) or not batch_ids:
+                return {"ok": False, "error": "resolutions must be a non-empty list"}
+            disposition = arguments.get("disposition")
+            if disposition == "no_task":
+                disposition = "no_follow_up"
+            outcome = "task_updated" if disposition == "tasks_updated" else disposition
+            resolutions = [
+                {
+                    "inbox_id": batch_id,
+                    "outcome": outcome,
+                    "task_ids": arguments.get("task_ids", []),
+                    "reason_code": arguments.get("reason_code", "chatter"),
+                    "rationale": arguments.get("rationale"),
+                }
+                for batch_id in batch_ids
+            ]
+        if not isinstance(resolutions, list) or not resolutions:
+            return {"ok": False, "error": "resolutions must be a non-empty list"}
+
+        normalized: list[dict] = []
+        seen_ids: set[str] = set()
+        for resolution in resolutions:
+            if not isinstance(resolution, dict):
+                return {"ok": False, "error": "each resolution must be an object"}
+            inbox_id = str(resolution.get("inbox_id") or "").strip()
+            if not inbox_id or inbox_id in seen_ids:
+                return {"ok": False, "error": "each resolution requires a unique inbox_id"}
+            seen_ids.add(inbox_id)
+            outcome = resolution.get("outcome")
+            if outcome not in {"new_task", "task_updated", "no_follow_up"}:
+                return {"ok": False, "error": "outcome must be new_task, task_updated, or no_follow_up"}
+            rationale = resolution.get("rationale")
+            if not isinstance(rationale, str) or not rationale.strip():
+                return {"ok": False, "error": "each resolution requires a non-empty rationale"}
+            task_ids = resolution.get("task_ids", [])
+            if not isinstance(task_ids, list) or any(not isinstance(item, str) or not item.strip() for item in task_ids):
+                return {"ok": False, "error": "task_ids must be a list of strings"}
+            task_ids = list(dict.fromkeys(item.strip() for item in task_ids))
+            reason_code = resolution.get("reason_code")
+            if outcome == "no_follow_up":
+                if task_ids:
+                    return {"ok": False, "error": "no_follow_up must not include task_ids"}
+                if reason_code not in TASK_INBOX_NO_FOLLOW_UP_REASONS:
+                    return {
+                        "ok": False,
+                        "error": "no_follow_up requires reason_code chatter, duplicate_evidence, or already_completed",
+                    }
+            elif not task_ids:
+                return {"ok": False, "error": f"{outcome} requires task_ids"}
+            elif outcome == "new_task" and len(task_ids) != 1:
+                return {"ok": False, "error": "new_task requires exactly one task id"}
+            normalized.append({
+                "inbox_id": inbox_id,
+                "outcome": outcome,
+                "task_ids": task_ids,
+                "reason_code": reason_code if outcome == "no_follow_up" else None,
+                "rationale": rationale.strip(),
+            })
+
+        task_outcomes = [item for item in normalized if item["outcome"] != "no_follow_up"]
+        if task_outcomes and (not isinstance(tool_cycle, dict) or not tool_cycle.get("tasks_queried")):
+            return {"ok": False, "error": "call get_tasks before resolving inbox evidence with tasks"}
+        upserted = set(tool_cycle.get("upserted_task_ids") or []) if isinstance(tool_cycle, dict) else set()
+        missing_upserts = sorted({task_id for item in task_outcomes for task_id in item["task_ids"]} - upserted)
+        if missing_upserts:
+            return {
+                "ok": False,
+                "error": "every referenced task must be upserted in this tool cycle",
+                "missing_task_ids": missing_upserts,
+            }
         now = time.time()
         with self.exploration_lock:
             data = self.read_exploration()
             inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
             missing_batches = sorted(
-                batch_id for batch_id in batch_ids
-                if not isinstance(inbox.get(batch_id), dict) or inbox[batch_id].get("status") != "pending"
+                item["inbox_id"] for item in normalized
+                if not isinstance(inbox.get(item["inbox_id"]), dict)
+                or inbox[item["inbox_id"]].get("status") != "pending"
             )
             if missing_batches:
                 return {"ok": False, "error": "unknown or already resolved task inbox batch", "missing_batch_ids": missing_batches}
-            for batch_id in batch_ids:
-                record = inbox[batch_id]
-                record["status"] = "dismissed" if disposition == "no_follow_up" else "promoted"
+            tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+            for item in task_outcomes:
+                record = inbox[item["inbox_id"]]
+                for task_id in item["task_ids"]:
+                    task = tasks.get(task_id)
+                    provenance = task.get("provenance") if isinstance(task, dict) else None
+                    linked_ids = provenance.get("task_inbox_batch_ids") if isinstance(provenance, dict) else None
+                    if not isinstance(linked_ids, list) or item["inbox_id"] not in linked_ids:
+                        return {
+                            "ok": False,
+                            "error": "every referenced task must durably link the resolved inbox evidence",
+                            "missing_inbox_links": [{"inbox_id": item["inbox_id"], "task_id": task_id}],
+                        }
+                    if item["outcome"] == "new_task":
+                        created_turn = int(task.get("created_agent_turn") or 0)
+                        evidence_turn = int(record.get("created_agent_turn") or 0)
+                        if task.get("status") != "active" or created_turn < evidence_turn:
+                            return {
+                                "ok": False,
+                                "error": "new_task requires an active task created from this evidence",
+                                "task_id": task_id,
+                            }
+            for item in normalized:
+                record = inbox[item["inbox_id"]]
+                record["status"] = "dismissed" if item["outcome"] == "no_follow_up" else "promoted"
                 record["resolved_at"] = now
                 record["resolved_agent_turn"] = self.current_agent_turn()
                 record["resolution"] = {
-                    "disposition": disposition,
-                    "rationale": rationale.strip(),
-                    "task_ids": task_ids,
+                    "outcome": item["outcome"],
+                    "rationale": item["rationale"],
+                    "task_ids": item["task_ids"],
                 }
-            if disposition == "tasks_updated":
-                tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
-                for task_id in task_ids:
-                    task = tasks.get(task_id)
-                    if not isinstance(task, dict):
-                        continue
-                    provenance = task.setdefault("provenance", {})
-                    inbox_ids = provenance.setdefault("task_inbox_batch_ids", [])
-                    inbox_ids.extend(batch_id for batch_id in batch_ids if batch_id not in inbox_ids)
-                data["tasks_revision"] = self.task_ledger_revision(data) + 1
+                if item["reason_code"] is not None:
+                    record["resolution"]["reason_code"] = item["reason_code"]
             self._prune_task_inbox_locked(data)
             self.write_exploration(data)
         if isinstance(tool_cycle, dict):
             resolved = tool_cycle.setdefault("resolved_inbox_batch_ids", [])
-            resolved.extend(batch_id for batch_id in batch_ids if batch_id not in resolved)
-        return {
+            resolved.extend(item["inbox_id"] for item in normalized if item["inbox_id"] not in resolved)
+        result = {
             "ok": True,
-            "disposition": disposition,
-            "resolved_batch_ids": batch_ids,
-            "task_ids": task_ids,
+            "resolutions": normalized,
+            "resolved_batch_ids": [item["inbox_id"] for item in normalized],
             "pending_total": len(self.task_inbox_pending()),
         }
+        if legacy:
+            result["disposition"] = arguments.get("disposition")
+            result["task_ids"] = list(dict.fromkeys(
+                task_id for item in normalized for task_id in item["task_ids"]
+            ))
+        return result
 
     def new_agent_tool_cycle(self, state: dict | None = None) -> dict:
         review = self.task_review_context(state)
@@ -4649,11 +4777,29 @@ class DebugState:
         status = arguments.get("status")
         if status is not None and status not in {"active", "completed", "abandoned"}:
             return {"ok": False, "error": "status must be active, completed, or abandoned"}
+        source_inbox_ids = arguments.get("source_inbox_ids", [])
+        if (
+            not isinstance(source_inbox_ids, list)
+            or any(not isinstance(item, str) or not item.strip() for item in source_inbox_ids)
+        ):
+            return {"ok": False, "error": "source_inbox_ids must be a list of strings"}
+        source_inbox_ids = list(dict.fromkeys(item.strip() for item in source_inbox_ids))
         now = time.time()
         turn = self.current_agent_turn()
         with self.exploration_lock:
             data = self.read_exploration()
             tasks = data.setdefault("tasks", {})
+            inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+            missing_inbox_ids = sorted(
+                inbox_id for inbox_id in source_inbox_ids
+                if not isinstance(inbox.get(inbox_id), dict) or inbox[inbox_id].get("status") != "pending"
+            )
+            if missing_inbox_ids:
+                return {
+                    "ok": False,
+                    "error": "source_inbox_ids must reference pending task inbox evidence",
+                    "missing_inbox_ids": missing_inbox_ids,
+                }
             existing = tasks.get(task_id) if task_id else None
             if not isinstance(existing, dict):
                 existing = None
@@ -4732,6 +4878,13 @@ class DebugState:
                 if existing.get(key) != value:
                     changed[key] = {"from": existing.get(key), "to": value}
                     existing[key] = value
+            if source_inbox_ids:
+                provenance = existing.setdefault("provenance", {})
+                linked_ids = provenance.setdefault("task_inbox_batch_ids", [])
+                added_ids = [inbox_id for inbox_id in source_inbox_ids if inbox_id not in linked_ids]
+                if added_ids:
+                    linked_ids.extend(added_ids)
+                    changed["source_inbox_ids"] = {"added": added_ids}
             if existing.get("status") == "completed" and previous_status != "completed":
                 state = state if isinstance(state, dict) else self.read_live_state()
                 existing["completed_at"] = now
@@ -10052,6 +10205,10 @@ class DebugState:
                             "transition_key": {"type": "string"}, "room_id": {"type": "string"},
                             "rationale": {"type": "string", "minLength": 1},
                             "review_token": {"type": "string", "minLength": 1},
+                            "source_inbox_ids": {
+                                "type": "array", "maxItems": 20,
+                                "items": {"type": "string", "minLength": 1},
+                            },
                         },
                         "additionalProperties": False,
                     },
@@ -10082,24 +10239,39 @@ class DebugState:
                 "function": {
                     "name": "review_task_inbox",
                     "description": (
-                        "归档已完成对话产生的 task_inbox 证据，不执行游戏动作。只有闲聊、重复台词、已自动完成或永不影响后续行动的证据才用 no_follow_up；"
-                        "需要创建、更新、完成或接续任务时，先 get_tasks，再 upsert_task，并用 tasks_updated 引用本轮写入的 task id。"
+                        "逐条归档已完成对话产生的 task_inbox 证据，不执行游戏动作。明确召唤、委托、约定或其他未完成行动使用 new_task；"
+                        "已有任务进展使用 task_updated；只有闲聊、重复证据或已观察完成的证据使用 no_follow_up。任务类结论必须先 get_tasks，"
+                        "再用 source_inbox_ids 成功 upsert 对应任务。所有 resolution 成功后才会结案。"
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "batch_ids": {
+                            "resolutions": {
                                 "type": "array", "minItems": 1, "maxItems": 20,
-                                "items": {"type": "string", "minLength": 1},
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "inbox_id": {"type": "string", "minLength": 1},
+                                        "outcome": {
+                                            "type": "string",
+                                            "enum": ["new_task", "task_updated", "no_follow_up"],
+                                        },
+                                        "task_ids": {
+                                            "type": "array", "maxItems": 20,
+                                            "items": {"type": "string", "minLength": 1},
+                                        },
+                                        "reason_code": {
+                                            "type": "string",
+                                            "enum": ["chatter", "duplicate_evidence", "already_completed"],
+                                        },
+                                        "rationale": {"type": "string", "minLength": 1, "maxLength": 500},
+                                    },
+                                    "required": ["inbox_id", "outcome", "rationale"],
+                                    "additionalProperties": False,
+                                },
                             },
-                            "disposition": {"type": "string", "enum": ["no_follow_up", "tasks_updated"]},
-                            "task_ids": {
-                                "type": "array", "maxItems": 20,
-                                "items": {"type": "string", "minLength": 1},
-                            },
-                            "rationale": {"type": "string", "minLength": 1, "maxLength": 500},
                         },
-                        "required": ["batch_ids", "disposition", "rationale"],
+                        "required": ["resolutions"],
                         "additionalProperties": False,
                     },
                 },
@@ -10435,10 +10607,13 @@ class DebugState:
                     reconciled = tool_cycle.setdefault("reconciled_task_ids", [])
                     if task_id and task_id not in reconciled:
                         reconciled.append(task_id)
-                    audit = tool_cycle.get("task_query_audit")
-                    if isinstance(audit, dict):
-                        with self.exploration_lock:
-                            audit["revision"] = self.task_ledger_revision(self.read_exploration())
+                audit = tool_cycle.get("task_query_audit")
+                if isinstance(audit, dict) and audit.get("complete") is True:
+                    # This cycle has already seen the complete ledger and receives
+                    # every successful write result, so keep the audited revision
+                    # current while it creates or updates multiple related tasks.
+                    with self.exploration_lock:
+                        audit["revision"] = self.task_ledger_revision(self.read_exploration())
             return result
         if name == "get_tasks":
             if isinstance(tool_cycle, dict):
@@ -10623,14 +10798,21 @@ class DebugState:
                 action=action,
                 target_id=arguments.get("target_id"),
             )
-            if inbox.get("review_required") and action not in {"advance_dialog", "select_choice"}:
+            dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+            choice = state.get("choice") if isinstance(state.get("choice"), dict) else {}
+            continuing_active_prompt = (
+                (action == "advance_dialog" and dialog.get("active"))
+                or (action == "select_choice" and choice.get("active"))
+            )
+            if inbox.get("review_required") and not continuing_active_prompt:
                 return {
                     "ok": False,
                     "error": {
                         "code": "task_inbox_review_required",
                         "message": (
-                            "Pending dialog evidence is at risk of being forgotten. "
-                            "Call review_task_inbox to dismiss it with a reason or promote it after get_tasks/upsert_task."
+                            "Pending dialog evidence must be resolved before another game action. "
+                            "For task outcomes, call get_tasks and upsert_task with source_inbox_ids before "
+                            "review_task_inbox; otherwise use a structured no_follow_up reason."
                         ),
                         "required_batch_ids": [
                             str(batch.get("id")) for batch in inbox.get("batches") or [] if batch.get("id")
@@ -10889,9 +11071,11 @@ class DebugState:
             "发现、调整、完成或作废任务时调用 upsert_task，不要仅凭时间自动关闭任务。创建未知 id 或无 id 任务前，必须在前一模型批次完整分页读取 include_closed=true、detail=summary 的账本，"
             "并使用最终页 review_token；只查 active、漏页、账本 revision 变化或同批并行 get_tasks+upsert_task 都不能创建。"
             "若审计发现语义等价的 completed/abandoned 任务，不得创建新 id；确有新证据要求重开则更新原 id，只有不同剧情阶段才创建后继任务并在 rationale 注明前序 id。"
-            "task_inbox 是尚未归档为任务结论的持久对话证据，不等于任务。review_required=false 时可继续同房间调查，但仍应在证据明确时主动归档。"
-            "task_inbox.review_required=true 时，必须先调用 review_task_inbox：只有闲聊、重复台词、已由剧情自动完成或永远不会用于后续行动的证据才用 no_follow_up 并说明理由；"
-            "需要后续行动的委托、线索或阶段目标先 get_tasks、upsert_task，再用 tasks_updated 引用本轮写入的 task id。"
+            "task_inbox 是尚未归档为任务结论的持久对话证据，不等于任务；每个说话轮次独立归档。对话结束后必须完成所有 pending 证据，才能提交任何游戏动作。"
+            "明确召唤即使准备立刻执行，也必须先建立可恢复的短期 active task；未知目标对象时可暂不填 object_id，实际交互确认后再绑定并完成。"
+            "调用 review_task_inbox 时，未完成的召唤、委托、约定或阶段目标使用 new_task；已有任务进展使用 task_updated；"
+            "只有闲聊、重复证据或已有可观察完成效果时才用 no_follow_up，并选择结构化 reason_code。"
+            "任务类结论必须先 get_tasks，再用 source_inbox_ids 成功 upsert 对应任务后归档；禁止写‘下轮另建’并提前结案。"
             "task_reconciliation.pending=true 表示 checkpoint 恢复、上下文压缩或旧状态升级后必须重建全账本可见性：完整读取 closed-inclusive summary 索引，"
             "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。完成前不可 navigate、use_item 或创建任务；对话可继续。"
             "task_review.required=true 表示新剧情证据晚于相关 active task 的上次审计。对话仍可继续 advance_dialog；对话结束后若要 navigate 或 use_item，"

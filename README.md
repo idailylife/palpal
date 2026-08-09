@@ -313,11 +313,14 @@ leads, which still belong in independent tasks. They survive Agent session reset
 follow checkpoint companion branches, and are cleared by Start New Game. The
 Agent tab exposes the current room's memo through a read-only `Room Memo` dialog.
 
-Dialogue evidence that can affect later action is promoted to one or more tasks
-with `review_task_inbox(..., disposition="tasks_updated")`, which records the
-inbox batch in task provenance. Only chatter, repeated dialogue, automatically
-completed instructions, or evidence that will never affect later action uses
-`no_follow_up`; the backend still accepts legacy `no_task` calls. Query outputs
+Each merged speaker turn becomes an independent persistent task-inbox item even
+when several speakers share one native trigger object. After dialogue ends, the
+Agent must resolve every pending item before any other game action. Explicit
+summons, commitments, and other unfinished follow-ups use `new_task`; existing
+task progress uses `task_updated`. The corresponding `upsert_task` call must
+include `source_inbox_ids`, so failed writes leave the evidence pending instead
+of allowing exploration to continue. Only chatter, duplicate evidence, or an
+instruction with an observed completed effect uses `no_follow_up`. Query outputs
 up to about 8000 estimated tokens stay
 verbatim. Larger JSON or text outputs are atomically archived under the current
 session's `runtime/agent/tool_outputs/` directory; the transcript keeps a valid

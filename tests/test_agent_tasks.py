@@ -473,7 +473,7 @@ def inbox_dialog(*, turn=5, text="请调查楼上的房间", source_key="dialog-
     }
 
 
-def test_task_inbox_is_soft_until_transition_then_requires_explicit_resolution(tmp_path, monkeypatch):
+def test_task_inbox_requires_explicit_resolution_immediately_after_dialog(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     transition = make_object(51, sprite_id=0, trigger_mode=5)
     state = make_state(objects=[transition])
@@ -484,7 +484,8 @@ def test_task_inbox_is_soft_until_transition_then_requires_explicit_resolution(t
 
     context = debug.task_inbox_gate_context(state)
     assert context["pending_total"] == 1
-    assert context["review_required"] is False
+    assert context["review_required"] is True
+    assert {reason["kind"] for reason in context["reasons"]} == {"pending_dialog_evidence"}
 
     cycle = debug.new_agent_tool_cycle(state)
     blocked = debug.run_agent_tool(
@@ -492,15 +493,26 @@ def test_task_inbox_is_soft_until_transition_then_requires_explicit_resolution(t
         tool_cycle=cycle,
     )
     assert blocked["error"]["code"] == "task_inbox_review_required"
+    inactive_dialog = debug.run_agent_tool(
+        "submit_decision", {"action": "advance_dialog", "reason": "No active dialog."}, state,
+        tool_cycle=cycle,
+    )
+    assert inactive_dialog["error"]["code"] == "task_inbox_review_required"
+    active_dialog_state = {**state, "dialog": {"active": True}}
+    assert debug.run_agent_tool(
+        "submit_decision", {"action": "advance_dialog", "reason": "Finish active dialog."},
+        active_dialog_state, tool_cycle=cycle,
+    )["ok"] is True
     batch_id = blocked["error"]["required_batch_ids"][0]
 
-    resolved = debug.run_agent_tool("review_task_inbox", {
-        "batch_ids": [batch_id],
-        "disposition": "no_follow_up",
+    resolved = debug.run_agent_tool("review_task_inbox", {"resolutions": [{
+        "inbox_id": batch_id,
+        "outcome": "no_follow_up",
+        "reason_code": "already_completed",
         "rationale": "The script already completed this instruction.",
-    }, state, tool_cycle=cycle)
+    }]}, state, tool_cycle=cycle)
     assert resolved["ok"] is True
-    assert resolved["disposition"] == "no_follow_up"
+    assert resolved["resolutions"][0]["outcome"] == "no_follow_up"
     assert resolved["pending_total"] == 0
     assert debug.task_inbox_gate_context(state)["pending_total"] == 0
 
@@ -514,10 +526,11 @@ def test_task_inbox_tasks_updated_requires_query_and_same_cycle_upsert(tmp_path,
     batch_id = debug.task_inbox_pending()[0]["id"]
     cycle = debug.new_agent_tool_cycle(state)
 
-    missing_query = debug.run_agent_tool("review_task_inbox", {
-        "batch_ids": [batch_id], "disposition": "tasks_updated",
+    resolution = {"resolutions": [{
+        "inbox_id": batch_id, "outcome": "new_task",
         "task_ids": ["investigate-room"], "rationale": "Explicit follow-up clue.",
-    }, state, tool_cycle=cycle)
+    }]}
+    missing_query = debug.run_agent_tool("review_task_inbox", resolution, state, tool_cycle=cycle)
     assert missing_query["ok"] is False
     assert "get_tasks" in missing_query["error"]
 
@@ -530,24 +543,158 @@ def test_task_inbox_tasks_updated_requires_query_and_same_cycle_upsert(tmp_path,
         "description": "Investigate the occupied room",
         "rationale": "The latest dialog gave a durable story clue.",
         "review_token": audit["review_token"],
+        "source_inbox_ids": [batch_id],
     }, state, tool_cycle=audit_cycle)
     assert created["ok"] is True
     debug.run_agent_tool("get_tasks", {}, state, tool_cycle=cycle)
-    missing_upsert = debug.run_agent_tool("review_task_inbox", {
-        "batch_ids": [batch_id], "disposition": "tasks_updated",
-        "task_ids": ["investigate-room"], "rationale": "Explicit follow-up clue.",
-    }, state, tool_cycle=cycle)
+    missing_upsert = debug.run_agent_tool("review_task_inbox", resolution, state, tool_cycle=cycle)
     assert missing_upsert["missing_task_ids"] == ["investigate-room"]
 
-    debug.run_agent_tool("upsert_task", {"id": "investigate-room"}, state, tool_cycle=cycle)
-    resolved = debug.run_agent_tool("review_task_inbox", {
-        "batch_ids": [batch_id], "disposition": "tasks_updated",
-        "task_ids": ["investigate-room"], "rationale": "Promoted the clue to a task.",
+    debug.run_agent_tool("upsert_task", {
+        "id": "investigate-room", "source_inbox_ids": [batch_id],
     }, state, tool_cycle=cycle)
+    resolved = debug.run_agent_tool("review_task_inbox", resolution, state, tool_cycle=cycle)
     assert resolved["ok"] is True
     task = debug.task_ledger()[0]
     assert task["id"] == "investigate-room"
     assert task["provenance"]["task_inbox_batch_ids"] == [batch_id]
+
+
+def test_task_inbox_separates_speaker_turns_with_same_trigger_object(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    monkeypatch.setattr(debug, "current_agent_turn", lambda: 110)
+    common = {
+        "time": 100.0,
+        "updated_at": 100.0,
+        "event_object_id": 63,
+        "agent_turn": 110,
+        "room_id": "S3/M10:000000000001",
+        "logical_room_id": "S3/M10:000000000001",
+    }
+    debug.record_task_inbox_entries([
+        {**common, "source_key": "dialog-drunk", "speaker_hint": "醉道士", "text": "明晚山神廟見。"},
+        {**common, "source_key": "dialog-narration", "text": "醉道士離去了。"},
+        {**common, "source_key": "dialog-aunt", "speaker_hint": "李大娘", "text": "逍遙～你過來一下！"},
+    ])
+
+    pending = debug.task_inbox_pending()
+    assert len(pending) == 3
+    assert {record["dialogs"][0]["speaker_hint"] for record in pending if record["dialogs"][0].get("speaker_hint")} == {
+        "醉道士", "李大娘",
+    }
+    assert {record["source_event_object_id"] for record in pending} == {63}
+
+
+def test_distinct_follow_ups_require_distinct_tasks_before_inbox_can_close(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = review_state()
+    write_state(debug, state)
+    monkeypatch.setattr(debug, "current_agent_turn", lambda: 110)
+    debug.record_task_inbox_entries([
+        inbox_dialog(turn=110, source_key="mountain", text="明晚三更十里坡山神廟，不見不散。"),
+        inbox_dialog(turn=110, source_key="summon", text="逍遙～你過來一下！"),
+    ])
+    by_text = {
+        record["dialogs"][0]["text"]: record["id"]
+        for record in debug.task_inbox_pending()
+    }
+    mountain_id = by_text["明晚三更十里坡山神廟，不見不散。"]
+    summon_id = by_text["逍遙～你過來一下！"]
+    cycle = debug.new_agent_tool_cycle(state)
+    audit = debug.run_agent_tool(
+        "get_tasks", {"include_closed": True, "detail": "summary"}, state, tool_cycle=cycle,
+    )
+    for task_id, description, inbox_id in (
+        ("meet-at-temple", "明晚赴山神廟", mountain_id),
+        ("answer-summons", "回應李大娘召喚", summon_id),
+    ):
+        result = debug.run_agent_tool("upsert_task", {
+            "id": task_id,
+            "description": description,
+            "rationale": "The dialog requires a future action.",
+            "review_token": audit["review_token"],
+            "source_inbox_ids": [inbox_id],
+        }, state, tool_cycle=cycle)
+        assert result["ok"] is True
+        audit["review_token"] = debug.run_agent_tool(
+            "get_tasks", {"include_closed": True, "detail": "summary"}, state, tool_cycle=cycle,
+        )["review_token"]
+
+    incomplete = debug.run_agent_tool("review_task_inbox", {"resolutions": [{
+        "inbox_id": mountain_id,
+        "outcome": "new_task",
+        "task_ids": ["meet-at-temple"],
+        "rationale": "Track the appointment.",
+    }, {
+        "inbox_id": summon_id,
+        "outcome": "task_updated",
+        "task_ids": ["meet-at-temple"],
+        "rationale": "Incorrectly reuse the appointment.",
+    }]}, state, tool_cycle=cycle)
+    assert incomplete["ok"] is False
+    assert incomplete["missing_inbox_links"] == [{"inbox_id": summon_id, "task_id": "meet-at-temple"}]
+
+    resolved = debug.run_agent_tool("review_task_inbox", {"resolutions": [{
+        "inbox_id": mountain_id,
+        "outcome": "new_task",
+        "task_ids": ["meet-at-temple"],
+        "rationale": "Track the appointment.",
+    }, {
+        "inbox_id": summon_id,
+        "outcome": "new_task",
+        "task_ids": ["answer-summons"],
+        "rationale": "Track the summons until the follow-up dialog occurs.",
+    }]}, state, tool_cycle=cycle)
+    assert resolved["ok"] is True
+    assert {task["id"] for task in debug.task_ledger()} == {"meet-at-temple", "answer-summons"}
+
+
+def test_failed_task_creation_keeps_inbox_pending_and_blocks_navigation(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = review_state()
+    transition = make_object(51, sprite_id=0, trigger_mode=5)
+    state["objects"] = [transition]
+    write_state(debug, state)
+    monkeypatch.setattr(debug, "current_agent_turn", lambda: 12)
+    debug.record_task_inbox_entries([inbox_dialog(turn=12, source_key="summon", text="Come here.")])
+    inbox_id = debug.task_inbox_pending()[0]["id"]
+    cycle = debug.new_agent_tool_cycle(state)
+
+    failed = debug.run_agent_tool("upsert_task", {
+        "id": "answer-summons",
+        "description": "Answer the summons",
+        "rationale": "The speaker requested a follow-up.",
+        "source_inbox_ids": [inbox_id],
+    }, state, tool_cycle=cycle)
+    assert failed["error"]["code"] == "task_creation_review_required"
+    assert [record["id"] for record in debug.task_inbox_pending()] == [inbox_id]
+    blocked = debug.run_agent_tool(
+        "submit_decision", {"action": "navigate", "target_id": 51, "reason": "Leave."},
+        state, tool_cycle=cycle,
+    )
+    assert blocked["error"]["code"] == "task_inbox_review_required"
+
+    audit = debug.run_agent_tool(
+        "get_tasks", {"include_closed": True, "detail": "summary"}, state, tool_cycle=cycle,
+    )
+    created = debug.run_agent_tool("upsert_task", {
+        "id": "answer-summons",
+        "description": "Answer the summons",
+        "rationale": "The speaker requested a follow-up.",
+        "review_token": audit["review_token"],
+        "source_inbox_ids": [inbox_id],
+    }, state, tool_cycle=cycle)
+    assert created["ok"] is True
+    assert debug.run_agent_tool("review_task_inbox", {"resolutions": [{
+        "inbox_id": inbox_id,
+        "outcome": "new_task",
+        "task_ids": ["answer-summons"],
+        "rationale": "Persisted before acting.",
+    }]}, state, tool_cycle=cycle)["ok"] is True
+    assert debug.run_agent_tool(
+        "submit_decision", {"action": "navigate", "target_id": 51, "reason": "Leave."},
+        state, tool_cycle=cycle,
+    )["ok"] is True
 
 
 def test_real_bag_clue_creates_one_task_and_repeated_guard_line_has_no_follow_up(tmp_path, monkeypatch):
@@ -570,12 +717,13 @@ def test_real_bag_clue_creates_one_task_and_repeated_guard_line_has_no_follow_up
         "description": "调查被占房间里的神秘麻布袋",
         "rationale": "麻布袋和禁止进入会影响后续行动。",
         "review_token": audit["review_token"],
+        "source_inbox_ids": [first_batch],
     }, state, tool_cycle=cycle)
     assert created["ok"] is True
-    promoted = debug.run_agent_tool("review_task_inbox", {
-        "batch_ids": [first_batch], "disposition": "tasks_updated",
+    promoted = debug.run_agent_tool("review_task_inbox", {"resolutions": [{
+        "inbox_id": first_batch, "outcome": "new_task",
         "task_ids": ["investigate-mysterious-bag"], "rationale": "Promoted unresolved clue.",
-    }, state, tool_cycle=cycle)
+    }]}, state, tool_cycle=cycle)
     assert promoted["ok"] is True
 
     monkeypatch.setattr(debug, "current_agent_turn", lambda: 21)
@@ -583,10 +731,11 @@ def test_real_bag_clue_creates_one_task_and_repeated_guard_line_has_no_follow_up
         turn=21, source_key="guard-repeat", text="不准靠近房間",
     )])
     repeated_batch = debug.task_inbox_pending()[0]["id"]
-    dismissed = debug.run_agent_tool("review_task_inbox", {
-        "batch_ids": [repeated_batch], "disposition": "no_follow_up",
+    dismissed = debug.run_agent_tool("review_task_inbox", {"resolutions": [{
+        "inbox_id": repeated_batch, "outcome": "no_follow_up",
+        "reason_code": "duplicate_evidence",
         "rationale": "Repeated guard warning; the existing bag investigation already covers it.",
-    }, state, tool_cycle=debug.new_agent_tool_cycle(state))
+    }]}, state, tool_cycle=debug.new_agent_tool_cycle(state))
     assert dismissed["ok"] is True
     assert [task["id"] for task in debug.task_ledger()] == ["investigate-mysterious-bag"]
 
@@ -599,12 +748,13 @@ def test_task_inbox_risk_gates_on_age_backlog_and_structural_change(tmp_path, mo
     debug.record_task_inbox_entries([inbox_dialog(turn=5)])
     aged = debug.task_inbox_gate_context(state)
     assert aged["review_required"] is True
-    assert {reason["kind"] for reason in aged["reasons"]} == {"aged"}
+    assert {reason["kind"] for reason in aged["reasons"]} == {"pending_dialog_evidence", "aged"}
 
     batch_id = debug.task_inbox_pending()[0]["id"]
-    debug.run_agent_tool("review_task_inbox", {
-        "batch_ids": [batch_id], "disposition": "no_task", "rationale": "No follow-up.",
-    }, state, tool_cycle=debug.new_agent_tool_cycle(state))
+    debug.run_agent_tool("review_task_inbox", {"resolutions": [{
+        "inbox_id": batch_id, "outcome": "no_follow_up", "reason_code": "chatter",
+        "rationale": "No follow-up.",
+    }]}, state, tool_cycle=debug.new_agent_tool_cycle(state))
     monkeypatch.setattr(debug, "current_agent_turn", lambda: 10)
     for index in range(3):
         debug.record_task_inbox_entries([
@@ -615,9 +765,10 @@ def test_task_inbox_risk_gates_on_age_backlog_and_structural_change(tmp_path, mo
     assert any(reason["kind"] == "backlog" for reason in backlog["reasons"])
 
     for record in debug.task_inbox_pending():
-        debug.run_agent_tool("review_task_inbox", {
-            "batch_ids": [record["id"]], "disposition": "no_task", "rationale": "No follow-up.",
-        }, state, tool_cycle=debug.new_agent_tool_cycle(state))
+        debug.run_agent_tool("review_task_inbox", {"resolutions": [{
+            "inbox_id": record["id"], "outcome": "no_follow_up", "reason_code": "chatter",
+            "rationale": "No follow-up.",
+        }]}, state, tool_cycle=debug.new_agent_tool_cycle(state))
     debug.record_task_inbox_entries([inbox_dialog(turn=10, source_key="structural")])
     debug.event_log.append({"time": 101.0, "type": "object_changed", "object_id": 51, "changes": {"state": {"from": 0, "to": 1}}})
     structural = debug.task_inbox_gate_context(state)
@@ -643,6 +794,43 @@ def test_task_inbox_persists_and_legacy_bootstrap_only_uses_latest_exchange(tmp_
     pending = reloaded.task_inbox_pending()
     assert len(pending) == 1
     assert pending[0]["dialogs"][0]["text"] == "latest"
+
+
+def test_task_inbox_v1_migration_splits_pending_dialogs_and_preserves_resolved_history(tmp_path):
+    debug = make_debug_state(tmp_path)
+    data = debug.empty_exploration()
+    data["task_inbox_version"] = 1
+    data["task_inbox"] = {
+        "legacy-pending": {
+            "id": "legacy-pending",
+            "status": "pending",
+            "created_at": 10.0,
+            "updated_at": 11.0,
+            "created_agent_turn": 7,
+            "room_id": "S3/M10:000000000001",
+            "event_object_id": 63,
+            "dialogs": [
+                {"source_key": "drunk", "speaker_hint": "醉道士", "event_object_id": 63, "text": "Meet later."},
+                {"source_key": "aunt", "speaker_hint": "李大娘", "event_object_id": 63, "text": "Come here."},
+            ],
+        },
+        "legacy-resolved": {
+            "id": "legacy-resolved",
+            "status": "dismissed",
+            "resolved_at": 9.0,
+            "dialogs": [{"source_key": "old", "text": "Old chatter."}],
+        },
+    }
+    debug.write_exploration(data)
+
+    migrated = debug.read_exploration()
+    assert migrated["task_inbox_version"] == 2
+    assert migrated["task_inbox"]["legacy-resolved"]["status"] == "dismissed"
+    pending = [record for record in migrated["task_inbox"].values() if record.get("status") == "pending"]
+    assert len(pending) == 2
+    assert {record["dialogs"][0]["speaker_hint"] for record in pending} == {"醉道士", "李大娘"}
+    assert {record["migrated_from_batch_id"] for record in pending} == {"legacy-pending"}
+    assert debug.read_exploration()["task_inbox"] == migrated["task_inbox"]
 
 
 def test_agent_tasks_view_groups_all_statuses_and_returns_compact_records(tmp_path):

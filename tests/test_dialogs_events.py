@@ -230,6 +230,35 @@ def test_dialog_event_stream_splits_when_speaker_changes(tmp_path):
     assert [entry['speaker_hint'] for entry in debug.dialog_history] == ['李大娘', '李逍遥']
     assert debug.dialog_history[0]['text'] == '逍遥你来的正好，快把门口的人赶走。'
     assert debug.dialog_history[1]['text'] == '啊！我马上就去。'
+    pending = debug.task_inbox_pending()
+    assert len(pending) == 2
+    assert [record['dialogs'][0]['speaker_hint'] for record in pending] == ['李大娘', '李逍遥']
+
+
+def test_task_inbox_keeps_new_speaker_goal_separate_inside_one_trigger_script(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state['dialog'] = {'events': [
+        {'sequence': 1, 'frame': 23453, 'message_id': 781, 'event_object_id': 63,
+         'speaker_hint': '醉道士', 'text': '哈哈哈！那就明晚三更'},
+        {'sequence': 2, 'frame': 23453, 'message_id': 782, 'event_object_id': 63,
+         'speaker_hint': '醉道士', 'text': '十里坡山神廟。不見不散！'},
+        {'sequence': 3, 'frame': 23453, 'message_id': 783, 'event_object_id': 63,
+         'speaker_hint': None, 'text': '醉道士話說完一溜煙地就不見了。'},
+        {'sequence': 4, 'frame': 23453, 'message_id': 787, 'event_object_id': 63,
+         'speaker_hint': '李大娘', 'text': '逍遙～你過來一下！'},
+    ]}
+
+    debug.record_dialog_event(state)
+
+    pending = debug.task_inbox_pending()
+    assert len(pending) == 3
+    assert [record['dialogs'][0]['text'] for record in pending] == [
+        '哈哈哈！那就明晚三更十里坡山神廟。不見不散！',
+        '醉道士話說完一溜煙地就不見了。',
+        '逍遙～你過來一下！',
+    ]
+    assert {record['source_event_object_id'] for record in pending} == {63}
 
 
 
