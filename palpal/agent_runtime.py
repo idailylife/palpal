@@ -32,6 +32,8 @@ EVENT_CACHE_SIZE = 1_000
 EVENT_TAIL_CHUNK_SIZE = 64 * 1024
 BATTLE_INSTRUCTION_LIMIT = 100
 BATTLE_CONTROL_TIMEOUT_SECONDS = 30.0
+AGENT_REASONING_EFFORT = "high"
+SUMMARY_REASONING_EFFORT = "low"
 
 
 class ReplanRequired(RuntimeError):
@@ -318,7 +320,7 @@ class BattleDelegate:
             return action
         try:
             from agents import (Agent, AsyncOpenAI, FunctionTool, ModelSettings,
-                                OpenAIChatCompletionsModel, Runner, SQLiteSession,
+                                OpenAIResponsesModel, Runner, SQLiteSession,
                                 set_tracing_disabled)
             from agents.agent import ToolsToFinalOutputResult
         except ImportError as exc:
@@ -511,10 +513,9 @@ class BattleDelegate:
             api_key=self.debug.config_value("DEEPSEEK_API_KEY"),
             base_url=(self.debug.config_value("DEEPSEEK_BASE_URL", "https://api.deepseek.com") or "https://api.deepseek.com").rstrip("/"),
         )
-        model = OpenAIChatCompletionsModel(
+        model = OpenAIResponsesModel(
             model=runtime.state.get("model"),
             openai_client=client,
-            buffer_streamed_tool_calls=True,
         )
         agent = Agent(
             name="PALPAL battle child",
@@ -529,7 +530,12 @@ class BattleDelegate:
             model=model,
             tools=[get_tool, item_tool, submit_tool],
             tool_use_behavior=finish,
-            model_settings=ModelSettings(temperature=0.1, include_usage=True),
+            model_settings=ModelSettings(
+                include_usage=True,
+                reasoning={"effort": AGENT_REASONING_EFFORT},
+                tool_choice="auto",
+            ),
+            reset_tool_choice=False,
         )
         session = SQLiteSession(self._control()["child_session_id"], runtime.sqlite_path)
         prompt = json.dumps({
@@ -538,13 +544,30 @@ class BattleDelegate:
             "active_tasks": self.debug.active_task_summary(),
             "resource_policy": "Prefer attacks; spend MP/items only for survival or material advantage.",
         }, ensure_ascii=False, separators=(",", ":"))
-        stream = Runner.run_streamed(agent, prompt, session=session, max_turns=6)
-        runtime.active_stream = stream
-        async for _event in stream.stream_events():
-            if runtime.cancel_event.is_set():
-                stream.cancel("immediate")
+        for attempt in range(2):
+            stream = Runner.run_streamed(agent, prompt, session=session, max_turns=6)
+            runtime.active_stream = stream
+            async for _event in stream.stream_events():
+                if runtime.cancel_event.is_set():
+                    stream.cancel("immediate")
+            if submitted is not None:
+                break
+            if attempt == 0:
+                self._emit(
+                    "protocol_retry",
+                    "Battle Agent ended without an accepted submit_battle_action; correcting once.",
+                    {"api": "responses", "reasoning_effort": AGENT_REASONING_EFFORT},
+                )
+                prompt = (
+                    "Your previous response ended without an accepted submit_battle_action tool call. "
+                    "Continue from the persisted tool results and call submit_battle_action after any "
+                    "required queries. Do not end with plain text."
+                )
         if submitted is None:
-            raise RuntimeError("submit_battle_action_not_called")
+            raise RuntimeError(
+                "submit_battle_action_protocol_error: no accepted submit_battle_action "
+                "after correction retry"
+            )
         return submitted
 
     def _summary(self, state: dict, instruction_count: int) -> dict:
@@ -695,10 +718,19 @@ class BattleDelegate:
             if count >= BATTLE_INSTRUCTION_LIMIT:
                 raise RuntimeError("battle_instruction_limit")
             self._persist_control(phase=str(battle.get("phase") or "resolving"))
+            request_details = {"instruction": count + 1, "feedback": feedback}
+            if (
+                self.runtime.battle_decision_provider is None
+                and self.debug.config_value("DEEPSEEK_API_KEY")
+            ):
+                request_details.update(
+                    api="responses",
+                    reasoning_effort=AGENT_REASONING_EFFORT,
+                )
             self._emit(
                 "request",
                 f"Battle Agent requested action {count + 1}.",
-                {"instruction": count + 1, "feedback": feedback},
+                request_details,
             )
             native_action_started = False
             frozen_window = self._command_window(state)
@@ -746,7 +778,7 @@ class BattleDelegate:
                     {"tool": "native_battle_action", "output": result},
                 )
             except Exception as exc:
-                decision_failed = str(exc) == "submit_battle_action_not_called"
+                decision_failed = str(exc).startswith("submit_battle_action_protocol_error:")
                 stale_command = str(exc) == "stale_battle_command"
                 if native_action_started:
                     self._emit(
@@ -1883,7 +1915,18 @@ class AgentRuntime:
                 started = _now()
                 self.state["phase"] = "deciding"
                 self._persist()
-                self.emit("model", "request", "Requesting the next recommendation.", {"model": self.state.get("model")})
+                request_details = {"model": self.state.get("model")}
+                if self.decision_provider is None and self.debug.config_value("DEEPSEEK_API_KEY"):
+                    request_details.update(
+                        api="responses",
+                        reasoning_effort=AGENT_REASONING_EFFORT,
+                    )
+                self.emit(
+                    "model",
+                    "request",
+                    "Requesting the next recommendation.",
+                    request_details,
+                )
                 decision = await self._decide(before, feedback)
                 if self.cancel_event.is_set() or generation != self.generation:
                     self.emit("interrupt", "cancelled", "A late model result was discarded.")
@@ -2038,10 +2081,10 @@ class AgentRuntime:
         return await self._sdk_decide(state, feedback)
 
     async def _sdk_decide(self, state: dict, feedback: str) -> dict:
-        """Use the Agents SDK's streamed Chat Completions runner and SQLiteSession."""
+        """Use the Agents SDK's streamed Responses runner and local SQLiteSession."""
         try:
             from agents import (Agent, AsyncOpenAI, FunctionTool, ModelSettings,
-                                OpenAIChatCompletionsModel, Runner, SQLiteSession,
+                                OpenAIResponsesModel, Runner, SQLiteSession,
                                 set_tracing_disabled)
             from agents.agent import ToolsToFinalOutputResult
         except ImportError as exc:
@@ -2106,10 +2149,9 @@ class AgentRuntime:
         api_key = self.debug.config_value("DEEPSEEK_API_KEY")
         base_url = (self.debug.config_value("DEEPSEEK_BASE_URL", "https://api.deepseek.com") or "https://api.deepseek.com").rstrip("/")
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        model = OpenAIChatCompletionsModel(
+        model = OpenAIResponsesModel(
             model=self.state.get("model"),
             openai_client=client,
-            buffer_streamed_tool_calls=True,
         )
         instructions = self.debug.agent_system_prompt() + "\n\n" + self.debug.agent_policy_prompt() + """
 
@@ -2123,7 +2165,12 @@ exploration value, and maintained local tasks to choose the next action.
             model=model,
             tools=tools,
             tool_use_behavior=finish_on_accepted_submit,
-            model_settings=ModelSettings(temperature=0.2, include_usage=True),
+            model_settings=ModelSettings(
+                include_usage=True,
+                reasoning={"effort": AGENT_REASONING_EFFORT},
+                tool_choice="auto",
+            ),
+            reset_tool_choice=False,
         )
         session = SQLiteSession(self.state["session_id"], self.sqlite_path)
         def current_prompt() -> str:
@@ -2135,31 +2182,53 @@ exploration value, and maintained local tasks to choose the next action.
         prompt = current_prompt()
         if await self._maybe_compact_sdk(session, client, prompt):
             prompt = current_prompt()
-        stream = Runner.run_streamed(agent, prompt, session=session, max_turns=16)
-        self.active_stream = stream
-        async for event in stream.stream_events():
-            if self.cancel_event.is_set():
-                stream.cancel("immediate")
-            event_type = getattr(event, "type", "")
-            name = getattr(event, "name", "")
-            if event_type == "run_item_stream_event" and name in {"tool_called", "tool_output"}:
-                self.emit("model", name, name.replace("_", " ").title())
-        output = submitted_decision if submitted_decision is not None else stream.final_output
-        if isinstance(output, str):
-            output = json.loads(output)
-        if not isinstance(output, dict):
-            raise RuntimeError("submit_decision did not return a decision object")
+        streams = []
+        for attempt in range(2):
+            stream = Runner.run_streamed(agent, prompt, session=session, max_turns=16)
+            streams.append(stream)
+            self.active_stream = stream
+            async for event in stream.stream_events():
+                if self.cancel_event.is_set():
+                    stream.cancel("immediate")
+                event_type = getattr(event, "type", "")
+                name = getattr(event, "name", "")
+                if event_type == "run_item_stream_event" and name in {"tool_called", "tool_output"}:
+                    self.emit("model", name, name.replace("_", " ").title())
+            if submitted_decision is not None:
+                break
+            if attempt == 0:
+                self.emit(
+                    "model",
+                    "protocol_retry",
+                    "Model ended without an accepted submit_decision; correcting once.",
+                    {"api": "responses", "reasoning_effort": AGENT_REASONING_EFFORT},
+                )
+                prompt = (
+                    "Your previous response ended without an accepted submit_decision tool call. "
+                    "Continue from the persisted tool results and call submit_decision after any "
+                    "required maintenance or queries. Do not end with plain text."
+                )
+        if submitted_decision is None:
+            raise RuntimeError(
+                "submit_decision_protocol_error: no accepted submit_decision "
+                "after correction retry"
+            )
+        output = submitted_decision
         output.update(backend="deepseek", model=self.state.get("model"))
-        usage = getattr(getattr(stream, "context_wrapper", None), "usage", None)
-        if usage:
+        usages = [
+            usage
+            for stream in streams
+            if (usage := getattr(getattr(stream, "context_wrapper", None), "usage", None))
+        ]
+        if usages:
             request_usage = {
-                "prompt_tokens": int(getattr(usage, "input_tokens", 0) or 0),
-                "completion_tokens": int(getattr(usage, "output_tokens", 0) or 0),
-                "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+                "prompt_tokens": sum(int(getattr(usage, "input_tokens", 0) or 0) for usage in usages),
+                "completion_tokens": sum(int(getattr(usage, "output_tokens", 0) or 0) for usage in usages),
+                "total_tokens": sum(int(getattr(usage, "total_tokens", 0) or 0) for usage in usages),
             }
             output["usage"] = request_usage
             self.state["last_request_usage"] = request_usage
-            last_prompt_tokens = self._last_prompt_tokens_from_usage(usage)
+            last_prompt_tokens = self._last_prompt_tokens_from_usage(usages[-1])
             if last_prompt_tokens is not None:
                 self.state["last_prompt_tokens"] = last_prompt_tokens
             self._persist()
@@ -2198,23 +2267,21 @@ exploration value, and maintained local tasks to choose the next action.
         retained_estimated_tokens = self._estimate_items_tokens(retained_items)
         retained_budget_exceeded = retained_estimated_tokens > retain_budget
         transcript = json.dumps(items[:recent_start], ensure_ascii=False)
-        response = await client.chat.completions.create(
+        response = await client.responses.create(
             model=self.state.get("model"),
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Summarize this PALPAL agent transcript compactly. The structured task ledger is the "
-                        "only authority for task status, so do not reconstruct task truth from this summary. Preserve "
-                        "plot evidence, decisions and execution results, known routes, unresolved "
-                        "risks, and latest stable state. Mark object semantics as inference or annotation."
-                    ),
-                },
-                {"role": "user", "content": transcript},
-            ],
-            temperature=0.1,
+            instructions=(
+                "Summarize this PALPAL agent transcript compactly. The structured task ledger is the "
+                "only authority for task status, so do not reconstruct task truth from this summary. Preserve "
+                "plot evidence, decisions and execution results, known routes, unresolved "
+                "risks, and latest stable state. Mark object semantics as inference or annotation."
+            ),
+            input=transcript,
+            reasoning={"effort": SUMMARY_REASONING_EFFORT},
         )
-        summary = response.choices[0].message.content
+        status = getattr(response, "status", None)
+        if status != "completed":
+            raise RuntimeError(f"context summarizer response status was {status or 'missing'}")
+        summary = getattr(response, "output_text", None)
         if not summary:
             raise RuntimeError("context summarizer returned no content")
         if self.cancel_event.is_set():

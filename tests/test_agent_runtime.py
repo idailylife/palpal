@@ -95,6 +95,34 @@ def test_runtime_counts_recommendations_and_can_resume(tmp_path):
     assert any(event["type"] == "decision" for event in runtime.events())
 
 
+def test_sdk_request_event_identifies_responses_api_and_reasoning(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime._unsafe_state_reason = lambda _state: None
+    original_config = debug.config_value
+    monkeypatch.setattr(
+        debug,
+        "config_value",
+        lambda key, default=None: (
+            "test-key" if key == "DEEPSEEK_API_KEY" else original_config(key, default)
+        ),
+    )
+
+    async def sdk_decide(_state, _feedback):
+        return decision()
+
+    monkeypatch.setattr(runtime, "_sdk_decide", sdk_decide)
+    runtime.start(None, 1)
+    wait_for_pause(runtime)
+
+    request = next(
+        event for event in runtime.events()
+        if event["type"] == "model" and event["phase"] == "request"
+    )
+    assert request["details"]["api"] == "responses"
+    assert request["details"]["reasoning_effort"] == "high"
+
+
 def test_runtime_start_feedback_has_no_permanent_macro_goal(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -926,12 +954,20 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
 
     class Agent:
         def __init__(self, **kwargs):
+            captured["agent_kwargs"] = kwargs
             captured["agent"] = self
             self.tools = kwargs["tools"]
             self.tool_use_behavior = kwargs["tool_use_behavior"]
 
     class Stream:
+        def __init__(self, attempt):
+            self.attempt = attempt
+
         async def stream_events(self):
+            if self.attempt == 1:
+                if False:
+                    yield None
+                return
             tools = {tool.name: tool for tool in captured["agent"].tools}
             get_output = await tools["get_battle"].kwargs["on_invoke_tool"](None, "{}")
             assert json.loads(get_output)["battle"]["generation"] == 5
@@ -955,15 +991,16 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
 
     class Runner:
         @classmethod
-        def run_streamed(cls, _agent, _prompt, **_kwargs):
-            return Stream()
+        def run_streamed(cls, _agent, prompt, **kwargs):
+            captured.setdefault("runs", []).append({"prompt": prompt, **kwargs})
+            return Stream(len(captured["runs"]))
 
     fake_agents = types.ModuleType("agents")
     fake_agents.Agent = Agent
     fake_agents.AsyncOpenAI = lambda **kwargs: object()
     fake_agents.FunctionTool = FunctionTool
     fake_agents.ModelSettings = lambda **kwargs: kwargs
-    fake_agents.OpenAIChatCompletionsModel = lambda **kwargs: object()
+    fake_agents.OpenAIResponsesModel = lambda **kwargs: captured.setdefault("model", kwargs) or object()
     fake_agents.Runner = Runner
     fake_agents.SQLiteSession = lambda *_args: object()
     fake_agents.set_tracing_disabled = lambda **_kwargs: None
@@ -975,21 +1012,83 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
     action = asyncio.run(runtime.battle_delegate._sdk_action(state, "Choose an action."))
 
     assert action["action_type"] == "use_item"
+    assert set(captured["model"]) == {"model", "openai_client"}
+    assert captured["agent_kwargs"]["model_settings"] == {
+        "include_usage": True,
+        "reasoning": {"effort": "high"},
+        "tool_choice": "auto",
+    }
+    assert captured["agent_kwargs"]["reset_tool_choice"] is False
+    assert [run["max_turns"] for run in captured["runs"]] == [6, 6]
+    assert "without an accepted submit_battle_action" in captured["runs"][1]["prompt"]
     events = [event for event in runtime.events() if event["type"] == "battle"]
     assert [event["phase"] for event in events] == [
-        "started", "tool_called", "tool_output", "tool_called", "tool_output",
+        "started", "protocol_retry", "tool_called", "tool_output", "tool_called", "tool_output",
         "tool_called", "tool_output",
     ]
-    assert [event["details"].get("tool") for event in events[1:]] == [
+    assert [event["details"].get("tool") for event in events[2:]] == [
         "get_battle", "get_battle", "get_item_details", "get_item_details",
         "submit_battle_action", "submit_battle_action",
     ]
-    assert events[2]["details"]["output"]["battle"]["generation"] == 5
-    assert events[4]["details"]["output"]["item"]["available_amount"] == 2
-    assert events[5]["details"]["arguments"] == {
+    assert events[3]["details"]["output"]["battle"]["generation"] == 5
+    assert events[5]["details"]["output"]["item"]["available_amount"] == 2
+    assert events[6]["details"]["arguments"] == {
         "action_type": "use_item", "object_id": 99, "target_index": 0,
     }
-    assert events[6]["details"]["output"] == {"ok": True, "accepted": True}
+    assert events[7]["details"]["output"] == {"ok": True, "accepted": True}
+
+
+def test_battle_sdk_two_non_submit_ends_raise_protocol_error(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "in_battle": True,
+        "battle": {
+            "generation": 5,
+            "command_generation": 9,
+            "phase": "command",
+            "current_player_index": 0,
+            "available_actions": [{
+                "action_type": "attack", "object_id": 0,
+                "target_mode": "single", "valid_target_indices": [0],
+            }],
+        },
+    }
+    debug.config_value = lambda key, default=None: "test-key" if key == "DEEPSEEK_API_KEY" else default
+    runtime.battle_delegate._begin(state)
+    captured = {"runs": []}
+
+    class Stream:
+        async def stream_events(self):
+            if False: yield None
+
+    class Runner:
+        @classmethod
+        def run_streamed(cls, _agent, prompt, **kwargs):
+            captured["runs"].append({"prompt": prompt, **kwargs})
+            return Stream()
+
+    fake_agents = types.ModuleType("agents")
+    fake_agents.Agent = lambda **kwargs: object()
+    fake_agents.AsyncOpenAI = lambda **kwargs: object()
+    fake_agents.FunctionTool = lambda **kwargs: object()
+    fake_agents.ModelSettings = lambda **kwargs: kwargs
+    fake_agents.OpenAIResponsesModel = lambda **kwargs: object()
+    fake_agents.Runner = Runner
+    fake_agents.SQLiteSession = lambda *_args: object()
+    fake_agents.set_tracing_disabled = lambda **kwargs: None
+    fake_agent_module = types.ModuleType("agents.agent")
+    fake_agent_module.ToolsToFinalOutputResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "agents", fake_agents)
+    monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
+
+    with pytest.raises(RuntimeError, match="submit_battle_action_protocol_error"):
+        asyncio.run(runtime.battle_delegate._sdk_action(state, "Choose an action."))
+
+    assert [run["max_turns"] for run in captured["runs"]] == [6, 6]
+    assert "without an accepted submit_battle_action" in captured["runs"][1]["prompt"]
 
 
 def test_battle_delegate_failure_and_interrupt_emit_terminal_trace(tmp_path):
@@ -1548,15 +1647,15 @@ def test_context_compression_replaces_history_and_keeps_recent_items(tmp_path, m
         async def add_items(self, items):
             self.items.extend(items)
 
-    class Completions:
+    class Responses:
         async def create(self, **kwargs):
-            self.messages = kwargs["messages"]
-            message = type("Message", (), {"content": "compact summary"})()
-            choice = type("Choice", (), {"message": message})()
-            return type("Response", (), {"choices": [choice]})()
+            self.kwargs = kwargs
+            return type("Response", (), {
+                "status": "completed", "output_text": "compact summary",
+            })()
 
     session = Session()
-    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    client = type("Client", (), {"responses": Responses()})()
     runtime.state["last_prompt_tokens"] = 1000
     asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
     assert session.items[0]["content"].startswith("Persistent context summary:")
@@ -1565,12 +1664,45 @@ def test_context_compression_replaces_history_and_keeps_recent_items(tmp_path, m
     assert runtime.snapshot()["last_prompt_tokens"] is None
     assert runtime.snapshot()["task_reconciliation_pending"] is True
     assert runtime.snapshot()["task_reconciliation_reason"] == "context_compacted"
-    compact_text = json.dumps(client.chat.completions.messages)
+    compact_text = json.dumps(client.responses.kwargs)
     assert "permanent goal" not in compact_text.lower()
     assert "finish the game" not in compact_text.lower()
+    assert client.responses.kwargs["reasoning"] == {"effort": "low"}
     events = [event for event in runtime.events() if event["type"] == "compression"]
     assert events[0]["details"]["observed_prompt_tokens"] == 1000
     assert events[-1]["phase"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("status", "output_text", "error"),
+    [
+        ("incomplete", "partial", "response status was incomplete"),
+        ("failed", "", "response status was failed"),
+        ("completed", "", "returned no content"),
+    ],
+)
+def test_context_compression_response_failure_keeps_original_session(
+    tmp_path, monkeypatch, status, output_text, error,
+):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    original = [{"role": "user", "content": f"item {index}"} for index in range(8)]
+    session = MemorySession(original)
+
+    class Responses:
+        async def create(self, **_kwargs):
+            return type("Response", (), {"status": status, "output_text": output_text})()
+
+    client = type("Client", (), {"responses": Responses()})()
+    runtime.state["last_prompt_tokens"] = 1000
+
+    with pytest.raises(RuntimeError, match=error):
+        asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
+
+    assert session.items == original
+    assert runtime.snapshot()["compactions"] == 0
+    assert runtime.snapshot()["last_compaction"] is None
+    assert runtime.snapshot()["last_prompt_tokens"] == 1000
 
 
 def test_context_compression_retains_two_complete_cycles_within_budget(tmp_path, monkeypatch):
@@ -1588,12 +1720,11 @@ def test_context_compression_retains_two_complete_cycles_within_budget(tmp_path,
     latest = [{"role": "user", "content": "latest"}, {"role": "assistant", "content": "latest answer"}]
     session = MemorySession(first + second + latest)
 
-    class Completions:
+    class Responses:
         async def create(self, **_kwargs):
-            message = type("Message", (), {"content": "summary"})()
-            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+            return type("Response", (), {"status": "completed", "output_text": "summary"})()
 
-    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    client = type("Client", (), {"responses": Responses()})()
     runtime.state["last_prompt_tokens"] = 1000
     asyncio.run(runtime._maybe_compact_sdk(session, client, "next prompt"))
 
@@ -1636,12 +1767,11 @@ def test_context_compression_summarizes_second_cycle_when_retention_exceeds_budg
     original = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old"}] + second + latest
     session = MemorySession(original)
 
-    class Completions:
+    class Responses:
         async def create(self, **_kwargs):
-            message = type("Message", (), {"content": "summary"})()
-            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+            return type("Response", (), {"status": "completed", "output_text": "summary"})()
 
-    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    client = type("Client", (), {"responses": Responses()})()
     runtime.state["last_prompt_tokens"] = 1000
     asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
 
@@ -1671,12 +1801,11 @@ def test_context_compression_keeps_latest_cycle_even_when_it_alone_exceeds_budge
         *latest,
     ])
 
-    class Completions:
+    class Responses:
         async def create(self, **_kwargs):
-            message = type("Message", (), {"content": "summary"})()
-            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+            return type("Response", (), {"status": "completed", "output_text": "summary"})()
 
-    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    client = type("Client", (), {"responses": Responses()})()
     runtime.state["last_prompt_tokens"] = 1000
     asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
 
@@ -1703,13 +1832,12 @@ def test_context_compression_replacement_failure_restores_transcript_and_state(t
                 raise RuntimeError("replacement failed")
             self.items.extend(items)
 
-    class Completions:
+    class Responses:
         async def create(self, **_kwargs):
-            message = type("Message", (), {"content": "summary"})()
-            return type("Response", (), {"choices": [type("Choice", (), {"message": message})()]})()
+            return type("Response", (), {"status": "completed", "output_text": "summary"})()
 
     session = FailingSession(original)
-    client = type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})()})()
+    client = type("Client", (), {"responses": Responses()})()
     runtime.state["last_prompt_tokens"] = 1000
     with pytest.raises(RuntimeError, match="replacement failed"):
         asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
@@ -1735,26 +1863,23 @@ def test_context_compression_waits_for_next_turn_exact_prompt_threshold(tmp_path
         async def clear_session(self): self.items = []
         async def add_items(self, items): self.items.extend(items)
 
-    class Completions:
+    class Responses:
         def __init__(self): self.calls = 0
         async def create(self, **_kwargs):
             self.calls += 1
-            message = type("Message", (), {"content": "summary"})()
-            return type("Response", (), {
-                "choices": [type("Choice", (), {"message": message})()],
-            })()
+            return type("Response", (), {"status": "completed", "output_text": "summary"})()
 
-    completions = Completions()
-    client = type("Client", (), {"chat": type("Chat", (), {"completions": completions})()})()
+    responses = Responses()
+    client = type("Client", (), {"responses": responses})()
     session = Session()
 
     runtime.state["last_prompt_tokens"] = 999
     asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
-    assert completions.calls == 0
+    assert responses.calls == 0
 
     runtime.state["last_prompt_tokens"] = 1000
     asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
-    assert completions.calls == 1
+    assert responses.calls == 1
     assert runtime.snapshot()["last_prompt_tokens"] is None
 
 
@@ -1799,7 +1924,7 @@ def test_context_estimate_counts_utf8_bytes_for_chinese():
     assert AgentRuntime._estimate_text_tokens("x" * 300) == 100
 
 
-def test_sdk_adapter_uses_streaming_tools_sqlite_and_buffering(tmp_path, monkeypatch):
+def test_sdk_responses_adapter_uses_streaming_tools_and_sqlite(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
     captured = {}
@@ -1864,7 +1989,7 @@ def test_sdk_adapter_uses_streaming_tools_sqlite_and_buffering(tmp_path, monkeyp
     fake_agents.AsyncOpenAI = lambda **kwargs: type("Client", (), {})()
     fake_agents.FunctionTool = FunctionTool
     fake_agents.ModelSettings = lambda **kwargs: kwargs
-    fake_agents.OpenAIChatCompletionsModel = Model
+    fake_agents.OpenAIResponsesModel = Model
     fake_agents.Runner = Runner
     fake_agents.SQLiteSession = SQLiteSession
     fake_agents.set_tracing_disabled = lambda **kwargs: captured.setdefault("tracing", kwargs)
@@ -1876,8 +2001,14 @@ def test_sdk_adapter_uses_streaming_tools_sqlite_and_buffering(tmp_path, monkeyp
 
     result = asyncio.run(runtime._sdk_decide(make_state(), "feedback"))
     expected_tools = [spec["function"]["name"] for spec in debug.agent_tool_specs()]
-    assert captured["model"]["buffer_streamed_tool_calls"] is True
+    assert set(captured["model"]) == {"model", "openai_client"}
     assert [tool.name for tool in captured["agent"]["tools"]] == expected_tools
+    assert captured["agent"]["model_settings"] == {
+        "include_usage": True,
+        "reasoning": {"effort": "high"},
+        "tool_choice": "auto",
+    }
+    assert captured["agent"]["reset_tool_choice"] is False
     behavior = captured["agent"]["tool_use_behavior"]
     query = types.SimpleNamespace(tool=types.SimpleNamespace(name="get_tasks"), output='{"ok":true}')
     rejected = types.SimpleNamespace(
@@ -1901,6 +2032,144 @@ def test_sdk_adapter_uses_streaming_tools_sqlite_and_buffering(tmp_path, monkeyp
     assert captured["tracing"] == {"disabled": True}
     assert result["usage"]["total_tokens"] == 22
     assert runtime.snapshot()["last_prompt_tokens"] == 11
+
+
+def test_sdk_plain_text_end_retries_once_in_same_session_and_requires_submit(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    captured = {"runs": []}
+
+    class FunctionTool:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.invoke = kwargs["on_invoke_tool"]
+
+    class Agent:
+        def __init__(self, **kwargs): self.tools = kwargs["tools"]
+
+    class Session:
+        async def get_items(self): return []
+        async def clear_session(self): pass
+        async def add_items(self, _items): pass
+
+    class Stream:
+        context_wrapper = None
+        final_output = "I will submit later."
+
+        def __init__(self, agent, attempt):
+            self.agent = agent
+            self.attempt = attempt
+
+        async def stream_events(self):
+            if self.attempt == 2:
+                submit = next(tool for tool in self.agent.tools if tool.name == "submit_decision")
+                await submit.invoke(None, json.dumps(submission()))
+            if False: yield None
+
+    class Runner:
+        @classmethod
+        def run_streamed(cls, agent, prompt, **kwargs):
+            captured["runs"].append({"prompt": prompt, **kwargs})
+            return Stream(agent, len(captured["runs"]))
+
+    fake_agents = types.ModuleType("agents")
+    fake_agents.Agent = Agent
+    fake_agents.AsyncOpenAI = lambda **kwargs: object()
+    fake_agents.FunctionTool = FunctionTool
+    fake_agents.ModelSettings = lambda **kwargs: kwargs
+    fake_agents.OpenAIResponsesModel = lambda **kwargs: object()
+    fake_agents.Runner = Runner
+    fake_agents.SQLiteSession = lambda *_args: Session()
+    fake_agents.set_tracing_disabled = lambda **kwargs: None
+    fake_agent_module = types.ModuleType("agents.agent")
+    fake_agent_module.ToolsToFinalOutputResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "agents", fake_agents)
+    monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
+    monkeypatch.setattr(runtime, "_maybe_compact_sdk", lambda *args: asyncio.sleep(0))
+
+    result = asyncio.run(runtime._sdk_decide(make_state(), "feedback"))
+
+    assert result["recommended_intent"] == "advance_dialog"
+    assert len(captured["runs"]) == 2
+    assert captured["runs"][0]["session"] is captured["runs"][1]["session"]
+    assert "without an accepted submit_decision" in captured["runs"][1]["prompt"]
+    retry = next(event for event in runtime.events() if event["phase"] == "protocol_retry")
+    assert retry["details"] == {"api": "responses", "reasoning_effort": "high"}
+
+
+def test_sdk_two_non_submit_ends_raise_protocol_error_without_parsing_text(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    captured = {"prompts": []}
+
+    class Session:
+        async def get_items(self): return []
+        async def clear_session(self): pass
+        async def add_items(self, _items): pass
+
+    class Stream:
+        context_wrapper = None
+        final_output = json.dumps(submission())
+        async def stream_events(self):
+            if False: yield None
+
+    class Runner:
+        @classmethod
+        def run_streamed(cls, _agent, prompt, **_kwargs):
+            captured["prompts"].append(prompt)
+            return Stream()
+
+    fake_agents = types.ModuleType("agents")
+    fake_agents.Agent = lambda **kwargs: object()
+    fake_agents.AsyncOpenAI = lambda **kwargs: object()
+    fake_agents.FunctionTool = lambda **kwargs: object()
+    fake_agents.ModelSettings = lambda **kwargs: kwargs
+    fake_agents.OpenAIResponsesModel = lambda **kwargs: object()
+    fake_agents.Runner = Runner
+    fake_agents.SQLiteSession = lambda *_args: Session()
+    fake_agents.set_tracing_disabled = lambda **kwargs: None
+    fake_agent_module = types.ModuleType("agents.agent")
+    fake_agent_module.ToolsToFinalOutputResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "agents", fake_agents)
+    monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
+    monkeypatch.setattr(runtime, "_maybe_compact_sdk", lambda *args: asyncio.sleep(0))
+
+    with pytest.raises(RuntimeError, match="submit_decision_protocol_error"):
+        asyncio.run(runtime._sdk_decide(make_state(), "feedback"))
+
+    assert len(captured["prompts"]) == 2
+
+
+def test_responses_adapter_accepts_legacy_chat_items_from_sqlite_session(tmp_path):
+    from agents import ModelSettings, OpenAIResponsesModel, SQLiteSession
+
+    async def build_request():
+        session = SQLiteSession("legacy-chat-session", tmp_path / "legacy.sqlite3")
+        await session.add_items([
+            {"role": "user", "content": "Legacy question"},
+            {"role": "assistant", "content": "Legacy answer"},
+        ])
+        legacy_items = await session.get_items()
+        model = OpenAIResponsesModel(model="deepseek-test", openai_client=object())
+        return model._build_response_create_kwargs(
+            system_instructions="Continue the existing session.",
+            input=[*legacy_items, {"role": "user", "content": "New turn"}],
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            stream=True,
+        )
+
+    request = asyncio.run(build_request())
+
+    assert request["input"] == [
+        {"role": "user", "content": "Legacy question"},
+        {"role": "assistant", "content": "Legacy answer"},
+        {"role": "user", "content": "New turn"},
+    ]
+    assert request["previous_response_id"].__class__.__name__ == "Omit"
+    assert request["conversation"].__class__.__name__ == "Omit"
+
 
 def test_last_prompt_tokens_uses_single_request_usage_only_as_exact_fallback():
     single = type("Usage", (), {
@@ -1997,7 +2266,7 @@ def test_sdk_rejected_submit_returns_to_model_and_recovers_in_same_tool_cycle(tm
     fake_agents.AsyncOpenAI = lambda **kwargs: object()
     fake_agents.FunctionTool = FunctionTool
     fake_agents.ModelSettings = lambda **kwargs: kwargs
-    fake_agents.OpenAIChatCompletionsModel = lambda **kwargs: object()
+    fake_agents.OpenAIResponsesModel = lambda **kwargs: object()
     fake_agents.Runner = Runner
     fake_agents.SQLiteSession = Session
     fake_agents.set_tracing_disabled = lambda **kwargs: None
@@ -2071,7 +2340,7 @@ def test_sdk_parallel_task_query_and_create_cannot_bypass_review_result(tmp_path
     fake_agents.AsyncOpenAI = lambda **kwargs: object()
     fake_agents.FunctionTool = FunctionTool
     fake_agents.ModelSettings = lambda **kwargs: kwargs
-    fake_agents.OpenAIChatCompletionsModel = lambda **kwargs: object()
+    fake_agents.OpenAIResponsesModel = lambda **kwargs: object()
     fake_agents.Runner = Runner
     fake_agents.SQLiteSession = lambda *_args: Session()
     fake_agents.set_tracing_disabled = lambda **kwargs: None
@@ -2091,29 +2360,40 @@ def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeyp
     runtime = debug.agent_runtime
     captured = {}
 
+    class FunctionTool:
+        def __init__(self, **kwargs):
+            self.name = kwargs["name"]
+            self.invoke = kwargs["on_invoke_tool"]
+
+    class Agent:
+        def __init__(self, **kwargs):
+            self.tools = kwargs["tools"]
+
     class Session:
         async def get_items(self): return []
         async def clear_session(self): pass
         async def add_items(self, items): pass
 
     class Stream:
-        final_output = json.dumps(decision())
         context_wrapper = None
+        def __init__(self, agent): self.agent = agent
         async def stream_events(self):
+            submit = next(tool for tool in self.agent.tools if tool.name == "submit_decision")
+            await submit.invoke(None, json.dumps(submission()))
             if False: yield None
 
     class Runner:
         @classmethod
         def run_streamed(cls, agent, prompt, **kwargs):
             captured["prompt"] = json.loads(prompt)
-            return Stream()
+            return Stream(agent)
 
     fake_agents = types.ModuleType("agents")
-    fake_agents.Agent = lambda **kwargs: object()
+    fake_agents.Agent = Agent
     fake_agents.AsyncOpenAI = lambda **kwargs: object()
-    fake_agents.FunctionTool = lambda **kwargs: object()
+    fake_agents.FunctionTool = FunctionTool
     fake_agents.ModelSettings = lambda **kwargs: kwargs
-    fake_agents.OpenAIChatCompletionsModel = lambda **kwargs: object()
+    fake_agents.OpenAIResponsesModel = lambda **kwargs: object()
     fake_agents.Runner = Runner
     fake_agents.SQLiteSession = lambda *args: Session()
     fake_agents.set_tracing_disabled = lambda **kwargs: None
