@@ -679,9 +679,11 @@ def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
     assert '只有实际 native trigger 和稳定落点证据才能学习真正的反向有向边' in policy
     assert '不要为此执行自动多跳 BFS' in policy
     assert 'room_memo 只是可能过期的地点语义注释' in policy
-    assert '发现冲突时用 upsert_room_memo 更新或清除' in policy
-    assert '不要在 memo 重复结构化探索、背包内容或临时坐标' in policy
-    assert '不要用 memo 代替行动相关线索的独立 task' in policy
+    assert '第一次获得稳定、高置信的地点身份或用途时立即用 upsert_room_memo' in policy
+    assert '新证据细化或否定地点身份时整体更新或清除' in policy
+    assert '不要重复坐标、传送列表、拾取记录或结构化探索' in policy
+    assert '行动相关线索必须保留为独立 task' in policy
+    assert '新增、改变非空 room_id 时，必须先查询每个候选房间的 get_room_memory' in policy
     assert 'task inbox 审查或 task reconciliation' in policy
 
 
@@ -746,8 +748,9 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert '紧凑' in by_name['get_navigation']['function']['description']
     assert '最小 dry-run 动作' in by_name['submit_decision']['function']['description']
     room_memory_description = by_name['get_room_memory']['function']['description']
-    assert '任意稳定 logical_room_id' in room_memory_description
-    assert '已确认的有向出边' in room_memory_description
+    assert '指定稳定 logical_room_id' in room_memory_description
+    assert 'transitions.outgoing/incoming' in room_memory_description
+    assert '已确认有向记录' in room_memory_description
     assert '不得伪造成反向可走路线' in room_memory_description
     memo = by_name['upsert_room_memo']['function']
     assert memo['parameters']['properties']['text']['maxLength'] == 800

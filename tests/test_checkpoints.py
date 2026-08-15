@@ -242,7 +242,36 @@ def test_v11_checkpoint_lazily_adds_interaction_context_without_rewriting_checkp
         'created_at': '2026-01-01T00:00:00Z',
         'companion_version': 11,
     }), encoding='utf-8')
-    legacy_exploration = b'{"version":11,"rooms":{},"transitions":{},"object_interactions":{},"tasks":{}}'
+    room_id = 'S3/M10:000000000001'
+    transition_key = '[3,10,32,0,4,4631]'
+    legacy_exploration = json.dumps({
+        'version': 11,
+        'rooms': {},
+        'transitions': {room_id: {transition_key: {
+            'transition_key': transition_key,
+            'transition_key_fields': {
+                'scene_id': 3, 'map_id': 10, 'x': 32, 'y': 0,
+                'trigger_mode': 4, 'trigger_script': 4631,
+            },
+            'object_id': 48,
+            'object': {'id': 48, 'x': 32, 'y': 0, 'trigger_script': 4631},
+            'from_room_id': room_id,
+            'to_room_id': room_id,
+            'confirmation': 'native_trigger',
+            'observed': True,
+            'traversal_count': 3,
+            'intra_room_transition': True,
+            'native_destination': {'x': 48, 'y': 8},
+            'from_subregion_id': '.48',
+            'to_subregion_id': '.47',
+            'from_location_id': f'{room_id}.48',
+            'to_location_id': f'{room_id}.47',
+            'subregion_basis': 'legacy-nearest-object',
+            'subregion_match_distance': 0,
+        }}},
+        'object_interactions': {},
+        'tasks': {},
+    }, separators=(',', ':')).encode()
     checkpoint_exploration = checkpoint_dir / 'companion' / 'exploration.json'
     checkpoint_exploration.write_bytes(legacy_exploration)
     (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[]', encoding='utf-8')
@@ -253,7 +282,15 @@ def test_v11_checkpoint_lazily_adds_interaction_context_without_rewriting_checkp
     assert result['ok']
     context = debug.interaction_context_snapshot()
     assert context['observable_revision'] == 0
-    assert isinstance(debug.read_exploration()['interaction_observable_context'], dict)
+    restored = debug.read_exploration()
+    assert isinstance(restored['interaction_observable_context'], dict)
+    record = restored['transitions'][room_id][transition_key]
+    assert record['transition_key'] == transition_key
+    assert record['native_destination'] == {'x': 48, 'y': 8}
+    assert record['traversal_count'] == 3
+    assert record['destination_endpoint']['kind'] == 'native_landing'
+    assert 'from_location_id' not in record
+    assert 'to_subregion_id' not in record
     assert checkpoint_exploration.read_bytes() == legacy_exploration
 
 

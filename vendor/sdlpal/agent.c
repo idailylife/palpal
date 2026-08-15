@@ -34,6 +34,10 @@ static BOOL g_agent_dir_active = FALSE;
 static DWORD g_agent_last_dialog_ticks = 0;
 static DWORD g_agent_dialog_sequence = 0;
 static WCHAR g_agent_dialog_speaker[64];
+static BOOL g_agent_dialog_speaker_bound = FALSE;
+static WORD g_agent_dialog_speaker_scene_id = 0;
+static WORD g_agent_dialog_speaker_map_id = 0;
+static WORD g_agent_dialog_speaker_event_object_id = 0;
 
 typedef struct tagPALPALAGENTTRIGGEROBSERVATION
 {
@@ -489,6 +493,18 @@ PALPAL_AgentCurrentMapId(
    return 0;
 }
 
+static VOID
+PALPAL_AgentClearDialogSpeaker(
+   VOID
+)
+{
+   g_agent_dialog_speaker[0] = 0;
+   g_agent_dialog_speaker_bound = FALSE;
+   g_agent_dialog_speaker_scene_id = 0;
+   g_agent_dialog_speaker_map_id = 0;
+   g_agent_dialog_speaker_event_object_id = 0;
+}
+
 VOID
 PALPAL_AgentBeginTriggerScript(
    WORD       wEventObjectID,
@@ -500,6 +516,7 @@ PALPAL_AgentBeginTriggerScript(
       return;
    }
 
+   PALPAL_AgentClearDialogSpeaker();
    g_agent_trigger_observation.valid = TRUE;
    g_agent_trigger_observation.completed = FALSE;
    g_agent_trigger_observation.generation++;
@@ -4185,7 +4202,7 @@ PALPAL_AgentObserveDialogStart(
       return;
    }
 
-   g_agent_dialog_speaker[0] = 0;
+   PALPAL_AgentClearDialogSpeaker();
 }
 
 VOID
@@ -4206,6 +4223,10 @@ PALPAL_AgentObserveDialogText(
    if (g_TextLib.nCurrentDialogLine == 0 && PALPAL_AgentIsSpeakerLine(lpszText))
    {
       PALPAL_AgentCopySpeakerName(g_agent_dialog_speaker, sizeof(g_agent_dialog_speaker) / sizeof(g_agent_dialog_speaker[0]), lpszText);
+      g_agent_dialog_speaker_bound = g_agent_dialog_speaker[0] != 0;
+      g_agent_dialog_speaker_scene_id = gpGlobals->wNumScene;
+      g_agent_dialog_speaker_map_id = PALPAL_AgentCurrentMapId();
+      g_agent_dialog_speaker_event_object_id = wEventObjectID;
       return;
    }
 
@@ -4219,7 +4240,13 @@ PALPAL_AgentObserveDialogText(
    event->event_object_id = wEventObjectID;
    event->message_id = iMessageID;
    event->position = g_TextLib.bDialogPosition;
-   PALPAL_AgentCopyWideString(event->speaker, sizeof(event->speaker) / sizeof(event->speaker[0]), g_agent_dialog_speaker);
+   if (g_agent_dialog_speaker_bound &&
+       g_agent_dialog_speaker_scene_id == event->scene_id &&
+       g_agent_dialog_speaker_map_id == event->map_id &&
+       g_agent_dialog_speaker_event_object_id == event->event_object_id)
+   {
+      PALPAL_AgentCopyWideString(event->speaker, sizeof(event->speaker) / sizeof(event->speaker[0]), g_agent_dialog_speaker);
+   }
    PALPAL_AgentCopyWideString(event->text, sizeof(event->text) / sizeof(event->text[0]), lpszText);
 
    slot = &g_agent_dialog_events[g_agent_dialog_event_next];

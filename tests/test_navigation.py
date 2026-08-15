@@ -803,10 +803,8 @@ def test_navigation_transition_records_observed_destination(tmp_path):
     assert record['observed_to_state']['room_key'] == 'next-room'
     assert record['confirmation'] == 'native_trigger'
     assert record['intra_room_transition'] is False
-    assert record['from_subregion_id'] is None
-    assert record['to_subregion_id'] is None
-    assert record['from_location_id'] == from_identity['id']
-    assert record['to_location_id'] == to_identity['id']
+    assert 'source_endpoint' not in record
+    assert 'destination_endpoint' not in record
 
 
 def test_dynamic_touch_native_trigger_is_handed_to_navigation_request(tmp_path):
@@ -1711,7 +1709,7 @@ def test_manual_movement_ignores_native_trigger_with_mismatched_source_scene(tmp
     assert diagnostic['reason'] == 'source_scene_mismatch'
 
 
-def test_intra_room_transition_freezes_source_and_uses_nearest_portal(tmp_path):
+def test_intra_room_transition_freezes_source_and_keeps_unmatched_native_landing(tmp_path):
     source_portal = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
     target_portal = {**source_portal, 'id': 47, 'x': 48, 'y': 8}
     tied_portal = {**source_portal, 'id': 49, 'x': 48, 'y': 8}
@@ -1757,20 +1755,167 @@ def test_intra_room_transition_freezes_source_and_uses_nearest_portal(tmp_path):
     records = debug.read_exploration()['transitions'][source_identity['id']]
     record = next(iter(records.values()))
     assert record['intra_room_transition'] is True
-    assert record['from_subregion_id'] == '.48'
-    assert record['to_subregion_id'] == '.47'
-    assert record['from_location_id'] == f"{source_identity['id']}.48"
-    assert record['to_location_id'] == f"{source_identity['id']}.47"
-    assert record['subregion_basis'] == 'native_trigger_destination_nearest_active_transition'
-    assert record['subregion_match_distance'] == 0
+    assert record['source_endpoint'] == {
+        'transition_key': record['transition_key'],
+        'object_id': 48,
+        'position': {'x': 32, 'y': 0},
+        'trigger_script': 4631,
+    }
+    assert record['destination_endpoint'] == {
+        'kind': 'native_landing',
+        'position': {'x': 48, 'y': 8},
+    }
     assert record['native_destination']['x'] == 48
     assert record['observed_to_state']['party_position'] == {'x': 80, 'y': 16}
 
     known = debug.known_transitions_summary(source_identity['id'], destination)['transitions'][0]
     assert known['intra_room_transition'] is True
-    assert known['from_location_id'].endswith('.48')
-    assert known['to_location_id'].endswith('.47')
+    assert known['source_endpoint'] == record['source_endpoint']
+    assert known['destination_endpoint'] == record['destination_endpoint']
     assert known['returns_to_recent_room'] is False
+
+
+def test_intra_room_confirmed_endpoints_pair_only_from_bidirectional_records(tmp_path):
+    portal_47 = {
+        'id': 47, 'x': 48, 'y': 8, 'sprite_id': 0, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 4701, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    portal_48 = {**portal_47, 'id': 48, 'x': 32, 'y': 0, 'trigger_script': 4801}
+    debug = make_debug_state(tmp_path)
+    room = make_state(objects=[portal_47, portal_48])
+    identity = debug.room_identity(room)
+
+    first = debug.record_transition_destination(
+        identity, 47, identity,
+        from_object=portal_47, from_state=room, to_state=room,
+        confirmation='native_trigger', intra_room_transition=True,
+        native_destination={'scene_id': 3, 'map_id': 10, 'x': 32, 'y': 0},
+    )
+    assert first['destination_endpoint']['kind'] == 'native_landing'
+
+    second = debug.record_transition_destination(
+        identity, 48, identity,
+        from_object=portal_48, from_state=room, to_state=room,
+        confirmation='native_trigger', intra_room_transition=True,
+        native_destination={'scene_id': 3, 'map_id': 10, 'x': 48, 'y': 8},
+    )
+    records = debug.read_exploration()['transitions'][identity['id']]
+    edge_47 = records[first['transition_key']]
+    edge_48 = records[second['transition_key']]
+
+    assert edge_47['destination_endpoint'] == {
+        'kind': 'confirmed_transition_source',
+        'transition_key': second['transition_key'],
+        'object_id': 48,
+        'position': {'x': 32, 'y': 0},
+    }
+    assert edge_48['destination_endpoint'] == {
+        'kind': 'confirmed_transition_source',
+        'transition_key': first['transition_key'],
+        'object_id': 47,
+        'position': {'x': 48, 'y': 8},
+    }
+    assert edge_47['native_destination']['x'] == 32
+    assert edge_48['native_destination']['x'] == 48
+    assert edge_47['traversal_count'] == edge_48['traversal_count'] == 1
+
+    memory = debug.run_agent_tool('get_room_memory', {}, room)['transitions']['outgoing']
+    by_object = {item['object_id']: item for item in memory}
+    assert by_object[47]['destination_endpoint']['object_id'] == 48
+    assert by_object[48]['destination_endpoint']['object_id'] == 47
+
+
+def test_dynamic_same_object_transition_states_remain_distinct_endpoints(tmp_path):
+    pad_a = {
+        'id': 258, 'x': 16, 'y': 8, 'sprite_id': 84, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 8101, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    pad_b = {**pad_a, 'x': 80, 'y': 24, 'trigger_script': 8102}
+    debug = make_debug_state(tmp_path)
+    room = make_state(objects=[pad_a])
+    identity = debug.room_identity(room)
+
+    edge_a = debug.record_transition_destination(
+        identity, 258, identity, from_object=pad_a, from_state=room, to_state=room,
+        confirmation='native_trigger', intra_room_transition=True,
+        native_destination={'x': 80, 'y': 24},
+    )
+    edge_b = debug.record_transition_destination(
+        identity, 258, identity, from_object=pad_b, from_state=room, to_state=room,
+        confirmation='native_trigger', intra_room_transition=True,
+        native_destination={'x': 16, 'y': 8},
+    )
+    records = debug.read_exploration()['transitions'][identity['id']]
+
+    assert edge_a['transition_key'] != edge_b['transition_key']
+    assert len(records) == 2
+    assert records[edge_a['transition_key']]['source_endpoint']['trigger_script'] == 8101
+    assert records[edge_b['transition_key']]['source_endpoint']['trigger_script'] == 8102
+    assert records[edge_a['transition_key']]['destination_endpoint']['transition_key'] == edge_b['transition_key']
+    assert records[edge_b['transition_key']]['destination_endpoint']['transition_key'] == edge_a['transition_key']
+
+
+def test_intra_room_endpoint_ties_require_unique_same_object_state(tmp_path):
+    debug = make_debug_state(tmp_path)
+    room = make_state()
+    identity = debug.room_identity(room)
+
+    def record(obj, landing):
+        return debug.record_transition_destination(
+            identity, obj['id'], identity,
+            from_object=obj, from_state=room, to_state=room,
+            confirmation='native_trigger', intra_room_transition=True,
+            native_destination={'x': landing[0], 'y': landing[1]},
+        )
+
+    same_object_state = {
+        'id': 84, 'x': 16, 'y': 8, 'trigger_mode': 4, 'trigger_script': 8402,
+    }
+    other_object = {
+        'id': 90, 'x': 48, 'y': 8, 'trigger_mode': 4, 'trigger_script': 9001,
+    }
+    record(same_object_state, (200, 200))
+    record(other_object, (200, 200))
+    unique = record(
+        {'id': 84, 'x': 0, 'y': 0, 'trigger_mode': 4, 'trigger_script': 8401},
+        (32, 0),
+    )
+    ambiguous = record(
+        {'id': 99, 'x': 0, 'y': 16, 'trigger_mode': 4, 'trigger_script': 9901},
+        (32, 0),
+    )
+    records = debug.read_exploration()['transitions'][identity['id']]
+
+    assert records[unique['transition_key']]['destination_endpoint']['kind'] == 'confirmed_transition_source'
+    assert records[unique['transition_key']]['destination_endpoint']['object_id'] == 84
+    assert records[ambiguous['transition_key']]['destination_endpoint'] == {
+        'kind': 'native_landing',
+        'position': {'x': 32, 'y': 0},
+    }
+
+
+def test_intra_room_endpoint_does_not_match_beyond_one_pal_step(tmp_path):
+    debug = make_debug_state(tmp_path)
+    room = make_state()
+    identity = debug.room_identity(room)
+    target = {'id': 47, 'x': 80, 'y': 0, 'trigger_mode': 4, 'trigger_script': 4701}
+    source = {'id': 48, 'x': 0, 'y': 0, 'trigger_mode': 4, 'trigger_script': 4801}
+    debug.record_transition_destination(
+        identity, 47, identity, from_object=target, from_state=room, to_state=room,
+        confirmation='native_trigger', intra_room_transition=True,
+        native_destination={'x': 0, 'y': 0},
+    )
+    edge = debug.record_transition_destination(
+        identity, 48, identity, from_object=source, from_state=room, to_state=room,
+        confirmation='native_trigger', intra_room_transition=True,
+        native_destination={'x': 40, 'y': 0},
+    )
+
+    records = debug.read_exploration()['transitions'][identity['id']]
+    assert records[edge['transition_key']]['destination_endpoint']['kind'] == 'native_landing'
+    assert len(records) == 2
 
 
 def test_script_control_on_non_grid_position_waits_without_bad_start_and_records_boat_transition(
@@ -1982,7 +2127,7 @@ def test_navigation_and_route_include_known_transition_destination(tmp_path):
     target_status = {target['id']: target for target in navigation['targets']}
     route = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']
     known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
-    known_by_key = {item['transition_key']: item for item in known['items']}
+    known_by_key = {item['transition_key']: item for item in known['outgoing']}
     assert target_status[52]['known_destination']
     assert target_status[52]['known_destination_room_id'] == to_identity['id']
     assert target_status[52]['destination_exploration']['frontier'] == 1
@@ -1996,11 +2141,10 @@ def test_navigation_and_route_include_known_transition_destination(tmp_path):
     assert route['known_destination_room_id'] == to_identity['id']
     assert route['traversal_context']['status'] == 'no_active_tasks'
     assert set(route['destination_exploration']) == set(target_status[52]['destination_exploration'])
-    assert known['from_room_id'] == from_identity['nav_room_id']
-    assert known['total'] == 1
+    assert len(known['outgoing']) == 1
     assert known_by_key[transition_key]['to_room_id'] == to_identity['id']
-    assert known_by_key[transition_key]['destination_exploration']['explored'] == 2
-    assert known_by_key[transition_key]['traversal_context']['total_count'] == 1
+    assert known_by_key[transition_key]['exploration']['explored'] == 2
+    assert known_by_key[transition_key]['traversal']['total_count'] == 1
 
 
 def test_confirmed_search_transition_stays_search_across_agent_tools(tmp_path):
@@ -2038,7 +2182,7 @@ def test_confirmed_search_transition_stays_search_across_agent_tools(tmp_path):
     assert route['transition_key'] == record['transition_key']
     assert executable_route['action'] == 'search'
     assert executable_route['status'] == 'transition'
-    assert memory['items'][0]['transition_key'] == record['transition_key']
+    assert memory['outgoing'][0]['transition_key'] == record['transition_key']
 
 
 def test_confirmed_search_transition_moves_before_starting_native_observer(tmp_path):
@@ -2102,8 +2246,9 @@ def test_generic_alternative_entrance_graph_learns_only_observed_directions(tmp_
         if item['id'] == 75
     )
 
-    assert goal_memory['transitions']['items'][0]['to_room_id'] == b_id
-    assert b_memory_before['transitions']['items'] == []
+    assert goal_memory['transitions']['outgoing'][0]['to_room_id'] == b_id
+    assert b_memory_before['transitions']['outgoing'] == []
+    assert {item['from_room_id'] for item in b_memory_before['transitions']['incoming']} == {a_id, goal_id}
     assert search_before['status'] == 'reachable'
     assert not search_before.get('transition_candidate', False)
 
@@ -2122,7 +2267,7 @@ def test_generic_alternative_entrance_graph_learns_only_observed_directions(tmp_
     assert search_after['kind'] == 'search'
     assert search_after['status'] == 'transition'
     assert search_after['known_destination_room_id'] == goal_id
-    assert b_memory_after['transitions']['items'][0]['to_room_id'] == goal_id
+    assert b_memory_after['transitions']['outgoing'][0]['to_room_id'] == goal_id
 
 
 def test_transition_task_context_reopens_only_for_structural_task_changes(tmp_path):
@@ -2204,7 +2349,14 @@ def test_transition_uses_frozen_pre_trigger_task_context(tmp_path):
         'id': 'route-task', 'description': 'Use the old route context', 'rationale': 'Evidence.',
     })['task']
     frozen = debug.transition_task_context_snapshot()
-    debug.run_agent_tool('upsert_task', {'id': task['id'], 'room_id': 'S4/M11:000000000001'})
+    cycle = debug.new_agent_tool_cycle(state)
+    debug.run_agent_tool(
+        'get_room_memory', {'room_id': 'S4/M11:000000000001'}, state, tool_cycle=cycle,
+    )
+    debug.run_agent_tool(
+        'upsert_task', {'id': task['id'], 'room_id': 'S4/M11:000000000001'},
+        state, tool_cycle=cycle,
+    )
 
     debug.record_transition_destination(
         debug.room_identity(state), 52, debug.room_identity(destination),
@@ -2259,20 +2411,150 @@ def test_get_room_memory_compacts_transition_evidence_for_agent(tmp_path):
     full = debug.known_transitions_summary(debug.room_identity(state)['id'], state)
     memory = debug.run_agent_tool('get_room_memory', {}, state)
     encoded = json.dumps(memory, ensure_ascii=False)
-    transition = memory['transitions']['items'][0]
+    transition = memory['transitions']['outgoing'][0]
 
     assert 'oversized_evidence' in full['transitions'][0]['observed_from_state']
-    assert memory['transitions']['total'] == 1
-    assert set(memory['transitions']) == {'from_room_id', 'total', 'items'}
+    assert set(memory['transitions']) == {'outgoing', 'incoming'}
     assert transition['transition_key'] == record['transition_key']
-    assert set(transition['object']) == {'x', 'y', 'trigger_mode', 'trigger_script'}
+    assert 'object' not in transition
     assert 'known_transitions' not in encoded
     assert 'known_transitions_by_object' not in encoded
     assert 'observed_from_state' not in encoded
     assert 'observed_to_state' not in encoded
-    assert 'legacy_' not in encoded
+    assert 'legacy_room_id' not in encoded
+    assert 'legacy_nav_room_id' not in encoded
     assert 'oversized_evidence' not in encoded
-    assert len(encoded) < 4000
+    assert 'context_digest' not in encoded
+    assert 'active_task_ids' not in encoded
+    assert len(encoded) < 5000
+
+
+def test_room_memory_exposes_scoped_dialog_evidence_and_confirmed_incoming_edges(tmp_path):
+    debug = make_debug_state(tmp_path)
+    village = make_state(objects=[make_touch_object(95, x=16, y=8, sprite_id=1)])
+    village.update({'scene_id': 2, 'map_id': 9, 'room': {'key': 'village'}})
+    inn = make_state(objects=[])
+    inn.update({'scene_id': 3, 'map_id': 10, 'room': {'key': 'inn'}})
+    lane = make_state(objects=[make_touch_object(99, x=32, y=8, sprite_id=1)])
+    lane.update({'scene_id': 7, 'map_id': 11, 'room': {'key': 'lane'}})
+    rumor = make_state(objects=[make_touch_object(77, x=48, y=8, sprite_id=1)])
+    rumor.update({'scene_id': 6, 'map_id': 10, 'room': {'key': 'rumor'}})
+    home = make_state(objects=[])
+    home.update({'scene_id': 8, 'map_id': 11, 'room': {'key': 'home'}})
+    village_id = debug.room_identity(village)['id']
+    inn_id = debug.room_identity(inn)['id']
+    lane_id = debug.room_identity(lane)['id']
+    home_id = debug.room_identity(home)['id']
+    debug.record_transition_destination(
+        debug.room_identity(village), 95, debug.room_identity(inn),
+        from_object=village['objects'][0], from_state=village, to_state=inn,
+        confirmation='native_trigger',
+    )
+    debug.record_transition_destination(
+        debug.room_identity(lane), 99, debug.room_identity(home),
+        from_object=lane['objects'][0], from_state=lane, to_state=home,
+        confirmation='native_trigger',
+    )
+    debug.record_transition_destination(
+        debug.room_identity(rumor), 77, debug.room_identity(inn),
+        from_object=rumor['objects'][0], from_state=rumor, to_state=inn,
+        confirmation='inferred',
+    )
+    debug.dialog_history = [
+        {'frame': 10, 'end_frame': 11, 'logical_room_id': inn_id, 'event_object_id': 25,
+         'message_ids': [100, 101], 'speaker_hint': '李大娘', 'text': '这里是客栈。'},
+        {'frame': 12, 'logical_room_id': inn_id, 'event_object_id': 25,
+         'message_id': 102, 'speaker_hint': '系统', 'text': '得到５００文钱'},
+        {'frame': 13, 'logical_room_id': inn_id, 'event_object_id': 26,
+         'message_id': 103, 'dialog_position': 'center_window', 'text': '中心提示'},
+        {'frame': 20, 'logical_room_id': home_id, 'event_object_id': 181,
+         'message_id': 200, 'speaker_hint': '老王', 'text': '阿珠在这里。'},
+        {'frame': 21, 'logical_room_id': home_id, 'event_object_id': 88,
+         'message_id': 201, 'speaker_hint': '阿珠', 'text': '咕．．咕．．'},
+        {'frame': 22, 'logical_room_id': home_id, 'event_object_id': 181,
+         'message_id': 202, 'text': '这孩子又不知跑到哪里玩去了。'},
+    ]
+
+    inn_memory = debug.run_agent_tool('get_room_memory', {'room_id': inn_id}, village)
+    home_memory = debug.run_agent_tool('get_room_memory', {'room_id': home_id}, village)
+
+    assert inn_memory['transitions']['outgoing'] == []
+    assert [(item['from_room_id'], item['object_id']) for item in inn_memory['transitions']['incoming']] == [
+        (village_id, 95),
+    ]
+    assert home_memory['transitions']['outgoing'] == []
+    assert [(item['from_room_id'], item['object_id']) for item in home_memory['transitions']['incoming']] == [
+        (lane_id, 99),
+    ]
+    assert inn_memory['semantic_evidence']['dialog_turns_total'] == 1
+    assert inn_memory['semantic_evidence']['participants'][0]['speaker_hint'] == '李大娘'
+    assert home_memory['semantic_evidence']['dialog_turns_total'] == 3
+    assert {item.get('speaker_hint') for item in home_memory['semantic_evidence']['participants']} == {
+        '老王', '阿珠', None,
+    }
+    assert home_memory['semantic_evidence']['speaker_hint_is_metadata'] is True
+    assert any(
+        sample['text'].startswith('这孩子')
+        for group in home_memory['semantic_evidence']['samples'].values()
+        for sample in group
+    )
+    assert all(
+        sample['text'] not in {'得到５００文钱', '中心提示'}
+        for group in inn_memory['semantic_evidence']['samples'].values()
+        for sample in group
+    )
+    assert all(item['from_room_id'] != inn_id for item in inn_memory['transitions']['incoming'])
+    assert all(item['from_room_id'] != home_id for item in home_memory['transitions']['incoming'])
+
+
+def test_room_memory_with_seven_edges_stays_under_five_kilobytes_without_redundant_fields(tmp_path):
+    targets = [
+        make_touch_object(50 + index, x=16 * index, y=8, sprite_id=1)
+        for index in range(7)
+    ]
+    debug = make_debug_state(tmp_path)
+    state = make_state(width=10, height=4, objects=targets)
+    source_identity = debug.room_identity(state)
+    for index, target in enumerate(targets):
+        destination = make_state(objects=[])
+        destination.update({
+            'scene_id': 10 + index,
+            'map_id': 20 + index,
+            'room': {'key': f'destination-{index}'},
+        })
+        debug.record_transition_destination(
+            source_identity, target['id'], debug.room_identity(destination),
+            from_object=target, from_state=state, to_state=destination,
+            confirmation='native_trigger',
+        )
+    debug.dialog_history = [
+        {'frame': frame, 'logical_room_id': source_identity['id'], 'event_object_id': 70 + frame,
+         'message_id': 300 + frame, 'speaker_hint': f'人物{frame}', 'text': '地点证据' * 12}
+        for frame in range(1, 10)
+    ]
+
+    memory = debug.run_agent_tool('get_room_memory', {}, state)
+    encoded = json.dumps(memory, ensure_ascii=False, separators=(',', ':'))
+
+    assert len(memory['transitions']['outgoing']) == 7
+    assert memory['semantic_evidence']['dialog_turns_total'] == 9
+    assert len(memory['semantic_evidence']['participants']) == 8
+    assert list(memory['semantic_evidence']['samples']) == ['latest']
+    assert [item['frame'] for item in memory['semantic_evidence']['samples']['latest']] == [7, 8, 9]
+    assert len(encoded.encode('utf-8')) < 5000
+    for forbidden in (
+        'context_digest', 'active_task_ids', 'observed_at', 'updated_at',
+        'trigger_script', 'trigger_mode', '"x"', '"y"', 'destination_exploration',
+    ):
+        assert forbidden not in encoded
+    def contains_null(value):
+        if isinstance(value, dict):
+            return any(contains_null(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_null(item) for item in value)
+        return value is None
+
+    assert not contains_null(memory['transitions'])
 
 
 
@@ -2291,8 +2573,7 @@ def test_transition_destination_is_known_across_regions_in_same_room(tmp_path):
     known = debug.run_agent_tool('get_room_memory', {}, query_from)['transitions']
     assert route['known_destination']
     assert route['known_destination_room_id'] == to_identity['id']
-    assert known['from_room_id'] == debug.room_identity(query_from)['nav_room_id']
-    assert known['items'][0]['to_room_id'] == to_identity['id']
+    assert known['outgoing'][0]['to_room_id'] == to_identity['id']
 
 
 
@@ -2310,7 +2591,7 @@ def test_transition_destination_crosses_raw_room_key_when_logical_room_matches(t
     route = debug.run_agent_tool('inspect_target', {'id': 54}, query_from)['route']
     known = debug.run_agent_tool('get_room_memory', {}, query_from)['transitions']
     assert route['known_destination']
-    assert known['items']
+    assert known['outgoing']
 
 
 def test_historical_room_memory_does_not_validate_against_current_room_object(tmp_path):
@@ -2341,10 +2622,10 @@ def test_historical_room_memory_does_not_validate_against_current_room_object(tm
         current,
     )
 
-    assert memory['transitions']['from_room_id'] == historical_identity['id']
-    assert memory['transitions']['total'] == 1
-    assert memory['transitions']['items'][0]['transition_key'] == record['transition_key']
-    assert memory['transitions']['items'][0]['to_room_id'] == destination_identity['id']
+    assert memory['room_id'] == historical_identity['id']
+    assert len(memory['transitions']['outgoing']) == 1
+    assert memory['transitions']['outgoing'][0]['transition_key'] == record['transition_key']
+    assert memory['transitions']['outgoing'][0]['to_room_id'] == destination_identity['id']
 
 
 def test_transition_destination_requires_exact_position_and_script_key(tmp_path):
@@ -2368,8 +2649,7 @@ def test_transition_destination_requires_exact_position_and_script_key(tmp_path)
     route = debug.run_agent_tool('inspect_target', {'id': 54}, query_from)['route']
     known = debug.run_agent_tool('get_room_memory', {}, query_from)['transitions']
     assert not route['known_destination']
-    assert known['items'] == []
-    assert known['total'] == 0
+    assert known['outgoing'] == []
 
 
 def test_transition_semantic_annotation_is_exposed_to_agent_navigation(tmp_path):
@@ -2391,7 +2671,7 @@ def test_transition_semantic_annotation_is_exposed_to_agent_navigation(tmp_path)
     navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
     route = debug.run_agent_tool('inspect_target', {'id': 54}, state)['route']
     known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
-    known_by_key = {item['transition_key']: item for item in known['items']}
+    known_by_key = {item['transition_key']: item for item in known['outgoing']}
     target_status = {target['id']: target for target in navigation['targets']}
     assert target_status[54]['to_semantic_room'] == '厨房'
     assert target_status[54]['confidence'] == 'human_confirmed'
@@ -2434,7 +2714,7 @@ def test_legacy_transition_record_is_read_but_not_used_as_a_known_destination(tm
     debug.write_exploration(data)
     route = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']
     known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
-    known_by_key = {item['transition_key']: item for item in known['items']}
+    known_by_key = {item['transition_key']: item for item in known['outgoing']}
     assert not route['known_destination']
     assert known_by_key[record['transition_key']]['unconfirmed_destination']
     assert route['traversal_context']['total_count'] == 1
@@ -2457,11 +2737,11 @@ def test_recent_transition_destination_is_marked_as_backtrack(tmp_path):
     navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
     target_status = {target['id']: target for target in navigation['targets']}
     known = debug.run_agent_tool('get_room_memory', {}, state)['transitions']
-    known_by_key = {item['transition_key']: item for item in known['items']}
+    known_by_key = {item['transition_key']: item for item in known['outgoing']}
     assert target_status[52]['returns_to_recent_room']
     assert target_status[52]['agent_priority'] == 'avoid_backtrack'
     assert known_by_key[transition_key]['returns_to_recent_room']
-    assert known_by_key[transition_key]['agent_priority'] == 'avoid_backtrack'
+    assert 'agent_priority' not in known_by_key[transition_key]
 
 
 

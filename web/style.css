@@ -601,7 +601,30 @@ button.is-active {
 .agentSessionButtons button:nth-child(2) { background: #4b2828; border-color: #895353; }
 .agentSessionButtons .roomMemoButton { grid-column: 1 / -1; }
 
-.roomMemoContent { gap: 0; }
+.roomMemoContent { gap: 20px; }
+
+.roomMemoSection,
+.roomMemoRecentList {
+  display: grid;
+  gap: 10px;
+}
+
+.roomMemoSection h3 {
+  color: #dce6ee;
+  font-size: 13px;
+  margin: 0;
+}
+
+.roomMemoSectionHeader {
+  align-items: baseline;
+  display: flex;
+  justify-content: space-between;
+}
+
+.roomMemoSectionHeader span {
+  color: #8193a3;
+  font-size: 11px;
+}
 
 .roomMemoCard {
   background: #101419;
@@ -617,6 +640,12 @@ button.is-active {
   margin: 0;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.roomMemoCardRoom {
+  color: #8fd9ff;
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 .roomMemoCard dl { display: grid; gap: 5px; margin: 0; }

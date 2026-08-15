@@ -2135,7 +2135,7 @@ exploration value, and maintained local tasks to choose the next action.
         prompt = current_prompt()
         if await self._maybe_compact_sdk(session, client, prompt):
             prompt = current_prompt()
-        stream = Runner.run_streamed(agent, prompt, session=session, max_turns=8)
+        stream = Runner.run_streamed(agent, prompt, session=session, max_turns=16)
         self.active_stream = stream
         async for event in stream.stream_events():
             if self.cancel_event.is_set():

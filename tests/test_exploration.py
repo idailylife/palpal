@@ -56,7 +56,11 @@ def test_room_memo_supports_historical_room_update_idempotence_and_clear(tmp_pat
     assert updated['memo']['created_at'] == created['memo']['created_at']
     assert updated['memo']['text'] == '门已经打开；原注释已过期。'
     memory = debug.run_agent_tool('get_room_memory', {'room_id': historical_room_id}, state)
-    assert memory['memo'] == updated['memo']
+    assert memory['memo'] == {
+        'text': updated['memo']['text'],
+        'source': 'agent_annotation',
+    }
+    assert 'updated_at' not in memory['memo']
 
     cleared = debug.run_agent_tool(
         'upsert_room_memo',
@@ -405,21 +409,18 @@ def test_get_room_memory_returns_compact_known_and_unknown_status(tmp_path):
     write_state(debug, state)
     debug.update_exploration(state)
     identity = debug.room_identity(state)
-    known = debug.run_agent_tool('get_room_memory', {'room_id': identity['id']}, state)['exploration']
-    unknown = debug.run_agent_tool('get_room_memory', {'room_id': '9/9/missing'}, state)['exploration']
+    known_memory = debug.run_agent_tool('get_room_memory', {'room_id': identity['id']}, state)
+    unknown_memory = debug.run_agent_tool('get_room_memory', {'room_id': '9/9/missing'}, state)
+    known = known_memory['exploration']
+    unknown = unknown_memory['exploration']
     assert known['known']
-    assert known['room_id'] == identity['id']
-    assert known['scene_id'] == 3
-    assert known['map_id'] == 10
+    assert known_memory['room_id'] == identity['id']
     assert known['explored'] == 1
     assert known['frontier'] == 4
     assert 'explorable' in known
-    assert set(known) == {
-        'known', 'room_id', 'scene_id', 'map_id',
-        'explored', 'explorable', 'frontier', 'updated_at',
-    }
+    assert set(known) == {'known', 'explored', 'explorable', 'frontier'}
     assert not unknown['known']
-    assert unknown['room_id'] == '9/9/missing'
+    assert unknown_memory['room_id'] == '9/9/missing'
 
 
 def test_legacy_room_complete_is_ignored_without_schema_migration(tmp_path):
@@ -441,3 +442,56 @@ def test_legacy_room_complete_is_ignored_without_schema_migration(tmp_path):
     assert debug.exploration_path.read_text(encoding='utf-8') == original
     debug.write_exploration(loaded)
     assert 'complete' not in json.loads(debug.exploration_path.read_text(encoding='utf-8'))['rooms']['legacy-room']
+
+
+def test_v11_exploration_drops_legacy_transition_location_fields_without_losing_facts(tmp_path):
+    debug = make_debug_state(tmp_path)
+    data = debug.empty_exploration()
+    room_id = 'S3/M10:000000000001'
+    transition_key = '[3,10,32,0,4,4631]'
+    data['transitions'][room_id] = {
+        transition_key: {
+            'transition_key': transition_key,
+            'transition_key_fields': {
+                'scene_id': 3, 'map_id': 10, 'x': 32, 'y': 0,
+                'trigger_mode': 4, 'trigger_script': 4631,
+            },
+            'object_id': 48,
+            'object': {'id': 48, 'x': 32, 'y': 0, 'trigger_script': 4631},
+            'from_room_id': room_id,
+            'to_room_id': room_id,
+            'confirmation': 'native_trigger',
+            'observed': True,
+            'observed_at': 123.0,
+            'traversal_count': 7,
+            'intra_room_transition': True,
+            'native_destination': {'x': 48, 'y': 8},
+            'from_subregion_id': '.48',
+            'to_subregion_id': '.47',
+            'from_location_id': f'{room_id}.48',
+            'to_location_id': f'{room_id}.47',
+            'subregion_basis': 'legacy-nearest-object',
+            'subregion_match_distance': 0,
+            'observations': [{'from_location_id': 'legacy-history'}],
+        },
+    }
+    original = json.dumps(data)
+    debug.exploration_path.write_text(original, encoding='utf-8')
+
+    loaded = debug.read_exploration()
+    record = loaded['transitions'][room_id][transition_key]
+
+    encoded = json.dumps(record)
+    for legacy_field in (
+        'from_subregion_id', 'to_subregion_id', 'from_location_id', 'to_location_id',
+        'subregion_basis', 'subregion_match_distance',
+    ):
+        assert legacy_field not in encoded
+    assert record['transition_key'] == transition_key
+    assert record['native_destination'] == {'x': 48, 'y': 8}
+    assert record['confirmation'] == 'native_trigger'
+    assert record['traversal_count'] == 7
+    assert record['observations'] == [{}]
+    assert record['source_endpoint']['object_id'] == 48
+    assert record['destination_endpoint']['kind'] == 'native_landing'
+    assert debug.exploration_path.read_text(encoding='utf-8') == original

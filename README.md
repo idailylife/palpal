@@ -307,11 +307,16 @@ first regardless of task priority.
 `upsert_room_memo` keeps at most one 800-character Agent-written semantic note
 per stable `logical_room_id`. The current room's memo (or `null`) is included in
 each turn's initial context; `get_room_memory` returns it for explicitly queried
-historical rooms. These notes are fallible location annotations, not substitutes
-for exploration evidence, inventory state, temporary coordinates, or actionable
-leads, which still belong in independent tasks. They survive Agent session reset,
-follow checkpoint companion branches, and are cleared by Start New Game. The
-Agent tab exposes the current room's memo through a read-only `Room Memo` dialog.
+historical rooms together with compact exploration counts, room-scoped dialog
+samples, and separately directed `outgoing` and confirmed `incoming` transition
+records. Speaker hints remain metadata rather than engine identities. These notes
+are fallible location annotations, not substitutes for exploration evidence,
+inventory state, temporary coordinates, or actionable leads, which still belong
+in independent tasks. Before adding or changing a task's non-empty `room_id`, the
+Agent must query that room in the same tool cycle. Memos survive Agent session
+reset, follow checkpoint companion branches, and are cleared by Start New Game.
+The Agent tab exposes the current room's memo plus the five most recently added
+other-room memos through a read-only `Room Memo` dialog.
 
 Each merged speaker turn becomes an independent persistent task-inbox item even
 when several speakers share one native trigger object. After dialogue ends, the

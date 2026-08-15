@@ -111,6 +111,7 @@ let agentTasksRequestId = 0;
 let goalsDialogTrigger = null;
 let roomMemo = null;
 let roomMemoRoomId = null;
+let roomMemoRecent = [];
 let roomMemoLoading = false;
 let roomMemoError = null;
 let roomMemoRequestId = 0;
@@ -556,10 +557,21 @@ function renderTransitionLinks(payload) {
     return;
   }
   transitionsContent.innerHTML = transitions.map((transition) => {
-    const objectId = transition.object_id ?? transition.object?.id ?? "-";
-    const destination = transition.intra_room_transition
-      ? `same room${transition.to_subregion_id || ""}`
-      : (transition.to_logical_room_label || transition.to_logical_room_id || transition.to_room_id || "-");
+    const objectId = transition.source_endpoint?.object_id ?? transition.object_id ?? transition.object?.id ?? "-";
+    let destination;
+    if (transition.intra_room_transition) {
+      const endpoint = transition.destination_endpoint || {};
+      const position = endpoint.position;
+      const coordinate = position?.x != null && position?.y != null
+        ? ` @ (${position.x},${position.y})`
+        : "";
+      const target = endpoint.kind === "confirmed_transition_source" && endpoint.object_id != null
+        ? ` #${endpoint.object_id}`
+        : "";
+      destination = `same room${target}${coordinate}`;
+    } else {
+      destination = transition.to_logical_room_label || transition.to_logical_room_id || transition.to_room_id || "-";
+    }
     return `<div class="transitionLink">
       <strong class="transitionPoint">#${escapeHtml(objectId)}</strong>
       <span class="transitionArrow" aria-hidden="true">→</span>
@@ -2754,21 +2766,31 @@ function renderRoomMemoDialog() {
     roomMemoContent.innerHTML = `<div class="goalsError">${escapeHtml(roomMemoError)}<br><button class="goalsRetry" type="button" data-room-memo-retry>Retry</button></div>`;
     return;
   }
-  if (!roomMemoRoomId) {
-    roomMemoContent.innerHTML = '<div class="goalsEmpty">A stable logical room is not available yet.</div>';
-    return;
-  }
-  if (!roomMemo) {
-    roomMemoContent.innerHTML = '<div class="goalsEmpty">The Agent has not written a memo for this room.</div>';
-    return;
-  }
-  roomMemoContent.innerHTML = `<article class="roomMemoCard">
-    <p>${escapeHtml(roomMemo.text || "")}</p>
+  const memoCard = (memo, showRoom = false) => `<article class="roomMemoCard">
+    ${showRoom ? `<div class="roomMemoCardRoom">${escapeHtml(memo.room_id || "Unknown room")}</div>` : ""}
+    <p>${escapeHtml(memo.text || "")}</p>
     <dl>
-      <div><dt>Source</dt><dd>${escapeHtml(roomMemo.source || "agent_annotation")}</dd></div>
-      <div><dt>Updated turn</dt><dd>${Number(roomMemo.updated_agent_turn || 0)}</dd></div>
+      <div><dt>Source</dt><dd>${escapeHtml(memo.source || "agent_annotation")}</dd></div>
+      <div><dt>Updated turn</dt><dd>${Number(memo.updated_agent_turn || 0)}</dd></div>
     </dl>
   </article>`;
+  const currentContent = !roomMemoRoomId
+    ? '<div class="goalsEmpty">A stable logical room is not available yet.</div>'
+    : roomMemo
+      ? memoCard(roomMemo)
+      : '<div class="goalsEmpty">The Agent has not written a memo for this room.</div>';
+  const recentContent = roomMemoRecent.length
+    ? `<div class="roomMemoRecentList">${roomMemoRecent.map((memo) => memoCard(memo, true)).join("")}</div>`
+    : '<div class="goalsEmpty">The Agent has not written memos for other rooms yet.</div>';
+  roomMemoContent.innerHTML = `
+    <section class="roomMemoSection">
+      <h3>Current room</h3>
+      ${currentContent}
+    </section>
+    <section class="roomMemoSection">
+      <div class="roomMemoSectionHeader"><h3>Recently added</h3><span>${roomMemoRecent.length} / 5</span></div>
+      ${recentContent}
+    </section>`;
 }
 
 async function refreshRoomMemo() {
@@ -2783,6 +2805,7 @@ async function refreshRoomMemo() {
     if (requestId !== roomMemoRequestId) return;
     roomMemoRoomId = result.room_id || null;
     roomMemo = result.memo || null;
+    roomMemoRecent = Array.isArray(result.recent_memos) ? result.recent_memos.slice(0, 5) : [];
   } catch (error) {
     if (requestId !== roomMemoRequestId) return;
     roomMemoError = error instanceof Error ? error.message : String(error);
@@ -2828,11 +2851,26 @@ function agentEventVisibleDetails(event) {
   return Object.keys(details).length ? details : null;
 }
 
+function isNavigationSteppingEvent(event) {
+  return event?.type === "navigation"
+    && event.phase === "progress"
+    && event.details?.result?.status === "stepping";
+}
+
 function agentTimelineItems(events) {
   const items = [];
   events.forEach((event) => {
     const metadata = battleDelegateMetadata(event);
     const previous = items.at(-1);
+    if (
+      !metadata
+      && isNavigationSteppingEvent(event)
+      && previous?.kind === "event"
+      && isNavigationSteppingEvent(previous.event)
+    ) {
+      previous.event = event;
+      return;
+    }
     if (metadata && previous?.kind === "battle" && previous.groupId === metadata.group_id) {
       previous.events.push(event);
       return;

@@ -8,6 +8,7 @@ import path from "node:path";
 const chromePath = process.env.PALPAL_CHROME_BIN || defaultChromePath();
 const targetUrl = process.env.PALPAL_VISUAL_URL || process.argv[2] || "http://127.0.0.1:8765";
 const timeoutMs = Number(process.env.PALPAL_VISUAL_TIMEOUT_MS || 15000);
+const roomMemoOnly = process.env.PALPAL_VISUAL_ROOM_MEMO_ONLY === "1";
 
 function defaultChromePath() {
   if (process.platform === "darwin") {
@@ -525,6 +526,91 @@ async function main() {
       throw new Error(`agent goals modal smoke failed (${JSON.stringify(goalsModalResult)})`);
     }
 
+    const roomMemoModal = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalFetch = window.fetch;
+          try {
+            window.fetch = async (url, options) => {
+              if (url === "/agent/room-memo") {
+                return {
+                  ok: true,
+                  json: async () => ({
+                    ok: true,
+                    room_id: "S3/M10:CURRENT000001",
+                    memo: { text: "Current inn room.", source: "agent_annotation", updated_agent_turn: 9 },
+                    recent_memos: Array.from({ length: 5 }, (_, index) => ({
+                      room_id: "S1/M1:RECENT" + String(index + 1).padStart(6, "0"),
+                      text: "Recent room memo " + (index + 1),
+                      source: "agent_annotation",
+                      updated_agent_turn: 8 - index,
+                    })),
+                  }),
+                };
+              }
+              return originalFetch(url, options);
+            };
+            const button = [...document.querySelectorAll(".agentSessionButtons button")]
+              .find((item) => item.textContent.includes("Room Memo"));
+            button?.focus();
+            button?.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const dialog = document.getElementById("roomMemoDialog");
+            const opened = dialog.open;
+            const headings = [...dialog.querySelectorAll(".roomMemoSection h3")].map((node) => node.textContent);
+            const cards = [...dialog.querySelectorAll(".roomMemoCard")];
+            const recentRooms = [...dialog.querySelectorAll(".roomMemoRecentList .roomMemoCardRoom")]
+              .map((node) => node.textContent);
+            const currentText = cards[0]?.querySelector("p")?.textContent;
+            const recentCount = dialog.querySelector(".roomMemoSectionHeader span")?.textContent;
+            const ignoresGameKeys = shouldIgnoreGameKeydown(new KeyboardEvent("keydown", { key: "ArrowUp" }));
+            dialog.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            return {
+              opened,
+              closedFromBackdrop: dialog.open === false,
+              headings,
+              cardCount: cards.length,
+              recentRooms,
+              currentText,
+              recentCount,
+              ignoresGameKeys,
+              restoredFocus: document.activeElement === button,
+            };
+          } finally {
+            window.fetch = originalFetch;
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const roomMemoModalResult = roomMemoModal.result?.value;
+    if (
+      !roomMemoModalResult?.opened
+      || !roomMemoModalResult.closedFromBackdrop
+      || JSON.stringify(roomMemoModalResult.headings) !== JSON.stringify(["Current room", "Recently added"])
+      || roomMemoModalResult.cardCount !== 6
+      || roomMemoModalResult.recentRooms.length !== 5
+      || roomMemoModalResult.recentRooms.includes("S3/M10:CURRENT000001")
+      || roomMemoModalResult.currentText !== "Current inn room."
+      || roomMemoModalResult.recentCount !== "5 / 5"
+      || !roomMemoModalResult.ignoresGameKeys
+      || !roomMemoModalResult.restoredFocus
+    ) {
+      throw new Error(`room memo modal smoke failed (${JSON.stringify(roomMemoModalResult)})`);
+    }
+    if (roomMemoOnly) {
+      if (cdp.exceptions.length) {
+        throw new Error(`console exceptions: ${cdp.exceptions.join("; ")}`);
+      }
+      console.log("room memo visual smoke ok: current room plus 5 recent memos");
+      ws.close();
+      return;
+    }
+
     const timelineState = await cdp.send(
       "Runtime.evaluate",
       {
@@ -608,6 +694,83 @@ async function main() {
       || timelineResult.runningAnimated !== 1
     ) {
       throw new Error(`agent timeline stability smoke failed (${JSON.stringify(timelineResult)})`);
+    }
+
+    const timelineNavigationSteps = await cdp.send(
+      "Runtime.evaluate",
+      {
+        returnByValue: true,
+        expression: `(() => {
+          const stepping = (seq, step, turn = 1) => ({
+            seq,
+            turn,
+            type: "navigation",
+            phase: "progress",
+            summary: "Navigation step " + step + ": stepping.",
+            details: { step, result: { status: "stepping", move: "right" } },
+          });
+          agentSessionEvents = [stepping(1, 1)];
+          agentTimelineRenderKey = null;
+          renderAgentTimeline();
+          const timeline = document.getElementById("agentTimeline");
+          const initialSeqs = [...timeline.querySelectorAll(".agentActivity[data-event-seq]")]
+            .map((node) => Number(node.dataset.eventSeq));
+          agentSessionEvents.push(stepping(2, 2));
+          renderAgentTimeline();
+          const liveSeqs = [...timeline.querySelectorAll(".agentActivity[data-event-seq]")]
+            .map((node) => Number(node.dataset.eventSeq));
+          agentSessionEvents.push(
+            {
+              seq: 3,
+              turn: 1,
+              type: "tool",
+              phase: "completed",
+              summary: "Navigation tool checkpoint.",
+              details: {},
+            },
+            stepping(4, 3),
+            stepping(5, 4),
+            {
+              seq: 6,
+              turn: 1,
+              type: "navigation",
+              phase: "progress",
+              summary: "Navigation step 5: facing.",
+              details: { step: 5, result: { status: "facing" } },
+            },
+            stepping(7, 1, 2),
+            stepping(8, 2, 2),
+          );
+          renderAgentTimeline();
+          const visibleActivities = [...timeline.querySelectorAll(".agentActivity[data-event-seq]")];
+          return {
+            initialSeqs,
+            liveSeqs,
+            visibleSeqs: visibleActivities.map((node) => Number(node.dataset.eventSeq)),
+            visibleSummaries: visibleActivities.map((node) => node.querySelector("strong")?.textContent),
+            originalSeqs: agentSessionEvents.map((event) => event.seq),
+            latestStep: JSON.parse(timeline.querySelector('[data-event-seq="5"] details pre')?.textContent || "null")?.step,
+          };
+        })()`,
+      },
+      sessionId
+    );
+    const timelineNavigationResult = timelineNavigationSteps.result?.value;
+    if (
+      JSON.stringify(timelineNavigationResult?.initialSeqs) !== JSON.stringify([1])
+      || JSON.stringify(timelineNavigationResult.liveSeqs) !== JSON.stringify([2])
+      || JSON.stringify(timelineNavigationResult.visibleSeqs) !== JSON.stringify([2, 3, 5, 6, 8])
+      || JSON.stringify(timelineNavigationResult.visibleSummaries) !== JSON.stringify([
+        "Navigation step 2: stepping.",
+        "Navigation tool checkpoint.",
+        "Navigation step 4: stepping.",
+        "Navigation step 5: facing.",
+        "Navigation step 2: stepping.",
+      ])
+      || JSON.stringify(timelineNavigationResult.originalSeqs) !== JSON.stringify([1, 2, 3, 4, 5, 6, 7, 8])
+      || timelineNavigationResult.latestStep !== 4
+    ) {
+      throw new Error(`agent timeline navigation-step compaction smoke failed (${JSON.stringify(timelineNavigationResult)})`);
     }
 
     const timelinePagingState = await cdp.send(

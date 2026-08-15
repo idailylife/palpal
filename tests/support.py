@@ -157,6 +157,14 @@ def create_agent_task(debug, arguments, state=None):
         tool_cycle=cycle,
     )
     assert reviewed["complete"] is True
+    room_id = arguments.get("room_id")
+    if isinstance(room_id, str) and room_id:
+        debug.run_agent_tool(
+            "get_room_memory",
+            {"room_id": room_id},
+            state,
+            tool_cycle=cycle,
+        )
     return debug.run_agent_tool(
         "upsert_task",
         {**arguments, "review_token": reviewed["review_token"]},

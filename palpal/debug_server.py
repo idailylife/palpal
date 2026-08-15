@@ -58,6 +58,7 @@ MAX_ACTIVE_TASK_CONTEXT = 8
 MAX_ACTIVE_TASK_DESCRIPTION = 160
 MAX_ROOM_MEMO_TEXT = 800
 MAX_TRANSITION_TASK_CONTEXTS = 16
+TRANSITION_ENDPOINT_MATCH_DISTANCE = 32
 MAX_TASK_INBOX_HISTORY = 100
 MAX_TASK_INBOX_CONTEXT = 3
 TASK_INBOX_SCHEMA_VERSION = 2
@@ -3725,6 +3726,8 @@ class DebugState:
         transitions = data.get("transitions")
         if not isinstance(transitions, dict):
             data["transitions"] = {}
+        else:
+            self.derive_transition_endpoints(data)
         object_interactions = data.get("object_interactions")
         if not isinstance(object_interactions, dict):
             data["object_interactions"] = {}
@@ -4718,7 +4721,42 @@ class DebugState:
             "reconciled_task_ids": [],
             "upserted_task_ids": [],
             "resolved_inbox_batch_ids": [],
+            "room_memory_queried_ids": [],
             "equipment_review_item_id": None,
+        }
+
+    def task_room_memory_review_error(
+        self,
+        arguments: dict,
+        tool_cycle: dict | None,
+    ) -> dict | None:
+        if "room_id" not in arguments or arguments.get("room_id") is None:
+            return None
+        room_id = arguments.get("room_id")
+        if not isinstance(room_id, str) or not room_id.strip():
+            return None
+        room_id = room_id.strip()
+        task_id = str(arguments.get("id") or "").strip()
+        with self.exploration_lock:
+            data = self.read_exploration()
+            tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+            existing = tasks.get(task_id) if task_id else None
+            existing_room_id = existing.get("room_id") if isinstance(existing, dict) else None
+        if existing_room_id == room_id:
+            return None
+        queried = set(tool_cycle.get("room_memory_queried_ids") or []) if isinstance(tool_cycle, dict) else set()
+        if room_id in queried:
+            return None
+        return {
+            "ok": False,
+            "error": {
+                "code": "room_memory_review_required",
+                "message": (
+                    "Adding or changing a non-empty task room_id requires get_room_memory "
+                    "for that room in the same tool cycle. The task was not changed."
+                ),
+                "room_id": room_id,
+            },
         }
 
     def task_creation_review_error(
@@ -5458,6 +5496,113 @@ class DebugState:
         values = [fields.get(key) for key in TRANSITION_KEY_FIELDS]
         return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
 
+    @staticmethod
+    def transition_endpoint_position(record: dict) -> dict | None:
+        fields = record.get("transition_key_fields") if isinstance(record.get("transition_key_fields"), dict) else {}
+        obj = record.get("object") if isinstance(record.get("object"), dict) else {}
+        try:
+            return {
+                "x": int(fields.get("x") if fields.get("x") is not None else obj.get("x")),
+                "y": int(fields.get("y") if fields.get("y") is not None else obj.get("y")),
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def transition_source_endpoint(self, record: dict, stored_key: object) -> dict:
+        fields = record.get("transition_key_fields") if isinstance(record.get("transition_key_fields"), dict) else {}
+        obj = record.get("object") if isinstance(record.get("object"), dict) else {}
+        return {
+            "transition_key": record.get("transition_key") or str(stored_key),
+            "object_id": self.int_or_none(record.get("object_id")),
+            "position": self.transition_endpoint_position(record),
+            "trigger_script": self.int_or_none(
+                fields.get("trigger_script")
+                if fields.get("trigger_script") is not None
+                else obj.get("trigger_script")
+            ),
+        }
+
+    def derive_transition_endpoints(self, data: dict) -> None:
+        legacy_fields = {
+            "from_subregion_id", "to_subregion_id",
+            "from_location_id", "to_location_id",
+            "subregion_basis", "subregion_match_distance",
+        }
+
+        def clear_legacy(value) -> None:
+            if isinstance(value, dict):
+                for key in legacy_fields:
+                    value.pop(key, None)
+                for item in value.values():
+                    clear_legacy(item)
+            elif isinstance(value, list):
+                for item in value:
+                    clear_legacy(item)
+
+        transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
+        for by_room in transitions.values():
+            if not isinstance(by_room, dict):
+                continue
+            sources = []
+            for stored_key, record in by_room.items():
+                if not isinstance(record, dict):
+                    continue
+                clear_legacy(record)
+                record.pop("source_endpoint", None)
+                record.pop("destination_endpoint", None)
+                endpoint = self.transition_source_endpoint(record, stored_key)
+                if record.get("intra_room_transition"):
+                    record["source_endpoint"] = endpoint
+                if record.get("confirmation") in {"native_trigger", "human_confirmed"}:
+                    sources.append((str(endpoint.get("transition_key")), endpoint))
+
+            for stored_key, record in by_room.items():
+                if not isinstance(record, dict) or not record.get("intra_room_transition"):
+                    continue
+                native = record.get("native_destination") if isinstance(record.get("native_destination"), dict) else {}
+                try:
+                    landing = {"x": int(native.get("x")), "y": int(native.get("y"))}
+                except (TypeError, ValueError):
+                    landing = None
+                destination = {"kind": "native_landing", "position": landing}
+                current_key = str(record.get("transition_key") or stored_key)
+                ranked = []
+                if (
+                    landing is not None
+                    and record.get("confirmation") in {"native_trigger", "human_confirmed"}
+                ):
+                    for candidate_key, endpoint in sources:
+                        position = endpoint.get("position") if isinstance(endpoint.get("position"), dict) else None
+                        if candidate_key == current_key or position is None:
+                            continue
+                        distance = pal_distance(
+                            (landing["x"], landing["y"]),
+                            (position["x"], position["y"]),
+                        )
+                        if distance <= TRANSITION_ENDPOINT_MATCH_DISTANCE:
+                            ranked.append((distance, candidate_key, endpoint))
+                if ranked:
+                    minimum = min(item[0] for item in ranked)
+                    nearest = [item for item in ranked if item[0] == minimum]
+                    selected = nearest[0] if len(nearest) == 1 else None
+                    if selected is None:
+                        source_object_id = self.int_or_none(record.get("object_id"))
+                        same_object = [
+                            item for item in nearest
+                            if item[2].get("object_id") == source_object_id
+                        ]
+                        if len(same_object) == 1:
+                            selected = same_object[0]
+                    if selected is not None:
+                        endpoint = selected[2]
+                        destination = {
+                            "kind": "confirmed_transition_source",
+                            "transition_key": endpoint.get("transition_key"),
+                            "object_id": endpoint.get("object_id"),
+                            "position": endpoint.get("position"),
+                        }
+                record["destination_endpoint"] = destination
+
     def transition_observed_state(self, state: dict | None, identity: dict | None = None) -> dict | None:
         if not isinstance(state, dict):
             return None
@@ -5694,10 +5839,8 @@ class DebugState:
                 "to_semantic_room": record.get("to_semantic_room"),
                 "confidence": record.get("confidence"),
                 "intra_room_transition": bool(record.get("intra_room_transition")),
-                "from_location_id": record.get("from_location_id") or record.get("from_room_id"),
-                "to_location_id": record.get("to_location_id") or record.get("to_room_id"),
-                "from_subregion_id": record.get("from_subregion_id"),
-                "to_subregion_id": record.get("to_subregion_id"),
+                "source_endpoint": record.get("source_endpoint"),
+                "destination_endpoint": record.get("destination_endpoint"),
                 "native_destination": record.get("native_destination"),
             }
         )
@@ -5829,30 +5972,12 @@ class DebugState:
             if not existing:
                 record["traversal_count"] = 0
             self.record_transition_traversal(record, snapshot, observed_at)
-            if intra_room_transition:
-                from_subregion_id = f".{int(object_id)}"
-                nearest = self.nearest_transition_candidate(to_state or {}, native_destination)
-                to_subregion_id = f".{nearest[0]}" if nearest else None
-                record.update({
-                    "from_subregion_id": from_subregion_id,
-                    "to_subregion_id": to_subregion_id,
-                    "from_location_id": f"{from_identity['id']}{from_subregion_id}",
-                    "to_location_id": f"{to_identity['id']}{to_subregion_id}" if to_subregion_id else to_identity["id"],
-                    "subregion_basis": "native_trigger_destination_nearest_active_transition" if nearest else None,
-                    "subregion_match_distance": nearest[1] if nearest else None,
-                })
-            else:
-                record.update({
-                    "from_subregion_id": None,
-                    "to_subregion_id": None,
-                    "from_location_id": from_identity["id"],
-                    "to_location_id": to_identity["id"],
-                })
             if existing.get("to_room_id") and existing.get("to_room_id") != to_identity["id"]:
                 previous = {key: value for key, value in existing.items() if key != "observations"}
                 observations = existing.get("observations") if isinstance(existing.get("observations"), list) else []
                 record["observations"] = [*observations, previous]
             by_room[transition_key] = record
+            self.derive_transition_endpoints(data)
             self.write_exploration(data)
         return record
 
@@ -6306,34 +6431,6 @@ class DebugState:
             },
             state,
         )
-
-    def nearest_transition_candidate(self, state: dict, position: dict | None = None) -> tuple[int, float] | None:
-        pos = position if isinstance(position, dict) else (
-            state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
-        )
-        try:
-            px, py = int(pos.get("x")), int(pos.get("y"))
-        except (TypeError, ValueError):
-            return None
-        candidates = []
-        for obj in state.get("objects") if isinstance(state.get("objects"), list) else []:
-            if (
-                not isinstance(obj, dict)
-                or not transition_candidate(obj)
-                or int(obj.get("state") or 0) <= 0
-            ):
-                continue
-            try:
-                object_id = int(obj.get("id") or 0)
-                dx, dy = int(obj.get("x")) - px, int(obj.get("y")) - py
-            except (TypeError, ValueError):
-                continue
-            if object_id > 0:
-                candidates.append((dx * dx + dy * dy, object_id))
-        if not candidates:
-            return None
-        distance_squared, object_id = min(candidates, key=lambda item: (item[0], item[1]))
-        return object_id, distance_squared ** 0.5
 
     def state_at_native_destination(self, state: dict, destination: dict | None) -> dict:
         if not isinstance(destination, dict):
@@ -7155,12 +7252,8 @@ class DebugState:
                     "observed_from_state": record.get("observed_from_state"),
                     "observed_to_state": record.get("observed_to_state"),
                     "intra_room_transition": bool(record.get("intra_room_transition")),
-                    "from_subregion_id": record.get("from_subregion_id"),
-                    "to_subregion_id": record.get("to_subregion_id"),
-                    "from_location_id": record.get("from_location_id") or record.get("from_room_id"),
-                    "to_location_id": record.get("to_location_id") or record.get("to_room_id"),
-                    "subregion_basis": record.get("subregion_basis"),
-                    "subregion_match_distance": record.get("subregion_match_distance"),
+                    "source_endpoint": record.get("source_endpoint"),
+                    "destination_endpoint": record.get("destination_endpoint"),
                     "native_destination": record.get("native_destination"),
                 }
                 confirmed = record.get("confirmation") in {"native_trigger", "human_confirmed"}
@@ -7218,31 +7311,145 @@ class DebugState:
             )
         }
 
-    def compact_room_transition(self, transition: dict) -> dict:
+    @staticmethod
+    def agent_room_exploration_counts(summary: dict) -> dict:
+        return {
+            key: summary.get(key)
+            for key in ("known", "explored", "explorable", "frontier")
+        }
+
+    @staticmethod
+    def without_nulls(value):
+        if isinstance(value, dict):
+            return {
+                key: DebugState.without_nulls(item)
+                for key, item in value.items()
+                if item is not None
+            }
+        if isinstance(value, list):
+            return [DebugState.without_nulls(item) for item in value]
+        return value
+
+    def compact_agent_room_transition(
+        self,
+        transition: dict,
+        *,
+        direction: str,
+        data: dict,
+    ) -> dict:
+        if direction == "outgoing":
+            other_room_id = transition.get("to_logical_room_id") or transition.get("to_room_id")
+            room_field = "to_room_id"
+        else:
+            other_room_id = transition.get("from_logical_room_id") or transition.get("from_room_id")
+            room_field = "from_room_id"
+        traversal = self.transition_traversal_context(transition, data)
         compact = {
-            key: transition.get(key)
-            for key in (
-                "transition_key", "object_id", "from_location_id", "to_room_id",
-                "to_location_id", "from_semantic_room", "to_semantic_room",
-                "confidence", "confirmation", "observed_at", "intra_room_transition",
-                "returns_to_recent_room", "traversal_context",
-            )
+            "transition_key": transition.get("transition_key"),
+            "object_id": transition.get("object_id"),
+            room_field: other_room_id,
+            "from_semantic_room": transition.get("from_semantic_room"),
+            "to_semantic_room": transition.get("to_semantic_room"),
+            "confidence": transition.get("confidence"),
+            "confirmation": transition.get("confirmation"),
+            "exploration": self.agent_room_exploration_counts(
+                self.room_exploration_summary_from_data(data, str(other_room_id) if other_room_id else None)
+            ),
+            "traversal": {
+                key: traversal.get(key)
+                for key in ("status", "current_context_count", "total_count")
+            },
         }
-        obj = transition.get("object") if isinstance(transition.get("object"), dict) else {}
-        compact["object"] = {
-            key: obj.get(key)
-            for key in ("x", "y", "trigger_mode", "trigger_script")
+        if transition.get("intra_room_transition") is True:
+            compact["intra_room_transition"] = True
+            compact["source_endpoint"] = transition.get("source_endpoint")
+            compact["destination_endpoint"] = transition.get("destination_endpoint")
+        if transition.get("returns_to_recent_room") is True:
+            compact["returns_to_recent_room"] = True
+        if transition.get("confirmation") not in {"native_trigger", "human_confirmed"}:
+            compact["unconfirmed_destination"] = True
+        return self.without_nulls(compact)
+
+    def room_dialog_semantic_evidence(self, room_id: str | None) -> dict:
+        matching = []
+        for index, entry in enumerate(self.dialog_history):
+            if not isinstance(entry, dict):
+                continue
+            entry_room_id = entry.get("logical_room_id") or entry.get("room_id")
+            if not room_id or entry_room_id != room_id:
+                continue
+            if entry.get("speaker_hint") == "系统":
+                continue
+            if str(entry.get("dialog_position") or "").startswith("center"):
+                continue
+            text = " ".join(str(entry.get("text") or "").split())
+            if not text:
+                continue
+            if text.startswith(("得到", "失去", "获得", "獲得", "取得")):
+                continue
+            matching.append((index, entry, text))
+
+        participants: dict[tuple[object, object], dict] = {}
+        samples = []
+        for index, entry, text in matching:
+            object_id = self.int_or_none(entry.get("event_object_id"))
+            speaker_hint = str(entry.get("speaker_hint") or "").strip() or None
+            key = (object_id, speaker_hint)
+            summary = participants.setdefault(key, {
+                "event_object_id": object_id,
+                "speaker_hint": speaker_hint,
+                "dialog_turns": 0,
+                "first_frame": self.int_frame(entry.get("frame")),
+                "latest_frame": self.int_frame(entry.get("end_frame", entry.get("frame"))),
+                "_latest_index": index,
+            })
+            summary["dialog_turns"] += 1
+            summary["latest_frame"] = self.int_frame(entry.get("end_frame", entry.get("frame")))
+            summary["_latest_index"] = index
+            message_ids = entry.get("message_ids") if isinstance(entry.get("message_ids"), list) else []
+            if not message_ids:
+                message_id = self.int_or_none(entry.get("message_id"))
+                message_ids = [] if message_id is None else [message_id]
+            samples.append(self.without_nulls({
+                "frame": self.int_frame(entry.get("frame")),
+                "event_object_id": object_id,
+                "message_ids": message_ids,
+                "speaker_hint": speaker_hint,
+                "text": text[:180],
+            }))
+
+        participant_rows = sorted(
+            participants.values(),
+            key=lambda item: (-int(item.get("_latest_index") or 0), -int(item.get("dialog_turns") or 0)),
+        )[:8]
+        participant_rows = [
+            self.without_nulls({key: value for key, value in item.items() if key != "_latest_index"})
+            for item in participant_rows
+        ]
+
+        def sample_key(item: dict) -> str:
+            return json.dumps({
+                key: item.get(key)
+                for key in ("event_object_id", "message_ids", "speaker_hint", "text")
+            }, ensure_ascii=False, sort_keys=True)
+
+        selected_keys = set()
+        latest_reversed = []
+        for item in reversed(samples):
+            key = sample_key(item)
+            if key in selected_keys:
+                continue
+            latest_reversed.append(item)
+            selected_keys.add(key)
+            if len(latest_reversed) == 3:
+                break
+        latest = list(reversed(latest_reversed))
+        return {
+            "dialog_turns_total": len(matching),
+            "speaker_hint_is_metadata": True,
+            "participants": participant_rows,
+            "samples": {"latest": latest},
         }
-        destination = (
-            transition.get("destination_exploration")
-            if isinstance(transition.get("destination_exploration"), dict)
-            else {}
-        )
-        compact["destination_exploration"] = self.compact_room_exploration_summary(destination)
-        for key in ("unconfirmed_destination", "agent_priority", "deprioritize_reason"):
-            if key in transition:
-                compact[key] = transition.get(key)
-        return compact
 
     def agent_room_memory(self, room_id: str | None, state: dict) -> dict:
         exploration = self.room_exploration_summary(room_id, state)
@@ -7252,19 +7459,47 @@ class DebugState:
             or transitions.get("from_room_id")
             or exploration.get("room_id")
         )
-        items = [
-            self.compact_room_transition(transition)
+        with self.exploration_lock:
+            data = self.read_exploration()
+        outgoing = [
+            self.compact_agent_room_transition(transition, direction="outgoing", data=data)
             for transition in transitions.get("transitions") or []
             if isinstance(transition, dict)
         ]
+        incoming = []
+        stored_transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
+        for by_room in stored_transitions.values():
+            if not isinstance(by_room, dict):
+                continue
+            for stored_key, transition in by_room.items():
+                if not isinstance(transition, dict):
+                    continue
+                destination = transition.get("to_logical_room_id") or transition.get("to_room_id")
+                if destination != resolved_room_id:
+                    continue
+                if transition.get("confirmation") not in {"native_trigger", "human_confirmed"}:
+                    continue
+                incoming.append(self.compact_agent_room_transition(
+                    {"transition_key": str(stored_key), **transition},
+                    direction="incoming",
+                    data=data,
+                ))
+        incoming.sort(key=lambda item: (str(item.get("from_room_id") or ""), str(item.get("transition_key") or "")))
+        memo = self.room_memo(resolved_room_id)
+        compact_memo = (
+            {key: memo.get(key) for key in ("text", "source")}
+            if isinstance(memo, dict)
+            else None
+        )
         return {
             "ok": True,
-            "memo": self.room_memo(resolved_room_id),
-            "exploration": self.compact_room_exploration_summary(exploration),
+            "room_id": resolved_room_id,
+            "memo": compact_memo,
+            "exploration": self.agent_room_exploration_counts(exploration),
+            "semantic_evidence": self.room_dialog_semantic_evidence(resolved_room_id),
             "transitions": {
-                "from_room_id": resolved_room_id,
-                "total": len(items),
-                "items": items,
+                "outgoing": outgoing,
+                "incoming": incoming,
             },
         }
 
@@ -7273,10 +7508,25 @@ class DebugState:
         self.attach_logical_room_fields(state)
         identity = self.room_identity(state)
         room_id = identity.get("id") if isinstance(identity, dict) else None
+        with self.exploration_lock:
+            data = self.read_exploration()
+        room_memos = data.get("room_memos") if isinstance(data.get("room_memos"), dict) else {}
+        recent_memos = sorted(
+            (
+                dict(memo)
+                for memo_room_id, memo in room_memos.items()
+                if memo_room_id != room_id and isinstance(memo, dict)
+            ),
+            key=lambda memo: (
+                -float(memo.get("created_at") or 0),
+                str(memo.get("room_id") or ""),
+            ),
+        )[:5]
         return {
             "ok": True,
             "room_id": room_id,
             "memo": self.room_memo(room_id),
+            "recent_memos": recent_memos,
         }
 
     def goal_nodes(self, state: dict, grid: dict, target: dict) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int]]:
@@ -10194,6 +10444,7 @@ class DebugState:
                         "创建或更新本地 agent 任务记忆，不执行游戏动作。已有 id 会更新；未知自选 id 或省略 id 的创建必须先完整读取 "
                         "closed-inclusive summary 账本，并在后一模型批次提供最终页 review_token。省略 id 创建时自动生成 task-* id。"
                         "对已有 id 不提供变化字段表示明确确认继续，也会刷新该任务的证据审计快照。"
+                        "新增或改变非空 room_id 前，必须在同一工具周期查询该房间的 get_room_memory。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -10397,9 +10648,9 @@ class DebugState:
                 "function": {
                     "name": "get_room_memory",
                     "description": (
-                        "返回当前或指定房间的 memo 和紧凑探索摘要；"
-                        "room_id 接受任意稳定 logical_room_id，transitions.items 只列该房间已确认的有向出边。"
-                        "从目标房间看到的出边不得伪造成反向可走路线，只能作为相邻房间的调查线索。"
+                        "返回当前或指定稳定 logical_room_id 的 memo、紧凑探索摘要、房间级对话原始证据，"
+                        "以及明确分向的 transitions.outgoing/incoming。incoming 只含真实持久化的已确认有向记录；"
+                        "speaker_hint 只是元数据，任何边都不得伪造成反向可走路线。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -10591,6 +10842,9 @@ class DebugState:
         arguments = arguments if isinstance(arguments, dict) else {}
         state = state or self.read_live_state()
         if name == "upsert_task":
+            room_review_error = self.task_room_memory_review_error(arguments, tool_cycle)
+            if room_review_error is not None:
+                return room_review_error
             reconciliation_pending = self.agent_runtime.task_reconciliation_pending()
             result = self.upsert_agent_task(arguments, tool_cycle, state)
             if result.get("ok") and isinstance(tool_cycle, dict):
@@ -10760,7 +11014,13 @@ class DebugState:
         if name == "get_room_memory":
             room_id = arguments.get("room_id")
             room_id = str(room_id) if room_id is not None else None
-            return self.agent_room_memory(room_id, state)
+            result = self.agent_room_memory(room_id, state)
+            resolved_room_id = result.get("room_id")
+            if isinstance(tool_cycle, dict) and isinstance(resolved_room_id, str) and resolved_room_id:
+                queried = tool_cycle.setdefault("room_memory_queried_ids", [])
+                if resolved_room_id not in queried:
+                    queried.append(resolved_room_id)
+            return result
         if name == "get_tool_output":
             return self.agent_runtime.get_tool_output(
                 arguments.get("output_ref"),
@@ -11066,8 +11326,11 @@ class DebugState:
             "任务是 agent 从对话和事件推断的记忆，不是引擎事实；结构化任务账本是任务状态的唯一权威来源，压缩摘要不是。"
             "自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
             "任何尚未解决、将影响未来行动的委托、线索或自发调查目标都必须成为独立 task，不要求 NPC 明说请去做；普通且不会影响后续行动的探索不必为每个对象创建 task。"
-            "room_memo 只是可能过期的地点语义注释和普通 companion 数据，不是引擎事实；发现冲突时用 upsert_room_memo 更新或清除。"
-            "不要在 memo 重复结构化探索、背包内容或临时坐标，也不要用 memo 代替行动相关线索的独立 task、task inbox 审查或 task reconciliation。"
+            "room_memo 只是可能过期的地点语义注释和普通 companion 数据，不是引擎事实，也不得覆盖 native transition、房间范围对话或 human-confirmed semantic annotation。"
+            "第一次获得稳定、高置信的地点身份或用途时立即用 upsert_room_memo 写入短 memo；新证据细化或否定地点身份时整体更新或清除。"
+            "memo 只记录地点语义、稳定功能和重要人物关系；不要重复坐标、传送列表、拾取记录或结构化探索，行动相关线索必须保留为独立 task。"
+            "根据地点语义比较候选入口，或准备给 task 新增、改变非空 room_id 时，必须先查询每个候选房间的 get_room_memory；证据不足则保持 task 未绑定房间。"
+            "不要用 memo 代替 task inbox 审查或 task reconciliation。"
             "发现、调整、完成或作废任务时调用 upsert_task，不要仅凭时间自动关闭任务。创建未知 id 或无 id 任务前，必须在前一模型批次完整分页读取 include_closed=true、detail=summary 的账本，"
             "并使用最终页 review_token；只查 active、漏页、账本 revision 变化或同批并行 get_tasks+upsert_task 都不能创建。"
             "若审计发现语义等价的 completed/abandoned 任务，不得创建新 id；确有新证据要求重开则更新原 id，只有不同剧情阶段才创建后继任务并在 rationale 注明前序 id。"

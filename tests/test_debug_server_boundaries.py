@@ -190,6 +190,45 @@ def test_http_handler_serves_only_confirmed_current_room_transitions(http_server
     assert payload["known_transitions_by_object"] == {}
 
 
+def test_http_handler_exposes_confirmed_intra_room_transition_endpoints(http_server):
+    base_url, debug = http_server
+    portal_47 = {
+        "id": 47, "x": 48, "y": 8, "sprite_id": 0, "state": 1,
+        "trigger_mode": 4, "trigger_script": 4701, "auto_script": 0,
+        "blocking": False, "interactable": True,
+    }
+    portal_48 = {**portal_47, "id": 48, "x": 32, "y": 0, "trigger_script": 4801}
+    state = make_state(objects=[portal_47, portal_48], frame=8)
+    identity = debug.room_identity(state)
+    edge_47 = debug.record_transition_destination(
+        identity, 47, identity, from_object=portal_47, from_state=state, to_state=state,
+        confirmation="native_trigger", intra_room_transition=True,
+        native_destination={"x": 32, "y": 0},
+    )
+    edge_48 = debug.record_transition_destination(
+        identity, 48, identity, from_object=portal_48, from_state=state, to_state=state,
+        confirmation="native_trigger", intra_room_transition=True,
+        native_destination={"x": 48, "y": 8},
+    )
+    write_state(debug, state)
+
+    status, _, raw = http_request(base_url, "/navigation/transitions")
+    payload = json.loads(raw)
+    by_object = {row["object_id"]: row for row in payload["transitions"]}
+
+    assert status == 200
+    assert by_object[47]["source_endpoint"]["transition_key"] == edge_47["transition_key"]
+    assert by_object[47]["destination_endpoint"] == {
+        "kind": "confirmed_transition_source",
+        "transition_key": edge_48["transition_key"],
+        "object_id": 48,
+        "position": {"x": 32, "y": 0},
+    }
+    assert by_object[48]["destination_endpoint"]["object_id"] == 47
+    assert b"from_location_id" not in raw
+    assert b"to_subregion_id" not in raw
+
+
 def test_http_handler_deletes_checkpoints_and_reports_missing(http_server):
     base_url, debug = http_server
     checkpoint_dir = debug.checkpoint_dir("cp1")
@@ -329,16 +368,29 @@ def test_http_handler_exposes_current_room_memo_read_only(http_server):
         {"room_id": room_id, "text": "A quiet room above the inn."},
         state,
     )
+    recent_room_ids = [f"S1/M1:{index:012X}" for index in range(1, 7)]
+    for index, recent_room_id in enumerate(recent_room_ids, start=1):
+        debug.run_agent_tool(
+            "upsert_room_memo",
+            {"room_id": recent_room_id, "text": f"Recent memo {index}."},
+            state,
+        )
+    data = debug.read_exploration()
+    for index, recent_room_id in enumerate(recent_room_ids, start=1):
+        data["room_memos"][recent_room_id]["created_at"] = float(index)
+    debug.write_exploration(data)
 
     status, _, raw = http_request(base_url, "/agent/room-memo")
     payload = json.loads(raw)
 
     assert status == 200
-    assert payload == {
-        "ok": True,
-        "room_id": room_id,
-        "memo": created["memo"],
-    }
+    assert payload["ok"] is True
+    assert payload["room_id"] == room_id
+    assert payload["memo"] == created["memo"]
+    assert [memo["room_id"] for memo in payload["recent_memos"]] == list(reversed(recent_room_ids[1:]))
+    assert [memo["text"] for memo in payload["recent_memos"]] == [
+        "Recent memo 6.", "Recent memo 5.", "Recent memo 4.", "Recent memo 3.", "Recent memo 2.",
+    ]
 
 
 def test_http_handler_exposes_structured_shop_actions(http_server):

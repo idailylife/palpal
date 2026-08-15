@@ -235,6 +235,41 @@ def test_dialog_event_stream_splits_when_speaker_changes(tmp_path):
     assert [record['dialogs'][0]['speaker_hint'] for record in pending] == ['李大娘', '李逍遥']
 
 
+def test_dialog_event_does_not_inherit_speaker_from_previous_event_object(tmp_path):
+    debug = make_debug_state(tmp_path)
+    azhu = make_state(frame=171108)
+    azhu['scene_id'] = 4
+    azhu['map_id'] = 1
+    azhu['dialog'] = {'events': [
+        {'sequence': 355, 'frame': 171108, 'scene_id': 4, 'map_id': 1,
+         'message_id': 842, 'event_object_id': 88, 'speaker_hint': '阿珠',
+         'text': '咕．．咕．．'},
+        {'sequence': 356, 'frame': 171108, 'scene_id': 4, 'map_id': 1,
+         'message_id': 843, 'event_object_id': 88, 'speaker_hint': '阿珠',
+         'text': '快快吃，快快長大喔．．'},
+    ]}
+    titleless = make_state(frame=171730)
+    titleless['scene_id'] = 8
+    titleless['map_id'] = 11
+    titleless['dialog'] = {'events': [
+        {'sequence': 357, 'frame': 171730, 'scene_id': 8, 'map_id': 11,
+         'message_id': 1821, 'event_object_id': 181, 'speaker_hint': None,
+         'text': '這孩子又不知跑到哪裡玩去了'},
+        {'sequence': 358, 'frame': 171730, 'scene_id': 8, 'map_id': 11,
+         'message_id': 1822, 'event_object_id': 181, 'speaker_hint': None,
+         'text': '這麼晚了還不知道要回來'},
+    ]}
+
+    debug.record_dialog_event(azhu)
+    debug.record_dialog_event(titleless)
+
+    assert len(debug.dialog_history) == 2
+    assert [entry['event_object_id'] for entry in debug.dialog_history] == [88, 181]
+    assert [entry['speaker_hint'] for entry in debug.dialog_history] == ['阿珠', None]
+    assert debug.dialog_history[1]['message_ids'] == [1821, 1822]
+    assert debug.dialog_history[1]['text'] == '這孩子又不知跑到哪裡玩去了這麼晚了還不知道要回來'
+
+
 def test_task_inbox_keeps_new_speaker_goal_separate_inside_one_trigger_script(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state()

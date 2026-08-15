@@ -1897,11 +1897,10 @@ def test_sdk_adapter_uses_streaming_tools_sqlite_and_buffering(tmp_path, monkeyp
     assert "finish the game" not in captured["agent"]["instructions"].lower()
     assert captured["sqlite"] == (runtime.snapshot()["session_id"], runtime.sqlite_path)
     assert captured["run"]["session"].__class__ is SQLiteSession
-    assert captured["run"]["max_turns"] == 8
+    assert captured["run"]["max_turns"] == 16
     assert captured["tracing"] == {"disabled": True}
     assert result["usage"]["total_tokens"] == 22
     assert runtime.snapshot()["last_prompt_tokens"] == 11
-
 
 def test_last_prompt_tokens_uses_single_request_usage_only_as_exact_fallback():
     single = type("Usage", (), {

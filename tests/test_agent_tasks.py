@@ -106,14 +106,68 @@ def test_task_upsert_accepts_stable_custom_id_and_does_not_duplicate_on_update(t
     assert created["operation"] == "created"
     assert created["task"]["id"] == "buy_shrimp"
 
+    cycle = debug.new_agent_tool_cycle()
+    debug.run_agent_tool(
+        "get_room_memory", {"room_id": "S3/M99:000000000001"}, tool_cycle=cycle,
+    )
     updated = debug.run_agent_tool("upsert_task", {
         "id": "buy_shrimp",
         "priority": 8,
         "room_id": "S3/M99:000000000001",
-    })
+    }, tool_cycle=cycle)
     assert updated["operation"] == "updated"
     assert updated["task"]["priority"] == 8
     assert list(debug.read_exploration()["tasks"]) == ["buy_shrimp"]
+
+
+def test_task_room_binding_requires_same_cycle_room_memory_review(tmp_path):
+    debug = make_debug_state(tmp_path)
+    task = create_agent_task(debug, {
+        "id": "find-inn", "description": "Find the inn", "rationale": "Need a room.",
+    })["task"]
+    room_id = "S3/M10:000000000001"
+    baseline = debug.read_exploration()["tasks"][task["id"]].copy()
+
+    cycle = debug.new_agent_tool_cycle()
+    blocked = debug.run_agent_tool(
+        "upsert_task", {"id": task["id"], "room_id": room_id}, tool_cycle=cycle,
+    )
+    assert blocked["error"]["code"] == "room_memory_review_required"
+    assert blocked["error"]["room_id"] == room_id
+    assert debug.read_exploration()["tasks"][task["id"]] == baseline
+
+    debug.run_agent_tool("get_room_memory", {"room_id": room_id}, tool_cycle=cycle)
+    bound = debug.run_agent_tool(
+        "upsert_task", {"id": task["id"], "room_id": room_id}, tool_cycle=cycle,
+    )
+    assert bound["ok"] is True
+    unchanged = debug.run_agent_tool(
+        "upsert_task", {"id": task["id"], "room_id": room_id},
+        tool_cycle=debug.new_agent_tool_cycle(),
+    )
+    assert unchanged["ok"] is True
+    cleared = debug.run_agent_tool(
+        "upsert_task", {"id": task["id"], "room_id": None},
+        tool_cycle=debug.new_agent_tool_cycle(),
+    )
+    assert cleared["ok"] is True
+
+    no_room = create_agent_task(debug, {
+        "id": "unbound", "description": "Keep looking", "rationale": "No room evidence.",
+    })
+    assert no_room["ok"] is True
+
+    creation_cycle = debug.new_agent_tool_cycle()
+    audit = debug.run_agent_tool(
+        "get_tasks", {"include_closed": True, "detail": "summary", "limit": 100},
+        tool_cycle=creation_cycle,
+    )
+    blocked_creation = debug.run_agent_tool("upsert_task", {
+        "id": "new-bound", "description": "Go there", "rationale": "Candidate location.",
+        "room_id": room_id, "review_token": audit["review_token"],
+    }, tool_cycle=creation_cycle)
+    assert blocked_creation["error"]["code"] == "room_memory_review_required"
+    assert "new-bound" not in debug.read_exploration()["tasks"]
 
 
 def test_unchanged_upsert_explicitly_reviews_task_and_refreshes_snapshot(tmp_path):
