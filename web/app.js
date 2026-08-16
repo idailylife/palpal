@@ -74,6 +74,11 @@ let navigationRetryIndex = 0;
 let navigationRetryDueAt = null;
 let navigationRetryRemainingMs = null;
 let navigationFailureWarned = false;
+let agentNavigationResult = null;
+let agentNavigationBase = null;
+let agentNavigationBaseEnvironmentKey = null;
+let latestLightweightNavigation = null;
+let latestLightweightNavigationEnvironmentKey = null;
 let explorationRenderKey = null;
 let summaryRenderKey = null;
 let dialogsRenderKey = null;
@@ -350,8 +355,73 @@ function navigationCanRefresh(state) {
     state?._navigation &&
     state._navigation.status !== "no_nav_grid" &&
     state?.control?.navigation_ready === true &&
-    !state?._debug?.runtime_stale
+    !state?._debug?.runtime_stale &&
+    !sessionRunning()
   );
+}
+
+function agentNavigationFromEvent(event) {
+  if (
+    event?.type !== "tool"
+    || event.phase !== "completed"
+    || event.details?.name !== "get_navigation"
+  ) {
+    return null;
+  }
+  const navigation = event.details?.result?.navigation;
+  if (!navigation || typeof navigation !== "object") return null;
+  return {
+    sessionId: event.session_id,
+    seq: Number(event.seq || 0),
+    navigation,
+  };
+}
+
+function restoreAgentNavigationResult() {
+  agentNavigationResult = null;
+  for (let index = agentSessionEvents.length - 1; index >= 0; index -= 1) {
+    const candidate = agentNavigationFromEvent(agentSessionEvents[index]);
+    if (candidate) {
+      agentNavigationResult = candidate;
+      break;
+    }
+  }
+}
+
+function applyAgentNavigation(state, environmentKey = navigationEnvironmentKey(state)) {
+  if (!sessionRunning()) return;
+  const navigation = agentNavigationResult?.navigation;
+  if (
+    agentNavigationResult?.sessionId !== agentSession?.session_id
+    || navigation?.environment_key !== environmentKey
+  ) {
+    return;
+  }
+  const resultsById = new Map(
+    (navigation.targets || []).map((target) => [Number(target.id || 0), target])
+  );
+  const base = agentNavigationBaseEnvironmentKey === environmentKey
+    ? agentNavigationBase
+    : state._navigation;
+  state._navigation = {
+    ...base,
+    status: navigation.status,
+    environment_key: navigation.environment_key,
+    targets: (base?.targets || []).map((target) => {
+      const result = resultsById.get(Number(target.id || 0));
+      return result ? { ...target, ...result } : { ...target, status: "pending" };
+    }),
+  };
+}
+
+function clearAgentNavigationLayer() {
+  agentNavigationResult = null;
+  if (latestState && agentNavigationBase) latestState._navigation = agentNavigationBase;
+  agentNavigationBase = null;
+  agentNavigationBaseEnvironmentKey = null;
+  navigationEnvironmentChangedAt = performance.now();
+  navigationStableEnvironmentKey = null;
+  resetNavigationRefreshRetry();
 }
 
 function navigationFullReady(state) {
@@ -687,7 +757,9 @@ function explorationStatusText(status) {
     state_stale: "stale",
     in_battle: "battle",
     in_dialog: "dialog",
+    in_choice: "choice",
     interrupted_by_dialog: "dialog interrupted",
+    interrupted_by_choice: "choice interrupted",
     interrupted_by_battle: "battle interrupted",
     interrupted_by_room_change: "room changed",
     interrupted_not_in_main_game: "runtime interrupted",
@@ -2062,8 +2134,8 @@ async function refreshNavigationForKey(requestKey) {
     }
     const navigation = await response.json();
     const returnedKey = navigation.environment_key;
-    cacheNavigation(returnedKey, navigation);
-    if (returnedKey !== requestKey) {
+    if (returnedKey) cacheNavigation(returnedKey, navigation);
+    if (returnedKey && returnedKey !== requestKey) {
       sendNavigationDiagnostic("navigation_key_mismatch", {
         request_key_length: requestKey.length,
         returned_key_length: returnedKey?.length || 0,
@@ -2071,8 +2143,14 @@ async function refreshNavigationForKey(requestKey) {
         returned_key_prefix: returnedKey?.slice(0, 160) || "",
       });
     }
+    if (!returnedKey) {
+      navigationEnvironmentChangedAt = performance.now();
+      navigationStableEnvironmentKey = null;
+    }
     if (
       latestState &&
+      !sessionRunning() &&
+      requestGeneration === navigationRefreshGeneration &&
       returnedKey &&
       returnedKey === navigationStableEnvironmentKey &&
       navigationEnvironmentKey(latestState) === returnedKey
@@ -2407,9 +2485,15 @@ function renderBattle(state) {
 
 function render(state) {
   const navKey = updateNavigationEnvironmentKey(state);
-  const cachedNavigation = getCachedNavigation(navKey);
-  if (cachedNavigation) {
-    state._navigation = cachedNavigation;
+  latestLightweightNavigation = state._navigation;
+  latestLightweightNavigationEnvironmentKey = navKey;
+  if (sessionRunning()) {
+    agentNavigationBase = latestLightweightNavigation;
+    agentNavigationBaseEnvironmentKey = navKey;
+    applyAgentNavigation(state, navKey);
+  } else {
+    const cachedNavigation = getCachedNavigation(navKey);
+    if (cachedNavigation) state._navigation = cachedNavigation;
   }
   latestState = state;
   renderStatusBar(state);
@@ -2486,14 +2570,35 @@ function setAgentSession(nextSession) {
     agentOlderEventsLoading = false;
     agentHistoryExpanded = false;
     agentUnread = 0;
+    agentNavigationResult = null;
+  }
+  const running = sessionRunning();
+  if (!wasRunning && running) {
+    if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+    navigationRefreshTimer = null;
+    navigationRefreshInFlightKey = null;
+    navigationRefreshInFlightToken = null;
+    navigationRefreshGeneration += 1;
+    if (latestState) {
+      const environmentKey = navigationEnvironmentKey(latestState);
+      agentNavigationBase = latestLightweightNavigationEnvironmentKey === environmentKey
+        ? latestLightweightNavigation
+        : latestState._navigation;
+      agentNavigationBaseEnvironmentKey = environmentKey;
+      latestState._navigation = agentNavigationBase;
+      applyAgentNavigation(latestState, agentNavigationBaseEnvironmentKey);
+    }
+  } else if (wasRunning && !running) {
+    clearAgentNavigationLayer();
   }
   renderStatusBar();
-  if (latestState && wasRunning !== sessionRunning()) {
+  if (latestState && wasRunning !== running) {
     renderCheckpoints(latestState);
     renderFastDialogButton(latestState);
     renderInventory(latestState);
     renderNavigation(latestState);
     updateExternalControls(latestState);
+    if (!running) scheduleNavigationRefresh(latestState);
   }
   return changed;
 }
@@ -2538,6 +2643,18 @@ async function loadLatestAgentEvents() {
   agentOldestTurn = result.oldest_turn == null ? null : Number(result.oldest_turn);
   agentHistoryExpanded = false;
   agentEventSeq = agentSessionEvents.reduce((value, event) => Math.max(value, Number(event.seq || 0)), 0);
+  restoreAgentNavigationResult();
+  if (latestState && sessionRunning()) {
+    if (agentNavigationBaseEnvironmentKey !== navigationEnvironmentKey(latestState)) {
+      agentNavigationBase = latestState._navigation;
+      agentNavigationBaseEnvironmentKey = navigationEnvironmentKey(latestState);
+    }
+    latestState._navigation = agentNavigationBase;
+    applyAgentNavigation(latestState, agentNavigationBaseEnvironmentKey);
+    renderNavigation(latestState);
+    renderObjects(latestState);
+    drawOverlay(latestState);
+  }
   agentTimelineRenderKey = null;
   return true;
 }
@@ -2618,6 +2735,14 @@ function renderAgentSession() {
   const session = agentSession || latestState?._debug?.agent_session || {};
   const usage = session.usage || {};
   const lastUsage = session.last_request_usage || {};
+  const providerUsage = session.provider_usage || {};
+  const providerScopes = Object.values(providerUsage.scopes || {});
+  const trackedTokens = providerScopes.reduce((sum, scope) => sum + Number(scope?.total_tokens || 0), 0);
+  const trackedInput = providerScopes.reduce((sum, scope) => sum + Number(scope?.input_tokens || 0), 0);
+  const trackedCached = providerScopes.reduce((sum, scope) => sum + Number(scope?.cached_tokens || 0), 0);
+  const usageDetailsComplete = providerScopes.length > 0 && providerScopes.every((scope) => scope?.details_complete === true);
+  const cacheRate = trackedInput > 0 ? `${(trackedCached * 100 / trackedInput).toFixed(1)}%${usageDetailsComplete ? "" : " · partial"}` : "-";
+  const providerLast = providerUsage.last_request || {};
   const lastCompaction = session.last_compaction || null;
   const running = ["running", "interrupting"].includes(session.status);
   const pending = Boolean(session.pending_decision);
@@ -2631,6 +2756,7 @@ function renderAgentSession() {
     session.run_turn,
     session.max_turns,
     usage.total_tokens,
+    providerUsage,
     lastUsage.total_tokens,
     session.last_prompt_tokens,
     lastCompaction,
@@ -2650,8 +2776,11 @@ function renderAgentSession() {
         <div><dt>Model</dt><dd>${escapeHtml(session.model || "-")}</dd></div>
         <div><dt>Turn</dt><dd>${Number(session.turn || 0)}</dd></div>
         <div><dt>Run</dt><dd>${Number(session.run_turn || 0)}/${Number(session.max_turns || agentMaxTurns)}</dd></div>
-        <div><dt>Billed</dt><dd>${Number(usage.total_tokens || 0).toLocaleString()}</dd></div>
+        <div><dt>Tracked tokens</dt><dd>${Number(trackedTokens || usage.total_tokens || 0).toLocaleString()}${providerUsage.incomplete_before_tracking ? " · partial" : ""}</dd></div>
         <div><dt>Last run</dt><dd>${Number(lastUsage.total_tokens || 0).toLocaleString()}</dd></div>
+        <div><dt>Tracking since</dt><dd>${escapeHtml(providerUsage.tracking_started_at || "-")}</dd></div>
+        <div><dt>Cache rate</dt><dd>${escapeHtml(cacheRate)}</dd></div>
+        <div><dt>Last request</dt><dd>${escapeHtml(providerLast.scope || "-")}${providerLast.total_tokens == null ? "" : ` · ${Number(providerLast.total_tokens).toLocaleString()}`}</dd></div>
         <div><dt>Last prompt</dt><dd>${session.last_prompt_tokens == null ? "-" : Number(session.last_prompt_tokens).toLocaleString()}</dd></div>
         <div><dt>Last compact</dt><dd>${lastCompaction ? `${Number(lastCompaction.trigger_prompt_tokens || 0).toLocaleString()} → ~${Number(lastCompaction.replacement_estimated_tokens || 0).toLocaleString()} · ${Number(lastCompaction.retained_cycles || 0)} cycle${Number(lastCompaction.retained_cycles || 0) === 1 ? "" : "s"}` : "-"}</dd></div>
         <div><dt>Compactions</dt><dd>${Number(session.compactions || 0)}</dd></div>
@@ -3102,6 +3231,17 @@ const agentEventChannel = createReconnectChannel("agent", {
     if (event.session_id !== agentSession?.session_id || Number(event.seq || 0) <= agentEventSeq) return;
     agentEventSeq = Number(event.seq || agentEventSeq);
     agentSessionEvents.push(event);
+    const navigationResult = agentNavigationFromEvent(event);
+    if (navigationResult) {
+      agentNavigationResult = navigationResult;
+      if (latestState && sessionRunning()) {
+        latestState._navigation = agentNavigationBase || latestState._navigation;
+        applyAgentNavigation(latestState);
+        renderNavigation(latestState);
+        renderObjects(latestState);
+        drawOverlay(latestState);
+      }
+    }
     if (!agentHistoryExpanded) trimAgentTimelineToLatestTurns();
     const nearBottom = agentTimelineEl.scrollHeight - agentTimelineEl.scrollTop - agentTimelineEl.clientHeight < 60;
     if (selectedStateTab !== "agent" || !nearBottom) agentUnread += 1;

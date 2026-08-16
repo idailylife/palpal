@@ -14,6 +14,7 @@ from palpal.agent_runtime import (
     TOOL_OUTPUT_PRESSURE_TARGET_TOKENS,
     AgentRuntime,
     ReplanRequired,
+    ToolOutputInputFilter,
 )
 
 
@@ -58,6 +59,111 @@ def wait_for_pause(runtime, timeout=3):
             return runtime.snapshot()
         time.sleep(0.02)
     raise AssertionError("agent runtime did not pause")
+
+
+def provider_usage(input_tokens, cached_tokens, output_tokens, reasoning_tokens):
+    details_in = types.SimpleNamespace(cached_tokens=cached_tokens)
+    details_out = types.SimpleNamespace(reasoning_tokens=reasoning_tokens)
+    entry = types.SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        input_tokens_details=details_in,
+        output_tokens_details=details_out,
+    )
+    return types.SimpleNamespace(
+        requests=1,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        request_usage_entries=[entry],
+    )
+
+
+def test_provider_usage_aggregates_scopes_and_keeps_main_last_prompt(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    runtime._record_provider_usage(
+        provider_usage(100, 40, 20, 7), "main_decision", update_last_prompt=True,
+    )
+    runtime._record_provider_usage(provider_usage(30, 10, 5, 2), "battle")
+    runtime._record_provider_usage(provider_usage(12, 0, 3, 1), "compaction")
+
+    state = runtime.snapshot()
+    tracked = state["provider_usage"]
+    assert tracked["scopes"]["main_decision"] == {
+        "requests": 1, "input_tokens": 100, "cached_tokens": 40,
+        "output_tokens": 20, "reasoning_tokens": 7, "total_tokens": 120,
+        "details_complete": True,
+    }
+    assert tracked["scopes"]["battle"]["total_tokens"] == 35
+    assert tracked["scopes"]["compaction"]["reasoning_tokens"] == 1
+    assert tracked["last_request"]["scope"] == "compaction"
+    assert state["last_prompt_tokens"] == 100
+    usage_events = [event for event in runtime.events(limit=20) if event["type"] == "usage"]
+    assert [event["details"]["scope"] for event in usage_events] == [
+        "main_decision", "battle", "compaction",
+    ]
+
+
+def test_provider_usage_marks_missing_details_partial_and_legacy_history_incomplete(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    bare = types.SimpleNamespace(
+        requests=1, input_tokens=10, output_tokens=2, total_tokens=12,
+        request_usage_entries=[types.SimpleNamespace(
+            input_tokens=10, output_tokens=2, total_tokens=12,
+            input_tokens_details=None, output_tokens_details=None,
+        )],
+    )
+    runtime._record_provider_usage(bare, "main_decision")
+    assert runtime.snapshot()["provider_usage"]["scopes"]["main_decision"]["details_complete"] is False
+
+    legacy = runtime.snapshot()
+    legacy.pop("provider_usage")
+    legacy["turn"] = 3
+    runtime._atomic_json(runtime.control_path, legacy)
+    runtime.state = runtime._load_or_create()
+    assert runtime.snapshot()["provider_usage"]["incomplete_before_tracking"] is True
+
+
+def test_tool_input_filter_shows_parallel_batch_once_then_stable_previews(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    input_filter = ToolOutputInputFilter(runtime, {"old"})
+    large_a = json.dumps({"ok": True, "id": "a", "data": "甲" * 2500}, ensure_ascii=False)
+    large_b = json.dumps({"ok": True, "id": "b", "data": "乙" * 2500}, ensure_ascii=False)
+
+    class ModelInputData:
+        def __init__(self, input, instructions):
+            self.input = input
+            self.instructions = instructions
+
+    def apply(items):
+        data = types.SimpleNamespace(model_data=ModelInputData(items, "system"))
+        return input_filter(data).input
+
+    first = apply([
+        {"type": "function_call_output", "call_id": "new-a", "output": large_a},
+        {"type": "function_call_output", "call_id": "new-b", "output": large_b},
+    ])
+    assert [item["output"] for item in first] == [large_a, large_b]
+    second = apply([
+        {"type": "function_call_output", "call_id": "new-a", "output": large_a},
+        {"type": "function_call_output", "call_id": "new-b", "output": large_b},
+    ])
+    previews = [json.loads(item["output"]) for item in second]
+    assert all(value["archived"] is True for value in previews)
+    assert all(len(value["head"]) == 500 and len(value["tail"]) == 500 for value in previews)
+    refs = [value["output_ref"] for value in previews]
+    third = apply([
+        {"type": "function_call_output", "call_id": "new-a", "output": large_a},
+        {"type": "function_call_output", "call_id": "new-b", "output": large_b},
+    ])
+    assert [json.loads(item["output"])["output_ref"] for item in third] == refs
+
+    session = MemorySession([
+        {"type": "function_call_output", "call_id": "new-a", "output": large_a},
+    ])
+    asyncio.run(runtime._sanitize_sdk_session(session, input_filter=input_filter))
+    assert json.loads(session.items[0]["output"])["output_ref"] == refs[0]
 
 
 def test_old_control_goal_is_silently_removed(tmp_path):
@@ -1847,6 +1953,30 @@ def test_context_compression_replacement_failure_restores_transcript_and_state(t
     assert runtime.snapshot()["task_reconciliation_pending"] is False
 
 
+def test_failed_context_summary_records_usage_without_replacing_transcript(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    original = [{"role": "user", "content": str(index)} for index in range(8)]
+    session = MemorySession(original)
+
+    class Responses:
+        async def create(self, **_kwargs):
+            return type("Response", (), {
+                "status": "failed", "output_text": None,
+                "usage": provider_usage(25, 8, 4, 1),
+            })()
+
+    runtime.state["last_prompt_tokens"] = 1000
+    client = type("Client", (), {"responses": Responses()})()
+    with pytest.raises(RuntimeError, match="response status was failed"):
+        asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
+    assert session.items == original
+    assert runtime.snapshot()["last_prompt_tokens"] == 1000
+    compact_usage = runtime.snapshot()["provider_usage"]["scopes"]["compaction"]
+    assert compact_usage["requests"] == 1
+    assert compact_usage["input_tokens"] == 25
+
+
 def test_context_compression_waits_for_next_turn_exact_prompt_threshold(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -1867,7 +1997,10 @@ def test_context_compression_waits_for_next_turn_exact_prompt_threshold(tmp_path
         def __init__(self): self.calls = 0
         async def create(self, **_kwargs):
             self.calls += 1
-            return type("Response", (), {"status": "completed", "output_text": "summary"})()
+            return type("Response", (), {
+                "status": "completed", "output_text": "summary",
+                "usage": provider_usage(20, 4, 5, 2),
+            })()
 
     responses = Responses()
     client = type("Client", (), {"responses": responses})()
@@ -1881,6 +2014,9 @@ def test_context_compression_waits_for_next_turn_exact_prompt_threshold(tmp_path
     asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
     assert responses.calls == 1
     assert runtime.snapshot()["last_prompt_tokens"] is None
+    compact_usage = runtime.snapshot()["provider_usage"]["scopes"]["compaction"]
+    assert compact_usage["requests"] == 1
+    assert compact_usage["cached_tokens"] == 4
 
 
 def test_context_compaction_threshold_defaults_and_invalid_values(tmp_path, monkeypatch):
@@ -1965,8 +2101,16 @@ def test_sdk_responses_adapter_uses_streaming_tools_and_sqlite(tmp_path, monkeyp
                 "output_tokens": 4,
                 "total_tokens": 22,
                 "request_usage_entries": [
-                    type("RequestUsage", (), {"input_tokens": 7})(),
-                    type("RequestUsage", (), {"input_tokens": 11})(),
+                    type("RequestUsage", (), {
+                        "input_tokens": 7, "output_tokens": 1, "total_tokens": 8,
+                        "input_tokens_details": types.SimpleNamespace(cached_tokens=2),
+                        "output_tokens_details": types.SimpleNamespace(reasoning_tokens=1),
+                    })(),
+                    type("RequestUsage", (), {
+                        "input_tokens": 11, "output_tokens": 3, "total_tokens": 14,
+                        "input_tokens_details": types.SimpleNamespace(cached_tokens=5),
+                        "output_tokens_details": types.SimpleNamespace(reasoning_tokens=2),
+                    })(),
                 ],
             })()
         })()
@@ -2029,9 +2173,14 @@ def test_sdk_responses_adapter_uses_streaming_tools_and_sqlite(tmp_path, monkeyp
     assert captured["sqlite"] == (runtime.snapshot()["session_id"], runtime.sqlite_path)
     assert captured["run"]["session"].__class__ is SQLiteSession
     assert captured["run"]["max_turns"] == 16
+    assert isinstance(captured["run"]["run_config"].call_model_input_filter, ToolOutputInputFilter)
     assert captured["tracing"] == {"disabled": True}
     assert result["usage"]["total_tokens"] == 22
     assert runtime.snapshot()["last_prompt_tokens"] == 11
+    tracked = runtime.snapshot()["provider_usage"]["scopes"]["main_decision"]
+    assert tracked["requests"] == 2
+    assert tracked["cached_tokens"] == 7
+    assert tracked["reasoning_tokens"] == 3
 
 
 def test_sdk_plain_text_end_retries_once_in_same_session_and_requires_submit(tmp_path, monkeypatch):
@@ -2053,12 +2202,14 @@ def test_sdk_plain_text_end_retries_once_in_same_session_and_requires_submit(tmp
         async def add_items(self, _items): pass
 
     class Stream:
-        context_wrapper = None
         final_output = "I will submit later."
 
         def __init__(self, agent, attempt):
             self.agent = agent
             self.attempt = attempt
+            self.context_wrapper = types.SimpleNamespace(
+                usage=provider_usage(10 + attempt, attempt, 2, 1),
+            )
 
         async def stream_events(self):
             if self.attempt == 2:
@@ -2092,7 +2243,12 @@ def test_sdk_plain_text_end_retries_once_in_same_session_and_requires_submit(tmp
     assert result["recommended_intent"] == "advance_dialog"
     assert len(captured["runs"]) == 2
     assert captured["runs"][0]["session"] is captured["runs"][1]["session"]
+    assert captured["runs"][0]["run_config"] is captured["runs"][1]["run_config"]
     assert "without an accepted submit_decision" in captured["runs"][1]["prompt"]
+    tracked = runtime.snapshot()["provider_usage"]["scopes"]["main_decision"]
+    assert tracked["requests"] == 2
+    assert tracked["input_tokens"] == 23
+    assert runtime.snapshot()["last_prompt_tokens"] == 12
     retry = next(event for event in runtime.events() if event["phase"] == "protocol_retry")
     assert retry["details"] == {"api": "responses", "reasoning_effort": "high"}
 
@@ -2281,6 +2437,12 @@ def test_sdk_rejected_submit_returns_to_model_and_recovers_in_same_tool_cycle(tm
     assert captured["calls"] == ["submit_decision", "get_tasks", "upsert_task", "submit_decision"]
     assert len({id(cycle) for cycle in captured["cycles"]}) == 1
     assert result["recommended_action"] == accepted_decision["recommended_action"]
+    decision_events = [event for event in runtime.events() if event["type"] == "decision"]
+    assert [(event["phase"], event["summary"]) for event in decision_events] == [
+        ("rejected", "Recommendation rejected: task_review_required."),
+        ("submitted", "Recommendation submitted."),
+    ]
+    assert decision_events[0]["details"]["result"]["error"]["code"] == "task_review_required"
 
 
 def test_sdk_parallel_task_query_and_create_cannot_bypass_review_result(tmp_path, monkeypatch):
@@ -2801,6 +2963,7 @@ def test_navigation_waits_for_scene_transition_instead_of_failing(tmp_path):
     [
         ("in_battle", "interrupted_by_battle"),
         ("in_shop", "interrupted_by_shop"),
+        ("in_choice", "interrupted_by_choice"),
     ],
 )
 def test_navigation_reports_game_requested_interactions_explicitly(
@@ -2821,6 +2984,73 @@ def test_navigation_reports_game_requested_interactions_explicitly(
     assert result["ok"] is True
     assert result["status"] == expected
     assert result["steps"] == 1
+
+
+def test_obj189_consecutive_confirms_require_two_explicit_model_choices(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state()
+    state_holder = {"value": state}
+    prompts_seen = []
+    executed = []
+
+    def choose(current, _model, _feedback):
+        choice = current.get("choice") or {}
+        if choice.get("active"):
+            prompts_seen.append(choice["prompt"]["text"])
+            option_index = 1 if choice["generation"] == 11 else 0
+            return decision(
+                "choice_select",
+                {"generation": choice["generation"], "option_index": option_index},
+                "select_choice",
+            )
+        return decision("navigation_step", {"id": 189}, "inspect_target")
+
+    def execute(recommendation):
+        action = recommendation["recommended_action"]
+        executed.append((action["tool"], dict(action["args"])))
+        if action["tool"] == "navigation_step":
+            state_holder["value"] = {
+                **state,
+                "choice": {
+                    "active": True,
+                    "generation": 11,
+                    "prompt": {"text": "要聽第一段故事嗎？"},
+                    "options": [{"index": 0, "text": "否"}, {"index": 1, "text": "是"}],
+                },
+            }
+            status = "interrupted_by_choice"
+        elif action["args"]["generation"] == 11:
+            state_holder["value"] = {
+                **state,
+                "choice": {
+                    "active": True,
+                    "generation": 12,
+                    "prompt": {"text": "要聽第二段故事嗎？"},
+                    "options": [{"index": 0, "text": "否"}, {"index": 1, "text": "是"}],
+                },
+            }
+            status = "selected"
+        else:
+            state_holder["value"] = state
+            status = "selected"
+        return {"ok": True, "result": {"status": status}, "delta": {}}
+
+    debug.snapshot = lambda: state_holder["value"]
+    runtime._unsafe_state_reason = lambda _state: None
+    runtime.decision_provider = choose
+    runtime._execute_decision = execute
+
+    runtime.start(None, 3)
+    paused = wait_for_pause(runtime)
+
+    assert paused["stop_reason"] == "turn_limit"
+    assert prompts_seen == ["要聽第一段故事嗎？", "要聽第二段故事嗎？"]
+    assert executed == [
+        ("navigation_step", {"id": 189}),
+        ("choice_select", {"generation": 11, "option_index": 1}),
+        ("choice_select", {"generation": 12, "option_index": 0}),
+    ]
 
 
 def test_navigation_waits_for_pending_transition_observation(tmp_path, monkeypatch):

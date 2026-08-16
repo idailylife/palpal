@@ -984,6 +984,63 @@ def test_choice_writer_uses_generation_and_waits_for_native_result(tmp_path, mon
     assert result["result"]["status"] == "selected"
 
 
+@pytest.mark.parametrize(
+    ("generation", "option_index", "pending", "expected"),
+    [
+        (6, 1, False, "stale_choice_command"),
+        (7, 2, False, "invalid_choice_option"),
+        (7, 1, True, "choice_action_pending"),
+    ],
+)
+def test_choice_writer_rejects_invalid_or_pending_commands(
+    tmp_path, generation, option_index, pending, expected,
+):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "choice": {
+            "active": True,
+            "generation": 7,
+            "selected_index": 0,
+            "command_pending": pending,
+            "options": [{"index": 0, "text": "否"}, {"index": 1, "text": "是"}],
+        },
+    }
+    write_state(debug, state)
+
+    with pytest.raises(RuntimeError, match=expected):
+        debug.write_choice_action(generation, option_index)
+
+    assert not debug.action_path.exists()
+
+
+def test_choice_writer_propagates_native_selection_mismatch(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "choice": {
+            "active": True,
+            "generation": 7,
+            "selected_index": 0,
+            "command_pending": False,
+            "options": [{"index": 0, "text": "否"}, {"index": 1, "text": "是"}],
+        },
+    }
+    write_state(debug, state)
+    monkeypatch.setattr(debug, "wait_for_choice_action_result", lambda *_args: {
+        "ok": False,
+        "action": "choice_select",
+        "generation": 7,
+        "requested_index": 1,
+        "selected_index": 0,
+        "status": "choice_selection_mismatch",
+        "error": "choice_selection_mismatch",
+    })
+
+    with pytest.raises(RuntimeError, match="choice_selection_mismatch"):
+        debug.write_choice_action(7, 1)
+
+
 def test_advance_dialog_continues_through_transient_inactive_gap(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
     snapshots = [

@@ -12,6 +12,7 @@ import select
 import shutil
 import socket
 import struct
+import sys
 import threading
 import time
 import urllib.error
@@ -25,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 from palpal.agent_runtime import AgentRuntime
 from palpal.observations import ObservationCoordinator
+from palpal.screen_inspection import ScreenInspector, valid_poe_api_key
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
@@ -61,6 +63,7 @@ MAX_TRANSITION_TASK_CONTEXTS = 16
 TRANSITION_ENDPOINT_MATCH_DISTANCE = 32
 MAX_TASK_INBOX_HISTORY = 100
 MAX_TASK_INBOX_CONTEXT = 3
+MAX_TASK_INBOX_REVIEW_BATCHES = 20
 TASK_INBOX_SCHEMA_VERSION = 2
 TASK_INBOX_MAX_PENDING_TURNS = 2
 TASK_INBOX_MAX_PENDING_BATCHES = 3
@@ -715,6 +718,7 @@ class DebugState:
         self.agent_status = self.empty_agent_status()
         self.recover_object_interactions_from_agent_llm_log()
         self.agent_runtime = AgentRuntime(self, self.runtime_dir)
+        self.screen_inspector = ScreenInspector(self)
 
     def config_value(self, key: str, default: str | None = None) -> str | None:
         return os.environ.get(key) or self.env_file.get(key) or default
@@ -4551,8 +4555,15 @@ class DebugState:
             )
             if isinstance(target, dict) and transition_candidate(target):
                 reasons.append({"kind": "leaving_room", "target_id": requested_id})
+        if action == "use_item":
+            reasons.append({"kind": "use_item_boundary"})
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
-        required = bool(pending and not dialog.get("active"))
+        hard_reason_kinds = {"leaving_room", "use_item_boundary"}
+        required = bool(
+            pending
+            and not dialog.get("active")
+            and any(reason.get("kind") in hard_reason_kinds for reason in reasons)
+        )
         return {
             "pending_total": len(pending),
             "batches": [
@@ -4566,7 +4577,7 @@ class DebugState:
                 for record in pending[:MAX_TASK_INBOX_CONTEXT]
             ],
             "review_required": required,
-            "reasons": reasons if required else [],
+            "reasons": reasons,
         }
 
     def review_agent_task_inbox(self, arguments: dict, state: dict, tool_cycle: dict | None) -> dict:
@@ -4697,11 +4708,22 @@ class DebugState:
         if isinstance(tool_cycle, dict):
             resolved = tool_cycle.setdefault("resolved_inbox_batch_ids", [])
             resolved.extend(item["inbox_id"] for item in normalized if item["inbox_id"] not in resolved)
+        remaining = self.task_inbox_pending()
         result = {
             "ok": True,
             "resolutions": normalized,
             "resolved_batch_ids": [item["inbox_id"] for item in normalized],
-            "pending_total": len(self.task_inbox_pending()),
+            "pending_total": len(remaining),
+            "pending_batches": [
+                {
+                    key: record.get(key)
+                    for key in (
+                        "id", "created_agent_turn", "room_id", "event_object_id",
+                        "source_event_object_id", "dialogs",
+                    )
+                }
+                for record in remaining[:MAX_TASK_INBOX_REVIEW_BATCHES]
+            ],
         }
         if legacy:
             result["disposition"] = arguments.get("disposition")
@@ -4723,6 +4745,7 @@ class DebugState:
             "resolved_inbox_batch_ids": [],
             "room_memory_queried_ids": [],
             "equipment_review_item_id": None,
+            "vision_request_used": False,
         }
 
     def task_room_memory_review_error(
@@ -5009,7 +5032,8 @@ class DebugState:
             result["requirements"] = (
                 "Read every get_tasks page with include_closed=true and detail=summary, then in a later model "
                 "batch upsert every active task with the returned review_token. Preserve completed tasks; mark "
-                "semantic duplicates abandoned with their relationship. A successful submit_decision clears the audit."
+                "semantic duplicates abandoned with their relationship. The audit clears as soon as every active "
+                "task has been reconciled."
             )
         if isinstance(tool_cycle, dict):
             audit = tool_cycle.get("task_query_audit")
@@ -5026,6 +5050,15 @@ class DebugState:
             )
             result["missing_active_task_ids"] = sorted(active_ids - reconciled)
         return result
+
+    def maybe_clear_task_reconciliation(self, tool_cycle: dict | None) -> bool:
+        if not self.agent_runtime.task_reconciliation_pending():
+            return False
+        reconciliation = self.task_reconciliation_context(tool_cycle)
+        if not reconciliation.get("audit_complete") or reconciliation.get("missing_active_task_ids"):
+            return False
+        self.agent_runtime.clear_task_reconciliation()
+        return True
 
     def object_event_key(self, event: dict) -> str:
         payload = {
@@ -7889,6 +7922,8 @@ class DebugState:
             return {"ok": False, "status": "in_battle", "target_id": target_id}
         if phase == "dialog":
             return {"ok": False, "status": "in_dialog", "target_id": target_id}
+        if phase == "choice":
+            return {"ok": False, "status": "in_choice", "target_id": target_id}
         if phase == "shop":
             return {"ok": False, "status": "in_shop", "target_id": target_id}
         if state.get("in_main_game") is False:
@@ -10492,7 +10527,7 @@ class DebugState:
                     "description": (
                         "逐条归档已完成对话产生的 task_inbox 证据，不执行游戏动作。明确召唤、委托、约定或其他未完成行动使用 new_task；"
                         "已有任务进展使用 task_updated；只有闲聊、重复证据或已观察完成的证据使用 no_follow_up。任务类结论必须先 get_tasks，"
-                        "再用 source_inbox_ids 成功 upsert 对应任务。所有 resolution 成功后才会结案。"
+                        "再用 source_inbox_ids 成功 upsert 对应任务。所有 resolution 成功后才会结案；成功结果会返回下一批 pending_batches。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -10661,6 +10696,29 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
+                    "name": "inspect_screen",
+                    "description": (
+                        "按需检查当前游戏 PNG 的低权威视觉注释。只有 get_navigation、get_room_memory、inspect_target 等"
+                        "结构化证据无法解释可见布局、房间边界、出口或疑似隐藏通道时调用；每个工具周期最多一次未缓存请求。"
+                        "结果不能确认 transition、对象 ID、说话者、脚本语义、task 或 Room Memo。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "focus": {
+                                "type": "string",
+                                "enum": ["room_layout", "passage", "ui_text"],
+                                "default": "room_layout",
+                            },
+                            "question": {"type": "string", "maxLength": 200},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_tool_output",
                     "description": "分页读取当前 Agent session 中已归档的完整工具输出；每次最多返回 6000 个字符。",
                     "parameters": {
@@ -10796,6 +10854,60 @@ class DebugState:
             compact["room_changed"] = True
         return compact
 
+    AGENT_DIALOG_FIELDS = (
+        "time", "agent_turn", "logical_frame", "scene_id", "map_id",
+        "logical_room_id", "event_object_id", "message_ids", "speaker_hint", "text",
+    )
+
+    @classmethod
+    def project_agent_dialog(cls, entry: dict) -> list:
+        return [entry.get(key) for key in cls.AGENT_DIALOG_FIELDS]
+
+    def project_agent_event(self, event: dict) -> dict:
+        base_keys = (
+            "type", "time", "logical_frame", "scene_id", "map_id", "logical_room_id",
+        )
+        compact = {key: event.get(key) for key in base_keys if key in event}
+        if event.get("type") in {"interaction_effect", "interaction_no_effect"}:
+            for key in ("object_id", "target_id", "via_target_id", "action", "transition"):
+                if key in event:
+                    compact[key] = event.get(key)
+            compact.update(self.compact_interaction_outcome(event))
+            return compact
+        redundant = {
+            "frame", "raw_frame", "room_id", "logical_room_label", "room_key",
+            "region_key", "nav_room_id", "legacy_room_id", "legacy_nav_room_id",
+            *base_keys,
+        }
+        compact.update({key: value for key, value in event.items() if key not in redundant})
+        return compact
+
+    def project_agent_observations(self, result: dict) -> dict:
+        """Compact get_observations for model input without changing stored/API evidence."""
+        if result.get("ok") is not True:
+            return result
+        if result.get("kind") == "speakers":
+            return result
+        projected = {
+            key: result.get(key)
+            for key in ("ok", "kind", "total", "events_total")
+            if key in result
+        }
+        if isinstance(result.get("dialogs"), list):
+            projected["dialog_fields"] = list(self.AGENT_DIALOG_FIELDS)
+            projected["dialogs"] = [
+                self.project_agent_dialog(entry)
+                for entry in result["dialogs"]
+                if isinstance(entry, dict)
+            ]
+        if isinstance(result.get("events"), list):
+            projected["events"] = [
+                self.project_agent_event(entry)
+                for entry in result["events"]
+                if isinstance(entry, dict)
+            ]
+        return projected
+
     def compact_agent_navigation(self, state: dict, limit: int = 20) -> dict:
         navigation = self.navigation(state)
         target_keys = (
@@ -10826,6 +10938,7 @@ class DebugState:
             targets.append(compact)
         return {
             "status": navigation.get("status"),
+            "environment_key": navigation.get("environment_key"),
             "targets": targets,
             "targets_returned": len(targets),
             "targets_total": len(navigation.get("targets") or []),
@@ -10868,6 +10981,7 @@ class DebugState:
                     # current while it creates or updates multiple related tasks.
                     with self.exploration_lock:
                         audit["revision"] = self.task_ledger_revision(self.read_exploration())
+                self.maybe_clear_task_reconciliation(tool_cycle)
             return result
         if name == "get_tasks":
             if isinstance(tool_cycle, dict):
@@ -10931,6 +11045,7 @@ class DebugState:
                     audit["review_token"] = token
                     result["review_token"] = token
                     result["audit_valid"] = True
+                    self.maybe_clear_task_reconciliation(tool_cycle)
             return result
         if name == "review_task_inbox":
             result = self.review_agent_task_inbox(arguments, state, tool_cycle)
@@ -11021,6 +11136,28 @@ class DebugState:
                 if resolved_room_id not in queried:
                     queried.append(resolved_room_id)
             return result
+        if name == "inspect_screen":
+            validated = self.screen_inspector.validate_arguments(arguments)
+            if isinstance(validated, dict):
+                return validated
+            frame_info = self.live_info("frame")
+            if not frame_info.get("available"):
+                return {"ok": False, "error": {"code": "frame_unavailable", "message": "No live frame is available."}}
+            if frame_info.get("stale", True):
+                return {"ok": False, "error": {"code": "frame_stale", "message": "The live frame is stale."}}
+            latest = self.latest_frame_png()
+            if latest is None:
+                return {"ok": False, "error": {"code": "frame_unavailable", "message": "No live frame is available."}}
+            frame_sequence, png = latest
+            visual_hash = hashlib.sha256(png).hexdigest()
+            return self.screen_inspector.inspect(
+                arguments,
+                state,
+                frame_sequence,
+                png,
+                visual_hash,
+                tool_cycle,
+            )
         if name == "get_tool_output":
             return self.agent_runtime.get_tool_output(
                 arguments.get("output_ref"),
@@ -11070,7 +11207,7 @@ class DebugState:
                     "error": {
                         "code": "task_inbox_review_required",
                         "message": (
-                            "Pending dialog evidence must be resolved before another game action. "
+                            "Pending dialog evidence must be resolved before crossing a transition or using an item. "
                             "For task outcomes, call get_tasks and upsert_task with source_inbox_ids before "
                             "review_task_inbox; otherwise use a structured no_follow_up reason."
                         ),
@@ -11109,7 +11246,7 @@ class DebugState:
                 and not reconciliation.get("missing_active_task_ids")
                 and validation.get("status") != "rejected"
             ):
-                self.agent_runtime.clear_task_reconciliation()
+                self.maybe_clear_task_reconciliation(tool_cycle)
             reviewed_item_id = tool_cycle.get("equipment_review_item_id") if isinstance(tool_cycle, dict) else None
             if (
                 reviewed_item_id
@@ -11317,6 +11454,9 @@ class DebugState:
             "touch 可能触发战斗、控制接管或此前未知的房间切换；发生任一情况时停止当前房间的连续探索并重新决策。"
             "transition_candidate=true 的 touch 应作为有意选择的离房路线，不要为了遍历 touch 而提前进入。"
             "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 inspect_target。"
+            "优先使用 get_navigation、get_room_memory、inspect_target 等结构化证据；只有这些证据无法解释可见房间布局、边界、出口或疑似隐藏通道时，才按需调用一次 inspect_screen。"
+            "inspect_screen 只是低权威 visual_annotation，即使 confidence=high 也不得直接写 Room Memo、创建或确认 transition、修改 task/dialog/observation 事实，"
+            "也不得推断 event object ID、speaker identity 或脚本语义。疑似密道必须通过真实 native action、房间变化和现有 transition observation/native trigger 才能确认。"
             "若当前目标 transition_candidate=true、最近对象历史显示它由非传送目标变为传送目标、且 known_destination=false，"
             "应将它视为刚解锁的探索路线并优先建议 enter_transition；解锁动作本身产生的 previously_tried 或 avoid_repeat 不应降低它的优先级。"
             "一旦该传送已有 known destination，则停止使用刚解锁优先级，恢复目的地探索价值、任务和回退风险的正常比较。"
@@ -11334,13 +11474,15 @@ class DebugState:
             "发现、调整、完成或作废任务时调用 upsert_task，不要仅凭时间自动关闭任务。创建未知 id 或无 id 任务前，必须在前一模型批次完整分页读取 include_closed=true、detail=summary 的账本，"
             "并使用最终页 review_token；只查 active、漏页、账本 revision 变化或同批并行 get_tasks+upsert_task 都不能创建。"
             "若审计发现语义等价的 completed/abandoned 任务，不得创建新 id；确有新证据要求重开则更新原 id，只有不同剧情阶段才创建后继任务并在 rationale 注明前序 id。"
-            "task_inbox 是尚未归档为任务结论的持久对话证据，不等于任务；每个说话轮次独立归档。对话结束后必须完成所有 pending 证据，才能提交任何游戏动作。"
+            "task_inbox 是尚未归档为任务结论的持久对话证据，不等于任务；每个说话轮次独立归档。应及时审查 pending 证据；普通同房间探索可以继续，"
+            "但进入 transition_candidate 或 use_item 前必须完成所有 pending 证据。"
             "明确召唤即使准备立刻执行，也必须先建立可恢复的短期 active task；未知目标对象时可暂不填 object_id，实际交互确认后再绑定并完成。"
             "调用 review_task_inbox 时，未完成的召唤、委托、约定或阶段目标使用 new_task；已有任务进展使用 task_updated；"
             "只有闲聊、重复证据或已有可观察完成效果时才用 no_follow_up，并选择结构化 reason_code。"
             "任务类结论必须先 get_tasks，再用 source_inbox_ids 成功 upsert 对应任务后归档；禁止写‘下轮另建’并提前结案。"
             "task_reconciliation.pending=true 表示 checkpoint 恢复、上下文压缩或旧状态升级后必须重建全账本可见性：完整读取 closed-inclusive summary 索引，"
-            "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。完成前不可 navigate、use_item 或创建任务；对话可继续。"
+            "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。全部 active 任务完成 upsert 后立即解除对账；"
+            "完成前不可 navigate、use_item 或创建任务，对话可继续。"
             "task_review.required=true 表示新剧情证据晚于相关 active task 的上次审计。对话仍可继续 advance_dialog；对话结束后若要 navigate 或 use_item，"
             "必须先调用 get_tasks，再对 task_review.tasks 中每个 id 调用 upsert_task，选择确认继续、改写、completed 或 abandoned。无字段变化的 upsert_task 表示确认继续。"
             "新证据改变对象身份或任务阶段时，应关闭或改写旧 task，并按需创建后继 task；把新对话与稳定状态变化写入 rationale，但不要把 sprite 数字硬编码成剧情语义。"
@@ -13397,6 +13539,10 @@ def main() -> int:
     parser.add_argument("--asset-dir", default="data/pal")
     parser.add_argument("--game-binary", default="vendor/sdlpal/unix/sdlpal")
     args = parser.parse_args()
+
+    if not valid_poe_api_key(read_env_file(ROOT / ".env")):
+        print("POE_API_KEY is required for Agent screen inspection", file=sys.stderr)
+        return 2
 
     server = Server((args.host, args.port), Handler)
     server.state = DebugState(

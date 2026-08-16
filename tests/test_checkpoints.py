@@ -372,6 +372,34 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
         pending_decision=saved_decision,
         usage={'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110},
         last_prompt_tokens=95,
+        provider_usage={
+            'version': 1,
+            'tracking_started_at': '2026-08-15T10:00:00Z',
+            'incomplete_before_tracking': True,
+            'scopes': {
+                'main_decision': {
+                    'requests': 2, 'input_tokens': 100, 'cached_tokens': 40,
+                    'output_tokens': 10, 'reasoning_tokens': 3, 'total_tokens': 110,
+                    'details_complete': True,
+                },
+                'battle': {
+                    'requests': 0, 'input_tokens': 0, 'cached_tokens': 0,
+                    'output_tokens': 0, 'reasoning_tokens': 0, 'total_tokens': 0,
+                    'details_complete': True,
+                },
+                'compaction': {
+                    'requests': 0, 'input_tokens': 0, 'cached_tokens': 0,
+                    'output_tokens': 0, 'reasoning_tokens': 0, 'total_tokens': 0,
+                    'details_complete': True,
+                },
+            },
+            'last_request': {
+                'scope': 'main_decision', 'model': 'deepseek-chat',
+                'time': '2026-08-15T10:00:00Z', 'input_tokens': 60,
+                'cached_tokens': 20, 'output_tokens': 6, 'reasoning_tokens': 2,
+                'total_tokens': 66, 'details_complete': True,
+            },
+        },
         last_compaction={
             'time': '2026-08-09T00:00:00Z',
             'trigger_prompt_tokens': 200001,
@@ -431,6 +459,9 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
     assert restored['pending_decision'] == saved_decision
     assert restored['usage']['total_tokens'] == 110
     assert restored['last_prompt_tokens'] == 95
+    assert restored['provider_usage']['scopes']['main_decision']['cached_tokens'] == 40
+    assert restored['provider_usage']['last_request']['scope'] == 'main_decision'
+    assert restored['provider_usage']['incomplete_before_tracking'] is True
     assert restored['last_compaction']['trigger_prompt_tokens'] == 200001
     assert restored['last_compaction']['retained_cycles'] == 1
     assert restored['last_compaction']['retained_budget_exceeded'] is True

@@ -114,6 +114,7 @@ PALPAL_AgentObserveDialogText(
    LPCWSTR    lpszText
 );
 
+VOID PALPAL_AgentPrepareChoice(WORD wEventObjectID, WORD wScriptEntry);
 VOID PALPAL_AgentBeginChoice(WORD wEventObjectID, WORD wScriptEntry);
 VOID PALPAL_AgentObserveChoiceSelection(WORD wSelectedIndex);
 VOID PALPAL_AgentEndChoice(WORD wSelectedIndex);

@@ -23,6 +23,8 @@ CHECKPOINT_BUNDLE_VERSION = 2
 DEFAULT_COMPACT_AT_TOKENS = 200_000
 DEFAULT_COMPACT_RETAIN_TOKENS = 24_000
 TOOL_OUTPUT_FULL_TOKENS = 8_000
+MODEL_REPLAY_FULL_TOKENS = 2_000
+MODEL_REPLAY_PREVIEW_CHARS = 500
 TOOL_OUTPUT_PRESSURE_TOKENS = 96_000
 TOOL_OUTPUT_PRESSURE_TARGET_TOKENS = 80_000
 TOOL_OUTPUT_RECENT_FULL = 6
@@ -34,6 +36,70 @@ BATTLE_INSTRUCTION_LIMIT = 100
 BATTLE_CONTROL_TIMEOUT_SECONDS = 30.0
 AGENT_REASONING_EFFORT = "high"
 SUMMARY_REASONING_EFFORT = "low"
+
+PROVIDER_USAGE_SCOPES = ("main_decision", "battle", "compaction", "vision")
+
+
+class ToolOutputInputFilter:
+    """Show new tool results once, then use stable reloadable previews."""
+
+    def __init__(self, runtime: "AgentRuntime", historical_call_ids: set[str] | None = None):
+        self.runtime = runtime
+        self.seen_call_ids = set(historical_call_ids or ())
+        self.previews: dict[str, str] = {}
+
+    @staticmethod
+    def _call_id(item: dict) -> str:
+        return str(item.get("call_id") or item.get("id") or "")
+
+    def preview(self, call_id: str, output: str, *, reason: str = "replayed_tool_output") -> str:
+        cached = self.previews.get(call_id)
+        if cached is not None:
+            return cached
+        existing_output_ref = None
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = None
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("full_result_archived") is True
+            and self.runtime._valid_output_ref(parsed.get("output_ref"))
+        ):
+            existing_output_ref = parsed["output_ref"]
+        preview = self.runtime._archived_tool_output_preview(
+            output,
+            reason=reason,
+            head_chars=MODEL_REPLAY_PREVIEW_CHARS,
+            tail_chars=MODEL_REPLAY_PREVIEW_CHARS,
+            output_ref=existing_output_ref,
+        )
+        self.previews[call_id] = preview
+        return preview
+
+    def __call__(self, data: Any) -> Any:
+        model_data = data.model_data
+        replacement: list[Any] = []
+        newly_seen: set[str] = set()
+        for item in model_data.input:
+            current = dict(item) if isinstance(item, dict) else item
+            if isinstance(current, dict) and current.get("type") == "function_call_output":
+                call_id = self._call_id(current)
+                output = current.get("output")
+                if (
+                    call_id
+                    and call_id in self.seen_call_ids
+                    and isinstance(output, str)
+                    and self.runtime._estimate_text_tokens(output) > MODEL_REPLAY_FULL_TOKENS
+                    and not self.runtime._is_archived_tool_preview(output)
+                ):
+                    current["output"] = self.preview(call_id, output)
+                if call_id:
+                    newly_seen.add(call_id)
+            replacement.append(current)
+        # Update only after the whole batch so parallel results are all visible once.
+        self.seen_call_ids.update(newly_seen)
+        return model_data.__class__(input=replacement, instructions=model_data.instructions)
 
 
 class ReplanRequired(RuntimeError):
@@ -319,6 +385,7 @@ class BattleDelegate:
             )
             return action
         try:
+            import agents as agents_sdk
             from agents import (Agent, AsyncOpenAI, FunctionTool, ModelSettings,
                                 OpenAIResponsesModel, Runner, SQLiteSession,
                                 set_tracing_disabled)
@@ -538,6 +605,11 @@ class BattleDelegate:
             reset_tool_choice=False,
         )
         session = SQLiteSession(self._control()["child_session_id"], runtime.sqlite_path)
+        input_filter = ToolOutputInputFilter(
+            runtime,
+            runtime._historical_tool_call_ids(await runtime._session_items_or_empty(session)),
+        )
+        run_config = runtime._sdk_run_config(agents_sdk, input_filter)
         prompt = json.dumps({
             "feedback": feedback,
             "battle": state["battle"],
@@ -545,11 +617,22 @@ class BattleDelegate:
             "resource_policy": "Prefer attacks; spend MP/items only for survival or material advantage.",
         }, ensure_ascii=False, separators=(",", ":"))
         for attempt in range(2):
-            stream = Runner.run_streamed(agent, prompt, session=session, max_turns=6)
+            stream = Runner.run_streamed(
+                agent, prompt, session=session, max_turns=6, run_config=run_config,
+            )
             runtime.active_stream = stream
-            async for _event in stream.stream_events():
-                if runtime.cancel_event.is_set():
-                    stream.cancel("immediate")
+            try:
+                async for _event in stream.stream_events():
+                    if runtime.cancel_event.is_set():
+                        stream.cancel("immediate")
+            finally:
+                usage = getattr(getattr(stream, "context_wrapper", None), "usage", None)
+                if usage is not None:
+                    runtime._record_provider_usage(
+                        usage,
+                        "battle",
+                        model=runtime.state.get("model"),
+                    )
             if submitted is not None:
                 break
             if attempt == 0:
@@ -564,10 +647,14 @@ class BattleDelegate:
                     "required queries. Do not end with plain text."
                 )
         if submitted is None:
+            if callable(getattr(session, "get_items", None)):
+                await runtime._sanitize_sdk_session(session, input_filter=input_filter)
             raise RuntimeError(
                 "submit_battle_action_protocol_error: no accepted submit_battle_action "
                 "after correction retry"
             )
+        if callable(getattr(session, "get_items", None)):
+            await runtime._sanitize_sdk_session(session, input_filter=input_filter)
         return submitted
 
     def _summary(self, state: dict, instruction_count: int) -> dict:
@@ -905,6 +992,24 @@ class AgentRuntime:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "last_request_usage": {},
             "last_prompt_tokens": None,
+            "provider_usage": {
+                "version": 1,
+                "tracking_started_at": None,
+                "incomplete_before_tracking": False,
+                "scopes": {
+                    scope: {
+                        "requests": 0,
+                        "input_tokens": 0,
+                        "cached_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 0,
+                        "details_complete": True,
+                    }
+                    for scope in PROVIDER_USAGE_SCOPES
+                },
+                "last_request": None,
+            },
             "last_compaction": None,
             "compactions": 0,
             "stop_reason": reason,
@@ -940,6 +1045,15 @@ class AgentRuntime:
         legacy_task_state = "task_reconciliation_pending" not in value
         value.setdefault("last_request_usage", {})
         value.setdefault("last_prompt_tokens", None)
+        if not isinstance(value.get("provider_usage"), dict):
+            legacy_usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
+            provider_usage = self._blank()["provider_usage"]
+            provider_usage["incomplete_before_tracking"] = bool(
+                int(value.get("turn") or 0)
+                or any(int(legacy_usage.get(key) or 0) for key in legacy_usage if str(key).endswith("tokens"))
+            )
+            value["provider_usage"] = provider_usage
+        self._normalize_provider_usage(value["provider_usage"])
         value.setdefault("last_compaction", None)
         # Older sessions exposed a local byte-size estimate as if it were context
         # usage. Never migrate that approximation into the provider-observed field.
@@ -1092,6 +1206,48 @@ class AgentRuntime:
             "complete": complete,
         }
 
+    def _model_tool_result(self, name: str, result: dict) -> dict:
+        """Project a full audited tool result only for the Responses model."""
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            return result
+        if name == "upsert_task":
+            task = result.get("task") if isinstance(result.get("task"), dict) else {}
+            history = task.get("history") if isinstance(task.get("history"), list) else []
+            changes = (
+                history[-1].get("changes")
+                if history and isinstance(history[-1], dict) and isinstance(history[-1].get("changes"), dict)
+                else {}
+            )
+            return {
+                "ok": True,
+                "operation": result.get("operation"),
+                "task": {
+                    key: task.get(key)
+                    for key in (
+                        "id", "status", "priority", "object_id", "transition_key", "room_id",
+                    )
+                    if key in task
+                },
+                "changed_fields": sorted(changes),
+                "source_inbox_ids": list((changes.get("source_inbox_ids") or {}).get("added") or []),
+            }
+        if name == "get_navigation":
+            projected = dict(result)
+            navigation = result.get("navigation")
+            if isinstance(navigation, dict):
+                projected["navigation"] = {
+                    key: value for key, value in navigation.items() if key != "environment_key"
+                }
+            return projected
+        if name != "get_observations":
+            return result
+        projected = self.debug.project_agent_observations(result)
+        raw = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        if self._tool_output_needs_archive(raw):
+            projected["output_ref"] = self._archive_tool_output(raw)
+            projected["full_result_archived"] = True
+        return projected
+
     def _persist(self, value: dict | None = None) -> None:
         value = value or self.state
         value["updated_at"] = _stamp()
@@ -1108,6 +1264,7 @@ class AgentRuntime:
             "session_id", "model", "status", "phase", "turn", "run_turn",
             "max_turns", "stop_reason", "usage", "compactions", "last_event_seq",
             "last_request_usage", "last_prompt_tokens", "game_instance_id",
+            "provider_usage",
             "last_compaction",
             "parent_session_id", "checkpoint_id", "restored_from_session_id",
             "task_reconciliation_pending", "task_reconciliation_reason",
@@ -1620,11 +1777,19 @@ class AgentRuntime:
             for key in (
                 "model", "turn", "max_turns", "pending_decision", "last_execution",
                 "usage", "last_request_usage", "last_prompt_tokens", "compactions",
+                "provider_usage",
                 "last_compaction",
                 "equipment_review",
             ):
                 if key in control:
                     restored[key] = control[key]
+            if "provider_usage" not in control:
+                legacy_usage = restored.get("usage") if isinstance(restored.get("usage"), dict) else {}
+                restored["provider_usage"]["incomplete_before_tracking"] = bool(
+                    int(restored.get("turn") or 0)
+                    or any(int(value or 0) for key, value in legacy_usage.items() if str(key).endswith("tokens"))
+                )
+            self._normalize_provider_usage(restored["provider_usage"])
             restored.update(status="paused", phase="paused", run_turn=0, stop_reason="checkpoint_restored", generation=self.generation)
             restored["task_reconciliation_pending"] = True
             restored["task_reconciliation_reason"] = "checkpoint_restored"
@@ -2083,6 +2248,7 @@ class AgentRuntime:
     async def _sdk_decide(self, state: dict, feedback: str) -> dict:
         """Use the Agents SDK's streamed Responses runner and local SQLiteSession."""
         try:
+            import agents as agents_sdk
             from agents import (Agent, AsyncOpenAI, FunctionTool, ModelSettings,
                                 OpenAIResponsesModel, Runner, SQLiteSession,
                                 set_tracing_disabled)
@@ -2103,16 +2269,40 @@ class AgentRuntime:
                 nonlocal submitted_decision
                 arguments = runtime._parse_tool_arguments(raw_arguments)
                 started = _now()
-                result = runtime.debug.run_agent_tool(
-                    name,
-                    arguments,
-                    runtime.debug.snapshot(),
-                    tool_cycle=tool_cycle,
+                if name == "inspect_screen":
+                    result = await asyncio.to_thread(
+                        runtime.debug.run_agent_tool,
+                        name,
+                        arguments,
+                        runtime.debug.snapshot(),
+                        tool_cycle=tool_cycle,
+                    )
+                else:
+                    result = runtime.debug.run_agent_tool(
+                        name,
+                        arguments,
+                        runtime.debug.snapshot(),
+                        tool_cycle=tool_cycle,
+                    )
+                submit_ok = name == "submit_decision" and result.get("ok") is True
+                submit_error = result.get("error") if name == "submit_decision" else None
+                submit_error_code = (
+                    submit_error.get("code")
+                    if isinstance(submit_error, dict)
+                    else submit_error
                 )
                 runtime.emit(
                     "decision" if name == "submit_decision" else "tool",
-                    "submitted" if name == "submit_decision" else "completed",
-                    "Recommendation submitted." if name == "submit_decision" else f"Query tool {name} completed.",
+                    (
+                        "submitted" if submit_ok else "rejected"
+                    ) if name == "submit_decision" else "completed",
+                    (
+                        "Recommendation submitted."
+                        if submit_ok
+                        else f"Recommendation rejected: {submit_error_code}."
+                        if submit_error_code
+                        else "Recommendation rejected."
+                    ) if name == "submit_decision" else f"Query tool {name} completed.",
                     {"name": name, "arguments": arguments, "result": result},
                     started=started,
                 )
@@ -2121,7 +2311,8 @@ class AgentRuntime:
                         return json.dumps(result, ensure_ascii=False)
                     submitted_decision = result["decision"]
                     return json.dumps({"ok": True, "accepted": True}, ensure_ascii=False)
-                return json.dumps(result, ensure_ascii=False)
+                projected = runtime._model_tool_result(name, result)
+                return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
 
             return FunctionTool(
                 name=name,
@@ -2173,6 +2364,11 @@ exploration value, and maintained local tasks to choose the next action.
             reset_tool_choice=False,
         )
         session = SQLiteSession(self.state["session_id"], self.sqlite_path)
+        input_filter = ToolOutputInputFilter(
+            self,
+            self._historical_tool_call_ids(await self._session_items_or_empty(session)),
+        )
+        run_config = self._sdk_run_config(agents_sdk, input_filter)
         def current_prompt() -> str:
             return json.dumps({
                 "feedback": feedback,
@@ -2184,16 +2380,28 @@ exploration value, and maintained local tasks to choose the next action.
             prompt = current_prompt()
         streams = []
         for attempt in range(2):
-            stream = Runner.run_streamed(agent, prompt, session=session, max_turns=16)
+            stream = Runner.run_streamed(
+                agent, prompt, session=session, max_turns=16, run_config=run_config,
+            )
             streams.append(stream)
             self.active_stream = stream
-            async for event in stream.stream_events():
-                if self.cancel_event.is_set():
-                    stream.cancel("immediate")
-                event_type = getattr(event, "type", "")
-                name = getattr(event, "name", "")
-                if event_type == "run_item_stream_event" and name in {"tool_called", "tool_output"}:
-                    self.emit("model", name, name.replace("_", " ").title())
+            try:
+                async for event in stream.stream_events():
+                    if self.cancel_event.is_set():
+                        stream.cancel("immediate")
+                    event_type = getattr(event, "type", "")
+                    name = getattr(event, "name", "")
+                    if event_type == "run_item_stream_event" and name in {"tool_called", "tool_output"}:
+                        self.emit("model", name, name.replace("_", " ").title())
+            finally:
+                usage = getattr(getattr(stream, "context_wrapper", None), "usage", None)
+                if usage is not None:
+                    self._record_provider_usage(
+                        usage,
+                        "main_decision",
+                        model=self.state.get("model"),
+                        update_last_prompt=True,
+                    )
             if submitted_decision is not None:
                 break
             if attempt == 0:
@@ -2209,6 +2417,7 @@ exploration value, and maintained local tasks to choose the next action.
                     "required maintenance or queries. Do not end with plain text."
                 )
         if submitted_decision is None:
+            await self._sanitize_sdk_session(session, input_filter=input_filter)
             raise RuntimeError(
                 "submit_decision_protocol_error: no accepted submit_decision "
                 "after correction retry"
@@ -2228,11 +2437,8 @@ exploration value, and maintained local tasks to choose the next action.
             }
             output["usage"] = request_usage
             self.state["last_request_usage"] = request_usage
-            last_prompt_tokens = self._last_prompt_tokens_from_usage(usages[-1])
-            if last_prompt_tokens is not None:
-                self.state["last_prompt_tokens"] = last_prompt_tokens
             self._persist()
-        await self._sanitize_sdk_session(session)
+        await self._sanitize_sdk_session(session, input_filter=input_filter)
         output = self.debug.attach_decision_context(state, output)
         return output
 
@@ -2278,6 +2484,13 @@ exploration value, and maintained local tasks to choose the next action.
             input=transcript,
             reasoning={"effort": SUMMARY_REASONING_EFFORT},
         )
+        response_usage = getattr(response, "usage", None)
+        if response_usage is not None:
+            self._record_provider_usage(
+                response_usage,
+                "compaction",
+                model=self.state.get("model"),
+            )
         status = getattr(response, "status", None)
         if status != "completed":
             raise RuntimeError(f"context summarizer response status was {status or 'missing'}")
@@ -2365,6 +2578,155 @@ exploration value, and maintained local tasks to choose the next action.
                 normalized[key] = int(value)
         if normalized:
             self.state["last_request_usage"] = normalized
+
+    @staticmethod
+    def _normalize_provider_usage(provider_usage: dict) -> None:
+        provider_usage["version"] = 1
+        provider_usage.setdefault("tracking_started_at", None)
+        provider_usage["incomplete_before_tracking"] = provider_usage.get("incomplete_before_tracking") is True
+        scopes = provider_usage.setdefault("scopes", {})
+        for scope in PROVIDER_USAGE_SCOPES:
+            value = scopes.get(scope)
+            if not isinstance(value, dict):
+                value = {}
+                scopes[scope] = value
+            for key in (
+                "requests", "input_tokens", "cached_tokens", "output_tokens",
+                "reasoning_tokens", "total_tokens",
+            ):
+                value[key] = max(0, int(value.get(key) or 0))
+            value["details_complete"] = value.get("details_complete", True) is True
+        provider_usage.setdefault("last_request", None)
+
+    @staticmethod
+    def _usage_detail_value(details: Any, key: str) -> tuple[int, bool]:
+        if details is None:
+            return 0, False
+        value = getattr(details, key, None)
+        if not isinstance(value, (int, float)):
+            return 0, False
+        return max(0, int(value)), True
+
+    @classmethod
+    def _provider_request_entries(cls, usage: Any) -> list[dict]:
+        entries = getattr(usage, "request_usage_entries", None)
+        if not isinstance(entries, list) or not entries:
+            request_count = getattr(usage, "requests", None)
+            has_tokens = any(
+                int(getattr(usage, key, 0) or 0) > 0
+                for key in (
+                    "input_tokens", "prompt_tokens", "output_tokens",
+                    "completion_tokens", "total_tokens",
+                )
+            )
+            if request_count is not None and int(request_count or 0) != 1:
+                return []
+            if request_count is None and not has_tokens:
+                return []
+            entries = [usage]
+        normalized = []
+        for entry in entries:
+            input_tokens = max(0, int(
+                getattr(entry, "input_tokens", None)
+                or getattr(entry, "prompt_tokens", 0)
+                or 0
+            ))
+            output_tokens = max(0, int(
+                getattr(entry, "output_tokens", None)
+                or getattr(entry, "completion_tokens", 0)
+                or 0
+            ))
+            total_tokens = max(0, int(getattr(entry, "total_tokens", 0) or 0))
+            cached_tokens, cached_complete = cls._usage_detail_value(
+                getattr(entry, "input_tokens_details", None)
+                or getattr(entry, "prompt_tokens_details", None), "cached_tokens"
+            )
+            reasoning_tokens, reasoning_complete = cls._usage_detail_value(
+                getattr(entry, "output_tokens_details", None)
+                or getattr(entry, "completion_tokens_details", None), "reasoning_tokens"
+            )
+            normalized.append({
+                "input_tokens": input_tokens,
+                "cached_tokens": cached_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "total_tokens": total_tokens or input_tokens + output_tokens,
+                "details_complete": cached_complete and reasoning_complete,
+            })
+        return normalized
+
+    def _record_provider_usage(
+        self,
+        usage: Any,
+        scope: str,
+        *,
+        model: str | None = None,
+        provider: str = "deepseek",
+        update_last_prompt: bool = False,
+    ) -> list[dict]:
+        entries = self._provider_request_entries(usage)
+        if not entries:
+            return []
+        if scope not in PROVIDER_USAGE_SCOPES:
+            raise ValueError(f"unknown provider usage scope: {scope}")
+        with self.lock:
+            provider_usage = self.state.setdefault("provider_usage", {})
+            self._normalize_provider_usage(provider_usage)
+            if provider_usage.get("tracking_started_at") is None:
+                provider_usage["tracking_started_at"] = _stamp()
+            target = provider_usage["scopes"][scope]
+            for entry in entries:
+                target["requests"] += 1
+                for key in (
+                    "input_tokens", "cached_tokens", "output_tokens",
+                    "reasoning_tokens", "total_tokens",
+                ):
+                    target[key] += entry[key]
+                target["details_complete"] = target["details_complete"] and entry["details_complete"]
+                recorded = {
+                    "scope": scope,
+                    "provider": provider,
+                    "model": model or self.state.get("model"),
+                    "time": _stamp(),
+                    **entry,
+                }
+                provider_usage["last_request"] = recorded
+                self.emit(
+                    "usage",
+                    "recorded",
+                    f"Provider usage recorded for {scope}.",
+                    recorded,
+                )
+            if update_last_prompt and entries[-1]["input_tokens"] > 0:
+                self.state["last_prompt_tokens"] = entries[-1]["input_tokens"]
+            self._persist()
+        return entries
+
+    @staticmethod
+    def _historical_tool_call_ids(items: list[dict]) -> set[str]:
+        return {
+            str(item.get("call_id") or item.get("id"))
+            for item in items
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and (item.get("call_id") or item.get("id"))
+        }
+
+    @staticmethod
+    async def _session_items_or_empty(session: Any) -> list[dict]:
+        getter = getattr(session, "get_items", None)
+        if not callable(getter):
+            return []
+        items = await getter()
+        return items if isinstance(items, list) else []
+
+    @staticmethod
+    def _sdk_run_config(agents_module: Any, input_filter: ToolOutputInputFilter) -> Any:
+        run_config = getattr(agents_module, "RunConfig", None)
+        if callable(run_config):
+            return run_config(call_model_input_filter=input_filter)
+        # Test doubles predating RunConfig only inspect the supplied object.
+        return type("RunConfig", (), {"call_model_input_filter": input_filter})()
 
     @staticmethod
     def _last_prompt_tokens_from_usage(usage: Any) -> int | None:
@@ -2489,7 +2851,13 @@ exploration value, and maintained local tasks to choose the next action.
             raise ValueError("tool arguments must be a JSON object")
         return value
 
-    async def _sanitize_sdk_session(self, session: Any, next_prompt: str = "") -> None:
+    async def _sanitize_sdk_session(
+        self,
+        session: Any,
+        next_prompt: str = "",
+        *,
+        input_filter: ToolOutputInputFilter | None = None,
+    ) -> None:
         """Archive oversized/old tool evidence while retaining reloadable previews."""
         items = await session.get_items()
         changed = False
@@ -2498,7 +2866,17 @@ exploration value, and maintained local tasks to choose the next action.
             current = dict(item)
             if current.get("type") == "function_call_output":
                 output = current.get("output")
-                if isinstance(output, str) and self._tool_output_needs_archive(output):
+                call_id = ToolOutputInputFilter._call_id(current)
+                if (
+                    input_filter is not None
+                    and call_id in input_filter.seen_call_ids
+                    and isinstance(output, str)
+                    and self._estimate_text_tokens(output) > MODEL_REPLAY_FULL_TOKENS
+                    and not self._is_archived_tool_preview(output)
+                ):
+                    current["output"] = input_filter.preview(call_id, output)
+                    changed = True
+                elif isinstance(output, str) and self._tool_output_needs_archive(output):
                     current["output"] = self._archived_tool_output_preview(output, reason="output_limit")
                     changed = True
             replacement.append(current)
@@ -2553,8 +2931,17 @@ exploration value, and maintained local tasks to choose the next action.
             and AgentRuntime._valid_output_ref(value.get("output_ref"))
         )
 
-    def _archived_tool_output_preview(self, output: str, *, reason: str) -> str:
-        output_ref = self._archive_tool_output(output)
+    def _archived_tool_output_preview(
+        self,
+        output: str,
+        *,
+        reason: str,
+        head_chars: int = 2_000,
+        tail_chars: int = 2_000,
+        output_ref: str | None = None,
+    ) -> str:
+        if not self._valid_output_ref(output_ref):
+            output_ref = self._archive_tool_output(output)
         try:
             parsed = json.loads(output)
         except json.JSONDecodeError:
@@ -2570,8 +2957,8 @@ exploration value, and maintained local tasks to choose the next action.
             "original_chars": len(output),
             "original_bytes": len(output.encode("utf-8")),
             "estimated_tokens": self._estimate_text_tokens(output),
-            "head": output[:2000],
-            "tail": output[-2000:] if len(output) > 2000 else "",
+            "head": output[:head_chars],
+            "tail": output[-tail_chars:] if len(output) > head_chars else "",
         }
         if isinstance(parsed, dict):
             preview["keys"] = sorted(str(key) for key in parsed.keys())[:40]
@@ -2905,7 +3292,7 @@ exploration value, and maintained local tasks to choose the next action.
                 raise RuntimeError("interrupted")
             control = self.debug.control_state(state)
             if control.get("phase") in {
-                "action_pending", "game_script", "entering_scene", "dialog", "battle", "shop",
+                "action_pending", "game_script", "entering_scene", "dialog", "choice", "battle", "shop",
             }:
                 return
             request = self.debug.observations.get(observation_id)
@@ -2963,6 +3350,14 @@ exploration value, and maintained local tasks to choose the next action.
                 return {
                     "ok": True,
                     "status": "interrupted_by_dialog",
+                    "steps": step,
+                    "target_id": target_id,
+                    "progress": progress[-20:],
+                }
+            if status == "in_choice":
+                return {
+                    "ok": True,
+                    "status": "interrupted_by_choice",
                     "steps": step,
                     "target_id": target_id,
                     "progress": progress[-20:],

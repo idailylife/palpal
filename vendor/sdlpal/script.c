@@ -3481,6 +3481,11 @@ PAL_RunTriggerScript(
          break;
 
       default:
+         if (pScript->wOperation == 0x000A)
+         {
+            /* Publish the structured choice while the question is still visible. */
+            PALPAL_AgentPrepareChoice(wEventObjectID, wScriptEntry);
+         }
          PAL_ClearDialog(TRUE);
          wScriptEntry = PAL_InterpretInstruction(wScriptEntry, wEventObjectID);
          break;

@@ -2086,6 +2086,46 @@ def test_long_dialog_suspends_native_trigger_control_timeout(tmp_path):
     assert debug.navigation_step(dialog, target_id=60)['status'] == 'in_dialog'
 
 
+def test_choice_interrupt_keeps_native_trigger_observation_pending(tmp_path):
+    target = {
+        'id': 189, 'x': 96, 'y': 0, 'sprite_id': 207, 'state': 1,
+        'trigger_mode': 6, 'trigger_script': 5486, 'auto_script': 5583,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=7, height=7, start=(0, 6), objects=[target], frame=10)
+    write_state(debug, source)
+    debug.snapshot()
+    assert debug.navigation_step(source, target_id=189)['ok'] is True
+    debug.action_path.unlink()
+    debug.pending_written_action = None
+
+    choice = dict(source)
+    choice['frame'] = 11
+    choice['choice'] = {
+        'active': True,
+        'generation': 3,
+        'prompt': {'text': '要聽故事嗎？'},
+        'options': [{'index': 0, 'text': '否'}, {'index': 1, 'text': '是'}],
+    }
+    choice['trigger_observation'] = {
+        'generation': 1,
+        'event_object_id': 189,
+        'trigger_script': 5486,
+        'completed': False,
+        'source': {'scene_id': 3, 'map_id': 10, 'x': 96, 'y': 0},
+    }
+    write_state(debug, choice)
+    debug.snapshot()
+    pending = debug.pending_transition_observation
+
+    result = debug.navigation_step(choice, target_id=189)
+
+    assert result['status'] == 'in_choice'
+    assert debug.pending_transition_observation is pending
+    assert debug.observations.get(pending['observation_id'])['status'] == 'pending'
+
+
 def test_same_room_trigger_without_position_jump_is_not_recorded(tmp_path):
     portal = {'id': 48, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
     debug = make_debug_state(tmp_path)
@@ -2775,6 +2815,24 @@ def test_dialog_stops_navigation_step(tmp_path):
     result = debug.navigation_step(state, target_id=48)
     assert not result['ok']
     assert result['status'] == 'in_dialog'
+    assert not debug.action_path.exists()
+
+
+def test_choice_stops_navigation_step_without_writing_search(tmp_path):
+    target = {'id': 189, 'x': 32, 'y': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 60, 'auto_script': 0, 'blocking': False, 'interactable': True}
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target])
+    state['choice'] = {
+        'active': True,
+        'generation': 7,
+        'selected_index': 0,
+        'options': [{'index': 0, 'text': '否'}, {'index': 1, 'text': '是'}],
+    }
+    write_state(debug, state)
+
+    result = debug.navigation_step(state, target_id=189)
+
+    assert result == {'ok': False, 'status': 'in_choice', 'target_id': 189}
     assert not debug.action_path.exists()
 
 

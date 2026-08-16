@@ -305,6 +305,7 @@ static int g_agent_dialog_event_count = 0;
 typedef struct tagPALPALAGENTCHOICE
 {
    BOOL active;
+   BOOL menu_started;
    DWORD generation;
    WORD event_object_id;
    WORD script_entry;
@@ -2330,6 +2331,11 @@ PALPAL_AgentQueueChoiceSelect(
 
    g_agent_choice.command_pending = TRUE;
    g_agent_choice.requested_index = option_index;
+   if (!g_agent_choice.menu_started)
+   {
+      /* Dismiss the question text before the confirm menu is constructed. */
+      PALPAL_AgentQueueMenuButton(kKeySearch);
+   }
    if (g_agent_choice.selected_index != option_index)
    {
       PALPAL_AgentQueueMenuButton(option_index > g_agent_choice.selected_index
@@ -2738,20 +2744,41 @@ PALPAL_AgentLoadActionFile(
 }
 
 VOID
-PALPAL_AgentBeginChoice(
+PALPAL_AgentPrepareChoice(
    WORD wEventObjectID,
    WORD wScriptEntry
 )
 {
    DWORD generation = g_agent_choice.generation + 1;
-   memset(&g_agent_choice, 0, sizeof(g_agent_choice));
    if (!PALPAL_AgentEnabled()) return;
+   if (g_agent_choice.active &&
+       g_agent_choice.event_object_id == wEventObjectID &&
+       g_agent_choice.script_entry == wScriptEntry)
+   {
+      return;
+   }
+   memset(&g_agent_choice, 0, sizeof(g_agent_choice));
    g_agent_choice.active = TRUE;
    g_agent_choice.generation = generation ? generation : 1;
    g_agent_choice.event_object_id = wEventObjectID;
    g_agent_choice.script_entry = wScriptEntry;
    g_agent_choice.selected_index = 0;
    g_agent_choice.requested_index = -1;
+}
+
+VOID
+PALPAL_AgentBeginChoice(
+   WORD wEventObjectID,
+   WORD wScriptEntry
+)
+{
+   PALPAL_AgentPrepareChoice(wEventObjectID, wScriptEntry);
+   if (g_agent_choice.active &&
+       g_agent_choice.event_object_id == wEventObjectID &&
+       g_agent_choice.script_entry == wScriptEntry)
+   {
+      g_agent_choice.menu_started = TRUE;
+   }
 }
 
 VOID

@@ -234,10 +234,14 @@ ws://127.0.0.1:8765/frames
 
 The Web UI's Agent tab runs a persistent, server-side loop that chooses useful
 local actions from current state, exploration value, and maintained tasks. Only
-one session can control the game at a time. DeepSeek uses
-the OpenAI Agents SDK over its OpenAI-compatible Chat Completions endpoint;
-without `DEEPSEEK_API_KEY`, the local rules backend remains available for
-development.
+one session can control the game at a time. DeepSeek uses the OpenAI Agents SDK
+over its OpenAI-compatible Responses endpoint. The debug server requires
+`POE_API_KEY` at startup so the main exploration Agent can call the read-only
+`inspect_screen` tool when structured evidence cannot explain the visible room
+layout or a suspected passage. `POE_VISION_MODEL` defaults to
+`gemini-3.7-flash`, `POE_VISION_BASE_URL` to `https://api.poe.com/v1`, and
+`POE_VISION_TIMEOUT` to 30 seconds. Values may be supplied through the process
+environment or the project `.env`; the key is never persisted in Agent data.
 
 ```text
 GET  /agent/session

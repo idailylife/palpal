@@ -172,6 +172,7 @@ async function main() {
             navigationEnvironmentChangedAt = performance.now();
             navigationStableEnvironmentKey = null;
             resetNavigationRefreshRetry();
+            updateExternalControls(latestState);
             window.fetch = async (url, options) => {
               if (url === "/action") {
                 actions.push(JSON.parse(options.body).buttons);
@@ -836,6 +837,7 @@ async function main() {
           expression: `(() => {
             document.getElementById("normalTab")?.click();
             const select = document.querySelector("[data-agent-model]");
+            if (!document.getElementById("agent")) return { ready: true, retained: true, legacyRemoved: true };
             if (!select) return { ready: false };
             select.focus();
             agentError = "synthetic deferred render";
@@ -853,6 +855,9 @@ async function main() {
         },
         sessionId
       );
+      if (result.exceptionDetails) {
+        throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || "normal Agent controls evaluation failed");
+      }
       const value = result.result?.value;
       return value?.ready ? value : null;
     }, "Timed out waiting for normal Agent controls");
@@ -1166,6 +1171,158 @@ async function main() {
       throw new Error(`agent session refresh single-flight smoke failed (${
         JSON.stringify(agentSessionRefreshSingleFlightResult)
       })`);
+    }
+
+    const agentNavigationReuse = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalFetch = window.fetch;
+          const originalState = latestState;
+          const originalSession = agentSession;
+          const originalEvents = agentSessionEvents;
+          const originalResult = agentNavigationResult;
+          const originalBase = agentNavigationBase;
+          const originalBaseKey = agentNavigationBaseEnvironmentKey;
+          const originalCache = new Map(navigationCache);
+          let navigationCalls = 0;
+          let mismatchDiagnostics = 0;
+          try {
+            if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+            navigationRefreshTimer = null;
+            navigationCache.clear();
+            const state = JSON.parse(JSON.stringify(originalState));
+            state.party_position = { ...(state.party_position || {}), x: 160, y: 80 };
+            state.dialog = { ...(state.dialog || {}), active: false };
+            state.in_battle = false;
+            state._debug = { ...(state._debug || {}), runtime_stale: false };
+            state.control = {
+              ...(state.control || {}),
+              navigation_ready: true,
+              allowed_actions: [...new Set([...(state.control?.allowed_actions || []), "navigation_step"])],
+            };
+            state._navigation = {
+              status: "pending",
+              targets: [
+                { id: 91001, kind: "search", status: "pending" },
+                { id: 91002, kind: "touch", status: "pending" },
+              ],
+            };
+            const environmentKey = navigationEnvironmentKey(state);
+            agentSession = { ...(originalSession || {}), session_id: "smoke-agent-navigation", status: "running" };
+            agentSessionEvents = [{
+              session_id: agentSession.session_id,
+              seq: 10,
+              type: "tool",
+              phase: "completed",
+              details: {
+                name: "get_navigation",
+                result: { ok: true, navigation: {
+                  status: "ok",
+                  environment_key: environmentKey,
+                  targets: [{ id: 91001, kind: "search", status: "reachable", steps: 7 }],
+                } },
+              },
+            }];
+            restoreAgentNavigationResult();
+            window.fetch = async (url, options) => {
+              if (url === "/diagnostics/navigation") {
+                if (JSON.parse(options?.body || "{}").event === "navigation_key_mismatch") mismatchDiagnostics += 1;
+                return { ok: true, json: async () => ({ ok: true }) };
+              }
+              if (url === "/navigation") {
+                navigationCalls += 1;
+                return { ok: true, json: async () => ({
+                  status: "ok",
+                  environment_key: navigationEnvironmentKey(latestState),
+                  targets: latestState._navigation.targets.map((target) => ({
+                    ...target, status: "reachable", steps: 3,
+                  })),
+                }) };
+              }
+              return originalFetch(url, options);
+            };
+
+            render(state);
+            navigationEnvironmentChangedAt = performance.now() - navigationSettleMs;
+            scheduleNavigationRefresh(latestState);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const matched = latestState._navigation.targets.map((target) => [target.id, target.status, target.steps ?? null]);
+            const buttonsLocked = [...navigationEl.querySelectorAll("button.navGo")].every((button) => button.disabled);
+            const callsWhileRunning = navigationCalls;
+
+            const changed = JSON.parse(JSON.stringify(state));
+            changed.party_position.x += 16;
+            changed._navigation = {
+              status: "pending",
+              targets: state._navigation.targets.map((target) => ({ ...target, status: "pending" })),
+            };
+            render(changed);
+            const staleHidden = latestState._navigation.targets.every((target) => target.status === "pending");
+
+            navigationEnvironmentChangedAt = performance.now() - navigationSettleMs;
+            setAgentSession({ ...agentSession, status: "paused" });
+            if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+            navigationRefreshTimer = null;
+            navigationEnvironmentChangedAt = performance.now() - navigationSettleMs;
+            scheduleNavigationRefresh(latestState);
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            const resumedKeyMatched = latestState._navigation.environment_key === navigationEnvironmentKey(latestState);
+            const resumedButtonEnabled = [...navigationEl.querySelectorAll("button.navGo")].some((button) => !button.disabled);
+            const resumed = navigationCalls === 1 && resumedKeyMatched && resumedButtonEnabled;
+
+            navigationCache.clear();
+            latestState._navigation = { status: "pending", targets: changed._navigation.targets };
+            navigationEnvironmentChangedAt = performance.now() - navigationSettleMs;
+            navigationStableEnvironmentKey = navigationEnvironmentKey(latestState);
+            let transientCalls = 0;
+            window.fetch = async (url, options) => {
+              if (url === "/diagnostics/navigation") {
+                if (JSON.parse(options?.body || "{}").event === "navigation_key_mismatch") mismatchDiagnostics += 1;
+                return { ok: true, json: async () => ({ ok: true }) };
+              }
+              if (url === "/navigation") {
+                transientCalls += 1;
+                return { ok: true, json: async () => ({ ok: true, status: "waiting_for_control" }) };
+              }
+              return originalFetch(url, options);
+            };
+            await refreshNavigationForKey(navigationEnvironmentKey(latestState));
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            const transientSettled = transientCalls === 1 && navigationRefreshTimer !== null;
+            return { matched, buttonsLocked, callsWhileRunning, staleHidden, resumed, resumedKeyMatched, resumedButtonEnabled, navigationCalls, transientSettled, mismatchDiagnostics };
+          } finally {
+            if (navigationRefreshTimer !== null) clearTimeout(navigationRefreshTimer);
+            navigationRefreshTimer = null;
+            window.fetch = originalFetch;
+            navigationCache.clear();
+            originalCache.forEach((value, key) => navigationCache.set(key, value));
+            latestState = originalState;
+            agentSession = originalSession;
+            agentSessionEvents = originalEvents;
+            agentNavigationResult = originalResult;
+            agentNavigationBase = originalBase;
+            agentNavigationBaseEnvironmentKey = originalBaseKey;
+            resetNavigationRefreshRetry();
+            if (latestState) render(latestState);
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const agentNavigationReuseResult = agentNavigationReuse.result?.value;
+    if (
+      JSON.stringify(agentNavigationReuseResult?.matched) !== JSON.stringify([[91001, "reachable", 7], [91002, "pending", null]])
+      || !agentNavigationReuseResult.buttonsLocked
+      || agentNavigationReuseResult.callsWhileRunning !== 0
+      || !agentNavigationReuseResult.staleHidden
+      || !agentNavigationReuseResult.resumed
+      || !agentNavigationReuseResult.transientSettled
+      || agentNavigationReuseResult.mismatchDiagnostics !== 0
+    ) {
+      throw new Error(`agent navigation reuse smoke failed (${JSON.stringify(agentNavigationReuseResult)})`);
     }
 
     const navigationSingleFlight = await cdp.send(

@@ -7,6 +7,114 @@ import pytest
 from tests.support import create_agent_task, make_debug_state, make_state, write_state
 
 
+def test_model_upsert_projection_is_small_and_failures_are_unchanged(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    full = {
+        "ok": True,
+        "operation": "updated",
+        "task": {
+            "id": "task-a", "status": "active", "priority": 2, "object_id": 57,
+            "transition_key": None, "room_id": "room-a",
+            "description": "large description " * 100,
+            "rationale": "large rationale " * 100,
+            "created_at": 1, "updated_at": 2,
+            "provenance": {"task_inbox_batch_ids": ["inbox-a"]},
+            "history": [{"changes": {
+                "priority": {"from": 1, "to": 2},
+                "source_inbox_ids": {"added": ["inbox-a"]},
+            }}] * 20,
+        },
+    }
+    projected = runtime._model_tool_result("upsert_task", full)
+    assert projected == {
+        "ok": True,
+        "operation": "updated",
+        "task": {
+            "id": "task-a", "status": "active", "priority": 2, "object_id": 57,
+            "transition_key": None, "room_id": "room-a",
+        },
+        "changed_fields": ["priority", "source_inbox_ids"],
+        "source_inbox_ids": ["inbox-a"],
+    }
+    assert len(json.dumps(projected)) < 1024
+    failed = {"ok": False, "error": {"code": "task_review_required", "message": "repair me"}}
+    assert runtime._model_tool_result("upsert_task", failed) is failed
+
+
+def test_agent_navigation_audit_keeps_environment_key_but_model_projection_omits_it(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[{
+        "id": 57, "x": 32, "y": 0, "state": 1, "sprite_id": 1,
+        "trigger_mode": 1, "trigger_script": 1, "blocking": False,
+        "interactable": True,
+    }])
+
+    full = debug.run_agent_tool("get_navigation", {"limit": 1}, state)
+    environment_key = full["navigation"]["environment_key"]
+    assert environment_key == debug.navigation_environment_payload(state)["environment_key"]
+
+    projected = debug.agent_runtime._model_tool_result("get_navigation", full)
+    assert "environment_key" not in projected["navigation"]
+    assert projected["navigation"]["targets"] == full["navigation"]["targets"]
+    assert full["navigation"]["environment_key"] == environment_key
+
+
+def test_model_observation_projection_shrinks_dialogs_and_archives_exact_raw(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    dialogs = []
+    for index in range(30):
+        dialogs.append({
+            "time": index, "agent_turn": 4, "logical_frame": 100 + index,
+            "scene_id": 3, "map_id": 10, "logical_room_id": "room-a",
+            "event_object_id": 57, "message_ids": [1000 + index],
+            "speaker_hint": "李大娘", "text": f"对话 {index} " + "内容" * 30,
+            "raw": "R" * 1200, "room_key": "legacy", "legacy_nav_room_id": "old",
+            "provenance": {"huge": "P" * 1000},
+        })
+    full = {"ok": True, "kind": "dialogs", "dialogs": dialogs, "total": 30}
+    raw = json.dumps(full, ensure_ascii=False, separators=(",", ":"))
+    projected = runtime._model_tool_result("get_observations", full)
+    encoded = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    assert len(encoded.encode("utf-8")) < len(raw.encode("utf-8")) * 0.2
+    restored_dialogs = [dict(zip(projected["dialog_fields"], values)) for values in projected["dialogs"]]
+    assert all(entry["speaker_hint"] == "李大娘" for entry in restored_dialogs)
+    assert all(entry["event_object_id"] == 57 for entry in restored_dialogs)
+    assert all(entry["logical_room_id"] == "room-a" for entry in restored_dialogs)
+    assert [entry["text"] for entry in restored_dialogs] == [entry["text"] for entry in dialogs]
+    assert projected["full_result_archived"] is True
+    assert runtime.get_tool_output(projected["output_ref"])["content"] == raw[:6000]
+    pages = []
+    offset = 0
+    while True:
+        page = runtime.get_tool_output(projected["output_ref"], offset)
+        pages.append(page["content"])
+        if page["complete"]:
+            break
+        offset = page["next_offset"]
+    assert "".join(pages) == raw
+
+
+def test_model_interaction_event_projection_keeps_semantic_outcome(tmp_path):
+    debug = make_debug_state(tmp_path)
+    event = {
+        "type": "interaction_no_effect", "time": 1.0, "frame": 5,
+        "logical_frame": 6, "raw_frame": 9, "scene_id": 3, "map_id": 10,
+        "room_id": "legacy", "logical_room_id": "room-a", "room_key": "duplicate",
+        "object_id": 57, "target_id": 57, "action": {"tool": "navigate"},
+        "started_object": {"id": 57, "state": 1},
+        "finished_object": {"id": 57, "state": 1},
+        "inventory_changes": [{"item_id": 1, "delta": 2, "amount": 3, "name": "x"}],
+        "room_changed": False, "reason": "no_state_change",
+    }
+    projected = debug.project_agent_event(event)
+    assert projected["object_id"] == 57
+    assert projected["reason"] == "no_state_change"
+    assert projected["inventory_changes"] == [{"item_id": 1, "delta": 2, "amount": 3}]
+    assert "started_object" not in projected and "finished_object" not in projected
+    assert "raw_frame" not in projected and "room_key" not in projected
+
+
 def equipment_item(
     item_id,
     name,
@@ -738,7 +846,8 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert set(names) == {
         'upsert_task', 'upsert_room_memo', 'get_tasks', 'get_navigation', 'inspect_target',
         'get_observations', 'get_inventory', 'get_shop', 'get_equipment',
-        'get_room_memory', 'get_tool_output', 'review_task_inbox', 'submit_decision',
+        'get_room_memory', 'inspect_screen', 'get_tool_output', 'review_task_inbox',
+        'submit_decision',
     }
     dialog_properties = by_name['get_observations']['function']['parameters']['properties']
     assert 'speaker' in dialog_properties
