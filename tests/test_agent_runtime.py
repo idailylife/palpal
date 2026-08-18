@@ -1248,6 +1248,79 @@ def test_battle_delegate_failure_and_interrupt_emit_terminal_trace(tmp_path):
     assert interrupted.snapshot()["battle_delegate"]["status"] == "stopped"
 
 
+def test_prebattle_dialog_uses_main_agent_then_delegates_at_command(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    prebattle = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "in_battle": True,
+        "battle": {
+            "generation": 5, "phase": "pre_battle", "result": "terminated", "enemies": [],
+        },
+        "dialog": {"active": True, "latest_event": {"message_id": 10, "text": "来吧"}},
+        "control": {
+            "owner": "client", "phase": "dialog",
+            "allowed_actions": ["advance_dialog"], "navigation_ready": False,
+        },
+        "_debug": {"runtime_stale": False},
+    }
+    command = {
+        **prebattle,
+        "dialog": {"active": False},
+        "battle": {
+            "generation": 5, "command_generation": 1, "phase": "command",
+            "current_player_index": 0, "available_actions": [], "enemies": [],
+        },
+        "control": {
+            "owner": "client", "phase": "battle",
+            "allowed_actions": ["battle_action", "press_buttons"], "navigation_ready": False,
+        },
+    }
+    current = {"state": prebattle}
+    debug.snapshot = lambda: current["state"]
+    runtime.decision_provider = lambda *_args: decision(
+        "advance_dialog", {"max_presses": 1}, "advance_dialog",
+    )
+    monkeypatch.setattr(runtime, "_execute_decision", lambda _decision: current.update(state=command) or {
+        "ok": True, "tool": "advance_dialog", "delta": {},
+    })
+    delegated = []
+
+    async def delegate(state):
+        delegated.append(state["battle"]["phase"])
+        return {"result": "lost"}
+
+    monkeypatch.setattr(runtime.battle_delegate, "run", delegate)
+
+    runtime.start(None, 2)
+    paused = wait_for_pause(runtime)
+
+    assert delegated == ["command"]
+    assert paused["stop_reason"] == "battle_lost"
+    assert paused["run_turn"] == 1
+    assert not [
+        event for event in runtime.events()
+        if event["type"] == "action" and event["phase"] == "failed"
+    ]
+
+
+def test_battle_delegate_reuses_child_session_for_same_generation(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    state = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "in_battle": True,
+        "battle": {"generation": 5, "phase": "command", "enemies": []},
+    }
+
+    first = runtime.battle_delegate._begin(state)
+    second = runtime.battle_delegate._begin(state)
+
+    assert second["child_session_id"] == first["child_session_id"]
+    assert second["battle_generation"] == 5
+
+
 def test_decide_once_is_disabled_in_battle(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime

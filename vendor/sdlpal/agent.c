@@ -3688,7 +3688,7 @@ PALPAL_AgentBattlePhaseName(
    switch (g_agent_battle.phase)
    {
    case kPalpalAgentBattlePreBattle:
-      return g_Battle.BattleResult == kBattleResultPreBattle ? "pre_battle" : "resolving";
+      return "pre_battle";
    case kPalpalAgentBattleCommand: return "command";
    case kPalpalAgentBattleReward: return "reward";
    case kPalpalAgentBattleEnding: return "ending";

@@ -599,6 +599,68 @@ def test_battle_control_exposes_only_command_windows(tmp_path):
     assert control["allowed_actions"] == []
 
 
+@pytest.mark.parametrize(
+    ("interaction", "phase", "allowed"),
+    [
+        ({"dialog": {"active": True}}, "dialog", ["advance_dialog"]),
+        (
+            {"choice": {"active": True, "generation": 3}},
+            "choice",
+            ["choice_select", "press_buttons"],
+        ),
+    ],
+)
+def test_prebattle_interactions_are_client_controlled(
+    tmp_path, interaction, phase, allowed,
+):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {"generation": 4, "phase": "pre_battle"},
+        **interaction,
+    }
+
+    control = debug.control_state(state)
+
+    assert control["owner"] == "client"
+    assert control["phase"] == phase
+    assert control["allowed_actions"] == allowed
+    assert control["battle_state_available"] is True
+
+
+def test_terminated_prebattle_dialog_is_client_controlled(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {"generation": 4, "phase": "pre_battle", "result": "terminated"},
+        "dialog": {"active": True},
+    }
+
+    control = debug.control_state(state)
+
+    assert control["owner"] == "client"
+    assert control["phase"] == "dialog"
+    assert control["allowed_actions"] == ["advance_dialog"]
+
+
+@pytest.mark.parametrize("phase", ["command", "resolving", "reward"])
+def test_dialog_does_not_take_control_in_normal_battle_phases(tmp_path, phase):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {"generation": 4, "phase": phase},
+        "dialog": {"active": True},
+    }
+
+    control = debug.control_state(state)
+
+    assert control["phase"] == "battle"
+    assert "advance_dialog" not in control["allowed_actions"]
+
+
 def test_old_battle_state_rejects_controls_as_unavailable(tmp_path):
     debug = make_debug_state(tmp_path)
     state = {**make_state(), "in_battle": True}
@@ -902,6 +964,168 @@ def test_advance_dialog_writes_search_and_stops_when_dialog_ends(tmp_path, monke
     assert result["ok"] is True
     assert result["status"] == "dialog_inactive"
     assert result["presses"] == 1
+    assert written == [(["search"], 1)]
+
+
+def test_advance_dialog_allows_prebattle_and_stops_at_native_termination(
+    tmp_path, monkeypatch,
+):
+    debug = make_debug_state(tmp_path)
+    active = active_dialog_state("你真的要交手嗎？")
+    active.update({
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "pre_battle", "result": "terminated"},
+    })
+    ended = {
+        **make_state(),
+        "last_battle": {
+            "generation": 8,
+            "result": "terminated",
+            "players": [],
+            "enemies": [{"object_id": 611, "name": "苗人"}],
+        },
+    }
+
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        [active, ended, ended, ended, ended],
+        {"max_presses": 3, "delay_ms": 100},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "dialog_inactive"
+    assert written == [(["search"], 1)]
+
+
+def test_advance_dialog_hands_off_when_prebattle_enters_command(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    active = active_dialog_state("准备战斗")
+    active.update({
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "pre_battle"},
+    })
+    command = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "command"},
+    }
+
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        [active, command, command],
+        {"max_presses": 3, "delay_ms": 100},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "battle_started"
+    assert written == [(["search"], 1)]
+
+
+def test_advance_dialog_rechecks_battle_state_without_repeating_the_press(
+    tmp_path, monkeypatch,
+):
+    debug = make_debug_state(tmp_path)
+    active = active_dialog_state("准备战斗")
+    active.update({
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "pre_battle"},
+    })
+    command = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "command"},
+    }
+
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        [active, command, active, command, command],
+        {"max_presses": 3, "delay_ms": 100},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "battle_started"
+    assert result["presses"] == 2
+    assert written == [(["search"], 1), (["search"], 1)]
+
+
+def test_advance_dialog_hands_off_from_normal_dialog_through_prebattle(
+    tmp_path, monkeypatch,
+):
+    debug = make_debug_state(tmp_path)
+    ordinary = active_dialog_state("你是什么人？")
+    prebattle = active_dialog_state("少废话，看招！")
+    prebattle.update({
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "pre_battle"},
+    })
+    command = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "command"},
+    }
+
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        [ordinary, prebattle, command, command],
+        {"max_presses": 3, "delay_ms": 100},
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "battle_started"
+    assert result["presses"] == 2
+    assert written == [(["search"], 1), (["search"], 1)]
+
+
+def test_advance_dialog_still_rejects_dialog_during_command_battle(
+    tmp_path, monkeypatch,
+):
+    debug = make_debug_state(tmp_path)
+    state = active_dialog_state()
+    state.update({
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "command"},
+    })
+
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        [state, state],
+        {"max_presses": 3, "delay_ms": 100},
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "in_battle"
+    assert written == []
+
+
+def test_advance_dialog_does_not_handoff_to_a_different_battle_generation(
+    tmp_path, monkeypatch,
+):
+    debug = make_debug_state(tmp_path)
+    active = active_dialog_state("准备战斗")
+    active.update({
+        "in_battle": True,
+        "battle": {"generation": 8, "phase": "pre_battle"},
+    })
+    changed = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {"generation": 9, "phase": "command"},
+    }
+
+    result, written = run_dialog_scenario(
+        debug,
+        monkeypatch,
+        [active, changed, changed],
+        {"max_presses": 3, "delay_ms": 100},
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "in_battle"
     assert written == [(["search"], 1)]
 
 

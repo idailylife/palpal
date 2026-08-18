@@ -925,6 +925,20 @@ class DebugState:
             local_pending = isinstance(self.pending_written_action, dict)
         return self.action_path.exists() or local_pending or bool(native and native["pending"])
 
+    @staticmethod
+    def prebattle_interaction(state: dict) -> str | None:
+        """Return the client-owned interaction active during native pre-battle."""
+        if not state.get("in_battle"):
+            return None
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        if battle is None or battle.get("phase") != "pre_battle":
+            return None
+        if bool((state.get("choice") or {}).get("active")):
+            return "choice"
+        if bool((state.get("dialog") or {}).get("active")):
+            return "dialog"
+        return None
+
     def control_state(self, state: dict, state_info: dict | None = None) -> dict:
         """Derive the client/game control contract from the compatible native fields."""
         has_transport_info = isinstance(state_info, dict)
@@ -952,10 +966,15 @@ class DebugState:
             owner, phase, allowed = "game", "unavailable", []
         elif state.get("in_battle"):
             battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+            prebattle_interaction = self.prebattle_interaction(state)
             if battle is None:
                 owner, phase, allowed = "game", "battle", []
             elif self.action_pending(state):
                 owner, phase, allowed = "game", "battle", []
+            elif prebattle_interaction == "choice":
+                owner, phase, allowed = "client", "choice", ["choice_select", "press_buttons"]
+            elif prebattle_interaction == "dialog":
+                owner, phase, allowed = "client", "dialog", ["advance_dialog"]
             elif battle.get("phase") in {"command", "reward"}:
                 owner, phase, allowed = "client", "battle", ["battle_action", "press_buttons"]
             else:
@@ -8834,7 +8853,7 @@ class DebugState:
             return "state_parse_error"
         if state.get("_debug", {}).get("runtime_stale"):
             return "runtime_stale"
-        if state.get("in_battle"):
+        if state.get("in_battle") and self.prebattle_interaction(state) not in {"dialog", "choice"}:
             return "in_battle"
         if state.get("in_main_game") is False:
             return "not_in_main_game"
@@ -8969,9 +8988,58 @@ class DebugState:
             state = self.snapshot()
             if bool((state.get("choice") or {}).get("active")):
                 return finish_result("choice_active")
+
+            started_in_battle = bool(state.get("in_battle"))
+            initial_prebattle_generation = None
+            if self.prebattle_interaction(state) in {"dialog", "choice"}:
+                try:
+                    initial_prebattle_generation = int(
+                        (state.get("battle") or {}).get("generation") or 0
+                    )
+                except (TypeError, ValueError):
+                    initial_prebattle_generation = None
+
+            def finish_stop_status(stop_status: str) -> dict | None:
+                nonlocal state
+                if stop_status == "in_battle":
+                    stopped_state = state
+                    state = self.snapshot()
+                    interaction = self.prebattle_interaction(state)
+                    stopped_battle = (
+                        stopped_state.get("battle")
+                        if isinstance(stopped_state.get("battle"), dict)
+                        else {}
+                    )
+                    battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+                    try:
+                        stopped_generation = int(stopped_battle.get("generation") or 0)
+                        generation = int(battle.get("generation") or 0)
+                    except (TypeError, ValueError):
+                        stopped_generation = generation = 0
+                    if (
+                        interaction is not None
+                        and generation > 0
+                        and generation == stopped_generation
+                    ):
+                        if interaction == "choice":
+                            return finish_result("choice_active")
+                        return None
+                    valid_handoff = generation > 0 and (
+                        not started_in_battle
+                        or generation == initial_prebattle_generation
+                    )
+                    if valid_handoff and battle.get("phase") != "pre_battle":
+                        return finish_result("battle_started")
+                return finish_result(
+                    stop_status,
+                    ok=stop_status in {"dialog_inactive", "choice_active", "cancelled"},
+                )
+
             state, stop_status = self.dialog_advance_wait_for_visible(state)
             if stop_status:
-                return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "choice_active", "cancelled"})
+                result = finish_stop_status(stop_status)
+                if result is not None:
+                    return result
 
             previous_active_key = self.dialog_advance_active_event_key(state)
             repeated_active_presses = 0
@@ -8992,7 +9060,9 @@ class DebugState:
                     return finish_result("choice_active")
                 state, stop_status = self.dialog_advance_wait_for_visible(state)
                 if stop_status:
-                    return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "choice_active", "cancelled"})
+                    result = finish_stop_status(stop_status)
+                    if result is not None:
+                        return result
 
                 event_observation = self.dialog_advance_observe_events(
                     state,

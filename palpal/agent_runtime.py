@@ -2026,7 +2026,7 @@ class AgentRuntime:
                 before = await asyncio.to_thread(self.debug.snapshot)
                 if self._game_control_active(before):
                     before = await asyncio.to_thread(self._wait_for_control)
-                if before.get("in_battle"):
+                if before.get("in_battle") and self.debug.prebattle_interaction(before) is None:
                     if not isinstance(before.get("battle"), dict):
                         self._pause("battle_state_unavailable")
                         return
