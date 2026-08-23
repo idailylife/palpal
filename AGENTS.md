@@ -23,7 +23,10 @@ automation layer.
 - `vendor/sdlpal/main.c`: patched startup to skip splash/menu in agent mode.
 - `vendor/sdlpal/uigame.c`: patched item, equipment, and shop UI handling.
 - `palpal/debug_server.py`: HTTP/WebSocket debug server.
-- `palpal/agent_runtime.py`: persistent Agent session, tasks, tools, and event stream.
+- `palpal/agent_runtime.py`: persistent Agent session, tasks, tools, battle
+  delegation, and event stream.
+- `palpal/screen_inspection.py`: low-authority screen inspection backing the
+  Agent's `inspect_screen` tool.
 - `palpal/observations.py`: structured observation lifecycle and persistence.
 - `web/`: browser debug UI.
 - `scripts/fetch_assets.py`: local-only asset fetch helper.
@@ -115,10 +118,10 @@ The native bridge consumes:
 
 - `action.txt`: line-oriented action request.
 
-Native item, equipment, and shop actions publish completion details through
-`action_result.json`. The Python server also maintains lower-frequency,
-file-backed exploration, dialog, observation, checkpoint, and Agent session
-data under `runtime/`.
+Native item, equipment, shop, checkpoint/slot, and battle actions publish
+completion details through `action_result.json`. The Python server also
+maintains lower-frequency, file-backed exploration, dialog, observation,
+checkpoint, and Agent session data under `runtime/`.
 
 Action format:
 
@@ -135,14 +138,15 @@ indexed frames as PNG for the browser.
 
 ## State Exposure Priorities
 
-Current exposure supports map exploration, inventory/equipment decisions, and
-shop interactions:
+Current exposure supports map exploration, inventory/equipment decisions, shop
+interactions, and battle automation:
 
 - party position and direction
 - scene/map/region
 - party stats and equipped items
 - inventory and item metadata
 - active shop state, offered items, prices, and purchase results
+- battle mode, phase, party/enemy combatants, and legal battle actions
 - event objects
 - interactable/blocking flags
 - trigger and auto script ids
@@ -151,7 +155,6 @@ shop interactions:
 
 Next useful extensions:
 
-- battle UI state and enemy/player action state
 - stable object annotation table
 - script opcode tracing
 - root-level save/load/reset endpoints wired through the native bridge

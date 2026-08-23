@@ -13,6 +13,9 @@ console for humans and LLM agents.
   `runtime/action.txt` and `runtime/action_result.json`.
 - HTTP endpoints for state, actions, navigation, inventory/equipment,
   checkpoints, and persistent Agent sessions.
+- Battle state exposure plus a dedicated in-battle Agent that picks legal
+  actions during fights, with a conservative default policy when no model key
+  is configured.
 - WebSocket streams for live state, frames, and Agent events.
 - Browser debug UI with the game frame, state and object inspection,
   navigation, equipment, checkpoints, Agent timeline/goals, and raw JSON.
@@ -131,8 +134,8 @@ The native bridge and debug server keep lower-frequency coordination and durable
 data under `runtime/`:
 
 - `action.txt`: next action for SDLPAL to consume.
-- `action_result.json`: native completion details for item, equipment, shop, and
-  checkpoint actions.
+- `action_result.json`: native completion details for item, equipment, shop,
+  checkpoint, and battle actions.
 - `exploration.json`, `events.json`, and `dialog_history.json`: learned map,
   room-scoped Agent memos, state-event, and dialog history.
 - `logs/`: game, debug-server, and navigation diagnostics.
@@ -234,14 +237,19 @@ ws://127.0.0.1:8765/frames
 
 The Web UI's Agent tab runs a persistent, server-side loop that chooses useful
 local actions from current state, exploration value, and maintained tasks. Only
-one session can control the game at a time. DeepSeek uses the OpenAI Agents SDK
-over its OpenAI-compatible Responses endpoint. The debug server requires
-`POE_API_KEY` at startup so the main exploration Agent can call the read-only
-`inspect_screen` tool when structured evidence cannot explain the visible room
-layout or a suspected passage. `POE_VISION_MODEL` defaults to
-`gemini-3.7-flash`, `POE_VISION_BASE_URL` to `https://api.poe.com/v1`, and
-`POE_VISION_TIMEOUT` to 30 seconds. Values may be supplied through the process
-environment or the project `.env`; the key is never persisted in Agent data.
+one session can control the game at a time. The exploration Agent and the
+in-battle Agent run on the OpenAI Agents SDK over DeepSeek's OpenAI-compatible
+Responses endpoint. The debug server needs `DEEPSEEK_API_KEY` to start an Agent
+session or delegate battle commands; `DEEPSEEK_BASE_URL` defaults to
+`https://api.deepseek.com`, `DEEPSEEK_MODEL` to `deepseek-v4-pro` (allowed
+`deepseek-v4-pro` or `deepseek-v4-flash`), and `DEEPSEEK_TIMEOUT` to 90 seconds.
+The debug server also requires `POE_API_KEY` at startup so the exploration Agent
+can call the read-only `inspect_screen` tool when structured evidence cannot
+explain the visible room layout or a suspected passage. `POE_VISION_MODEL`
+defaults to `gemini-3.7-flash`, `POE_VISION_BASE_URL` to
+`https://api.poe.com/v1`, and `POE_VISION_TIMEOUT` to 30 seconds. Values may be
+supplied through the process environment or the project `.env`; keys are never
+persisted in Agent data.
 
 ```text
 GET  /agent/session
@@ -296,17 +304,17 @@ compression summary does not replace it. After compression or checkpoint
 restore, the next Agent run must reconcile a compact index of active,
 completed, and abandoned tasks before navigation or item use resumes.
 
-The persistent model sees thirteen tools: `upsert_task`, `upsert_room_memo`, `get_tasks`,
+The persistent model sees fourteen tools: `upsert_task`, `upsert_room_memo`, `get_tasks`,
 `get_navigation`, `inspect_target`, `get_observations`, `get_shop`,
-`get_equipment`, `get_inventory`, `get_room_memory`, `get_tool_output`,
-`review_task_inbox`, and `submit_decision`. `get_tasks` remains backward
-compatible by defaulting to active tasks with full records, and also supports
-summary/full detail plus offset pagination. Creating a task requires a complete,
-fresh, closed-inclusive summary review; its final page returns a review token
-that cannot be used by a parallel write from the same model batch. A transition
-to `completed` records its wall-clock time, Agent turn, logical frame, and raw
-native frame when available; completed records are returned newest-completion
-first regardless of task priority.
+`get_equipment`, `get_inventory`, `get_room_memory`, `inspect_screen`,
+`get_tool_output`, `review_task_inbox`, and `submit_decision`. `get_tasks`
+remains backward compatible by defaulting to active tasks with full records, and
+also supports summary/full detail plus offset pagination. Creating a task
+requires a complete, fresh, closed-inclusive summary review; its final page
+returns a review token that cannot be used by a parallel write from the same
+model batch. A transition to `completed` records its wall-clock time, Agent
+turn, logical frame, and raw native frame when available; completed records are
+returned newest-completion first regardless of task priority.
 
 `upsert_room_memo` keeps at most one 800-character Agent-written semantic note
 per stable `logical_room_id`. The current room's memo (or `null`) is included in
@@ -349,10 +357,11 @@ next decision.
 `submit_decision` accepts only a minimal action plus a short reason.
 `navigate` adds `target_id`; `use_item` adds `item_id` and exactly one of
 `role_id` and `target: "all"`; `equip_item` adds `item_id` and `role_id`;
-`buy_item` adds `item_id`; and `advance_dialog` and `leave_shop` need no additional
-fields. Runtime synchronization may still wait internally, but `wait` is not a
-model action. The server derives the internal intent, evidence, risk, and executable
-preview; the former nested decision payload is rejected.
+`buy_item` adds `item_id`; `select_choice` adds `option_index`; and
+`advance_dialog` and `leave_shop` need no additional fields. Runtime
+synchronization may still wait internally, but `wait` is not a model action. The
+server derives the internal intent, evidence, risk, and executable preview; the
+former nested decision payload is rejected.
 
 The checkpoint endpoints above are implemented. These separate root-level
 bridge endpoints remain reserved but are not implemented yet:
@@ -361,10 +370,24 @@ bridge endpoints remain reserved but are not implemented yet:
 - `POST /save`
 - `POST /load`
 
+### Battle State and Automation
+
+While `in_battle` is true, the exported state includes the battle `phase`
+(`pre_battle`, `command`, `reward`, `ending`), `is_boss`,
+`current_player_index`, party `players`, `enemies`, and an `available_actions`
+list with `target_mode`, `valid_target_indices`, and
+`submission_target_indices`. The runtime hands the fight to a dedicated battle
+Agent that exposes `get_battle`, `get_item_details`, and
+`submit_battle_action` and must submit exactly one legal action per command
+round; without `DEEPSEEK_API_KEY` it falls back to a conservative default
+policy. Pre-battle prompts are handled by the main exploration Agent before the
+battle Agent takes over. While the battle Agent owns control, manual game
+actions are rejected.
+
 ## State Model
 
 The exported state currently supports map exploration and the implemented
-inventory, equipment, and shop workflows:
+inventory, equipment, shop, and battle workflows:
 
 - frame and mode flags
 - `scene_id`, `map_id`, and `region_key`
@@ -372,6 +395,7 @@ inventory, equipment, and shop workflows:
 - party members, HP/MP, level, money, and equipped items
 - inventory entries with item metadata and usable/equippable properties
 - active shop mode, selection phase, offered items, and prices
+- battle mode, phase, party/enemy combatants, and legal actions during fights
 - dialog state and recent dialog events
 - current scene event objects
 - nearby blocked map tiles and the local navigation grid

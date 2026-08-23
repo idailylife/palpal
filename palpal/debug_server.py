@@ -1372,6 +1372,39 @@ class DebugState:
     def companion_checkpoint_path(self, checkpoint_dir: Path, relative_path: Path) -> Path:
         return checkpoint_dir / "companion" / relative_path
 
+    @property
+    def companion_owner_path(self) -> Path:
+        return self.runtime_dir / "companion_owner.json"
+
+    def write_companion_owner(self, reason: str) -> None:
+        snapshot = self.agent_runtime.snapshot()
+        owner = {
+            "session_id": snapshot.get("session_id"),
+            "checkpoint_id": snapshot.get("checkpoint_id"),
+            "generation": snapshot.get("generation"),
+            "reason": str(reason)[:80],
+            "updated_at": utc_timestamp(),
+        }
+        self.atomic_write_text(
+            self.companion_owner_path,
+            json.dumps(owner, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def read_companion_owner(self) -> dict | None:
+        try:
+            value = json.loads(self.companion_owner_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def companion_owner_matches(self) -> bool:
+        owner = self.read_companion_owner()
+        if owner is None:
+            # No sidecar yet: unguarded for backward compatibility.
+            return True
+        return str(owner.get("session_id") or "") == str(self.agent_runtime.snapshot().get("session_id") or "")
+
     def checkpoint_id(self, value: str | None = None, generate: bool = True) -> str:
         if value:
             checkpoint_id = CHECKPOINT_ID_RE.sub("-", value.strip()).strip(".-")
@@ -1790,6 +1823,7 @@ class DebugState:
             tmp = checkpoint_dir / "manifest.json.tmp"
             tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             os.replace(tmp, checkpoint_dir / "manifest.json")
+            self.write_companion_owner("save_checkpoint")
             return {"ok": True, "checkpoint": self.checkpoint_manifest(checkpoint_dir)}
         except Exception:
             shutil.rmtree(checkpoint_dir, ignore_errors=True)
@@ -1825,11 +1859,13 @@ class DebugState:
             checkpoint_id,
             state.get("game_instance_id"),
         )
+        self.write_companion_owner("load_checkpoint")
         return result
 
     def start_new_game(self) -> dict:
         state = self.read_live_state()
         self.preflight_start_new_game(state)
+        old_session_id = str(self.agent_runtime.snapshot().get("session_id") or "")
         command_result = self.run_slot_command("start_slot", 0)
         self.clear_runtime_history(reason="start_new_game", state=state)
         self.logical_frame_offset = 0
@@ -1842,6 +1878,46 @@ class DebugState:
             "native_result": command_result["result"],
         }
         self.agent_runtime.reset("start_new_game", game_instance_id=state.get("game_instance_id"))
+        if old_session_id:
+            try:
+                self.agent_runtime.prune_sessions({old_session_id})
+            except Exception:
+                pass
+        self.write_companion_owner("new_game")
+        return result
+
+    def reset_agent_session(self) -> dict:
+        runtime = self.agent_runtime
+        if runtime.is_running():
+            raise RuntimeError("agent_session_running")
+        old_session_id = str(runtime.snapshot().get("session_id") or "")
+        archived_checkpoint_id = None
+        try:
+            auto_id = "auto-reset-" + time.strftime("%Y%m%d-%H%M%S", time.localtime())
+            archived = self.save_checkpoint(auto_id, "auto archive before reset")
+            archived_checkpoint_id = (archived.get("checkpoint") or {}).get("id")
+        except Exception:
+            archived_checkpoint_id = None
+        self.clear_runtime_history(reason="user_reset")
+        session = runtime.reset("user_reset")
+        if archived_checkpoint_id is not None and old_session_id:
+            try:
+                runtime.prune_sessions({old_session_id})
+            except Exception:
+                pass
+        self.write_companion_owner("reset")
+        return {"ok": True, "session": session, "archived_checkpoint_id": archived_checkpoint_id}
+
+    def prune_orphan_sessions(self, session_ids: set[str] | None = None) -> dict:
+        runtime = self.agent_runtime
+        if session_ids is None:
+            discovered = runtime.discover_session_ids()
+            live = str(runtime.snapshot().get("session_id") or "")
+            orphaned = discovered - {live}
+        else:
+            orphaned = {str(session_id) for session_id in session_ids if str(session_id)}
+        result = runtime.prune_sessions(orphaned)
+        result["pruned_total"] = len(result.get("pruned_session_ids") or [])
         return result
 
     def delete_checkpoint(self, checkpoint_id: str) -> dict:
@@ -2050,6 +2126,7 @@ class DebugState:
                 self.dialogs_path,
                 self.exploration_path,
                 self.navigation_log_path,
+                self.companion_owner_path,
             ):
                 try:
                     path.unlink()
@@ -10832,6 +10909,19 @@ class DebugState:
         ]
 
     def agent_tool_initial_context(self, state: dict) -> dict:
+        if not self.companion_owner_matches():
+            self.agent_runtime.emit(
+                "isolation",
+                "paused",
+                "Companion memory ownership mismatch; withholding memory.",
+            )
+            return {
+                "state_summary": self.agent_state_summary(state),
+                "isolation_error": "companion_owner_mismatch",
+                "room_memo": None,
+                "active_tasks": [],
+                "task_reconciliation": {"pending": False, "reason": "companion_owner_mismatch"},
+            }
         identity = self.room_identity(state)
         room_id = identity.get("id") if isinstance(identity, dict) else None
         context = {
@@ -13309,8 +13399,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/agent/session/reset":
             try:
-                session = self.server.state.agent_runtime.reset("user_reset")
-                self.send_json({"ok": True, "session": session})
+                result = self.server.state.reset_agent_session()
+                self.send_json(result)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
             return
@@ -13406,6 +13496,23 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_body_json()
                 result = self.server.state.load_checkpoint(str(payload.get("id") or ""))
                 self.send_json(result)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
+        if self.path == "/checkpoints/prune":
+            if self.reject_if_agent_running():
+                return
+            try:
+                payload = self.read_body_json()
+                raw_ids = payload.get("session_ids")
+                session_ids = (
+                    {str(session_id) for session_id in raw_ids if str(session_id)}
+                    if isinstance(raw_ids, list)
+                    else None
+                )
+                result = self.server.state.prune_orphan_sessions(session_ids)
+                self.send_json({"ok": True, **result})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
             return

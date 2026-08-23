@@ -276,6 +276,7 @@ case "$command" in
         ;;
     clean)
         prepare_live_runtime
+        rm -rf "$RUNTIME_DIR/checkpoint_migration_backups"
         ;;
     help|-h|--help)
         usage

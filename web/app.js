@@ -2989,6 +2989,9 @@ function isNavigationSteppingEvent(event) {
 function agentTimelineItems(events) {
   const items = [];
   events.forEach((event) => {
+    // Provider usage accounting is redundant telemetry (already shown in the Agent
+    // session header) and clutters the timeline, splitting Battle Agent groups.
+    if (event?.type === "usage") return;
     const metadata = battleDelegateMetadata(event);
     const previous = items.at(-1);
     if (
@@ -3085,14 +3088,18 @@ function renderAgentTimeline({ anchorScrollHeight = null, anchorScrollTop = 0 } 
   const earlierButton = agentHasOlderEvents
     ? `<button class="agentLoadEarlier" type="button" data-agent-load-earlier>Load earlier turns</button>`
     : "";
-  agentTimelineEl.innerHTML = agentSessionEvents.length ? earlierButton + [...groups.entries()].map(([turn, events]) => `
+  agentTimelineEl.innerHTML = agentSessionEvents.length ? earlierButton + [...groups.entries()].map(([turn, events]) => {
+    const items = agentTimelineItems(events);
+    if (!items.length) return "";
+    return `
     <section class="agentTurn">
       <h3>${turn ? `Turn ${turn}` : "Session"}</h3>
-      ${agentTimelineItems(events).map((item) => item.kind === "battle"
+      ${items.map((item) => item.kind === "battle"
         ? renderBattleTimelineGroup(item, currentEventSeq, openDetails, openBattleGroups)
         : renderAgentActivity(item.event, currentEventSeq, openDetails)
       ).join("")}
-    </section>`).join("") : '<div class="agentTimelineEmpty">No activity yet. Ask Agent to start.</div>';
+    </section>`;
+  }).join("") : '<div class="agentTimelineEmpty">No activity yet. Ask Agent to start.</div>';
   agentTimelineRenderKey = timelineRenderKey;
   if (anchorScrollHeight != null) {
     agentTimelineEl.scrollTop = anchorScrollTop + agentTimelineEl.scrollHeight - anchorScrollHeight;

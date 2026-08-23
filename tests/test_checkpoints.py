@@ -348,7 +348,7 @@ def test_load_checkpoint_discards_incompatible_companion_files(tmp_path):
     assert not debug.exploration_path.exists()
 
 
-def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
+def test_checkpoint_restores_agent_with_rollback_semantics(tmp_path):
     debug = make_debug_state(tmp_path)
     state = {**make_state(), 'game_instance_id': 'game-a'}
     state['inventory'] = [{
@@ -449,9 +449,9 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
         debug.load_checkpoint('agent-branch')
 
     restored = runtime.snapshot()
-    assert restored['session_id'] not in {source_session_id, later_session_id}
-    assert restored['parent_session_id'] == later_session_id
-    assert restored['restored_from_session_id'] == source_session_id
+    assert restored['session_id'] == source_session_id
+    assert restored['parent_session_id'] is None
+    assert restored['restored_from_session_id'] is None
     assert restored['checkpoint_id'] == 'agent-branch'
     assert restored['game_instance_id'] == 'game-a'
     assert restored['turn'] == 4
@@ -475,15 +475,14 @@ def test_checkpoint_restores_agent_as_an_isolated_branch(tmp_path):
     summaries = [event['summary'] for event in runtime.events(limit=500)]
     assert 'Saved activity.' in summaries
     assert 'Post-checkpoint activity.' not in summaries
-    assert summaries[-1] == 'Restored Agent branch from checkpoint agent-branch.'
+    assert summaries[-1] == 'Restored checkpoint agent-branch.'
 
-    first_branch_id = restored['session_id']
     with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
         debug.load_checkpoint('agent-branch')
-    second_branch = runtime.snapshot()
-    assert second_branch['session_id'] != first_branch_id
-    assert second_branch['restored_from_session_id'] == source_session_id
-    assert second_branch['turn'] == 4
+    second_restore = runtime.snapshot()
+    assert second_restore['session_id'] == source_session_id
+    assert second_restore['restored_from_session_id'] is None
+    assert second_restore['turn'] == 4
     assert runtime.get_tool_output(output_ref)['content'] == archived_output
 
 
@@ -570,3 +569,105 @@ def test_delete_checkpoint_only_removes_target_directory(tmp_path):
     assert result['ok']
     assert not first.exists()
     assert second.exists()
+
+
+def test_prune_orphan_sessions_keeps_only_live_session(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    live_id = runtime.snapshot()["session_id"]
+    other_id = "a" * 32
+    runtime.emit("decision", "ready", "Live activity.")
+    other_state = dict(runtime.snapshot(), session_id=other_id)
+    runtime._event_for(other_state, "decision", "ready", "Other activity.")
+    runtime._session_tool_outputs_dir(other_id).mkdir(parents=True, exist_ok=True)
+
+    result = debug.prune_orphan_sessions()
+    assert other_id in result["pruned_session_ids"]
+    assert live_id not in result["pruned_session_ids"]
+    assert all(event["session_id"] != other_id for event in runtime._read_events_file())
+    assert not runtime._session_tool_outputs_dir(other_id).exists()
+
+
+def test_reset_agent_session_clears_companion_and_prunes_old(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    write_state(debug, state)
+    debug.snapshot()
+    runtime = debug.agent_runtime
+    old_id = runtime.snapshot()["session_id"]
+    runtime.emit("decision", "ready", "Old activity.")
+    debug.dialogs_path.write_text('[{"source_key":"old","text":"old"}]', encoding="utf-8")
+    debug.events_path.write_text('[{"type":"old"}]', encoding="utf-8")
+    debug.agent_log_path.write_text('{"turn":9}\n', encoding="utf-8")
+    debug.exploration_path.write_text('{"version":11,"rooms":{},"transitions":{}}', encoding="utf-8")
+    debug.snapshot()
+
+    with patch.object(debug, "run_slot_command", side_effect=fake_save_command(debug)):
+        result = debug.reset_agent_session()
+
+    assert result["ok"] is True
+    assert result["archived_checkpoint_id"] is not None
+    new_id = runtime.snapshot()["session_id"]
+    assert new_id != old_id
+    assert not debug.dialogs_path.exists()
+    assert not debug.events_path.exists()
+    assert not debug.agent_log_path.exists()
+    assert not debug.exploration_path.exists()
+    assert debug.agent_tasks_view()["counts"]["total"] == 0
+    assert all(event["session_id"] != old_id for event in runtime._read_events_file())
+    owner = debug.read_companion_owner()
+    assert owner["session_id"] == new_id
+    assert owner["reason"] == "reset"
+
+
+def test_agent_context_withholds_memory_on_owner_mismatch(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    write_state(debug, state)
+    debug.snapshot()
+    debug.atomic_write_text(
+        debug.companion_owner_path,
+        json.dumps({
+            "session_id": "b" * 32,
+            "checkpoint_id": None,
+            "generation": 0,
+            "reason": "stale",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    context = debug.agent_tool_initial_context(state)
+    assert context.get("isolation_error") == "companion_owner_mismatch"
+    assert context.get("room_memo") is None
+    assert context.get("active_tasks") == []
+
+
+def test_load_later_checkpoint_restores_longer_event_prefix(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state["game_instance_id"] = "game-a"
+    write_state(debug, state)
+    debug.snapshot()
+    runtime = debug.agent_runtime
+    source_id = runtime.snapshot()["session_id"]
+
+    runtime.emit("decision", "ready", "First activity.")
+    with patch.object(debug, "run_slot_command", side_effect=fake_save_command(debug)):
+        debug.save_checkpoint("cp-a", "A")
+
+    runtime.emit("decision", "ready", "Second activity.")
+    with patch.object(debug, "run_slot_command", side_effect=fake_save_command(debug)):
+        debug.save_checkpoint("cp-b", "B")
+
+    with patch.object(debug, "run_slot_command", side_effect=fake_load_command):
+        debug.load_checkpoint("cp-a")
+    summaries = [event["summary"] for event in runtime.events(limit=500)]
+    assert "First activity." in summaries
+    assert "Second activity." not in summaries
+
+    with patch.object(debug, "run_slot_command", side_effect=fake_load_command):
+        debug.load_checkpoint("cp-b")
+    summaries = [event["summary"] for event in runtime.events(limit=500)]
+    assert "First activity." in summaries
+    assert "Second activity." in summaries
+    assert runtime.snapshot()["session_id"] == source_id

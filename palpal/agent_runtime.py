@@ -1618,6 +1618,15 @@ class AgentRuntime:
         if items:
             await session.add_items(items)
 
+    async def _clear_sdk_session(self, session_id: str) -> bool:
+        try:
+            from agents import SQLiteSession
+        except ImportError:
+            return False
+        session = SQLiteSession(session_id, self.sqlite_path)
+        await session.clear_session()
+        return True
+
     def _checkpoint_tool_outputs(self, checkpoint_dir: Path, session_id: str) -> list[dict]:
         source_dir = self._session_tool_outputs_dir(session_id)
         if not source_dir.is_dir():
@@ -1647,10 +1656,9 @@ class AgentRuntime:
         entries: list[dict],
         session_id: str,
     ) -> None:
-        if not entries:
-            return
         source_dir = checkpoint_dir / "agent" / "tool_outputs"
         target_dir = self._session_tool_outputs_dir(session_id)
+        wanted: set[str] = set()
         for entry in entries:
             output_ref = entry.get("output_ref") if isinstance(entry, dict) else None
             if not self._valid_output_ref(output_ref):
@@ -1669,6 +1677,19 @@ class AgentRuntime:
                     tmp.unlink()
                 except FileNotFoundError:
                     pass
+            wanted.add(output_ref)
+        # Replace semantics: drop files produced after the checkpoint point.
+        if target_dir.is_dir():
+            for existing in target_dir.iterdir():
+                if (
+                    existing.is_file()
+                    and existing.name not in wanted
+                    and not existing.name.endswith(".tmp")
+                ):
+                    try:
+                        existing.unlink()
+                    except FileNotFoundError:
+                        pass
 
     def export_checkpoint(self, checkpoint_dir: Path) -> dict:
         with self.lock:
@@ -1699,31 +1720,63 @@ class AgentRuntime:
             "tool_outputs": len(tool_outputs),
         }
 
-    def _append_restored_events(self, events: list[dict], session_id: str) -> None:
-        with self.lock:
-            seq = self._last_event_seq()
-            with self.events_path.open("a", encoding="utf-8") as handle:
-                for source in events:
-                    if not isinstance(source, dict):
+    def _read_events_file(self) -> list[dict]:
+        events: list[dict] = []
+        try:
+            with self.events_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeError):
                         continue
-                    seq += 1
-                    event = {
-                        "seq": seq,
-                        "session_id": session_id,
-                        "turn": int(source.get("turn") or 0),
-                        "type": str(source.get("type") or "event"),
-                        "phase": str(source.get("phase") or "restored"),
-                        "time": source.get("time") or _stamp(),
-                        "elapsed": source.get("elapsed"),
-                        "summary": str(source.get("summary") or "Restored activity.")[:1000],
-                        "details": self._safe_details(source.get("details") or {}),
-                    }
+                    if isinstance(event, dict):
+                        events.append(event)
+        except OSError:
+            return []
+        return events
+
+    def _rewrite_events_file(self, events: list[dict]) -> None:
+        tmp = self.events_path.with_name(f"{self.events_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                for event in events:
                     handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-                    self.event_cache.append(event)
-            self.state["last_event_seq"] = seq
-            self._event_seq = seq
-            self._persist()
-            self.event_condition.notify_all()
+            os.replace(tmp, self.events_path)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+        self._event_seq = max((int(event.get("seq") or 0) for event in events), default=0)
+        self.event_cache.clear()
+        self.event_cache.extend(events[-EVENT_CACHE_SIZE:])
+        self.state["last_event_seq"] = self._event_seq
+        self._persist()
+        self.event_condition.notify_all()
+
+    def _replace_session_events(self, session_id: str, saved_events: list[dict]) -> None:
+        """Replace one session's event suffix so the file mirrors the checkpoint prefix."""
+        with self.lock:
+            kept = [event for event in self._read_events_file() if event.get("session_id") != session_id]
+            for source in saved_events:
+                if not isinstance(source, dict):
+                    continue
+                event = {
+                    "seq": int(source.get("seq") or 0),
+                    "session_id": session_id,
+                    "turn": int(source.get("turn") or 0),
+                    "type": str(source.get("type") or "event"),
+                    "phase": str(source.get("phase") or "restored"),
+                    "time": source.get("time") or _stamp(),
+                    "elapsed": source.get("elapsed"),
+                    "summary": str(source.get("summary") or "Restored activity.")[:1000],
+                    "details": self._safe_details(source.get("details") or {}),
+                }
+                if event["seq"] <= 0:
+                    event["seq"] = max((int(existing.get("seq") or 0) for existing in kept), default=0) + 1
+                kept.append(event)
+            kept.sort(key=lambda item: int(item.get("seq") or 0))
+            self._rewrite_events_file(kept)
 
     def restore_checkpoint(self, checkpoint_dir: Path, checkpoint_id: str, game_instance_id: str | None) -> dict:
         path = checkpoint_dir / "agent" / "session.json"
@@ -1766,14 +1819,17 @@ class AgentRuntime:
             if self.is_running():
                 raise RuntimeError("agent_session_running")
             previous_session_id = self.state.get("session_id")
+            # Rollback semantics: resume the checkpoint's own session instead of forking.
+            target_session_id = source_session_id or previous_session_id
             self.generation += 1
             restored = self._blank(
                 "checkpoint_restored",
                 game_instance_id=game_instance_id,
-                parent_session_id=previous_session_id,
+                parent_session_id=None,
                 checkpoint_id=checkpoint_id,
-                restored_from_session_id=source_session_id,
+                restored_from_session_id=None,
             )
+            restored["session_id"] = target_session_id
             for key in (
                 "model", "turn", "max_turns", "pending_decision", "last_execution",
                 "usage", "last_request_usage", "last_prompt_tokens", "compactions",
@@ -1807,14 +1863,102 @@ class AgentRuntime:
                 parent_session_id=previous_session_id,
                 restored_from_session_id=source_session_id,
             )
-        self._append_restored_events(events, restored["session_id"])
+        self._replace_session_events(restored["session_id"], events)
         self.emit(
             "session",
             "paused",
-            f"Restored Agent branch from checkpoint {checkpoint_id}.",
+            f"Restored checkpoint {checkpoint_id}.",
             {"checkpoint_id": checkpoint_id, "source_session_id": source_session_id},
         )
         return self.snapshot()
+
+    def assert_session_scope(self, session_id: str | None) -> None:
+        if str(session_id or "") != str(self.state.get("session_id") or ""):
+            raise ValueError("session_out_of_scope")
+
+    def discover_session_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for event in self._read_events_file():
+            session_id = event.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                ids.add(session_id)
+        if self.tool_outputs_root.is_dir():
+            for child in self.tool_outputs_root.iterdir():
+                if child.is_dir() and re.fullmatch(r"[0-9a-f]{32}", child.name):
+                    ids.add(child.name)
+        try:
+            import sqlite3
+        except ImportError:
+            sqlite3 = None
+        if sqlite3 is not None:
+            try:
+                connection = sqlite3.connect(str(self.sqlite_path))
+                try:
+                    for row in connection.execute("SELECT session_id FROM agent_sessions"):
+                        session_id = row[0] if row else None
+                        if isinstance(session_id, str) and session_id:
+                            ids.add(session_id)
+                finally:
+                    connection.close()
+            except Exception:
+                pass
+        return ids
+
+    def prune_sessions(self, session_ids: set[str]) -> dict:
+        with self.lock:
+            if self.is_running():
+                raise RuntimeError("agent_session_running")
+            live = str(self.state.get("session_id") or "")
+            protected = {live}
+            battle_delegate = self.state.get("battle_delegate")
+            if isinstance(battle_delegate, dict):
+                child = battle_delegate.get("child_session_id")
+                if isinstance(child, str) and child:
+                    protected.add(child)
+            target = {str(session_id) for session_id in session_ids if str(session_id)}
+            skipped_live = sorted(target & {live})
+            skipped_protected = sorted(target & protected)
+            target.difference_update(protected)
+
+            events_removed = 0
+            if target:
+                all_events = self._read_events_file()
+                kept = [event for event in all_events if event.get("session_id") not in target]
+                events_removed = len(all_events) - len(kept)
+                if events_removed:
+                    self._rewrite_events_file(kept)
+
+            sqlite_sessions_cleared = 0
+            sqlite_skipped: list[str] = []
+            for session_id in sorted(target):
+                try:
+                    cleared = self._submit(self._clear_sdk_session(session_id)).result(timeout=30)
+                except Exception:
+                    cleared = False
+                if cleared:
+                    sqlite_sessions_cleared += 1
+                else:
+                    sqlite_skipped.append(session_id)
+
+            tool_output_dirs_removed = 0
+            for session_id in sorted(target):
+                try:
+                    directory = self._session_tool_outputs_dir(session_id)
+                except ValueError:
+                    continue
+                if directory.is_dir():
+                    shutil.rmtree(directory)
+                    tool_output_dirs_removed += 1
+
+            return {
+                "events_removed": events_removed,
+                "sqlite_sessions_cleared": sqlite_sessions_cleared,
+                "sqlite_skipped": sqlite_skipped,
+                "tool_output_dirs_removed": tool_output_dirs_removed,
+                "skipped_live": skipped_live,
+                "skipped_protected": skipped_protected,
+                "pruned_session_ids": sorted(target),
+            }
 
     def _ensure_loop(self) -> None:
         with self.lock:

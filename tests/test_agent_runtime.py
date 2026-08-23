@@ -3831,3 +3831,86 @@ def test_tool_output_pressure_cleanup_waits_until_96k(tmp_path, monkeypatch):
     asyncio.run(runtime._sanitize_sdk_session(session))
     assert [item["output"] for item in session.items] == raw_outputs
     assert not runtime._session_tool_outputs_dir().exists()
+
+
+def test_prune_sessions_removes_non_live_session_data(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    live_id = runtime.snapshot()["session_id"]
+    other_id = "a" * 32
+
+    runtime.emit("decision", "ready", "Live activity.")
+    other_state = dict(runtime.snapshot(), session_id=other_id)
+    runtime._event_for(other_state, "decision", "ready", "Other activity.")
+
+    other_dir = runtime._session_tool_outputs_dir(other_id)
+    other_dir.mkdir(parents=True, exist_ok=True)
+    ref = "tool-" + "b" * 32 + ".txt"
+    (other_dir / ref).write_text("other output", encoding="utf-8")
+
+    runtime._submit(runtime._replace_sdk_session_items(other_id, [
+        {"role": "user", "content": "other transcript"},
+    ])).result(timeout=5)
+
+    result = runtime.prune_sessions({other_id})
+    assert result["events_removed"] == 1
+    assert result["tool_output_dirs_removed"] == 1
+    assert result["sqlite_sessions_cleared"] == 1
+    assert not other_dir.exists()
+    assert any(event["summary"] == "Live activity." for event in runtime.events(limit=500))
+    assert all(event["session_id"] != other_id for event in runtime._read_events_file())
+    remaining = runtime._submit(runtime._sdk_session_items(other_id)).result(timeout=5)
+    assert remaining == []
+
+    protected = runtime.prune_sessions({live_id})
+    assert protected["skipped_live"] == [live_id]
+    assert protected["events_removed"] == 0
+
+
+def test_prune_sessions_rejects_running_agent(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime.state["status"] = "running"
+    runtime._persist()
+    with pytest.raises(RuntimeError, match="agent_session_running"):
+        runtime.prune_sessions({"a" * 32})
+
+
+def test_discover_session_ids_finds_events_tool_outputs_and_sqlite(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    live_id = runtime.snapshot()["session_id"]
+    other_id = "a" * 32
+    runtime.emit("decision", "ready", "Live activity.")
+    other_state = dict(runtime.snapshot(), session_id=other_id)
+    runtime._event_for(other_state, "decision", "ready", "Other activity.")
+    runtime._session_tool_outputs_dir(other_id).mkdir(parents=True, exist_ok=True)
+    runtime._submit(runtime._replace_sdk_session_items(other_id, [
+        {"role": "user", "content": "other transcript"},
+    ])).result(timeout=5)
+
+    discovered = runtime.discover_session_ids()
+    assert live_id in discovered
+    assert other_id in discovered
+
+
+def test_prune_sessions_protects_battle_delegate_child_session(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    live_id = runtime.snapshot()["session_id"]
+    child_id = "c" * 32
+    runtime.state["battle_delegate"] = {
+        "child_session_id": child_id,
+        "parent_session_id": live_id,
+        "status": "running",
+    }
+    runtime._persist()
+    runtime._submit(runtime._replace_sdk_session_items(child_id, [
+        {"role": "user", "content": "battle context"},
+    ])).result(timeout=5)
+
+    result = runtime.prune_sessions({child_id})
+    assert child_id in result["skipped_protected"]
+    assert child_id not in result["pruned_session_ids"]
+    remaining = runtime._submit(runtime._sdk_session_items(child_id)).result(timeout=5)
+    assert [item["content"] for item in remaining] == ["battle context"]
