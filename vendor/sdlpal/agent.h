@@ -103,6 +103,11 @@ PALPAL_AgentWriteFrame(
 );
 
 VOID
+PALPAL_AgentPollFrame(
+   VOID
+);
+
+VOID
 PALPAL_AgentObserveDialogStart(
    WORD       wEventObjectID
 );

@@ -4798,7 +4798,17 @@ enum {
    PALPAL_LIVE_MESSAGE_STATE = 2,
    PALPAL_LIVE_MESSAGE_FRAME = 3,
    PALPAL_LIVE_MESSAGE_FRAME_REPEAT = 5,
-   PALPAL_LIVE_RETRY_MS = 500
+   PALPAL_LIVE_RETRY_MS = 500,
+   PALPAL_FRAME_WIDTH = 320,
+   PALPAL_FRAME_HEIGHT = 200,
+   PALPAL_FRAME_HEADER_SIZE = 24,
+   PALPAL_FRAME_PALETTE_COLORS = 256,
+   PALPAL_FRAME_PALETTE_SIZE = PALPAL_FRAME_PALETTE_COLORS * 4,
+   PALPAL_FRAME_PIXEL_SIZE = PALPAL_FRAME_WIDTH * PALPAL_FRAME_HEIGHT,
+   PALPAL_FRAME_PAYLOAD_SIZE = PALPAL_FRAME_PALETTE_SIZE + PALPAL_FRAME_PIXEL_SIZE,
+   PALPAL_FRAME_MESSAGE_SIZE = PALPAL_FRAME_HEADER_SIZE + PALPAL_FRAME_PAYLOAD_SIZE,
+   PALPAL_FRAME_FORMAT_INDEXED8 = 2,
+   PALPAL_FRAME_INTERVAL_MS = 66
 };
 
 typedef struct tagPALPALLIVEMESSAGE
@@ -4819,6 +4829,13 @@ static PALPALLIVEMESSAGE *g_agent_live_current = NULL;
 static PALPALLIVEMESSAGE *g_agent_live_state = NULL;
 static PALPALLIVEMESSAGE *g_agent_live_frame = NULL;
 static WORD g_agent_live_last_data_type = 0;
+static BYTE g_agent_latest_frame[PALPAL_FRAME_PAYLOAD_SIZE];
+static BYTE g_agent_published_frame[PALPAL_FRAME_PAYLOAD_SIZE];
+static DWORD g_agent_latest_frame_num = 0;
+static DWORD g_agent_last_frame_publish_time = 0;
+static BOOL g_agent_have_latest_frame = FALSE;
+static BOOL g_agent_have_published_frame = FALSE;
+static BOOL g_agent_latest_frame_dirty = FALSE;
 
 static VOID
 PALPAL_AgentFreeLiveMessage(
@@ -5132,7 +5149,7 @@ PALPAL_AgentPumpLive(
    }
 }
 
-static VOID
+static BOOL
 PALPAL_AgentQueueLiveMessage(
    WORD type,
    const VOID *payload,
@@ -5146,7 +5163,7 @@ PALPAL_AgentQueueLiveMessage(
    message = PALPAL_AgentBuildLiveMessage(type, payload, payload_length);
    if (message == NULL)
    {
-      return;
+      return FALSE;
    }
    slot = type == PALPAL_LIVE_MESSAGE_FRAME || type == PALPAL_LIVE_MESSAGE_FRAME_REPEAT
       ? &g_agent_live_frame
@@ -5157,11 +5174,12 @@ PALPAL_AgentQueueLiveMessage(
    {
       PALPAL_AgentFreeLiveMessage(&message);
       PALPAL_AgentPumpLive();
-      return;
+      return TRUE;
    }
    PALPAL_AgentFreeLiveMessage(slot);
    *slot = message;
    PALPAL_AgentPumpLive();
+   return TRUE;
 }
 
 VOID
@@ -5169,37 +5187,11 @@ PALPAL_AgentWriteFrame(
    VOID
 )
 {
-   enum {
-      PALPAL_FRAME_WIDTH = 320,
-      PALPAL_FRAME_HEIGHT = 200,
-      PALPAL_FRAME_HEADER_SIZE = 24,
-      PALPAL_FRAME_PALETTE_COLORS = 256,
-      PALPAL_FRAME_PALETTE_SIZE = PALPAL_FRAME_PALETTE_COLORS * 4,
-      PALPAL_FRAME_PIXEL_SIZE = PALPAL_FRAME_WIDTH * PALPAL_FRAME_HEIGHT,
-      PALPAL_FRAME_PAYLOAD_SIZE = PALPAL_FRAME_PALETTE_SIZE + PALPAL_FRAME_PIXEL_SIZE,
-      PALPAL_FRAME_MESSAGE_SIZE = PALPAL_FRAME_HEADER_SIZE + PALPAL_FRAME_PAYLOAD_SIZE,
-      PALPAL_FRAME_FORMAT_INDEXED8 = 2,
-      PALPAL_FRAME_INTERVAL_MS = 66
-   };
-   static DWORD s_last_frame_send_time = 0;
-   static BYTE s_frame[PALPAL_FRAME_MESSAGE_SIZE];
-   static BYTE s_last_payload[PALPAL_FRAME_PAYLOAD_SIZE];
-   static BOOL s_have_last_payload = FALSE;
    SDL_Palette *palette;
-   DWORD now;
-   DWORD frame_num = 0;
    int i, y;
 
    if (!PALPAL_AgentEnabled() || gpScreen == NULL)
    {
-      return;
-   }
-
-   now = SDL_GetTicks();
-   if (s_last_frame_send_time != 0 &&
-       !SDL_TICKS_PASSED(now, s_last_frame_send_time + PALPAL_FRAME_INTERVAL_MS))
-   {
-      PALPAL_AgentPumpLive();
       return;
    }
 
@@ -5221,7 +5213,7 @@ PALPAL_AgentWriteFrame(
    for (i = 0; i < PALPAL_FRAME_PALETTE_COLORS; i++)
    {
       SDL_Color color = i < palette->ncolors ? palette->colors[i] : palette->colors[0];
-      BYTE *entry = s_frame + PALPAL_FRAME_HEADER_SIZE + i * 4;
+      BYTE *entry = g_agent_latest_frame + i * 4;
       entry[0] = color.r;
       entry[1] = color.g;
       entry[2] = color.b;
@@ -5230,7 +5222,7 @@ PALPAL_AgentWriteFrame(
    for (y = 0; y < PALPAL_FRAME_HEIGHT; y++)
    {
       BYTE *src = (BYTE *)gpScreen->pixels + y * gpScreen->pitch;
-      BYTE *dst = s_frame + PALPAL_FRAME_HEADER_SIZE + PALPAL_FRAME_PALETTE_SIZE +
+      BYTE *dst = g_agent_latest_frame + PALPAL_FRAME_PALETTE_SIZE +
          y * PALPAL_FRAME_WIDTH;
       memcpy(dst, src, PALPAL_FRAME_WIDTH);
    }
@@ -5242,19 +5234,57 @@ PALPAL_AgentWriteFrame(
 
    if (gpGlobals != NULL)
    {
-      frame_num = gpGlobals->dwFrameNum;
+      g_agent_latest_frame_num = gpGlobals->dwFrameNum;
    }
-
-   s_last_frame_send_time = now;
-   if (!g_agent_live_force_frame && s_have_last_payload &&
-       memcmp(s_last_payload, s_frame + PALPAL_FRAME_HEADER_SIZE, PALPAL_FRAME_PAYLOAD_SIZE) == 0)
+   else
    {
-      PALPAL_AgentQueueLiveMessage(PALPAL_LIVE_MESSAGE_FRAME_REPEAT, NULL, 0);
+      g_agent_latest_frame_num = 0;
+   }
+   g_agent_have_latest_frame = TRUE;
+   g_agent_latest_frame_dirty = TRUE;
+}
+
+VOID
+PALPAL_AgentPollFrame(
+   VOID
+)
+{
+   static BYTE s_frame[PALPAL_FRAME_MESSAGE_SIZE];
+   DWORD now;
+   BOOL changed;
+
+   if (!PALPAL_AgentEnabled())
+   {
       return;
    }
-   memcpy(s_last_payload, s_frame + PALPAL_FRAME_HEADER_SIZE, PALPAL_FRAME_PAYLOAD_SIZE);
-   s_have_last_payload = TRUE;
-   g_agent_live_force_frame = FALSE;
+
+   PALPAL_AgentPumpLive();
+   if (!g_agent_have_latest_frame)
+   {
+      return;
+   }
+
+   now = SDL_GetTicks();
+   if (g_agent_last_frame_publish_time != 0 &&
+       !SDL_TICKS_PASSED(now,
+          g_agent_last_frame_publish_time + PALPAL_FRAME_INTERVAL_MS))
+   {
+      return;
+   }
+
+   changed = g_agent_latest_frame_dirty &&
+      (!g_agent_have_published_frame ||
+       memcmp(g_agent_published_frame, g_agent_latest_frame,
+          PALPAL_FRAME_PAYLOAD_SIZE) != 0);
+   if (!g_agent_live_force_frame && !changed)
+   {
+      if (PALPAL_AgentQueueLiveMessage(PALPAL_LIVE_MESSAGE_FRAME_REPEAT, NULL, 0))
+      {
+         g_agent_last_frame_publish_time = now;
+         g_agent_latest_frame_dirty = FALSE;
+      }
+      return;
+   }
 
    memset(s_frame, 0, PALPAL_FRAME_HEADER_SIZE);
    memcpy(s_frame, "PFRM", 4);
@@ -5263,9 +5293,19 @@ PALPAL_AgentWriteFrame(
    PALPAL_WriteLE16(s_frame + 8, PALPAL_FRAME_HEIGHT);
    PALPAL_WriteLE16(s_frame + 10, PALPAL_FRAME_FORMAT_INDEXED8);
    PALPAL_WriteLE32(s_frame + 12, PALPAL_FRAME_PALETTE_COLORS);
-   PALPAL_WriteLE32(s_frame + 16, frame_num);
+   PALPAL_WriteLE32(s_frame + 16, g_agent_latest_frame_num);
    PALPAL_WriteLE32(s_frame + 20, PALPAL_FRAME_PAYLOAD_SIZE);
-   PALPAL_AgentQueueLiveMessage(PALPAL_LIVE_MESSAGE_FRAME, s_frame, sizeof(s_frame));
+   memcpy(s_frame + PALPAL_FRAME_HEADER_SIZE, g_agent_latest_frame,
+      PALPAL_FRAME_PAYLOAD_SIZE);
+   if (PALPAL_AgentQueueLiveMessage(PALPAL_LIVE_MESSAGE_FRAME, s_frame, sizeof(s_frame)))
+   {
+      memcpy(g_agent_published_frame, g_agent_latest_frame,
+         PALPAL_FRAME_PAYLOAD_SIZE);
+      g_agent_have_published_frame = TRUE;
+      g_agent_latest_frame_dirty = FALSE;
+      g_agent_live_force_frame = FALSE;
+      g_agent_last_frame_publish_time = now;
+   }
 }
 
 static VOID
