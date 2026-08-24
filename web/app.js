@@ -2461,18 +2461,66 @@ function renderJson(state, options = {}) {
   updateJsonStatus();
 }
 
+function playerBattleView(state) {
+  const projected = state?._debug?.battle_player_view;
+  if (projected) return projected;
+  const battle = state?.battle;
+  if (!battle) return null;
+  return {
+    generation: battle.generation,
+    command_generation: battle.command_generation,
+    result: battle.result,
+    phase: battle.phase,
+    current_player_index: battle.current_player_index,
+    awaiting_ack: battle.awaiting_ack,
+    players: (battle.players || []).map((item) => ({
+      index: item.index,
+      name: item.name,
+      hp: item.hp,
+      max_hp: item.max_hp,
+      mp: item.mp,
+      max_mp: item.max_mp,
+    })),
+    enemies: (battle.enemies || []).map((item) => ({
+      slot_index: item.slot_index,
+      present: item.present,
+      object_id: item.object_id,
+      name: item.name,
+    })),
+    available_actions: (battle.available_actions || []).map((item) => ({
+      action_type: item.action_type,
+      object_id: item.object_id,
+      name: item.name,
+      target_side: item.target_side,
+      target_mode: item.target_mode,
+      valid_target_indices: item.valid_target_indices,
+      submission_target_indices: item.submission_target_indices,
+      ...(item.action_type === "magic" && item.mp_cost != null ? { mp_cost: item.mp_cost } : {}),
+      ...(item.action_type === "magic" && item.description ? { description: item.description } : {}),
+    })),
+  };
+}
+
 function renderBattle(state) {
-  const battle = state.battle;
+  const battle = playerBattleView(state);
   const delegate = state._debug?.agent_session?.battle_delegate || {};
   if (battleSectionEl) battleSectionEl.hidden = !battle && !state.last_battle;
   if (navigationEl?.closest("section")) navigationEl.closest("section").hidden = Boolean(state.in_battle);
   if (explorationEl?.closest("section")) explorationEl.closest("section").hidden = Boolean(state.in_battle);
   if (!battleStatusEl) return;
+  const namedActions = (battle?.available_actions || [])
+    .filter((item) => item.name)
+    .map((item) => {
+      const label = `${escapeHtml(item.name)}${item.action_type === "magic" && item.mp_cost != null ? ` (${Number(item.mp_cost)} MP)` : ""}`;
+      if (item.action_type !== "magic" || !item.description) return label;
+      return `${label}<div class="muted">${escapeHtml(item.description).replace(/\r?\n/g, "<br>")}</div>`;
+    });
   const current = battle ? `
-    <div><strong>${battle.is_boss ? "Boss battle" : "Battle"} · ${escapeHtml(battle.phase || "resolving")}</strong></div>
+    <div><strong>Battle · ${escapeHtml(battle.phase || "resolving")}</strong></div>
     <div>${battle.phase === "resolving" ? "Game acting…" : battle.phase === "command" ? `Waiting for player ${Number(battle.current_player_index || 0)}` : battle.phase === "reward" ? "Reward confirmation" : escapeHtml(battle.result || "")}</div>
-    <div>Players: ${(battle.players || []).map((item) => `${escapeHtml(item.name || `#${item.index}`)} ${Number(item.hp || 0)}/${Number(item.max_hp || 0)} HP`).join(" · ")}</div>
-    <div>Enemies: ${(battle.enemies || []).filter((item) => item.present).map((item) => `${escapeHtml(item.name || `#${item.slot_index}`)} ${Number(item.hp || 0)}/${Number(item.max_hp || 0)} HP`).join(" · ")}</div>
+    <div>Players: ${(battle.players || []).map((item) => `${escapeHtml(item.name || `#${item.index}`)} ${Number(item.hp || 0)}/${Number(item.max_hp || 0)} HP · ${Number(item.mp || 0)}/${Number(item.max_mp || 0)} MP`).join(" · ")}</div>
+    <div>Enemies: ${(battle.enemies || []).filter((item) => item.present).map((item) => escapeHtml(item.name || `#${item.slot_index}`)).join(" · ")}</div>
+    ${namedActions.length ? `<div>Available: ${namedActions.join(" · ")}</div>` : ""}
     ${delegate.child_session_id ? `<div>Battle Agent: ${escapeHtml(delegate.status || "-")} · ${escapeHtml(delegate.phase || "-")} · ${Number(delegate.instruction_count || 0)}/${Number(delegate.instruction_limit || 100)}</div>` : ""}
   ` : "";
   const last = !battle && state.last_battle ? `

@@ -376,13 +376,22 @@ While `in_battle` is true, the exported state includes the battle `phase`
 (`pre_battle`, `command`, `reward`, `ending`), `is_boss`,
 `current_player_index`, party `players`, `enemies`, and an `available_actions`
 list with `target_mode`, `valid_target_indices`, and
-`submission_target_indices`. The runtime hands the fight to a dedicated battle
-Agent that exposes `get_battle`, `get_item_details`, and
+`submission_target_indices`. This root `battle` object is a full debugging view.
+`_debug.battle_player_view` is the player-visible projection used by the browser
+and battle Agent: it includes party HP/MP, enemy names, legal targets, and the MP
+cost and menu descriptions shown for battle magic and items. Friendly players
+also expose active `status_effects` with semantic keys and remaining rounds plus
+named `poisons`; enemy internal effects remain hidden. The root non-battle
+`party` entries expose the same friendly effects so persistent high-level poison
+and equipment effects remain visible after battle. Exact enemy HP, resistances,
+technique probabilities, and other internal combat values remain omitted. The runtime hands the
+fight to a dedicated battle Agent that exposes `get_battle`, `get_item_details`, and
 `submit_battle_action` and must submit exactly one legal action per command
-round; without `DEEPSEEK_API_KEY` it falls back to a conservative default
+round. Its item tool exposes counts, player-visible menu descriptions, and legal
+battle uses but not script-derived effects. Without `DEEPSEEK_API_KEY` it falls back to a conservative default
 policy. Pre-battle prompts are handled by the main exploration Agent before the
-battle Agent takes over. While the battle Agent owns control, manual game
-actions are rejected.
+battle Agent takes over. While the battle Agent owns control, manual game actions
+are rejected.
 
 ## State Model
 

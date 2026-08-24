@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -368,7 +369,15 @@ class BattleDelegate:
         provider = self.runtime.battle_decision_provider
         if provider is None:
             return await self._sdk_action(state, feedback)
-        value = provider(state, self.runtime.state.get("model"), feedback)
+        player_state = dict(state)
+        player_state["battle"] = self.debug.player_battle_view(state)
+        player_state["inventory"] = [
+            self.debug.player_battle_inventory_item(item)
+            for item in state.get("inventory") or []
+            if isinstance(item, dict)
+        ]
+        player_state.pop("_debug", None)
+        value = provider(player_state, self.runtime.state.get("model"), feedback)
         if asyncio.iscoroutine(value):
             value = await value
         if not isinstance(value, dict):
@@ -397,6 +406,7 @@ class BattleDelegate:
         submitted: dict | None = None
         runtime = self.runtime
         frozen_window = self._command_window(state)
+        player_battle = self.debug.player_battle_view(state)
 
         async def get_battle(_context: Any, _raw: str) -> str:
             self._emit(
@@ -406,7 +416,7 @@ class BattleDelegate:
             )
             try:
                 latest = self.debug.snapshot()
-                output = {"ok": True, "battle": latest.get("battle")}
+                output = {"ok": True, "battle": self.debug.player_battle_view(latest)}
             except Exception as exc:
                 self._emit(
                     "tool_output",
@@ -444,8 +454,21 @@ class BattleDelegate:
                 {"tool": "get_item_details", "arguments": {"item_id": item_id}},
             )
             latest = self.debug.snapshot()
-            output = self.debug.agent_inventory(latest, item_id=item_id)
-            if output.get("ok"):
+            inventory = latest.get("inventory") if isinstance(latest.get("inventory"), list) else []
+            candidate = next(
+                (
+                    item for item in inventory
+                    if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+                ),
+                None,
+            )
+            if candidate is None:
+                output = {"ok": False, "error": "item_not_in_inventory", "item_id": item_id}
+            else:
+                output = {
+                    "ok": True,
+                    "item": self.debug.player_battle_inventory_item(candidate),
+                }
                 battle = latest.get("battle") if isinstance(latest.get("battle"), dict) else {}
                 legal_actions = [
                     {
@@ -465,7 +488,7 @@ class BattleDelegate:
             self._emit(
                 "tool_output",
                 (
-                    "get_item_details returned structured item effects."
+                    "get_item_details returned player-visible inventory facts."
                     if output.get("ok")
                     else "get_item_details could not find the item."
                 ),
@@ -534,9 +557,9 @@ class BattleDelegate:
         item_tool = FunctionTool(
             name="get_item_details",
             description=(
-                "Read current inventory count, legal battle uses, and structured use/throw "
-                "effects for one item_id. Query this before spending an item when its effect "
-                "is not already known. preview_complete=false means the effect is incomplete."
+                "Read player-visible inventory count, menu description, and legal battle uses "
+                "for one item_id. Hidden scripted effects are intentionally unavailable; rely "
+                "on explicit menu wording rather than inferring effects from the item name."
             ),
             params_json_schema={
                 "type": "object",
@@ -588,8 +611,14 @@ class BattleDelegate:
             name="PALPAL battle child",
             instructions=(
                 "You control one PALPAL battle. You have get_battle, get_item_details, and "
-                "submit_battle_action. Query get_item_details before relying on an unfamiliar "
-                "consumable; never infer its effect from the name alone. Preserve scarce MP and consumables when a normal "
+                "submit_battle_action. Battle and item tools intentionally contain only facts "
+                "visible to a human player. Never infer weaknesses, elements, damage, or item "
+                "effects from names alone. Player status_effects and poisons are current friendly "
+                "effects; enemy internal effects remain hidden. Item and magic descriptions are "
+                "player-visible menu text and may guide your choice, but vague wording does not "
+                "establish an exact element, damage amount, or weakness. Use outcomes observed in "
+                "this battle when available. "
+                "Preserve scarce MP and consumables when a normal "
                 "attack is sufficient; use healing or stronger actions when survival needs it. "
                 "Never invent targets or actions. Choose target_index from the action's "
                 "submission_target_indices and submit exactly one current legal action."
@@ -612,7 +641,7 @@ class BattleDelegate:
         run_config = runtime._sdk_run_config(agents_sdk, input_filter)
         prompt = json.dumps({
             "feedback": feedback,
-            "battle": state["battle"],
+            "battle": player_battle,
             "active_tasks": self.debug.active_task_summary(),
             "resource_policy": "Prefer attacks; spend MP/items only for survival or material advantage.",
         }, ensure_ascii=False, separators=(",", ":"))
@@ -958,6 +987,7 @@ class AgentRuntime:
         self.thread: threading.Thread | None = None
         self.run_future: Future | None = None
         self.active_stream: Any = None
+        self.active_compression_task: asyncio.Task | None = None
         self.generation = 0
         # Tests may replace this with a sync or async callable(state, model, feedback).
         self.decision_provider: Callable[..., Any] | None = None
@@ -2037,13 +2067,16 @@ class AgentRuntime:
                 self.cancel_event.set()
                 self._persist()
                 stream = self.active_stream
+                compression_task = self.active_compression_task
                 loop = self.loop
             else:
                 was_running = False
                 stream = None
+                compression_task = None
                 loop = None
         if stream is not None and loop is not None:
             loop.call_soon_threadsafe(stream.cancel, "immediate")
+        self._cancel_async_task(compression_task)
         if was_running:
             self.emit("interrupt", "interrupting", "Game instance changed; discarding the previous session after cancellation.")
             return
@@ -2084,6 +2117,7 @@ class AgentRuntime:
                 self.state.update(status="interrupting", phase="interrupting", stop_reason="interrupt_requested")
                 self._persist()
                 stream = self.active_stream
+                compression_task = self.active_compression_task
                 loop = self.loop
             self.debug.cancel_dialog_advance()
             pending = self.debug.pending_transition_observation
@@ -2107,8 +2141,15 @@ class AgentRuntime:
             )
         if stream is not None and loop is not None:
             loop.call_soon_threadsafe(stream.cancel, "immediate")
+        self._cancel_async_task(compression_task)
         self.emit("interrupt", "interrupting", "Immediate interrupt requested.")
         return self.snapshot()
+
+    @staticmethod
+    def _cancel_async_task(task: asyncio.Task | None) -> None:
+        if task is None or task.done():
+            return
+        task.get_loop().call_soon_threadsafe(task.cancel)
 
     async def execute_pending(self) -> dict:
         with self.lock:
@@ -2598,66 +2639,107 @@ exploration value, and maintained local tasks to choose the next action.
             return False
         if self.cancel_event.is_set():
             raise RuntimeError("interrupted")
-        self.emit(
-            "compression",
-            "starting",
-            "Context compression started.",
-            {
-                "observed_prompt_tokens": observed_tokens,
-                "compact_at_tokens": threshold,
-                "retain_tokens": retain_budget,
-                "items": len(items),
-            },
-        )
         recent_start, retained_cycles = self._compaction_retained_start(items, retain_budget)
         if recent_start <= 0:
             return False
+        starting_details = {
+            "observed_prompt_tokens": observed_tokens,
+            "compact_at_tokens": threshold,
+            "retain_tokens": retain_budget,
+            "items": len(items),
+        }
         retained_items = items[recent_start:]
         before = self._context_estimate_breakdown(items, next_prompt)
         retained_estimated_tokens = self._estimate_items_tokens(retained_items)
         retained_budget_exceeded = retained_estimated_tokens > retain_budget
         transcript = json.dumps(items[:recent_start], ensure_ascii=False)
-        response = await client.responses.create(
-            model=self.state.get("model"),
-            instructions=(
-                "Summarize this PALPAL agent transcript compactly. The structured task ledger is the "
-                "only authority for task status, so do not reconstruct task truth from this summary. Preserve "
-                "plot evidence, decisions and execution results, known routes, unresolved "
-                "risks, and latest stable state. Mark object semantics as inference or annotation."
-            ),
-            input=transcript,
-            reasoning={"effort": SUMMARY_REASONING_EFFORT},
-        )
-        response_usage = getattr(response, "usage", None)
-        if response_usage is not None:
-            self._record_provider_usage(
-                response_usage,
-                "compaction",
-                model=self.state.get("model"),
+        telemetry_before = {
+            key: copy.deepcopy(self.state.get(key))
+            for key in (
+                "last_prompt_tokens", "compactions", "last_compaction",
+                "task_reconciliation_pending", "task_reconciliation_reason",
+                "provider_usage",
             )
-        status = getattr(response, "status", None)
-        if status != "completed":
-            raise RuntimeError(f"context summarizer response status was {status or 'missing'}")
-        summary = getattr(response, "output_text", None)
-        if not summary:
-            raise RuntimeError("context summarizer returned no content")
-        if self.cancel_event.is_set():
-            raise RuntimeError("interrupted")
-        replacement = [
-            {"role": "user", "content": "Persistent context summary:\n" + summary},
-            {"role": "assistant", "content": "I will preserve this context while choosing useful local actions."},
-            *retained_items,
-        ]
-        summary_estimated_tokens = self._estimate_text_tokens(summary)
-        replacement_breakdown = self._context_estimate_breakdown(replacement, next_prompt)
+        }
+        request_task: asyncio.Task | None = None
+        transcript_replaced = False
+        self.emit(
+            "compression",
+            "starting",
+            "Context compression started.",
+            starting_details,
+        )
         try:
+            request_task = asyncio.create_task(client.responses.create(
+                model=self.state.get("model"),
+                instructions=(
+                    "Summarize this PALPAL agent transcript compactly. The structured task ledger is the "
+                    "only authority for task status, so do not reconstruct task truth from this summary. Preserve "
+                    "plot evidence, decisions and execution results, known routes, unresolved "
+                    "risks, and latest stable state. Mark object semantics as inference or annotation."
+                ),
+                input=transcript,
+                reasoning={"effort": SUMMARY_REASONING_EFFORT},
+            ))
+            with self.lock:
+                self.active_compression_task = request_task
+                interrupted = self.cancel_event.is_set()
+            if interrupted:
+                request_task.cancel()
+            response = await request_task
+            response_usage = getattr(response, "usage", None)
+            if response_usage is not None:
+                self._record_provider_usage(
+                    response_usage,
+                    "compaction",
+                    model=self.state.get("model"),
+                )
+            status = getattr(response, "status", None)
+            if status != "completed":
+                raise RuntimeError(f"context summarizer response status was {status or 'missing'}")
+            summary = getattr(response, "output_text", None)
+            if not summary:
+                raise RuntimeError("context summarizer returned no content")
+            if self.cancel_event.is_set():
+                raise asyncio.CancelledError
+            replacement = [
+                {"role": "user", "content": "Persistent context summary:\n" + summary},
+                {"role": "assistant", "content": "I will preserve this context while choosing useful local actions."},
+                *retained_items,
+            ]
+            summary_estimated_tokens = self._estimate_text_tokens(summary)
+            replacement_breakdown = self._context_estimate_breakdown(replacement, next_prompt)
             await session.clear_session()
+            transcript_replaced = True
+            if self.cancel_event.is_set():
+                raise asyncio.CancelledError
             await session.add_items(replacement)
-        except Exception:
-            # Restore the complete transcript if the atomic-style replacement fails.
-            await session.clear_session()
-            await session.add_items(items)
+            if self.cancel_event.is_set():
+                raise asyncio.CancelledError
+        except asyncio.CancelledError:
+            if transcript_replaced:
+                await session.clear_session()
+                await session.add_items(items)
+            with self.lock:
+                for key, value in telemetry_before.items():
+                    self.state[key] = value
+                self._persist()
+            self.emit("compression", "cancelled", "Context compression cancelled.", starting_details)
             raise
+        except Exception as exc:
+            # Restore the complete transcript if the atomic-style replacement fails.
+            if transcript_replaced:
+                await session.clear_session()
+                await session.add_items(items)
+            self.emit(
+                "compression", "failed", f"Context compression failed: {exc}",
+                {**starting_details, "error": str(exc)},
+            )
+            raise
+        finally:
+            with self.lock:
+                if self.active_compression_task is request_task:
+                    self.active_compression_task = None
         self.state["compactions"] = int(self.state.get("compactions") or 0) + 1
         # The replacement has not been sent to DeepSeek yet, so its exact token
         # count is intentionally unknown until the next real model request.
@@ -3664,6 +3746,25 @@ exploration value, and maintained local tasks to choose the next action.
             (item.get("item_id"), item.get("amount"), item.get("amount_in_use"))
             for item in state.get("inventory") or [] if isinstance(item, dict)
         )
+        party_effects = tuple(
+            (
+                role.get("role_id"),
+                tuple(
+                    (
+                        effect.get("status_id"), effect.get("key"),
+                        effect.get("remaining_rounds"), effect.get("persistent"),
+                    )
+                    for effect in role.get("status_effects") or []
+                    if isinstance(effect, dict)
+                ),
+                tuple(
+                    (poison.get("poison_id"), poison.get("name"))
+                    for poison in role.get("poisons") or []
+                    if isinstance(poison, dict)
+                ),
+            )
+            for role in state.get("party") or [] if isinstance(role, dict)
+        )
         objects = tuple(
             (
                 item.get("id"), item.get("state"), vanish_phase(item.get("vanish_time")),
@@ -3690,7 +3791,7 @@ exploration value, and maintained local tasks to choose the next action.
             bool(shop.get("active")), shop.get("mode"), shop.get("store_id"),
             shop.get("phase"), shop.get("selected_item_id"), shop_items,
             bool(choice.get("active")), choice.get("generation"), choice.get("selected_index"),
-            inventory, objects,
+            inventory, party_effects, objects,
         )
 
     @staticmethod

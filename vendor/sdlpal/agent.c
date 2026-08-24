@@ -61,6 +61,21 @@ static PALPALAGENTTRIGGEROBSERVATION g_agent_trigger_observation;
 
 #define PALPAL_AGENT_MAX_ACTION_STEPS 64
 #define PALPAL_AGENT_DIALOG_EVENT_CAPACITY 32
+#define PALPAL_AGENT_OBJECT_DESC_CHARS 512
+
+typedef struct tagPALPALAGENTOBJECTDESC
+{
+   BOOL resolved;
+   WCHAR text[PALPAL_AGENT_OBJECT_DESC_CHARS];
+} PALPALAGENTOBJECTDESC;
+
+static PALPALAGENTOBJECTDESC g_agent_magic_desc[MAX_OBJECTS];
+static PALPALAGENTOBJECTDESC g_agent_item_desc[MAX_OBJECTS];
+
+static LPCWSTR PALPAL_AgentMagicDescription(WORD object_id);
+static LPCWSTR PALPAL_AgentItemDescription(WORD object_id);
+static VOID PALPAL_AgentWriteStatusEffects(FILE *fp, WORD *values);
+static VOID PALPAL_AgentWritePlayerPoisons(FILE *fp, WORD party_index);
 
 typedef struct tagPALPALACTIONSTEP
 {
@@ -1486,6 +1501,15 @@ PALPAL_AgentWriteItemMetadata(
       (unsigned int)item.item.wScriptOnEquip,
       (unsigned int)item.item.wScriptOnThrow);
    PALPAL_AgentWriteItemFlags(fp, item.item.wFlags);
+   if (item_id != 0 && item_id < MAX_OBJECTS)
+   {
+      LPCWSTR description = PALPAL_AgentItemDescription(item_id);
+      if (description != NULL && description[0] != L'\0')
+      {
+         fprintf(fp, ",\"description\":");
+         PALPAL_AgentWriteJsonWideString(fp, description);
+      }
+   }
    if (item_id != 0 && item_id < MAX_OBJECTS &&
       (item.item.wFlags & (kItemFlagUsable | kItemFlagThrowable)))
    {
@@ -3658,6 +3682,10 @@ PALPAL_AgentWriteParty(
          gpGlobals->rgParty[i].y,
          gpGlobals->rgParty[i].wFrame);
       PALPAL_AgentWriteEquipment(fp, role);
+      fprintf(fp, ",\"status_effects\":");
+      PALPAL_AgentWriteStatusEffects(fp, gpGlobals->rgPlayerStatus[role]);
+      fprintf(fp, ",\"poisons\":");
+      PALPAL_AgentWritePlayerPoisons(fp, i);
       fprintf(fp, "}");
    }
    fprintf(fp, "]");
@@ -3745,16 +3773,45 @@ PALPAL_AgentWriteStatusValues(
 }
 
 static VOID
+PALPAL_AgentWriteStatusEffects(
+   FILE *fp,
+   WORD *values
+)
+{
+   int i, first = 1;
+   fprintf(fp, "[");
+   for (i = 0; i < kStatusAll; i++)
+   {
+      WORD value = values[i];
+      if (value == 0) continue;
+      if (!first) fprintf(fp, ",");
+      fprintf(fp,
+         "{\"status_id\":%d,\"key\":\"%s\",\"remaining_rounds\":",
+         i, PALPAL_AgentStatusKey((WORD)i));
+      if (value > 999)
+      {
+         fprintf(fp, "null,\"persistent\":true}");
+      }
+      else
+      {
+         fprintf(fp, "%u,\"persistent\":false}", value);
+      }
+      first = 0;
+   }
+   fprintf(fp, "]");
+}
+
+static VOID
 PALPAL_AgentWritePlayerPoisons(
    FILE *fp,
-   WORD role
+   WORD party_index
 )
 {
    int i, first = 1;
    fprintf(fp, "[");
    for (i = 0; i < MAX_POISONS; i++)
    {
-      POISONSTATUS *poison = &gpGlobals->rgPoisonStatus[i][role];
+      POISONSTATUS *poison = &gpGlobals->rgPoisonStatus[i][party_index];
       if (poison->wPoisonID == 0) continue;
       if (!first) fprintf(fp, ",");
       fprintf(fp, "{\"poison_id\":%u,\"script\":%u,\"name\":",
@@ -3819,6 +3876,161 @@ PALPAL_AgentWriteBattleTargets(
    fprintf(fp, "]");
 }
 
+static BOOL
+PALPAL_AgentAppendObjectDescription(
+   WCHAR *output,
+   size_t *length,
+   LPCWSTR text,
+   BOOL new_line
+)
+{
+   size_t text_length;
+
+   if (text == NULL || text[0] == L'\0') return TRUE;
+   text_length = wcslen(text);
+   if (*length >= PALPAL_AGENT_OBJECT_DESC_CHARS ||
+       (new_line && *length > 0 && *length == PALPAL_AGENT_OBJECT_DESC_CHARS - 1) ||
+       text_length > PALPAL_AGENT_OBJECT_DESC_CHARS - 1 - *length -
+          ((new_line && *length > 0) ? 1 : 0))
+      return FALSE;
+   if (new_line && *length > 0) output[(*length)++] = L'\n';
+   memcpy(output + *length, text, text_length * sizeof(WCHAR));
+   *length += text_length;
+   output[*length] = L'\0';
+   return TRUE;
+}
+
+static BOOL
+PALPAL_AgentReadWin95ObjectDescription(
+   WORD script,
+   WCHAR *output
+)
+{
+   BOOL first_line = TRUE;
+   BOOL next_new_line = TRUE;
+   size_t length = 0;
+   int steps = 0;
+
+   while (script != 0)
+   {
+      LPSCRIPTENTRY entry;
+      if (script >= gpGlobals->g.nScriptEntry || ++steps > gpGlobals->g.nScriptEntry)
+         return FALSE;
+      entry = &gpGlobals->g.lprgScriptEntry[script];
+      if (entry->wOperation == 0) break;
+      if (entry->wOperation == 0x00A7)
+      {
+         script++;
+         continue;
+      }
+      if (entry->wOperation != 0xFFFF) return FALSE;
+
+      if (gConfig.pszMsgFile)
+      {
+         WORD start = script;
+         WORD current = script;
+         WORD first_message = entry->rgwOperand[0];
+         WORD last_message = first_message;
+         int order = 0, message;
+
+         while (current < gpGlobals->g.nScriptEntry)
+         {
+            LPSCRIPTENTRY candidate = &gpGlobals->g.lprgScriptEntry[current];
+            if (candidate->wOperation == 0x008E)
+            {
+               current++;
+               continue;
+            }
+            if (candidate->wOperation != 0xFFFF ||
+                (current != start && candidate->rgwOperand[0] != (WORD)(last_message + 1)))
+               break;
+            last_message = candidate->rgwOperand[0];
+            current++;
+         }
+         if (current == start || current > gpGlobals->g.nScriptEntry) return FALSE;
+         while ((message = PAL_GetMsgNum(first_message, last_message - first_message, order++)) >= 0)
+         {
+            if (message > 0)
+            {
+               if (!PALPAL_AgentAppendObjectDescription(output, &length,
+                     PAL_GetMsg(message), !first_line)) return FALSE;
+               if (PAL_GetMsg(message)[0] != L'\0') first_line = FALSE;
+            }
+         }
+         script = current;
+      }
+      else
+      {
+         LPCWSTR message = PAL_GetMsg(entry->rgwOperand[0]);
+         if (!PALPAL_AgentAppendObjectDescription(output, &length, message,
+               !first_line && next_new_line))
+            return FALSE;
+         if (message[0] != L'\0') first_line = FALSE;
+         next_new_line = entry->rgwOperand[1] != 1;
+         script++;
+      }
+   }
+   return length > 0;
+}
+
+static LPCWSTR
+PALPAL_AgentObjectDescription(
+   WORD object_id,
+   BOOL item
+)
+{
+   PALPALAGENTOBJECTDESC *cached;
+
+   if (object_id == 0 || object_id >= MAX_OBJECTS) return NULL;
+   cached = item ? &g_agent_item_desc[object_id] : &g_agent_magic_desc[object_id];
+   if (!cached->resolved)
+   {
+      cached->resolved = TRUE;
+      cached->text[0] = L'\0';
+      if (gConfig.fIsWIN95)
+      {
+         WORD script = item ? gpGlobals->g.rgObject[object_id].item.wScriptDesc :
+            gpGlobals->g.rgObject[object_id].magic.wScriptDesc;
+         if (script == 0 || !PALPAL_AgentReadWin95ObjectDescription(script, cached->text))
+            cached->text[0] = L'\0';
+      }
+      else
+      {
+         LPCWSTR source = PAL_GetObjectDesc(gpGlobals->lpObjectDesc, object_id);
+         size_t i, length;
+         if (source != NULL && (length = wcslen(source)) < PALPAL_AGENT_OBJECT_DESC_CHARS)
+         {
+            BOOL has_text = FALSE;
+            for (i = 0; i < length; i++)
+            {
+               cached->text[i] = source[i] == L'*' ? L'\n' : source[i];
+               if (cached->text[i] != L'\n' && cached->text[i] != L'\r' &&
+                   cached->text[i] != L' ' && cached->text[i] != L'\t') has_text = TRUE;
+            }
+            cached->text[length] = L'\0';
+            if (!has_text) cached->text[0] = L'\0';
+         }
+      }
+   }
+   return cached->text[0] == L'\0' ? NULL : cached->text;
+}
+
+static LPCWSTR
+PALPAL_AgentMagicDescription(
+   WORD object_id
+)
+{
+   return PALPAL_AgentObjectDescription(object_id, FALSE);
+}
+
+static LPCWSTR
+PALPAL_AgentItemDescription(
+   WORD object_id
+)
+{
+   return PALPAL_AgentObjectDescription(object_id, TRUE);
+}
+
 static VOID
 PALPAL_AgentWriteBattleActionEntry(
    FILE *fp,
@@ -3826,7 +4038,9 @@ PALPAL_AgentWriteBattleActionEntry(
    const char *type,
    WORD object_id,
    const char *target_side,
-   BOOL target_all
+   BOOL target_all,
+   int mp_cost,
+   LPCWSTR description
 )
 {
    if (!*first) fprintf(fp, ",");
@@ -3861,6 +4075,15 @@ PALPAL_AgentWriteBattleActionEntry(
       fprintf(fp, ",\"name\":");
       PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(object_id));
    }
+   if (mp_cost >= 0)
+   {
+      fprintf(fp, ",\"mp_cost\":%d", mp_cost);
+   }
+   if (description != NULL && description[0] != L'\0')
+   {
+      fprintf(fp, ",\"description\":");
+      PALPAL_AgentWriteJsonWideString(fp, description);
+   }
    fprintf(fp, "}");
    *first = FALSE;
 }
@@ -3878,14 +4101,14 @@ PALPAL_AgentWriteBattleActions(
    fprintf(fp, "\"available_actions\":[");
    if (g_agent_battle.phase == kPalpalAgentBattleReward && g_agent_battle.awaiting_ack)
    {
-      PALPAL_AgentWriteBattleActionEntry(fp, &first, "continue", 0, "none", FALSE);
+      PALPAL_AgentWriteBattleActionEntry(fp, &first, "continue", 0, "none", FALSE, -1, NULL);
    }
    else if (g_agent_battle.phase == kPalpalAgentBattleCommand &&
             player_index <= gpGlobals->wMaxPartyMemberIndex)
    {
       role = gpGlobals->rgParty[player_index].wPlayerRole;
       PALPAL_AgentWriteBattleActionEntry(fp, &first, "attack", 0, "enemy",
-         PAL_PlayerCanAttackAll(role));
+         PAL_PlayerCanAttackAll(role), -1, NULL);
       if (gpGlobals->rgPlayerStatus[role][kStatusSilence] == 0)
       {
          for (i = 0; i < MAX_PLAYER_MAGICS; i++)
@@ -3901,7 +4124,9 @@ PALPAL_AgentWriteBattleActions(
                continue;
             PALPAL_AgentWriteBattleActionEntry(fp, &first, "magic", object_id,
                (flags & kMagicFlagUsableToEnemy) ? "enemy" : "player",
-               (flags & kMagicFlagApplyToAll) != 0);
+               (flags & kMagicFlagApplyToAll) != 0,
+               gpGlobals->g.lprgMagic[number].wCostMP,
+               PALPAL_AgentMagicDescription(object_id));
          }
       }
       if (PALPAL_BattleCoopActionAvailable())
@@ -3912,7 +4137,8 @@ PALPAL_AgentWriteBattleActions(
          {
             PALPAL_AgentWriteBattleActionEntry(fp, &first, "coop_magic", object_id,
                (flags & kMagicFlagUsableToEnemy) ? "enemy" : "player",
-               (flags & kMagicFlagApplyToAll) != 0);
+               (flags & kMagicFlagApplyToAll) != 0, -1,
+               PALPAL_AgentMagicDescription(object_id));
          }
       }
       for (i = 0; i < MAX_INVENTORY; i++)
@@ -3924,14 +4150,16 @@ PALPAL_AgentWriteBattleActions(
          flags = gpGlobals->g.rgObject[object_id].item.wFlags;
          if (flags & kItemFlagUsable)
             PALPAL_AgentWriteBattleActionEntry(fp, &first, "use_item", object_id,
-               "player", (flags & kItemFlagApplyToAll) != 0);
+               "player", (flags & kItemFlagApplyToAll) != 0, -1,
+               PALPAL_AgentItemDescription(object_id));
          if (flags & kItemFlagThrowable)
             PALPAL_AgentWriteBattleActionEntry(fp, &first, "throw_item", object_id,
-               "enemy", (flags & kItemFlagApplyToAll) != 0);
+               "enemy", (flags & kItemFlagApplyToAll) != 0, -1,
+               PALPAL_AgentItemDescription(object_id));
       }
-      PALPAL_AgentWriteBattleActionEntry(fp, &first, "defend", 0, "none", FALSE);
+      PALPAL_AgentWriteBattleActionEntry(fp, &first, "defend", 0, "none", FALSE, -1, NULL);
       if (!g_Battle.fIsBoss)
-         PALPAL_AgentWriteBattleActionEntry(fp, &first, "flee", 0, "none", FALSE);
+         PALPAL_AgentWriteBattleActionEntry(fp, &first, "flee", 0, "none", FALSE, -1, NULL);
    }
    fprintf(fp, "]");
 }
@@ -3998,8 +4226,10 @@ PALPAL_AgentWriteBattle(
          PAL_GetPlayerElementalResistance(role, 3),
          PAL_GetPlayerElementalResistance(role, 4));
       PALPAL_AgentWriteStatusValues(fp, gpGlobals->rgPlayerStatus[role]);
+      fprintf(fp, ",\"status_effects\":");
+      PALPAL_AgentWriteStatusEffects(fp, gpGlobals->rgPlayerStatus[role]);
       fprintf(fp, ",\"poisons\":");
-      PALPAL_AgentWritePlayerPoisons(fp, role);
+      PALPAL_AgentWritePlayerPoisons(fp, i);
       fprintf(fp,
          ",\"time_meter\":%.2f,\"fighter_state\":\"%s\",\"defending\":%s,"
          "\"submitted_action\":{\"action_type\":\"%s\",\"object_id\":%u,\"target_index\":%d}}",

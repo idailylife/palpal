@@ -353,7 +353,10 @@ def test_battle_delegate_uses_child_budget_and_returns_one_summary(tmp_path):
             "is_boss": False,
             "current_player_index": 0,
             "players": [{"index": 0, "name": "李逍遥", "hp": 100, "max_hp": 100}],
-            "enemies": [{"slot_index": 0, "present": True, "name": "苗人", "hp": 20, "max_hp": 20}],
+            "enemies": [{
+                "slot_index": 0, "present": True, "object_id": 10, "name": "苗人",
+                "hp": 20, "max_hp": 20, "physical_resistance": 7,
+            }],
             "available_actions": [{
                 "action_type": "attack",
                 "object_id": 0,
@@ -413,9 +416,13 @@ def test_battle_delegate_uses_child_budget_and_returns_one_summary(tmp_path):
         }
 
     debug.write_battle_action = execute_battle
-    runtime.battle_decision_provider = lambda state, model, feedback: {
-        "action_type": "attack", "object_id": 0, "target_index": 0,
-    }
+    provider_states = []
+
+    def choose_battle(state, _model, _feedback):
+        provider_states.append(state)
+        return {"action_type": "attack", "object_id": 0, "target_index": 0}
+
+    runtime.battle_decision_provider = choose_battle
     main_feedback = []
     runtime.decision_provider = lambda state, model, feedback: main_feedback.append(feedback) or decision()
 
@@ -426,6 +433,10 @@ def test_battle_delegate_uses_child_budget_and_returns_one_summary(tmp_path):
     assert paused["battle_delegate"]["instruction_count"] == 1
     assert paused["battle_delegate"]["status"] == "completed"
     assert paused["battle_delegate"]["child_session_id"] != paused["session_id"]
+    assert provider_states[0]["battle"]["enemies"] == [{
+        "slot_index": 0, "present": True, "object_id": 10, "name": "苗人",
+    }]
+    assert "_debug" not in provider_states[0]
     battle_events = [event for event in runtime.events() if event["type"] == "battle"]
     assert [event["phase"] for event in battle_events] == [
         "started", "request", "tool_called", "tool_output", "completed",
@@ -1020,6 +1031,15 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
             "target_mode": "single",
             "valid_target_indices": [0],
         }, {
+            "action_type": "magic",
+            "object_id": 327,
+            "name": "炎咒",
+            "mp_cost": 8,
+            "description": "灼熱火焰\n攻擊敵人",
+            "target_mode": "single",
+            "valid_target_indices": [0],
+            "submission_target_indices": [0],
+        }, {
             "action_type": "use_item",
             "object_id": 99,
             "target_mode": "single",
@@ -1034,6 +1054,7 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
         "battle": battle,
         "inventory": [{
             "slot": 0, "item_id": 99, "name": "止血草", "amount": 2,
+            "description": "恢復少量體力",
             "amount_in_use": 0, "usable": True, "throwable": False,
             "consuming": True, "apply_to_all": False,
             "use_effect": {
@@ -1076,13 +1097,17 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
                 return
             tools = {tool.name: tool for tool in captured["agent"].tools}
             get_output = await tools["get_battle"].kwargs["on_invoke_tool"](None, "{}")
-            assert json.loads(get_output)["battle"]["generation"] == 5
+            tool_battle = json.loads(get_output)["battle"]
+            assert tool_battle["generation"] == 5
+            assert tool_battle["available_actions"][1]["description"] == "灼熱火焰\n攻擊敵人"
             item_output = await tools["get_item_details"].kwargs["on_invoke_tool"](
                 None, json.dumps({"item_id": 99}),
             )
             item = json.loads(item_output)
             assert item["item"]["available_amount"] == 2
-            assert item["item"]["use_effect"]["effects"][0]["amount"] == 50
+            assert item["item"]["description"] == "恢復少量體力"
+            assert "use_effect" not in item["item"]
+            assert "effect_available" not in item["item"]
             submit_output = await tools["submit_battle_action"].kwargs["on_invoke_tool"](
                 None,
                 json.dumps({"action_type": "use_item", "object_id": 99, "target_index": 0}),
@@ -1126,6 +1151,9 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
     }
     assert captured["agent_kwargs"]["reset_tool_choice"] is False
     assert [run["max_turns"] for run in captured["runs"]] == [6, 6]
+    initial_prompt = json.loads(captured["runs"][0]["prompt"])
+    assert initial_prompt["battle"] == debug.player_battle_view(state)
+    assert "Item and magic descriptions are player-visible menu text" in captured["agent_kwargs"]["instructions"]
     assert "without an accepted submit_battle_action" in captured["runs"][1]["prompt"]
     events = [event for event in runtime.events() if event["type"] == "battle"]
     assert [event["phase"] for event in events] == [
@@ -1882,6 +1910,122 @@ def test_context_compression_response_failure_keeps_original_session(
     assert runtime.snapshot()["compactions"] == 0
     assert runtime.snapshot()["last_compaction"] is None
     assert runtime.snapshot()["last_prompt_tokens"] == 1000
+
+
+def test_interrupt_cancels_inflight_context_compression_and_pauses_run(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime._unsafe_state_reason = lambda _state: None
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    original = [{"role": "user", "content": f"item {index}"} for index in range(8)]
+    session = MemorySession(original)
+    request_started = threading.Event()
+    request_cancelled = threading.Event()
+
+    class Responses:
+        async def create(self, **_kwargs):
+            request_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                request_cancelled.set()
+                raise
+
+    client = type("Client", (), {"responses": Responses()})()
+    runtime.state["last_prompt_tokens"] = 1000
+
+    async def compact_decision(_state, _feedback):
+        await runtime._maybe_compact_sdk(session, client, "next")
+        raise AssertionError("compression unexpectedly completed")
+
+    runtime._decide = compact_decision
+    runtime.start(None, 1)
+    assert request_started.wait(1)
+    runtime.interrupt()
+    paused = wait_for_pause(runtime)
+
+    assert paused["stop_reason"] == "interrupted"
+    assert request_cancelled.wait(1)
+    assert runtime.active_compression_task is None
+    assert session.items == original
+    assert paused["last_prompt_tokens"] == 1000
+    assert paused["compactions"] == 0
+    assert paused["last_compaction"] is None
+    compression_events = [event for event in runtime.events() if event["type"] == "compression"]
+    assert [event["phase"] for event in compression_events] == ["starting", "cancelled"]
+
+
+def test_context_compression_interrupt_after_clear_restores_transcript(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    original = [{"role": "user", "content": f"item {index}"} for index in range(8)]
+
+    class InterruptingSession(MemorySession):
+        async def clear_session(self):
+            await super().clear_session()
+            if not runtime.cancel_event.is_set():
+                runtime.state.update(status="running", phase="deciding")
+                runtime.interrupt()
+
+    class Responses:
+        async def create(self, **_kwargs):
+            return type("Response", (), {"status": "completed", "output_text": "summary"})()
+
+    session = InterruptingSession(original)
+    client = type("Client", (), {"responses": Responses()})()
+    runtime.state["last_prompt_tokens"] = 1000
+    before_reconciliation = (
+        runtime.state["task_reconciliation_pending"],
+        runtime.state["task_reconciliation_reason"],
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runtime._maybe_compact_sdk(session, client, "next"))
+
+    assert session.items == original
+    assert runtime.active_compression_task is None
+    assert runtime.state["last_prompt_tokens"] == 1000
+    assert runtime.state["compactions"] == 0
+    assert runtime.state["last_compaction"] is None
+    assert (
+        runtime.state["task_reconciliation_pending"],
+        runtime.state["task_reconciliation_reason"],
+    ) == before_reconciliation
+
+
+def test_game_instance_change_cancels_inflight_context_compression(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    monkeypatch.setenv("PALPAL_AGENT_COMPACT_AT_TOKENS", "1000")
+    original = [{"role": "user", "content": f"item {index}"} for index in range(8)]
+    session = MemorySession(original)
+    request_started = asyncio.Event()
+
+    class Responses:
+        async def create(self, **_kwargs):
+            request_started.set()
+            await asyncio.Event().wait()
+
+    client = type("Client", (), {"responses": Responses()})()
+    runtime.state.update(
+        game_instance_id="game-a", status="running", phase="deciding",
+        turn=1, last_prompt_tokens=1000,
+    )
+
+    async def scenario():
+        compacting = asyncio.create_task(runtime._maybe_compact_sdk(session, client, "next"))
+        await asyncio.wait_for(request_started.wait(), 1)
+        runtime.observe_game_instance("game-b")
+        with pytest.raises(asyncio.CancelledError):
+            await compacting
+
+    asyncio.run(scenario())
+
+    assert runtime.cancel_event.is_set()
+    assert runtime.state["pending_game_instance_id"] == "game-b"
+    assert runtime.active_compression_task is None
+    assert session.items == original
+    assert runtime.state["last_prompt_tokens"] == 1000
+    assert runtime.state["compactions"] == 0
 
 
 def test_context_compression_retains_two_complete_cycles_within_budget(tmp_path, monkeypatch):
@@ -2926,6 +3070,20 @@ def test_state_signature_ignores_vanish_countdown_but_observes_phase_changes():
     assert AgentRuntime._state_signature(positive) == AgentRuntime._state_signature(positive_next)
     assert AgentRuntime._state_signature(positive) != AgentRuntime._state_signature(visible)
     assert AgentRuntime._state_signature(positive) != AgentRuntime._state_signature(negative)
+
+
+def test_state_signature_observes_nonbattle_party_effect_changes():
+    before = make_state()
+    before["party"] = [{"role_id": 1, "status_effects": [], "poisons": []}]
+    poisoned = json.loads(json.dumps(before))
+    poisoned["party"][0]["poisons"] = [{"poison_id": 563, "name": "赤毒"}]
+    slowed = json.loads(json.dumps(before))
+    slowed["party"][0]["status_effects"] = [{
+        "status_id": 1, "key": "slow", "remaining_rounds": 2, "persistent": False,
+    }]
+
+    assert AgentRuntime._state_signature(before) != AgentRuntime._state_signature(poisoned)
+    assert AgentRuntime._state_signature(before) != AgentRuntime._state_signature(slowed)
 
 
 def test_state_signature_uses_latest_semantic_event_before_vanish_noise():

@@ -8873,6 +8873,7 @@ class DebugState:
             "agent_session": self.agent_runtime.compact_snapshot(),
             "dialog_advance_status": self.dialog_advance_status_snapshot(),
             "timeline": timeline,
+            "battle_player_view": self.player_battle_view(state),
         }
         state["control"] = control
         self.agent_runtime.observe_game_instance(state.get("game_instance_id"))
@@ -8956,15 +8957,19 @@ class DebugState:
                 continue
             stop_status = self.dialog_advance_stop_status(state)
             if stop_status == "dialog_inactive":
-                if not confirm_inactive:
-                    continue
                 payload = request.get("payload", {})
                 if not payload.get("inactive_started"):
+                    self.observations.reschedule(
+                        observation_id,
+                        DIALOG_ADVANCE_VISIBILITY_TIMEOUT,
+                    )
                     self.observations.update_payload(
                         observation_id,
                         inactive_started=True,
                         inactive_polls=0,
                     )
+                    continue
+                if not confirm_inactive:
                     continue
                 inactive_polls = int(payload.get("inactive_polls") or 0) + 1
                 if inactive_polls >= DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS:
@@ -8985,6 +8990,10 @@ class DebugState:
                 )
                 continue
             if request.get("payload", {}).get("inactive_started"):
+                self.observations.reschedule(
+                    observation_id,
+                    DIALOG_ADVANCE_VISIBILITY_TIMEOUT,
+                )
                 self.observations.update_payload(
                     observation_id,
                     inactive_started=False,
@@ -10233,6 +10242,12 @@ class DebugState:
                     "max_hp": role.get("max_hp"),
                     "mp": role.get("mp"),
                     "max_mp": role.get("max_mp"),
+                    "status_effects": role.get("status_effects") or [],
+                    "poisons": [
+                        {"name": poison.get("name")}
+                        for poison in role.get("poisons") or []
+                        if isinstance(poison, dict) and poison.get("name")
+                    ],
                 }
                 for role in party[:6]
                 if isinstance(role, dict)
@@ -10301,6 +10316,93 @@ class DebugState:
         if candidate.get("equipable") is True:
             result["equipment_comparisons"] = self.equipment_comparisons(state, candidate)
         return result
+
+    @staticmethod
+    def player_battle_view(state: dict) -> dict | None:
+        """Project native battle debug data onto facts visible to a player."""
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        if battle is None:
+            return None
+
+        view = {
+            key: battle.get(key)
+            for key in (
+                "generation", "command_generation", "result", "phase",
+                "current_player_index", "awaiting_ack",
+            )
+            if key in battle
+        }
+        view["players"] = []
+        for player in battle.get("players") or []:
+            if not isinstance(player, dict):
+                continue
+            visible = {
+                key: player.get(key)
+                for key in (
+                    "index", "role_id", "name", "hp", "max_hp", "mp", "max_mp",
+                    "level", "attack_strength", "magic_strength", "defense",
+                    "dexterity", "flee_rate", "defending", "submitted_action",
+                )
+                if key in player
+            }
+            visible["status_effects"] = [
+                {
+                    key: effect.get(key)
+                    for key in ("status_id", "key", "remaining_rounds", "persistent")
+                    if key in effect
+                }
+                for effect in player.get("status_effects") or []
+                if isinstance(effect, dict) and effect.get("key")
+            ]
+            visible["poisons"] = [
+                {"name": poison.get("name")}
+                for poison in player.get("poisons") or []
+                if isinstance(poison, dict) and poison.get("name")
+            ]
+            view["players"].append(visible)
+
+        view["enemies"] = [
+            {
+                key: enemy.get(key)
+                for key in ("slot_index", "present", "object_id", "name")
+                if key in enemy
+            }
+            for enemy in battle.get("enemies") or []
+            if isinstance(enemy, dict)
+        ]
+        view["available_actions"] = []
+        for action in battle.get("available_actions") or []:
+            if not isinstance(action, dict):
+                continue
+            visible = {
+                key: action.get(key)
+                for key in (
+                    "action_type", "object_id", "name", "target_side", "target_mode",
+                    "valid_target_indices", "submission_target_indices", "description",
+                )
+                if key in action
+            }
+            if action.get("action_type") == "magic" and "mp_cost" in action:
+                visible["mp_cost"] = action.get("mp_cost")
+            view["available_actions"].append(visible)
+        return view
+
+    @staticmethod
+    def player_battle_inventory_item(item: dict) -> dict:
+        """Return inventory facts available from ordinary battle menus."""
+        return {
+            key: item.get(key)
+            for key in (
+                "slot", "item_id", "name", "description", "amount", "amount_in_use",
+                "equipped_count", "usable", "throwable", "consuming", "apply_to_all",
+            )
+            if key in item
+        } | {
+            "available_amount": max(
+                0,
+                int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
+            ),
+        }
 
     @staticmethod
     def compact_inventory_item(item: dict) -> dict:
@@ -11539,6 +11641,12 @@ class DebugState:
                     {
                         "role_id": role.get("role_id"),
                         "scene_sprite_id": role.get("scene_sprite_id"),
+                        "status_effects": role.get("status_effects") or [],
+                        "poisons": [
+                            {"name": poison.get("name")}
+                            for poison in role.get("poisons") or []
+                            if isinstance(poison, dict) and poison.get("name")
+                        ],
                     }
                     for role in state.get("party", [])
                     if isinstance(role, dict)

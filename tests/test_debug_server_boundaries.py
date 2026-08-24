@@ -599,6 +599,116 @@ def test_battle_control_exposes_only_command_windows(tmp_path):
     assert control["allowed_actions"] == []
 
 
+def test_battle_player_view_exposes_only_human_visible_facts(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "in_battle": True,
+        "battle": {
+            "generation": 4,
+            "command_generation": 7,
+            "phase": "command",
+            "result": "ongoing",
+            "is_boss": True,
+            "current_player_index": 0,
+            "awaiting_ack": False,
+            "players": [{
+                "index": 0, "role_id": 1, "name": "李逍遙",
+                "hp": 80, "max_hp": 100, "mp": 22, "max_mp": 30,
+                "level": 5, "attack_strength": 21, "magic_strength": 18,
+                "defense": 17, "dexterity": 16, "flee_rate": 15,
+                "poison_resistance": 9, "elemental_resistance": [1, 2, 3, 4, 5],
+                "status": [0, 2], "time_meter": 48.0, "fighter_state": "command",
+                "status_effects": [
+                    {"status_id": 1, "key": "slow", "remaining_rounds": 2, "persistent": False},
+                    {"status_id": 6, "key": "protect", "remaining_rounds": None, "persistent": True},
+                ],
+                "defending": False,
+                "submitted_action": {"action_type": "pass", "object_id": 0},
+                "poisons": [{"poison_id": 563, "script": 100, "name": "赤毒"}],
+            }],
+            "enemies": [{
+                "slot_index": 0, "present": True, "object_id": 81, "enemy_id": 12,
+                "name": "燈籠", "hp": 70, "max_hp": 100, "level": 8,
+                "physical_resistance": 4, "elemental_resistance": [2, 3, 4, 5, 6],
+                "magic_id": 321, "magic_rate": 7, "status": [0, 0],
+                "poisons": [], "time_meter": 60.0, "fighter_state": "waiting",
+            }],
+            "available_actions": [{
+                "action_type": "magic", "object_id": 327, "name": "炎咒",
+                "target_side": "enemy", "target_mode": "single",
+                "valid_target_indices": [0], "submission_target_indices": [0],
+                "mp_cost": 8, "description": "灼熱火焰\n攻擊敵人",
+                "base_damage": 70, "element": 4,
+            }, {
+                "action_type": "coop_magic", "object_id": 400, "name": "合擊",
+                "target_side": "enemy", "target_mode": "all",
+                "valid_target_indices": [], "submission_target_indices": [-1],
+                "mp_cost": 99, "description": "全體合擊",
+            }, {
+                "action_type": "use_item", "object_id": 99, "name": "解毒草",
+                "target_side": "player", "target_mode": "single",
+                "valid_target_indices": [0], "submission_target_indices": [0],
+                "description": "解除中毒",
+            }],
+        },
+    }
+
+    view = debug.player_battle_view(state)
+
+    assert view["players"][0]["poisons"] == [{"name": "赤毒"}]
+    assert view["players"][0]["status_effects"] == [
+        {"status_id": 1, "key": "slow", "remaining_rounds": 2, "persistent": False},
+        {"status_id": 6, "key": "protect", "remaining_rounds": None, "persistent": True},
+    ]
+    assert "poison_resistance" not in view["players"][0]
+    assert "status" not in view["players"][0]
+    assert view["enemies"] == [{
+        "slot_index": 0, "present": True, "object_id": 81, "name": "燈籠",
+    }]
+    assert "is_boss" not in view
+    assert view["available_actions"][0]["mp_cost"] == 8
+    assert view["available_actions"][0]["description"] == "灼熱火焰\n攻擊敵人"
+    assert "base_damage" not in view["available_actions"][0]
+    assert "element" not in view["available_actions"][0]
+    assert "mp_cost" not in view["available_actions"][1]
+    assert view["available_actions"][1]["description"] == "全體合擊"
+    assert view["available_actions"][2]["description"] == "解除中毒"
+
+    write_state(debug, state)
+    snapshot = debug.snapshot()
+    assert snapshot["battle"]["enemies"][0]["hp"] == 70
+    assert snapshot["_debug"]["battle_player_view"] == view
+
+
+def test_agent_state_views_expose_nonbattle_party_effects(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state["party"] = [{
+        "role_id": 1,
+        "scene_sprite_id": 7,
+        "level": 5,
+        "hp": 80,
+        "max_hp": 100,
+        "mp": 22,
+        "max_mp": 30,
+        "status_effects": [
+            {"status_id": 7, "key": "haste", "remaining_rounds": None, "persistent": True},
+        ],
+        "poisons": [{"poison_id": 563, "script": 100, "name": "赤毒"}],
+    }]
+
+    summary = debug.agent_state_summary(state)
+    assert summary["party"][0]["status_effects"] == [
+        {"status_id": 7, "key": "haste", "remaining_rounds": None, "persistent": True},
+    ]
+    assert summary["party"][0]["poisons"] == [{"name": "赤毒"}]
+
+    context = debug.agent_context(state, {"targets": []}, {"dialogs": []}, [])
+    assert context["state"]["party"][0]["status_effects"][0]["key"] == "haste"
+    assert context["state"]["party"][0]["poisons"] == [{"name": "赤毒"}]
+
+
 @pytest.mark.parametrize(
     ("interaction", "phase", "allowed"),
     [
@@ -1350,25 +1460,68 @@ def test_advance_dialog_visibility_timeout_does_not_press(tmp_path, monkeypatch)
     assert written == []
 
 
-def test_background_snapshots_do_not_confirm_dialog_inactive_for_owner(tmp_path):
+def test_background_snapshot_starts_fresh_dialog_inactive_confirmation_near_deadline(
+    tmp_path,
+    monkeypatch,
+):
     debug = make_debug_state(tmp_path)
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
     observation_id = debug.observations.register(
         "dialog_gate",
         owner="dialog_advance",
         timeout=2,
         payload={"inactive_started": False, "inactive_polls": 0},
     )
+    original_deadline = debug.observations.get(observation_id)["deadline"]
     inactive = make_state()
 
+    now[0] = original_deadline - 0.01
     for _ in range(10):
         debug.observe_dialog_gates(inactive)
-    assert debug.observations.get(observation_id)["status"] == "pending"
+    request = debug.observations.get(observation_id)
+    assert request["status"] == "pending"
+    assert request["deadline"] == pytest.approx(now[0] + 2)
+    assert request["payload"] == {"inactive_started": True, "inactive_polls": 0}
 
-    for _ in range(4):
+    for expected_polls in range(1, 3):
         debug.observe_dialog_gates(inactive, confirm_inactive=True)
+        request = debug.observations.get(observation_id)
+        assert request["status"] == "pending"
+        assert request["payload"]["inactive_polls"] == expected_polls
+    debug.observe_dialog_gates(inactive, confirm_inactive=True)
     assert debug.observations.get(observation_id)["status"] == "completed"
     completed = debug.observations.consume(observation_id, owner="dialog_advance")
     assert completed["result"]["status"] == "dialog_inactive"
+
+
+def test_dialog_inactive_confirmation_resets_to_visibility_phase(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    observation_id = debug.observations.register(
+        "dialog_gate",
+        owner="dialog_advance",
+        timeout=2,
+        payload={"inactive_started": False, "inactive_polls": 0},
+    )
+
+    debug.observe_dialog_gates(make_state())
+    debug.observe_dialog_gates(make_state(), confirm_inactive=True)
+    assert debug.observations.get(observation_id)["payload"]["inactive_polls"] == 1
+
+    now[0] = 101.0
+    debug.observe_dialog_gates(held_dialog_state())
+    request = debug.observations.get(observation_id)
+    assert request["status"] == "pending"
+    assert request["deadline"] == pytest.approx(103.0)
+    assert request["payload"] == {"inactive_started": False, "inactive_polls": 0}
+
+    debug.observe_dialog_gates(visible_dialog_state("next"))
+    completed = debug.observations.consume(observation_id, owner="dialog_advance")
+    assert completed["status"] == "completed"
+    assert completed["result"]["status"] == "ready"
+    assert completed["result"]["state"]["dialog"]["latest_event"]["text"] == "next"
 
 
 def test_advance_dialog_reports_pending_timeout_and_cancel(tmp_path, monkeypatch):
