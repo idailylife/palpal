@@ -1682,6 +1682,75 @@ def test_background_search_trigger_records_objective_transition(tmp_path):
     assert debug.navigation_transition_requests == {}
 
 
+def test_dialog_entry_confirmation_records_context_and_unique_return_candidate(tmp_path):
+    entrance = {
+        'id': 692, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 13546, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    return_side = {
+        'id': 703, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1,
+        'trigger_mode': 4, 'trigger_script': 13601, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    deeper = {
+        'id': 707, 'x': 160, 'y': 40, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 13620, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=12, height=7, start=(1, 1), objects=[entrance], frame=10)
+    source['map_id'] = 40
+    destination = make_state(
+        width=12, height=7, start=(1, 1), objects=[return_side, deeper], frame=11,
+    )
+    destination['map_id'] = 41
+    destination['trigger_observation'] = {
+        'generation': 1, 'event_object_id': 692, 'trigger_script': 13546,
+        'completed': True,
+        'source': {'scene_id': 3, 'map_id': 40, 'x': 16, 'y': 8},
+        'destination': {'scene_id': 3, 'map_id': 41, 'x': 16, 'y': 8, 'frame': 11},
+    }
+    debug.last_stable_room_state = source
+    debug.bind_room_entry_intent(source, 692)
+
+    debug.discover_native_transition_observation(destination)
+    assert debug.pending_transition_observation['room_entry_intent']['target_id'] == 692
+    debug.observe_pending_transition_destination(destination)
+    destination['frame'] = 12
+    record = debug.observe_pending_transition_destination(destination)
+
+    context = debug.agent_runtime.snapshot()['room_entry_context']
+    assert context['status'] == 'entered'
+    assert context['source_target_id'] == 692
+    assert context['source_transition_key'] == record['transition_key']
+    candidate = record['destination_entry_candidate']
+    assert candidate['object_id'] == 703
+    assert candidate['candidate_return_room_id'] == debug.room_identity(source)['id']
+    assert candidate['entry_relation'] == 'inferred_entry_return'
+
+    navigation = debug.run_agent_tool('get_navigation', {}, destination)['navigation']
+    targets = {target['id']: target for target in navigation['targets']}
+    assert targets[703]['entry_relation'] == 'inferred_entry_return'
+    assert targets[703]['candidate_return_room_id'] == debug.room_identity(source)['id']
+    assert targets[707].get('possible_entry_return') is not True
+    memory = debug.run_agent_tool('get_room_memory', {}, destination)['transitions']
+    assert memory['outgoing'] == []
+    assert memory['entry_candidates'][0]['object_id'] == 703
+    write_state(debug, destination)
+    rejected = debug.run_agent_tool('submit_decision', {
+        'action': 'navigate', 'target_id': 703,
+        'reason': 'Immediately return through the inferred entrance.',
+    }, destination)['decision']
+    assert rejected['validation']['reason'] == 'immediate_entry_return'
+    selected = debug.run_agent_tool('submit_decision', {
+        'action': 'navigate', 'target_id': 707,
+        'reason': 'Continue deeper instead of immediately returning.',
+    }, destination)['decision']
+    assert selected['recommended_action']['args']['id'] == 707
+    assert selected.get('validation', {}).get('status') != 'rejected'
+
+
 def test_manual_movement_ignores_native_trigger_with_mismatched_source_scene(tmp_path):
     target = {'id': 52, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1, 'trigger_mode': 4, 'trigger_script': 4631, 'auto_script': 0, 'blocking': False, 'interactable': True}
     debug = make_debug_state(tmp_path)
@@ -2219,10 +2288,69 @@ def test_confirmed_search_transition_stays_search_across_agent_tools(tmp_path):
     assert target_view['known_destination_room_id'] == debug.room_identity(destination)['id']
     assert route['kind'] == 'search'
     assert route['status'] == 'transition'
-    assert route['transition_key'] == record['transition_key']
+    assert route['transition_key'] != record['transition_key']
+    assert route['known_destination_basis'] == 'confirmed_site_history'
     assert executable_route['action'] == 'search'
     assert executable_route['status'] == 'transition'
     assert memory['outgoing'][0]['transition_key'] == record['transition_key']
+
+
+def test_site_history_requires_same_position_mode_and_one_destination(tmp_path):
+    debug = make_debug_state(tmp_path)
+    base = {
+        'id': 692, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
+        'trigger_mode': 1, 'trigger_script': 13546, 'auto_script': 0,
+        'blocking': False, 'interactable': True,
+    }
+    source = make_state(objects=[base])
+    destination_a = make_state(objects=[])
+    destination_a['map_id'] = 40
+    destination_b = make_state(objects=[])
+    destination_b['map_id'] = 41
+    debug.record_transition_destination(
+        debug.room_identity(source), 692, debug.room_identity(destination_a),
+        from_object=base, from_state=source, to_state=destination_a,
+        confirmation='native_trigger',
+    )
+
+    advanced = {**source, 'objects': [{**base, 'trigger_script': 13583}]}
+    inherited = debug.transition_destination_for_state(advanced, 692)
+    assert inherited['known_destination'] is True
+    assert inherited['known_destination_basis'] == 'confirmed_site_history'
+    assert inherited['known_destination_room_id'] == debug.room_identity(destination_a)['id']
+
+    moved = {**advanced, 'objects': [{**advanced['objects'][0], 'x': 32}]}
+    assert debug.transition_destination_for_state(moved, 692)['known_destination'] is False
+
+    conflicting = {**base, 'trigger_script': 13570}
+    debug.record_transition_destination(
+        debug.room_identity(source), 692, debug.room_identity(destination_b),
+        from_object=conflicting, from_state={**source, 'objects': [conflicting]},
+        to_state=destination_b, confirmation='native_trigger',
+    )
+    assert debug.transition_destination_for_state(advanced, 692)['known_destination'] is False
+
+
+def test_multiple_nearby_transitions_do_not_infer_entry_return(tmp_path):
+    debug = make_debug_state(tmp_path)
+    portals = [
+        {
+            'id': object_id, 'x': x, 'y': y, 'sprite_id': 0, 'state': 1,
+            'trigger_mode': 4, 'trigger_script': 14000 + object_id, 'auto_script': 0,
+            'blocking': False, 'interactable': True,
+        }
+        for object_id, x, y in ((703, 32, 0), (704, 0, 0))
+    ]
+    destination = make_state(width=7, height=5, start=(1, 1), objects=portals)
+    source = make_state()
+    source['map_id'] = 40
+    source_record = {
+        'transition_key': 'forward-key',
+        'native_destination': {'scene_id': 3, 'map_id': 10, 'x': 16, 'y': 8},
+    }
+    assert debug.infer_destination_entry_candidate(
+        destination, debug.room_identity(source), source_record,
+    ) is None
 
 
 def test_confirmed_search_transition_moves_before_starting_native_observer(tmp_path):

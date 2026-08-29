@@ -2369,6 +2369,15 @@ class AgentRuntime:
             if (
                 current
                 and current.get("status") == "entered"
+                and current.get("source_room_id") == before_room_id
+                and current.get("destination_room_id") == after_room_id
+                and int(current.get("source_target_id") or 0) == target_id
+                and current.get("source_transition_key") == transition_key
+            ):
+                return
+            if (
+                current
+                and current.get("status") == "entered"
                 and current.get("destination_room_id") == before_room_id
                 and current.get("source_room_id") == after_room_id
                 and not entry_return_selected
@@ -2383,6 +2392,7 @@ class AgentRuntime:
                     "return_landing_position": self._position_snapshot(after),
                 })
                 self._set_room_entry_context(current)
+
                 self.emit(
                     "navigation",
                     "transition_loop",
@@ -2445,6 +2455,26 @@ class AgentRuntime:
                     "progress_target_id": target_id,
                 })
                 self._set_room_entry_context(current)
+
+    def _record_confirmed_room_entry(
+        self,
+        before: dict | None,
+        after: dict,
+        target_id: int,
+        transition: dict,
+        *,
+        intentional_return: bool = False,
+    ) -> None:
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return
+        self._update_room_entry_after_execution(
+            before,
+            after,
+            "navigation_step",
+            {"id": int(target_id)},
+            {"status": "transitioned", "transition": transition},
+            entry_return_selected=intentional_return,
+        )
 
     async def _automatic_room_inspection(self, state: dict) -> str | None:
         room_id = self._observe_room_for_inspection(state)
@@ -3594,6 +3624,12 @@ exploration value, and maintained local tasks to choose the next action.
             tool == "navigation_step"
             and self.debug.navigation_target_is_entry_return(before, int(args.get("id") or 0))
         )
+        if tool == "navigation_step":
+            self.debug.bind_room_entry_intent(
+                before,
+                int(args.get("id") or 0),
+                intentional_return=entry_return_selected,
+            )
         started = _now()
         matched_item_object = None
         self.emit("action", "validating", f"Validated {tool}.", {"tool": tool, "args": args})

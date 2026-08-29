@@ -555,6 +555,49 @@ def test_selected_only_entry_return_is_allowed_and_records_normal_entry(tmp_path
     assert entry_return_checks == [(70, 758)]
 
 
+def test_site_history_entry_return_with_alternative_is_soft_avoid_only(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    source = make_state(objects=[transition_object(706, 32, 0, 13729)], frame=10)
+    source["map_id"] = 40
+    old_return = transition_object(758, 32, 0, 13773)
+    current_return = {**old_return, "trigger_script": 13774}
+    alternative = transition_object(767, 160, 40, 13790)
+    destination = make_state(
+        width=12, height=7, start=(1, 1),
+        objects=[current_return, alternative], frame=20,
+    )
+    destination["map_id"] = 70
+    runtime._update_room_entry_after_execution(
+        source, destination, "navigation_step", {"id": 706},
+        {"status": "transitioned", "progress": [{"status": "transitioned"}]},
+    )
+    historical_destination = {**destination, "objects": [old_return, alternative]}
+    debug.record_transition_destination(
+        debug.room_identity(destination),
+        758,
+        debug.room_identity(source),
+        from_object=old_return,
+        from_state=historical_destination,
+        to_state=source,
+        confirmation="native_trigger",
+    )
+    write_state(debug, destination)
+
+    navigation = debug.run_agent_tool("get_navigation", {}, destination)["navigation"]
+    target = next(item for item in navigation["targets"] if item["id"] == 758)
+    assert target["entry_relation"] == "confirmed_entry_return"
+    assert target["known_destination_basis"] == "confirmed_site_history"
+
+    submitted = debug.run_agent_tool("submit_decision", {
+        "action": "navigate",
+        "target_id": 758,
+        "reason": "Deliberately return through the known entrance.",
+    }, destination)["decision"]
+    assert submitted["recommended_action"]["tool"] == "navigation_step"
+    assert submitted.get("validation", {}).get("status") != "rejected"
+
+
 def test_recovery_then_selected_entry_return_does_not_rearm_recovery(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime

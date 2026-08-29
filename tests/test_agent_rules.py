@@ -946,17 +946,42 @@ def install_entry_context(debug, state):
     return context
 
 
+def install_entry_candidate(debug, state, context):
+    candidate = debug.transition_observation_from_state(state, 758)
+    data = debug.read_exploration()
+    data.setdefault('transitions', {}).setdefault(context['source_room_id'], {})[
+        context['source_transition_key']
+    ] = {
+        'transition_key': context['source_transition_key'],
+        'object_id': 706,
+        'from_room_id': context['source_room_id'],
+        'to_room_id': context['destination_room_id'],
+        'confirmation': 'native_trigger',
+        'destination_entry_candidate': {
+            'entry_relation': 'inferred_entry_return',
+            'object_id': 758,
+            'transition_key': candidate['transition_key'],
+            'transition_key_fields': candidate['transition_key_fields'],
+            'candidate_return_room_id': context['source_room_id'],
+            'source_transition_key': context['source_transition_key'],
+            'evidence': {'kind': 'native_landing_proximity', 'steps': 0, 'max_steps': 4},
+        },
+    }
+    debug.write_exploration(data)
+
+
 def test_entry_adjacent_unknown_transition_is_marked_and_rejected_before_movement(tmp_path):
     debug = make_debug_state(tmp_path)
     state = entry_room_state()
     context = install_entry_context(debug, state)
+    install_entry_candidate(debug, state, context)
     write_state(debug, state)
 
     navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
     targets = {target['id']: target for target in navigation['targets']}
     assert navigation['entry_context'] == context
     assert targets[758]['possible_entry_return'] is True
-    assert targets[758]['entry_relation'] == 'arrival_adjacent_unknown_transition'
+    assert targets[758]['entry_relation'] == 'inferred_entry_return'
     assert targets[758]['agent_priority'] == 'avoid_immediate_backtrack'
     assert 'possible_entry_return' not in targets[767]
 
@@ -973,7 +998,8 @@ def test_entry_adjacent_unknown_transition_is_marked_and_rejected_before_movemen
 def test_entry_return_is_allowed_without_alternative_or_with_explicit_task_binding(tmp_path):
     debug = make_debug_state(tmp_path)
     state = entry_room_state()
-    install_entry_context(debug, state)
+    context = install_entry_context(debug, state)
+    install_entry_candidate(debug, state, context)
     state['objects'] = [state['objects'][0]]
     write_state(debug, state)
     allowed = debug.run_agent_tool('submit_decision', {
@@ -982,7 +1008,8 @@ def test_entry_return_is_allowed_without_alternative_or_with_explicit_task_bindi
     assert allowed['recommended_action']['tool'] == 'navigation_step'
 
     state = entry_room_state()
-    install_entry_context(debug, state)
+    context = install_entry_context(debug, state)
+    install_entry_candidate(debug, state, context)
     write_state(debug, state)
     created = create_agent_task(debug, {
         'id': 'task-return',

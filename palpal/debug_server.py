@@ -663,6 +663,7 @@ class DebugState:
         self.last_stable_room_state: dict | None = None
         self.pending_transition_observation: dict | None = None
         self.pending_interaction_observation: dict | None = None
+        self.pending_room_entry_intent: dict | None = None
         self.observations = ObservationCoordinator()
         self.navigation_transition_requests: dict[int, str] = {}
         self.navigation_action_lock = threading.RLock()
@@ -1529,6 +1530,7 @@ class DebugState:
         self.last_stable_room_state = None
         self.pending_transition_observation = None
         self.pending_interaction_observation = None
+        self.pending_room_entry_intent = None
 
     def cancel_runtime_observations(self, reason: str) -> None:
         self.observations.clear_all(reason)
@@ -1536,6 +1538,7 @@ class DebugState:
         self.dialog_advance_observation_id = None
         self.pending_transition_observation = None
         self.pending_interaction_observation = None
+        self.pending_room_entry_intent = None
 
     def int_frame(self, value) -> int | None:
         try:
@@ -6311,26 +6314,111 @@ class DebugState:
             transition_key,
             recent_semantic_room_keys,
         )
-        if (
-            not payload.get("known_destination")
-            and isinstance(obj, dict)
-            and trigger_kind(int(obj.get("trigger_mode") or 0)) == "search"
-        ):
-            # Search scripts may replace their own trigger entry.  A single
-            # confirmed record for this object in the same logical room remains
-            # authoritative even when the current script id has advanced.
-            fallback = self.transition_destination_payload(
-                data,
-                identity["id"] if identity else None,
-                object_id,
-                recent_room_ids,
-                None,
-                None,
-                recent_semantic_room_keys,
-            )
-            if fallback.get("known_destination"):
-                return fallback
+        if not payload.get("known_destination") and isinstance(obj, dict) and identity is not None:
+            fields = self.transition_key_fields(identity, obj, object_id)
+            by_room = (data.get("transitions") or {}).get(identity["id"], {})
+            site_records = []
+            for record in by_room.values() if isinstance(by_room, dict) else []:
+                versions = [record]
+                versions.extend(
+                    item for item in record.get("observations") or []
+                    if isinstance(item, dict)
+                )
+                for version in versions:
+                    record_fields = version.get("transition_key_fields")
+                    if not isinstance(record_fields, dict):
+                        continue
+                    if version.get("confirmation") not in {"native_trigger", "human_confirmed"}:
+                        continue
+                    if int(version.get("object_id") or 0) != int(object_id):
+                        continue
+                    if all(
+                        record_fields.get(key) == fields.get(key)
+                        for key in ("scene_id", "map_id", "x", "y", "trigger_mode")
+                    ):
+                        site_records.append(version)
+            destinations = {
+                str(record.get("to_room_id"))
+                for record in site_records
+                if record.get("to_room_id")
+            }
+            if len(destinations) == 1:
+                record = site_records[0]
+                fallback = self.transition_destination_payload(
+                    data,
+                    identity["id"],
+                    object_id,
+                    recent_room_ids,
+                    None,
+                    str(record.get("transition_key")),
+                    recent_semantic_room_keys,
+                )
+                if fallback.get("known_destination"):
+                    fallback["known_destination_basis"] = "confirmed_site_history"
+                    fallback["transition_key"] = transition_key
+                    fallback["transition_key_fields"] = fields
+                    return fallback
         return payload
+
+    def infer_destination_entry_candidate(
+        self,
+        destination_state: dict,
+        source_identity: dict,
+        source_record: dict,
+    ) -> dict | None:
+        navigation = self.navigation(destination_state)
+        executable = {"reachable", "transition", "blocked_by_interactable"}
+        nearby = []
+        for target in navigation.get("targets") or []:
+            try:
+                steps = int(target.get("steps"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                target.get("transition_candidate") is True
+                and target.get("status") in executable
+                and steps <= IMMEDIATE_ENTRY_RETURN_MAX_STEPS
+            ):
+                nearby.append(target)
+        if len(nearby) != 1:
+            return None
+        target = nearby[0]
+        return {
+            "entry_relation": "inferred_entry_return",
+            "object_id": int(target.get("id") or 0),
+            "transition_key": target.get("transition_key"),
+            "transition_key_fields": target.get("transition_key_fields"),
+            "candidate_return_room_id": source_identity.get("id"),
+            "source_transition_key": source_record.get("transition_key"),
+            "evidence": {
+                "kind": "native_landing_proximity",
+                "steps": int(target.get("steps") or 0),
+                "max_steps": IMMEDIATE_ENTRY_RETURN_MAX_STEPS,
+                "native_destination": source_record.get("native_destination"),
+            },
+        }
+
+    def destination_entry_candidate_for_target(
+        self,
+        data: dict,
+        room_id: str,
+        object_id: int,
+        transition_key: str | None,
+    ) -> dict | None:
+        matches = []
+        for by_room in (data.get("transitions") or {}).values():
+            if not isinstance(by_room, dict):
+                continue
+            for record in by_room.values():
+                candidate = record.get("destination_entry_candidate") if isinstance(record, dict) else None
+                if not isinstance(candidate, dict) or record.get("to_room_id") != room_id:
+                    continue
+                if int(candidate.get("object_id") or 0) != int(object_id):
+                    continue
+                if transition_key and candidate.get("transition_key") != transition_key:
+                    continue
+                matches.append(candidate)
+        return copy.deepcopy(matches[0]) if len(matches) == 1 else None
 
     def record_transition_destination(
         self,
@@ -6568,6 +6656,14 @@ class DebugState:
                 else None
             ),
         }
+        intent = self.pending_room_entry_intent
+        if (
+            isinstance(intent, dict)
+            and intent.get("source_room_id") == observation.get("from_room", {}).get("id")
+            and int(intent.get("target_id") or 0) == int(object_id)
+            and intent.get("source_transition_key") == observation.get("transition_key")
+        ):
+            payload["room_entry_intent"] = copy.deepcopy(intent)
         observation_id = self.observations.register(
             "transition",
             owner=owner,
@@ -6590,6 +6686,35 @@ class DebugState:
                 self.observations.consume(previous_id, owner="navigation")
             self.navigation_transition_requests[int(object_id)] = observation_id
         return observation_id
+
+    def bind_room_entry_intent(
+        self,
+        state: dict,
+        object_id: int,
+        *,
+        intentional_return: bool = False,
+    ) -> dict | None:
+        observation = self.transition_observation_from_state(state, object_id)
+        if not isinstance(observation, dict):
+            self.pending_room_entry_intent = None
+            return None
+        intent = {
+            "source_room_id": (observation.get("from_room") or {}).get("id"),
+            "target_id": int(object_id),
+            "source_transition_key": observation.get("transition_key"),
+            "intentional_return": bool(intentional_return),
+            "armed_at": time.time(),
+        }
+        self.pending_room_entry_intent = intent
+        pending = self.pending_transition_observation
+        if (
+            isinstance(pending, dict)
+            and pending.get("from_room", {}).get("id") == intent.get("source_room_id")
+            and int(pending.get("object_id") or 0) == int(object_id)
+            and pending.get("transition_key") == intent.get("source_transition_key")
+        ):
+            pending["room_entry_intent"] = copy.deepcopy(intent)
+        return intent
 
     def matching_pending_search_interaction(
         self,
@@ -7097,6 +7222,39 @@ class DebugState:
                 else None
             ),
         )
+        destination_state = self.state_at_native_destination(state, destination)
+        intent = pending.get("room_entry_intent")
+        runtime = getattr(self, "agent_runtime", None)
+        if isinstance(intent, dict) and runtime is not None:
+            runtime._record_confirmed_room_entry(
+                pending.get("frozen_source_state"),
+                destination_state,
+                object_id,
+                record,
+                intentional_return=bool(intent.get("intentional_return")),
+            )
+        candidate = self.infer_destination_entry_candidate(
+            destination_state,
+            from_identity,
+            record,
+        )
+        if candidate is not None:
+            record["destination_entry_candidate"] = candidate
+        else:
+            record.pop("destination_entry_candidate", None)
+        with self.exploration_lock:
+            data = self.read_exploration()
+            stored = (
+                (data.get("transitions") or {}).get(from_identity.get("id"), {})
+                .get(record.get("transition_key"))
+            )
+            if isinstance(stored, dict):
+                if candidate is not None:
+                    stored["destination_entry_candidate"] = candidate
+                else:
+                    stored.pop("destination_entry_candidate", None)
+                self.write_exploration(data)
+        self.pending_room_entry_intent = None
         self.complete_linked_transition_interaction(pending, state, record)
         self.append_navigation_diagnostic(
             "native_transition_confirmed",
@@ -7892,6 +8050,7 @@ class DebugState:
             if isinstance(transition, dict)
         ]
         incoming = []
+        entry_candidates = []
         stored_transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
         for by_room in stored_transitions.values():
             if not isinstance(by_room, dict):
@@ -7909,14 +8068,35 @@ class DebugState:
                     direction="incoming",
                     data=data,
                 ))
+                candidate = transition.get("destination_entry_candidate")
+                if isinstance(candidate, dict):
+                    current_records = stored_transitions.get(resolved_room_id, {})
+                    confirmed_reverse = (
+                        current_records.get(candidate.get("transition_key"))
+                        if isinstance(current_records, dict)
+                        else None
+                    )
+                    if not (
+                        isinstance(confirmed_reverse, dict)
+                        and confirmed_reverse.get("confirmation") in {"native_trigger", "human_confirmed"}
+                    ):
+                        entry_candidates.append(self.without_nulls({
+                            "entry_relation": "inferred_entry_return",
+                            "object_id": candidate.get("object_id"),
+                            "transition_key": candidate.get("transition_key"),
+                            "candidate_return_room_id": candidate.get("candidate_return_room_id"),
+                            "source_transition_key": candidate.get("source_transition_key"),
+                            "entry_evidence": candidate.get("evidence"),
+                        }))
         incoming.sort(key=lambda item: (str(item.get("from_room_id") or ""), str(item.get("transition_key") or "")))
+        entry_candidates.sort(key=lambda item: (int(item.get("object_id") or 0), str(item.get("transition_key") or "")))
         memo = self.room_memo(resolved_room_id)
         compact_memo = (
             {key: memo.get(key) for key in ("text", "source")}
             if isinstance(memo, dict)
             else None
         )
-        return {
+        result = {
             "ok": True,
             "room_id": resolved_room_id,
             "memo": compact_memo,
@@ -7927,6 +8107,9 @@ class DebugState:
                 "incoming": incoming,
             },
         }
+        if entry_candidates:
+            result["transitions"]["entry_candidates"] = entry_candidates
+        return result
 
     def current_room_memo_view(self) -> dict:
         state = self.read_live_state()
@@ -9009,6 +9192,10 @@ class DebugState:
             if is_transition:
                 target["transition_candidate"] = True
                 target.update(destination_payload)
+                observation = self.transition_observation_from_state(state, target_id)
+                if isinstance(observation, dict):
+                    target.setdefault("transition_key", observation.get("transition_key"))
+                    target.setdefault("transition_key_fields", observation.get("transition_key_fields"))
             if blocker is not None:
                 target["blocker"] = blocker
             if approach is not None:
@@ -10501,15 +10688,16 @@ class DebugState:
         status = context.get("status")
         if status == "progressed":
             return targets, context
+        identity = self.room_identity(state)
+        with self.exploration_lock:
+            exploration = self.read_exploration()
         decorated = []
         for original in targets:
             target = dict(original)
             try:
                 target_id = int(target.get("id") or 0)
-                steps = int(target.get("steps")) if target.get("steps") is not None else None
             except (TypeError, ValueError):
                 target_id = 0
-                steps = None
             if status == "recovery_pending":
                 matches_target = target_id == int(context.get("source_target_id") or 0)
                 matches_key = bool(
@@ -10528,26 +10716,34 @@ class DebugState:
                     target.get("known_destination")
                     and target.get("known_destination_room_id") == context.get("source_room_id")
                 )
-                arrival_adjacent_unknown = bool(
-                    not target.get("known_destination")
-                    and target.get("status") in {"reachable", "transition", "blocked_by_interactable"}
-                    and steps is not None
-                    and steps <= IMMEDIATE_ENTRY_RETURN_MAX_STEPS
+                candidate = self.destination_entry_candidate_for_target(
+                    exploration,
+                    identity.get("id") if isinstance(identity, dict) else "",
+                    target_id,
+                    target.get("transition_key"),
                 )
-                if known_return or arrival_adjacent_unknown:
+                inferred_return = bool(
+                    isinstance(candidate, dict)
+                    and candidate.get("candidate_return_room_id") == context.get("source_room_id")
+                    and candidate.get("source_transition_key") == context.get("source_transition_key")
+                )
+                if known_return or inferred_return:
                     target.update({
                         "entry_relation": (
                             "confirmed_entry_return" if known_return
-                            else "arrival_adjacent_unknown_transition"
+                            else "inferred_entry_return"
                         ),
                         "possible_entry_return": True,
                         "agent_priority": "avoid_immediate_backtrack",
                         "deprioritize_reason": (
                             "该传送已确认返回刚离开的逻辑房间；先探索当前房间的其他可执行目标。"
                             if known_return
-                            else "该未知传送紧邻新房间落点，可能是刚使用入口的返回侧；先探索其他可执行目标。"
+                            else "该未知传送是落点附近唯一可执行传送，可能是刚使用入口的返回侧；先探索其他可执行目标。"
                         ),
                     })
+                    if inferred_return:
+                        target["candidate_return_room_id"] = candidate.get("candidate_return_room_id")
+                        target["entry_evidence"] = candidate.get("evidence")
             decorated.append(target)
         return decorated, context
 
@@ -11600,7 +11796,8 @@ class DebugState:
             "interaction_feedback_state", "interaction_evidence",
             "known_destination_room_id", "known_destination_observed_at",
             "approach", "affordances", "entry_relation", "possible_entry_return",
-            "recovery_route",
+            "recovery_route", "candidate_return_room_id", "entry_evidence",
+            "known_destination_basis",
         )
         targets = []
         for target in (navigation.get("targets") or [])[:limit]:
@@ -11757,6 +11954,7 @@ class DebugState:
                 for key in (
                     "entry_relation", "possible_entry_return", "recovery_route",
                     "agent_priority", "deprioritize_reason",
+                    "candidate_return_room_id", "entry_evidence",
                 ):
                     if key in entry_target:
                         route[key] = entry_target[key]
@@ -11770,6 +11968,7 @@ class DebugState:
                 "to_semantic_room", "confidence", "returns_to_recent_room",
                 "approach", "interaction_feedback_state", "interaction_evidence",
                 "entry_relation", "possible_entry_return", "recovery_route",
+                "candidate_return_room_id", "entry_evidence", "known_destination_basis",
             )
             compact_route = {key: route.get(key) for key in route_keys if key in route}
             if isinstance(compact_route.get("destination_exploration"), dict):
@@ -12637,7 +12836,7 @@ class DebugState:
             return None
         task_override = self.active_task_binds_navigation_target(state, target_id)
         executable = {"reachable", "transition", "blocked_by_interactable"}
-        if selected.get("possible_entry_return") is True and not task_override:
+        if selected.get("entry_relation") == "inferred_entry_return" and not task_override:
             alternatives = [
                 target for target in targets
                 if int(target.get("id") or 0) != target_id
