@@ -2879,13 +2879,13 @@ function renderGoalsDialog() {
     return;
   }
   const counts = agentTaskCounts;
-  goalsSummary.textContent = `${Number(counts.active || 0)} active · ${Number(counts.completed || 0)} completed · ${Number(counts.abandoned || 0)} abandoned`;
+  goalsSummary.textContent = `${Number(counts.active || 0)} active · ${Number(counts.dormant || 0)} dormant · ${Number(counts.completed || 0)} completed · ${Number(counts.abandoned || 0)} abandoned`;
   if (!agentTasks.length) {
     goalsContent.innerHTML = '<div class="goalsEmpty">The Agent has not created any tool tasks yet.</div>';
     return;
   }
-  const labels = { active: "Active", completed: "Completed", abandoned: "Abandoned" };
-  goalsContent.innerHTML = ["active", "completed", "abandoned"].map((status) => {
+  const labels = { active: "Active", dormant: "Dormant", completed: "Completed", abandoned: "Abandoned" };
+  goalsContent.innerHTML = ["active", "dormant", "completed", "abandoned"].map((status) => {
     const tasks = agentTasks.filter((task) => task.status === status);
     return `<section class="goalsGroup is-${status}">
       <div class="goalsGroupHeader"><h3>${labels[status]}</h3><span>${tasks.length}</span></div>

@@ -2344,9 +2344,17 @@ def test_transition_task_context_reopens_only_for_structural_task_changes(tmp_pa
     rewritten = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']
     assert rewritten['status'] == 'untraversed_current_context'
 
-    debug.run_agent_tool('upsert_task', {'id': created['id'], 'status': 'completed'})
+    debug.event_log.append({'time': 100.0, 'type': 'test_task_status_evidence'})
+    debug.run_agent_tool('upsert_task', {
+        'id': created['id'], 'status': 'completed',
+        'status_reason': 'The clue has been resolved.', 'status_evidence': ['event:0'],
+    })
     assert debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']['status'] == 'no_active_tasks'
-    debug.run_agent_tool('upsert_task', {'id': created['id'], 'status': 'active'})
+    debug.event_log.append({'time': 101.0, 'type': 'test_task_status_evidence'})
+    debug.run_agent_tool('upsert_task', {
+        'id': created['id'], 'status': 'active',
+        'status_reason': 'New evidence reopens the clue.', 'status_evidence': ['event:1'],
+    })
     reopened = debug.run_agent_tool('inspect_target', {'id': 52}, state)['route']['traversal_context']
     assert reopened['status'] == 'untraversed_current_context'
 

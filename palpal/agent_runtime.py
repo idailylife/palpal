@@ -212,6 +212,9 @@ class BattleDelegate:
                 "y": source.get("y"),
             },
         }
+        identity = self.debug.room_identity(state)
+        if isinstance(identity, dict) and identity.get("logical_room_id"):
+            context["logical_room_id"] = identity["logical_room_id"]
         exploration = self.debug.agent_current_exploration(state)
         last_route = (
             exploration.get("last_route")
@@ -813,6 +816,7 @@ class BattleDelegate:
                 ):
                     raise RuntimeError("battle_generation_changed")
                 summary = self._summary(state, int(self._control().get("instruction_count") or 0))
+                self.debug.record_battle_reappearance_candidate(summary, state)
                 self._persist_control(
                     status="completed",
                     phase="ended",
@@ -1057,6 +1061,13 @@ class AgentRuntime:
             "battle_delegate": None,
             "task_reconciliation_pending": False,
             "task_reconciliation_reason": None,
+            "room_inspection": {
+                "baseline_required": True,
+                "last_observed_room_id": None,
+                "pending_room_id": None,
+                "inspected_rooms": {},
+            },
+            "room_entry_context": None,
         }
 
     def _load_or_create(self) -> dict:
@@ -1093,6 +1104,25 @@ class AgentRuntime:
         value.setdefault("checkpoint_id", None)
         value.setdefault("restored_from_session_id", None)
         value.setdefault("pending_game_instance_id", None)
+        room_inspection = value.get("room_inspection")
+        if not isinstance(room_inspection, dict):
+            room_inspection = {
+                "baseline_required": True,
+                "last_observed_room_id": None,
+                "pending_room_id": None,
+                "inspected_rooms": {},
+            }
+            value["room_inspection"] = room_inspection
+        room_inspection.setdefault("baseline_required", False)
+        room_inspection.setdefault("last_observed_room_id", None)
+        room_inspection.setdefault("pending_room_id", None)
+        if not isinstance(room_inspection.get("inspected_rooms"), dict):
+            room_inspection["inspected_rooms"] = {}
+        room_entry_context = value.get("room_entry_context")
+        if not isinstance(room_entry_context, dict):
+            value["room_entry_context"] = None
+        elif room_entry_context.get("status") not in {"entered", "progressed", "recovery_pending"}:
+            value["room_entry_context"] = None
         if legacy_task_state:
             value["task_reconciliation_pending"] = True
             value["task_reconciliation_reason"] = "legacy_control_upgrade"
@@ -1866,6 +1896,8 @@ class AgentRuntime:
                 "provider_usage",
                 "last_compaction",
                 "equipment_review",
+                "room_inspection",
+                "room_entry_context",
             ):
                 if key in control:
                     restored[key] = control[key]
@@ -2200,6 +2232,271 @@ class AgentRuntime:
         if pending_instance:
             self.reset("game_instance_changed", game_instance_id=str(pending_instance))
 
+    @staticmethod
+    def _room_screen_obscured(state: dict) -> bool:
+        control = state.get("control") if isinstance(state.get("control"), dict) else {}
+        if control.get("phase") in {"dialog", "choice", "shop", "battle"}:
+            return True
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else {}
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        return bool(
+            state.get("in_battle")
+            or dialog.get("active") is True
+            or choice.get("active") is True
+            or shop.get("active") is True
+        )
+
+    def _observe_room_for_inspection(self, state: dict) -> str | None:
+        identity = self.debug.room_identity(state)
+        room_id = identity.get("id") if isinstance(identity, dict) else None
+        if not isinstance(room_id, str) or not room_id:
+            return None
+        with self.lock:
+            control = self.state.setdefault("room_inspection", {})
+            inspected = control.setdefault("inspected_rooms", {})
+            previous = control.get("last_observed_room_id")
+            if control.get("baseline_required") is True:
+                control["baseline_required"] = False
+                control["last_observed_room_id"] = room_id
+                control["pending_room_id"] = None
+                self._persist()
+                return room_id
+            if previous != room_id:
+                control["last_observed_room_id"] = room_id
+                control["pending_room_id"] = None if room_id in inspected else room_id
+                self._persist()
+            elif control.get("pending_room_id") not in {None, room_id}:
+                control["pending_room_id"] = None if room_id in inspected else room_id
+                self._persist()
+        return room_id
+
+    def _record_room_inspection(self, room_id: str, result: dict) -> None:
+        if result.get("ok") is not True:
+            return
+        with self.lock:
+            control = self.state.setdefault("room_inspection", {})
+            inspected = control.setdefault("inspected_rooms", {})
+            inspected[room_id] = {
+                "inspected_at": _stamp(),
+                "frame_sequence": result.get("frame_sequence"),
+                "visual_hash": result.get("visual_hash"),
+            }
+            if control.get("pending_room_id") == room_id:
+                control["pending_room_id"] = None
+            self._persist()
+
+    def room_entry_context_for_state(self, state: dict | None = None) -> dict | None:
+        context = self.state.get("room_entry_context")
+        if not isinstance(context, dict):
+            return None
+        current = self.debug.room_identity(state) if isinstance(state, dict) else None
+        current_room_id = current.get("id") if isinstance(current, dict) else None
+        status = context.get("status")
+        expected_room_id = (
+            context.get("source_room_id")
+            if status == "recovery_pending"
+            else context.get("destination_room_id")
+        )
+        if current_room_id and expected_room_id != current_room_id:
+            return None
+        return copy.deepcopy(context)
+
+    def recent_transition_chain(self, state: dict | None = None) -> list[dict]:
+        context = self.room_entry_context_for_state(state)
+        if not isinstance(context, dict):
+            return []
+        chain = [{
+            "from_room_id": context.get("source_room_id"),
+            "target_id": context.get("source_target_id"),
+            "transition_key": context.get("source_transition_key"),
+            "to_room_id": context.get("destination_room_id"),
+            "entered_at": context.get("entered_at"),
+        }]
+        if context.get("status") == "recovery_pending":
+            chain.append({
+                "from_room_id": context.get("destination_room_id"),
+                "target_id": context.get("return_target_id"),
+                "transition_key": context.get("return_transition_key"),
+                "to_room_id": context.get("source_room_id"),
+                "returned_at": context.get("returned_at"),
+                "classification": "transition_loop",
+            })
+        return chain
+
+    @staticmethod
+    def _position_snapshot(state: dict) -> dict:
+        position = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        return {"x": position.get("x"), "y": position.get("y")}
+
+    def _transition_key_for_target(self, state: dict, target_id: int) -> str | None:
+        observation = self.debug.transition_observation_from_state(state, target_id)
+        if not isinstance(observation, dict):
+            return None
+        value = observation.get("transition_key")
+        return str(value) if value else None
+
+    def _set_room_entry_context(self, context: dict | None) -> None:
+        with self.lock:
+            self.state["room_entry_context"] = copy.deepcopy(context)
+            self._persist()
+
+    def _update_room_entry_after_execution(
+        self,
+        before: dict,
+        after: dict,
+        tool: str,
+        args: dict,
+        action_result: dict,
+        *,
+        entry_return_selected: bool = False,
+    ) -> None:
+        before_identity = self.debug.room_identity(before)
+        after_identity = self.debug.room_identity(after)
+        before_room_id = before_identity.get("id") if isinstance(before_identity, dict) else None
+        after_room_id = after_identity.get("id") if isinstance(after_identity, dict) else None
+        if not before_room_id or not after_room_id:
+            return
+        try:
+            target_id = int(args.get("id") or 0) if tool == "navigation_step" else 0
+        except (TypeError, ValueError):
+            target_id = 0
+        current = self.state.get("room_entry_context")
+        current = copy.deepcopy(current) if isinstance(current, dict) else None
+
+        if before_room_id != after_room_id and target_id > 0:
+            transition_key = self._transition_key_for_target(before, target_id)
+            if (
+                current
+                and current.get("status") == "entered"
+                and current.get("destination_room_id") == before_room_id
+                and current.get("source_room_id") == after_room_id
+                and not entry_return_selected
+                and not self.debug.active_task_binds_navigation_target(before, target_id)
+            ):
+                current.update({
+                    "status": "recovery_pending",
+                    "return_target_id": target_id,
+                    "return_transition_key": transition_key,
+                    "returned_at": _stamp(),
+                    "returned_frame_sequence": after.get("frame"),
+                    "return_landing_position": self._position_snapshot(after),
+                })
+                self._set_room_entry_context(current)
+                self.emit(
+                    "navigation",
+                    "transition_loop",
+                    f"Detected immediate room return {before_room_id} -> {after_room_id}; recovery is required.",
+                    {"room_entry_context": current},
+                )
+                return
+
+            recovered = bool(
+                current
+                and current.get("status") == "recovery_pending"
+                and current.get("source_room_id") == before_room_id
+                and current.get("destination_room_id") == after_room_id
+                and int(current.get("source_target_id") or 0) == target_id
+            )
+            next_context = {
+                "status": "entered",
+                "source_room_id": before_room_id,
+                "source_region_key": before_identity.get("region_key"),
+                "source_target_id": target_id,
+                "source_transition_key": transition_key,
+                "destination_room_id": after_room_id,
+                "destination_region_key": after_identity.get("region_key"),
+                "landing_position": self._position_snapshot(after),
+                "entered_at": _stamp(),
+                "entered_frame_sequence": after.get("frame"),
+                "recovered_from_loop": recovered,
+            }
+            self._set_room_entry_context(next_context)
+            self.emit(
+                "navigation",
+                "room_entry_context",
+                f"Recorded room entry {before_room_id} -> {after_room_id}.",
+                {"room_entry_context": next_context},
+            )
+            return
+
+        if (
+            current
+            and current.get("status") == "entered"
+            and current.get("destination_room_id") == after_room_id
+            and tool == "navigation_step"
+            and target_id > 0
+            and not self.debug.navigation_target_is_entry_return(before, target_id)
+        ):
+            progress = action_result.get("progress") if isinstance(action_result.get("progress"), list) else []
+            meaningful = action_result.get("status") in {"arrived", "approached", "interacting"} or any(
+                isinstance(item, dict)
+                and (
+                    item.get("status") in {"stepping", "arrived", "approached", "interacting"}
+                    or bool(item.get("move"))
+                    or int(item.get("segment_steps") or 0) > 0
+                )
+                for item in progress
+            )
+            if meaningful:
+                current.update({
+                    "status": "progressed",
+                    "progressed_at": _stamp(),
+                    "progress_target_id": target_id,
+                })
+                self._set_room_entry_context(current)
+
+    async def _automatic_room_inspection(self, state: dict) -> str | None:
+        room_id = self._observe_room_for_inspection(state)
+        control = self.state.get("room_inspection") or {}
+        if (
+            not room_id
+            or control.get("pending_room_id") != room_id
+            or self._room_screen_obscured(state)
+        ):
+            return None
+        started = _now()
+        arguments = {
+            "focus": "room_layout",
+            "question": "Describe the current room layout, visible exits, and obvious risks. Do not infer object IDs, scripts, or confirmed transitions.",
+        }
+        result = await asyncio.to_thread(
+            self.debug.run_agent_tool,
+            "inspect_screen",
+            arguments,
+            state,
+            tool_cycle=self.debug.new_agent_tool_cycle(state),
+        )
+        if result.get("ok") is not True:
+            error = result.get("error") if isinstance(result.get("error"), dict) else {}
+            code = str(error.get("code") or "screen_inspection_failed")
+            self.emit(
+                "tool",
+                "automatic_visual_inspection_failed",
+                f"Automatic room inspection failed for {room_id}: {code}.",
+                {"name": "inspect_screen", "automatic": True, "room_id": room_id, "error_code": code},
+                started=started,
+            )
+            self._pause(
+                "automatic_room_inspection_failed",
+                details={"room_id": room_id, "error_code": code},
+                summary=f"Agent paused: automatic room inspection failed for {room_id} ({code}).",
+            )
+            return ""
+        self._record_room_inspection(room_id, result)
+        self.emit(
+            "tool",
+            "automatic_visual_inspection",
+            f"Automatically inspected new room {room_id}.",
+            {"name": "inspect_screen", "automatic": True, "room_id": room_id, "result": result},
+            started=started,
+        )
+        return (
+            "Automatic low-authority visual inspection of the newly entered room. "
+            "Treat it only as visual_annotation and do not write Room Memo, task, or transition facts from it:\n"
+            + json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        )
+
     async def _run(self, generation: int, *, decide_only: bool) -> None:
         feedback = "Inspect the latest stable game state and choose the next useful local action."
         replans = 0
@@ -2211,6 +2508,11 @@ class AgentRuntime:
                 before = await asyncio.to_thread(self.debug.snapshot)
                 if self._game_control_active(before):
                     before = await asyncio.to_thread(self._wait_for_control)
+                inspection_feedback = await self._automatic_room_inspection(before)
+                if inspection_feedback == "":
+                    return
+                if inspection_feedback:
+                    feedback = feedback + "\n\n" + inspection_feedback
                 if before.get("in_battle") and self.debug.prebattle_interaction(before) is None:
                     if not isinstance(before.get("battle"), dict):
                         self._pause("battle_state_unavailable")
@@ -2454,19 +2756,20 @@ class AgentRuntime:
                 nonlocal submitted_decision
                 arguments = runtime._parse_tool_arguments(raw_arguments)
                 started = _now()
+                tool_state = runtime.debug.snapshot()
                 if name == "inspect_screen":
                     result = await asyncio.to_thread(
                         runtime.debug.run_agent_tool,
                         name,
                         arguments,
-                        runtime.debug.snapshot(),
+                        tool_state,
                         tool_cycle=tool_cycle,
                     )
                 else:
                     result = runtime.debug.run_agent_tool(
                         name,
                         arguments,
-                        runtime.debug.snapshot(),
+                        tool_state,
                         tool_cycle=tool_cycle,
                     )
                 submit_ok = name == "submit_decision" and result.get("ok") is True
@@ -2491,6 +2794,11 @@ class AgentRuntime:
                     {"name": name, "arguments": arguments, "result": result},
                     started=started,
                 )
+                if name == "inspect_screen" and result.get("ok") is True:
+                    identity = runtime.debug.room_identity(tool_state)
+                    room_id = identity.get("id") if isinstance(identity, dict) else None
+                    if isinstance(room_id, str) and room_id:
+                        runtime._record_room_inspection(room_id, result)
                 if name == "submit_decision":
                     if not result.get("ok"):
                         return json.dumps(result, ensure_ascii=False)
@@ -3282,6 +3590,10 @@ exploration value, and maintained local tasks to choose the next action.
             raise ReplanRequired(replan_reason)
         if tool not in EXECUTABLE_TOOLS:
             raise RuntimeError(f"unsupported_action:{tool}")
+        entry_return_selected = bool(
+            tool == "navigation_step"
+            and self.debug.navigation_target_is_entry_return(before, int(args.get("id") or 0))
+        )
         started = _now()
         matched_item_object = None
         self.emit("action", "validating", f"Validated {tool}.", {"tool": tool, "args": args})
@@ -3345,6 +3657,14 @@ exploration value, and maintained local tasks to choose the next action.
             action_result = {**action_result, "observation": observation}
         delta = self.state_delta(before, after)
         result = {"ok": True, "tool": tool, "args": args, "result": self._compact_action_result(action_result), "delta": delta, "state": self._compact_state(after)}
+        self._update_room_entry_after_execution(
+            before,
+            after,
+            tool,
+            args,
+            action_result,
+            entry_return_selected=entry_return_selected,
+        )
         self.emit("action", "completed", f"Executed {tool}.", {"result": action_result}, started=started)
         self.emit("state_diff", "observed", "Observed stable state changes.", delta)
         return result

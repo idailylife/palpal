@@ -56,6 +56,7 @@ LOGICAL_ROOM_ID_RE = re.compile(r"^S\d+/M\d+:[0-9A-F]{12}$")
 MAX_OBJECT_INTERACTION_HISTORY = 20
 MAX_INTERACTION_CONTEXT_EVIDENCE = 40
 MAX_TASK_HISTORY = 20
+MAX_TASK_EVIDENCE = 20
 MAX_ACTIVE_TASK_CONTEXT = 8
 MAX_ACTIVE_TASK_DESCRIPTION = 160
 MAX_ROOM_MEMO_TEXT = 800
@@ -91,6 +92,7 @@ TRANSITION_OBSERVATION_TIMEOUT_SECONDS = 4.0
 GAME_CONTROL_TIMEOUT_SECONDS = 30.0
 TRANSITION_STABLE_SNAPSHOTS = 2
 MAX_NAVIGATION_SEGMENT_STEPS = 8
+IMMEDIATE_ENTRY_RETURN_MAX_STEPS = 4
 VIEWPORT_WIDTH = 320
 VIEWPORT_HEIGHT = 200
 OPENING_LI_XIAOYAO_MONOLOGUE_MESSAGES = {1956, 1957, 1958, 1962, 1963, 1964}
@@ -3770,6 +3772,7 @@ class DebugState:
             "room_memos": {},
             "transitions": {},
             "object_interactions": {},
+            "battle_reappearances": {},
             "interaction_observable_context": {
                 "revision": 0,
                 "event_keys": [],
@@ -3831,6 +3834,9 @@ class DebugState:
         object_interactions = data.get("object_interactions")
         if not isinstance(object_interactions, dict):
             data["object_interactions"] = {}
+        battle_reappearances = data.get("battle_reappearances")
+        if not isinstance(battle_reappearances, dict):
+            data["battle_reappearances"] = {}
         observable_context = data.get("interaction_observable_context")
         if not isinstance(observable_context, dict):
             data["interaction_observable_context"] = None
@@ -3857,6 +3863,125 @@ class DebugState:
             json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def battle_trigger_is_absent(obj: dict) -> bool:
+        try:
+            vanish_time = int(obj.get("vanish_time") or 0)
+            object_state = int(obj.get("state") or 0)
+        except (TypeError, ValueError):
+            return False
+        return obj.get("interactable") is False or object_state <= 0 or vanish_time != 0
+
+    def record_battle_reappearance_candidate(self, summary: dict, state: dict) -> dict | None:
+        """Remember a won battle only after its trigger is observably absent."""
+        if not isinstance(summary, dict) or summary.get("result") != "won":
+            return None
+        context = summary.get("trigger_context")
+        if not isinstance(context, dict):
+            return None
+        room_id = context.get("logical_room_id")
+        try:
+            object_id = int(context.get("event_object_id") or 0)
+            trigger_script = int(context.get("trigger_script") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not is_logical_room_id(room_id) or object_id <= 0 or trigger_script <= 0:
+            return None
+        identity = self.room_identity(state)
+        if not isinstance(identity, dict) or identity.get("id") != room_id:
+            return None
+        obj = next(
+            (entry for entry in state.get("objects") or []
+             if isinstance(entry, dict) and int(entry.get("id") or 0) == object_id),
+            None,
+        )
+        if obj is None or int(obj.get("trigger_script") or 0) != trigger_script:
+            return None
+        if not self.battle_trigger_is_absent(obj):
+            return None
+        now = time.time()
+        with self.exploration_lock:
+            data = self.read_exploration()
+            history = data.setdefault("battle_reappearances", {})
+            room = history.get(room_id)
+            if not isinstance(room, dict):
+                room = {}
+                history[room_id] = room
+            scripts = room.get(str(object_id))
+            if not isinstance(scripts, dict):
+                scripts = {}
+                room[str(object_id)] = scripts
+            previous = scripts.get(str(trigger_script))
+            try:
+                count = int(previous.get("battle_count") or 0) if isinstance(previous, dict) else 0
+                reappearance_count = int(previous.get("reappearance_count") or 0) if isinstance(previous, dict) else 0
+            except (TypeError, ValueError):
+                count = 0
+                reappearance_count = 0
+            entry = {
+                "object_id": object_id,
+                "trigger_script": trigger_script,
+                "battle_count": count + 1,
+                "reappearance_count": reappearance_count,
+                "status": "awaiting_reappearance",
+                "last_battle_at": now,
+            }
+            if isinstance(previous, dict) and previous.get("last_reappeared_at") is not None:
+                entry["last_reappeared_at"] = previous["last_reappeared_at"]
+            scripts[str(trigger_script)] = entry
+            self.write_exploration(data)
+        return dict(entry)
+
+    def observe_battle_reappearances(self, state: dict) -> list[dict]:
+        """Confirm pending records from a stable, matching, interactable object."""
+        if not self.room_state_stable(state):
+            return []
+        identity = self.room_identity(state)
+        if identity is None:
+            return []
+        objects = {str(entry.get("id")): entry for entry in state.get("objects") or [] if isinstance(entry, dict)}
+        confirmed = []
+        with self.exploration_lock:
+            data = self.read_exploration()
+            history = data.get("battle_reappearances")
+            room = history.get(identity["id"]) if isinstance(history, dict) else None
+            if not isinstance(room, dict):
+                return []
+            now = time.time()
+            for object_id, scripts in room.items():
+                obj = objects.get(object_id)
+                if obj is None or not isinstance(scripts, dict) or obj.get("interactable") is not True:
+                    continue
+                script = str(obj.get("trigger_script") or 0)
+                entry = scripts.get(script)
+                if not isinstance(entry, dict) or entry.get("status") != "awaiting_reappearance":
+                    continue
+                entry["status"] = "confirmed"
+                entry["reappearance_count"] = int(entry.get("reappearance_count") or 0) + 1
+                entry["last_reappeared_at"] = now
+                confirmed.append(dict(entry))
+            if confirmed:
+                self.write_exploration(data)
+        return confirmed
+
+    def battle_reappearance_for_target(self, state: dict, target_id: int) -> dict | None:
+        identity = self.room_identity(state)
+        obj = next((entry for entry in state.get("objects") or [] if isinstance(entry, dict) and int(entry.get("id") or 0) == target_id), None)
+        if identity is None or obj is None:
+            return None
+        data = self.read_exploration()
+        history = data.get("battle_reappearances")
+        room = history.get(identity["id"]) if isinstance(history, dict) else None
+        scripts = room.get(str(target_id)) if isinstance(room, dict) else None
+        entry = scripts.get(str(obj.get("trigger_script") or 0)) if isinstance(scripts, dict) else None
+        if not isinstance(entry, dict) or entry.get("status") != "confirmed":
+            return None
+        return {
+            key: entry.get(key)
+            for key in ("battle_count", "reappearance_count", "last_battle_at", "last_reappeared_at")
+            if entry.get(key) is not None
+        }
 
     def room_memo(self, room_id: str | None, data: dict | None = None) -> dict | None:
         if not is_logical_room_id(room_id):
@@ -4096,8 +4221,11 @@ class DebugState:
                 "updated_at", "created_agent_turn", "updated_agent_turn",
                 "completed_at", "completed_frame", "completed_raw_frame",
                 "completed_agent_turn",
+                "status_changed_at", "status_changed_agent_turn",
+                "dormant_at", "dormant_agent_turn", "abandoned_at", "abandoned_agent_turn",
                 "last_reviewed_at", "last_reviewed_agent_turn",
-                "provenance",
+                "provenance", "review_watch", "status_reason", "status_evidence",
+                "origin_evidence", "recent_evidence",
             )
         }
         result["last_reviewed_at"] = task.get("last_reviewed_at", task.get("updated_at"))
@@ -4121,6 +4249,7 @@ class DebugState:
                 for key in (
                     "id", "status", "object_id",
                     "transition_key", "room_id",
+                    "review_watch", "status_reason", "status_evidence",
                     "completed_at", "completed_frame", "completed_raw_frame",
                     "completed_agent_turn",
                 )
@@ -4172,7 +4301,7 @@ class DebugState:
         view = self.task_summary_view if detail == "summary" else self.task_view
         counts = {
             status: sum(1 for task in records if task.get("status") == status)
-            for status in ("active", "completed", "abandoned")
+            for status in ("active", "dormant", "completed", "abandoned")
         }
         return {
             "revision": revision,
@@ -4195,7 +4324,7 @@ class DebugState:
         return page["tasks"]
 
     def agent_tasks_view(self) -> dict:
-        grouped = {status: [] for status in ("active", "completed", "abandoned")}
+        grouped = {status: [] for status in ("active", "dormant", "completed", "abandoned")}
         for task in self.task_ledger(include_closed=True, limit=None):
             status = task.get("status")
             if status not in grouped:
@@ -4211,7 +4340,7 @@ class DebugState:
             })
         tasks = [
             task
-            for status in ("active", "completed", "abandoned")
+            for status in ("active", "dormant", "completed", "abandoned")
             for task in grouped[status]
         ]
         counts = {status: len(records) for status, records in grouped.items()}
@@ -4243,6 +4372,87 @@ class DebugState:
             except (TypeError, ValueError):
                 continue
         return None
+
+    @staticmethod
+    def task_review_watch(value: object) -> dict:
+        """Normalize explicit resource subscriptions; absent fields subscribe to nothing."""
+        value = value if isinstance(value, dict) else {}
+        def ids(name: str) -> list[int]:
+            raw = value.get(name)
+            if not isinstance(raw, list):
+                return []
+            normalized = []
+            for item in raw:
+                try:
+                    number = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if number >= 0 and number not in normalized:
+                    normalized.append(number)
+            return normalized
+        return {
+            "cash": value.get("cash") is True,
+            "inventory_item_ids": ids("inventory_item_ids"),
+            "party_role_ids": ids("party_role_ids"),
+        }
+
+    def task_evidence_catalog(self, data: dict | None = None) -> dict[str, dict]:
+        """Build compact references from persisted/current narrative evidence only."""
+        data = data if isinstance(data, dict) else self.read_exploration()
+        catalog: dict[str, dict] = {}
+        def add(ref: str, kind: str, entry: dict, summary: str = "") -> None:
+            ref = str(ref or "").strip()
+            if not ref or ref in catalog:
+                return
+            compact = {"ref": ref, "kind": kind}
+            observed_at = self.task_evidence_time(entry)
+            if observed_at is not None:
+                compact["observed_at"] = observed_at
+            if summary:
+                compact["summary"] = " ".join(summary.split())[:240]
+            catalog[ref] = compact
+
+        inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+        for inbox_id, record in inbox.items():
+            if not isinstance(record, dict):
+                continue
+            text = " ".join(str(item.get("text") or "") for item in record.get("dialogs") or [] if isinstance(item, dict))
+            add(str(inbox_id), "task_inbox", record, text)
+            add(f"task-inbox:{inbox_id}", "task_inbox", record, text)
+        for entry in self.dialog_history:
+            if not isinstance(entry, dict):
+                continue
+            for raw in (entry.get("source_key"), entry.get("message_id")):
+                if raw is not None and str(raw).strip():
+                    add(str(raw), "dialog", entry, str(entry.get("text") or ""))
+                    add(f"dialog:{raw}", "dialog", entry, str(entry.get("text") or ""))
+        for index, entry in enumerate(self.event_log):
+            if not isinstance(entry, dict):
+                continue
+            refs = [entry.get(key) for key in ("id", "source_key", "event_key")]
+            refs.append(f"event:{index}")
+            for raw in refs:
+                if raw is not None and str(raw).strip():
+                    add(str(raw), "event", entry, str(entry.get("type") or "event"))
+        transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
+        for by_room in transitions.values():
+            if not isinstance(by_room, dict):
+                continue
+            for stored_key, record in by_room.items():
+                if isinstance(record, dict):
+                    key = str(record.get("transition_key") or stored_key)
+                    add(key, "transition", record, key)
+                    add(f"transition:{key}", "transition", record, key)
+        return catalog
+
+    def resolve_task_evidence(self, refs: object, data: dict) -> tuple[list[dict] | None, str | None]:
+        if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+            return None, "status_evidence must be a non-empty list of evidence references"
+        catalog = self.task_evidence_catalog(data)
+        missing = [ref.strip() for ref in refs if ref.strip() not in catalog]
+        if missing:
+            return None, f"status_evidence references were not found: {', '.join(missing)}"
+        return [catalog[ref.strip()] for ref in dict.fromkeys(refs)], None
 
     def task_review_for(self, task: dict, state: dict | None = None) -> dict | None:
         if task.get("status") != "active":
@@ -4316,7 +4526,11 @@ class DebugState:
 
         current = self.task_review_snapshot(state)
         baseline = task.get("_review_snapshot") if isinstance(task.get("_review_snapshot"), dict) else {}
-        if not baseline:
+        watch = self.task_review_watch(task.get("review_watch"))
+        watches_resources = bool(
+            watch["cash"] or watch["inventory_item_ids"] or watch["party_role_ids"]
+        )
+        if not baseline and watches_resources:
             # Reconstruct the review-time net state for tasks created before
             # snapshots were introduced. This is intentionally numeric only.
             baseline = json.loads(json.dumps(current))
@@ -4349,7 +4563,7 @@ class DebugState:
                     except (TypeError, ValueError):
                         pass
         if baseline:
-            if int(current.get("cash") or 0) != int(baseline.get("cash") or 0):
+            if watch["cash"] and int(current.get("cash") or 0) != int(baseline.get("cash") or 0):
                 reasons.append({
                     "kind": "cash_net_changed",
                     "from": int(baseline.get("cash") or 0),
@@ -4357,16 +4571,18 @@ class DebugState:
                 })
             before_inventory = baseline.get("inventory") if isinstance(baseline.get("inventory"), dict) else {}
             after_inventory = current.get("inventory") if isinstance(current.get("inventory"), dict) else {}
+            watched_items = {str(item_id) for item_id in watch["inventory_item_ids"]}
             changed_items = sorted(
-                key for key in set(before_inventory) | set(after_inventory)
+                key for key in watched_items
                 if int(before_inventory.get(key) or 0) != int(after_inventory.get(key) or 0)
             )
             if changed_items:
                 reasons.append({"kind": "inventory_net_changed", "item_ids": changed_items[:12]})
             before_sprites = baseline.get("party_sprites") if isinstance(baseline.get("party_sprites"), dict) else {}
             after_sprites = current.get("party_sprites") if isinstance(current.get("party_sprites"), dict) else {}
+            watched_roles = {str(role_id) for role_id in watch["party_role_ids"]}
             changed_roles = sorted(
-                key for key in set(before_sprites) & set(after_sprites)
+                key for key in watched_roles & set(before_sprites) & set(after_sprites)
                 if int(before_sprites.get(key) or 0) != int(after_sprites.get(key) or 0)
             )
             if changed_roles:
@@ -4662,6 +4878,8 @@ class DebugState:
         )
         return {
             "pending_total": len(pending),
+            "active_tasks": self.active_task_summary(limit=1_000_000) if pending else [],
+            "active_tasks_total": len(self.task_ledger(limit=None)) if pending else 0,
             "batches": [
                 {
                     key: record.get(key)
@@ -4892,8 +5110,8 @@ class DebugState:
                 "error": {
                     "code": "task_creation_review_required",
                     "message": (
-                        "Creating a task requires a complete summary audit of active, completed, "
-                        "and abandoned tasks from a previous model batch. Call get_tasks with "
+                        "Creating a task requires a complete summary audit of active, dormant, "
+                        "completed, and abandoned tasks from a previous model batch. Call get_tasks with "
                         "include_closed=true and detail=summary, following every page."
                     ),
                 },
@@ -4932,8 +5150,18 @@ class DebugState:
     ) -> dict:
         task_id = str(arguments.get("id") or "").strip()
         status = arguments.get("status")
-        if status is not None and status not in {"active", "completed", "abandoned"}:
-            return {"ok": False, "error": "status must be active, completed, or abandoned"}
+        if status is not None and status not in {"active", "dormant", "completed", "abandoned"}:
+            return {"ok": False, "error": "status must be active, dormant, completed, or abandoned"}
+        if "review_watch" in arguments:
+            raw_watch = arguments.get("review_watch")
+            if not isinstance(raw_watch, dict) or set(raw_watch) - {"cash", "inventory_item_ids", "party_role_ids"}:
+                return {"ok": False, "error": "review_watch must contain only cash, inventory_item_ids, and party_role_ids"}
+            if "cash" in raw_watch and not isinstance(raw_watch.get("cash"), bool):
+                return {"ok": False, "error": "review_watch.cash must be a boolean"}
+            for key in ("inventory_item_ids", "party_role_ids"):
+                values = raw_watch.get(key, [])
+                if not isinstance(values, list) or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in values):
+                    return {"ok": False, "error": f"review_watch.{key} must be a list of non-negative integers"}
         source_inbox_ids = arguments.get("source_inbox_ids", [])
         if (
             not isinstance(source_inbox_ids, list)
@@ -5019,6 +5247,19 @@ class DebugState:
                     if review_error is not None:
                         review_error["error"]["code"] = "task_reconciliation_required"
                         return review_error
+            requested_status = status if status is not None else existing.get("status")
+            status_changed = previous_status is not None and requested_status != previous_status
+            if previous_status is None and requested_status != "active":
+                status_changed = True
+            resolved_status_evidence: list[dict] = []
+            if status_changed:
+                status_reason = arguments.get("status_reason")
+                if not isinstance(status_reason, str) or not status_reason.strip():
+                    return {"ok": False, "error": "a status change requires non-empty status_reason"}
+                resolved, evidence_error = self.resolve_task_evidence(arguments.get("status_evidence"), data)
+                if evidence_error is not None:
+                    return {"ok": False, "error": evidence_error}
+                resolved_status_evidence = resolved or []
             changed = {}
             for key in ("description", "rationale", "status", "transition_key", "room_id"):
                 if key not in arguments:
@@ -5042,6 +5283,18 @@ class DebugState:
                 if added_ids:
                     linked_ids.extend(added_ids)
                     changed["source_inbox_ids"] = {"added": added_ids}
+            if "review_watch" in arguments:
+                value = self.task_review_watch(arguments.get("review_watch"))
+                if existing.get("review_watch") != value:
+                    changed["review_watch"] = {"from": existing.get("review_watch"), "to": value}
+                    existing["review_watch"] = value
+            else:
+                existing.setdefault("review_watch", self.task_review_watch(None))
+            if status_changed:
+                existing["status_reason"] = arguments["status_reason"].strip()
+                existing["status_evidence"] = resolved_status_evidence
+                changed["status_reason"] = {"to": existing["status_reason"]}
+                changed["status_evidence"] = {"to": resolved_status_evidence}
             if existing.get("status") == "completed" and previous_status != "completed":
                 state = state if isinstance(state, dict) else self.read_live_state()
                 existing["completed_at"] = now
@@ -5056,6 +5309,17 @@ class DebugState:
                     "completed_agent_turn",
                 ):
                     existing.pop(key, None)
+            if status_changed:
+                existing["status_changed_at"] = now
+                existing["status_changed_agent_turn"] = turn
+                for lifecycle_status in ("dormant", "abandoned"):
+                    prefix = lifecycle_status
+                    if existing.get("status") == lifecycle_status:
+                        existing[f"{prefix}_at"] = now
+                        existing[f"{prefix}_agent_turn"] = turn
+                    elif previous_status == lifecycle_status:
+                        existing.pop(f"{prefix}_at", None)
+                        existing.pop(f"{prefix}_agent_turn", None)
             for key in ("priority", "object_id"):
                 if key not in arguments:
                     continue
@@ -5074,17 +5338,49 @@ class DebugState:
                 changed = {"created": True, **changed}
             structural_changes = {
                 "created", "description", "priority", "status",
-                "object_id", "transition_key", "room_id",
+                "object_id", "transition_key", "room_id", "review_watch",
             }
             if structural_changes.intersection(changed):
                 existing["route_context_revision"] = max(
                     0, int(existing.get("route_context_revision") or 0)
                 ) + 1
-            existing["updated_at"] = now
-            existing["updated_agent_turn"] = turn
             existing["last_reviewed_at"] = now
             existing["last_reviewed_agent_turn"] = turn
             existing["_review_snapshot"] = self.task_review_snapshot()
+            linked_evidence = []
+            catalog = self.task_evidence_catalog(data)
+            for inbox_id in source_inbox_ids:
+                if inbox_id in catalog:
+                    linked_evidence.append(catalog[inbox_id])
+            linked_evidence.extend(resolved_status_evidence)
+            if operation == "updated":
+                review = self.task_review_for(existing, state)
+                for reason in (review or {}).get("reasons") or []:
+                    compact = {
+                        key: copy.deepcopy(reason.get(key))
+                        for key in ("kind", "object_id", "transition_key", "room_id", "from", "to", "item_ids", "roles")
+                        if reason.get(key) is not None
+                    }
+                    compact["ref"] = "review:" + hashlib.sha256(
+                        json.dumps(compact, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    ).hexdigest()[:16]
+                    if review.get("latest_evidence_at") is not None:
+                        compact["observed_at"] = review["latest_evidence_at"]
+                    linked_evidence.append(compact)
+            if operation == "created":
+                existing["origin_evidence"] = list(linked_evidence)[:MAX_TASK_EVIDENCE]
+            existing.setdefault("origin_evidence", [])
+            recent = list(existing.get("recent_evidence") or [])
+            for evidence in linked_evidence:
+                recent = [item for item in recent if item.get("ref") != evidence.get("ref")]
+                recent.append(evidence)
+            existing["recent_evidence"] = recent[-MAX_TASK_EVIDENCE:]
+            if not changed:
+                tasks[task_id] = existing
+                self.write_exploration(data)
+                return {"ok": True, "operation": operation, "task": self.task_view(existing)}
+            existing["updated_at"] = now
+            existing["updated_agent_turn"] = turn
             existing.setdefault("history", []).append({
                 "time": now, "agent_turn": turn, "changes": changed,
                 "status": existing.get("status"),
@@ -5096,7 +5392,7 @@ class DebugState:
             return {"ok": True, "operation": operation, "task": self.task_view(existing)}
 
     def active_task_summary(self, limit: int = MAX_ACTIVE_TASK_CONTEXT) -> list[dict]:
-        limit = max(0, min(int(limit), MAX_ACTIVE_TASK_CONTEXT))
+        limit = max(0, int(limit))
         def compact_description(value) -> str:
             description = str(value or "")
             if len(description) <= MAX_ACTIVE_TASK_DESCRIPTION:
@@ -8739,6 +9035,7 @@ class DebugState:
                     })
             target = self.decorate_target_affordance(state, target, affordance_context)
             targets.append(target)
+        targets, entry_context = self.decorate_room_entry_navigation(state, targets)
         return {
             "status": "ok",
             **environment_payload,
@@ -8749,6 +9046,7 @@ class DebugState:
                 "height": grid["height"],
             },
             "targets": targets,
+            **({"entry_context": entry_context} if entry_context is not None else {}),
         }
 
     def lightweight_navigation(self, state: dict) -> dict:
@@ -8829,6 +9127,7 @@ class DebugState:
                 self.observe_dialog_gates(state)
                 self.observe_pending_interaction_outcome(state)
             if state_info.get("available") and client_stable_room_state:
+                self.observe_battle_reappearances(state)
                 state["_navigation"] = self.lightweight_navigation(state)
                 if self.pending_transition_observation is None:
                     state["_exploration"] = self.update_exploration(state)
@@ -10079,6 +10378,14 @@ class DebugState:
         return outcomes
 
     def target_affordance(self, state: dict, target_id: int, context: dict | None = None) -> dict:
+        reappearance = self.battle_reappearance_for_target(state, target_id)
+        if reappearance is not None:
+            return {
+                "interaction_state": "reappeared_battle_trigger",
+                "agent_priority": "avoid_repeat",
+                "battle_reappearance_history": reappearance,
+                "deprioritize_reason": "该对象已确认在战斗胜利后消失并再次可交互；不要为了清点房间、距离近或重新可交互而主动追逐。",
+            }
         recently_cleared = (
             context.get("recently_cleared_target_ids")
             if isinstance(context, dict) and isinstance(context.get("recently_cleared_target_ids"), set)
@@ -10160,6 +10467,98 @@ class DebugState:
         if target.get("agent_priority") == "avoid_backtrack" and affordance.get("agent_priority") == "normal":
             affordance = {key: value for key, value in affordance.items() if key not in {"agent_priority", "deprioritize_reason"}}
         return {**target, **affordance}
+
+    def active_task_binds_navigation_target(self, state: dict, target_id: int) -> bool:
+        try:
+            target_id = int(target_id)
+        except (TypeError, ValueError):
+            return False
+        transition = self.transition_observation_from_state(state, target_id)
+        transition_key = transition.get("transition_key") if isinstance(transition, dict) else None
+        for task in self.task_ledger(limit=None):
+            if task.get("status") != "active":
+                continue
+            try:
+                object_id = int(task.get("object_id") or 0)
+            except (TypeError, ValueError):
+                object_id = 0
+            if object_id == target_id:
+                return True
+            if transition_key and task.get("transition_key") == transition_key:
+                return True
+        return False
+
+    def room_entry_navigation_context(self, state: dict) -> dict | None:
+        runtime = getattr(self, "agent_runtime", None)
+        if runtime is None:
+            return None
+        return runtime.room_entry_context_for_state(state)
+
+    def decorate_room_entry_navigation(self, state: dict, targets: list[dict]) -> tuple[list[dict], dict | None]:
+        context = self.room_entry_navigation_context(state)
+        if not isinstance(context, dict):
+            return targets, None
+        status = context.get("status")
+        if status == "progressed":
+            return targets, context
+        decorated = []
+        for original in targets:
+            target = dict(original)
+            try:
+                target_id = int(target.get("id") or 0)
+                steps = int(target.get("steps")) if target.get("steps") is not None else None
+            except (TypeError, ValueError):
+                target_id = 0
+                steps = None
+            if status == "recovery_pending":
+                matches_target = target_id == int(context.get("source_target_id") or 0)
+                matches_key = bool(
+                    context.get("source_transition_key")
+                    and target.get("transition_key") == context.get("source_transition_key")
+                )
+                if matches_target or matches_key:
+                    target.update({
+                        "entry_relation": "recovery_route",
+                        "recovery_route": True,
+                        "agent_priority": "resume_interrupted_entry",
+                    })
+                    target.pop("deprioritize_reason", None)
+            elif status == "entered" and target.get("transition_candidate") is True:
+                known_return = bool(
+                    target.get("known_destination")
+                    and target.get("known_destination_room_id") == context.get("source_room_id")
+                )
+                arrival_adjacent_unknown = bool(
+                    not target.get("known_destination")
+                    and target.get("status") in {"reachable", "transition", "blocked_by_interactable"}
+                    and steps is not None
+                    and steps <= IMMEDIATE_ENTRY_RETURN_MAX_STEPS
+                )
+                if known_return or arrival_adjacent_unknown:
+                    target.update({
+                        "entry_relation": (
+                            "confirmed_entry_return" if known_return
+                            else "arrival_adjacent_unknown_transition"
+                        ),
+                        "possible_entry_return": True,
+                        "agent_priority": "avoid_immediate_backtrack",
+                        "deprioritize_reason": (
+                            "该传送已确认返回刚离开的逻辑房间；先探索当前房间的其他可执行目标。"
+                            if known_return
+                            else "该未知传送紧邻新房间落点，可能是刚使用入口的返回侧；先探索其他可执行目标。"
+                        ),
+                    })
+            decorated.append(target)
+        return decorated, context
+
+    def navigation_target_is_entry_return(self, state: dict, target_id: int) -> bool:
+        navigation = self.navigation(state)
+        return any(
+            isinstance(target, dict)
+            and int(target.get("id") or 0) == int(target_id)
+            and target.get("possible_entry_return") is True
+            for target in navigation.get("targets") or []
+        )
 
     def agent_recent_decision_context(self, limit: int = 5) -> list[dict]:
         context = []
@@ -10735,13 +11134,27 @@ class DebugState:
                         "properties": {
                             "id": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1},
                             "priority": {"type": "integer"},
-                            "status": {"type": "string", "enum": ["active", "completed", "abandoned"]},
+                            "status": {"type": "string", "enum": ["active", "dormant", "completed", "abandoned"]},
                             "object_id": {"type": "integer", "minimum": 1},
                             "transition_key": {"type": "string"}, "room_id": {"type": "string"},
                             "rationale": {"type": "string", "minLength": 1},
                             "review_token": {"type": "string", "minLength": 1},
                             "source_inbox_ids": {
                                 "type": "array", "maxItems": 20,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "review_watch": {
+                                "type": "object",
+                                "properties": {
+                                    "cash": {"type": "boolean"},
+                                    "inventory_item_ids": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                                    "party_role_ids": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                                },
+                                "additionalProperties": False,
+                            },
+                            "status_reason": {"type": "string", "minLength": 1},
+                            "status_evidence": {
+                                "type": "array", "minItems": 1, "maxItems": 20,
                                 "items": {"type": "string", "minLength": 1},
                             },
                         },
@@ -11031,6 +11444,8 @@ class DebugState:
             "room_memo": self.room_memo(room_id),
             **self.active_task_context(state),
             "task_reconciliation": self.task_reconciliation_context(),
+            "room_entry_context": self.agent_runtime.room_entry_context_for_state(state),
+            "recent_transition_chain": self.agent_runtime.recent_transition_chain(state),
         }
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         review = self.agent_runtime.pending_equipment_review()
@@ -11178,12 +11593,14 @@ class DebugState:
             "to_room_id", "to_semantic_room", "confidence", "traversal_context",
             "destination_exploration", "returns_to_recent_room", "agent_priority",
             "interaction_state", "previously_tried", "previously_cleared",
+            "battle_reappearance_history",
             "soft_avoid", "deprioritize_reason", "blocker",
             "transition_key", "dialog_feedback_state", "recent_dialog_feedback",
             "stale_dialog_feedback", "previous_interaction_outcome",
             "interaction_feedback_state", "interaction_evidence",
             "known_destination_room_id", "known_destination_observed_at",
-            "approach", "affordances",
+            "approach", "affordances", "entry_relation", "possible_entry_return",
+            "recovery_route",
         )
         targets = []
         for target in (navigation.get("targets") or [])[:limit]:
@@ -11201,6 +11618,7 @@ class DebugState:
         return {
             "status": navigation.get("status"),
             "environment_key": navigation.get("environment_key"),
+            **({"entry_context": navigation.get("entry_context")} if navigation.get("entry_context") is not None else {}),
             "targets": targets,
             "targets_returned": len(targets),
             "targets_total": len(navigation.get("targets") or []),
@@ -11331,14 +11749,27 @@ class DebugState:
             history = self.object_history_view(state, target_id, limit=limit)
             route = self.route_to_object(state, target_id, avoid_transitions=True)
             route.update(self.target_affordance(state, target_id))
+            entry_target = next((
+                target for target in self.navigation(state).get("targets") or []
+                if isinstance(target, dict) and int(target.get("id") or 0) == target_id
+            ), None)
+            if isinstance(entry_target, dict):
+                for key in (
+                    "entry_relation", "possible_entry_return", "recovery_route",
+                    "agent_priority", "deprioritize_reason",
+                ):
+                    if key in entry_target:
+                        route[key] = entry_target[key]
             route_keys = (
                 "ok", "kind", "status", "steps", "remaining_steps", "segment_steps",
                 "required_direction", "move", "blocker", "agent_priority",
                 "interaction_state", "known_destination", "known_destination_room_id",
+                "battle_reappearance_history",
                 "known_destination_observed_at", "traversal_context",
                 "destination_exploration", "transition_key", "to_room_id",
                 "to_semantic_room", "confidence", "returns_to_recent_room",
                 "approach", "interaction_feedback_state", "interaction_evidence",
+                "entry_relation", "possible_entry_return", "recovery_route",
             )
             compact_route = {key: route.get(key) for key in route_keys if key in route}
             if isinstance(compact_route.get("destination_exploration"), dict):
@@ -11720,15 +12151,21 @@ class DebugState:
             "active 任务本身不等于紧急；明确的剧情时限、直接可执行的关键目标、明显绕路或风险可以压过顺路搜索。"
             "search 和 touch 只是引擎交互方式，不证明目标是物资、宝箱或 NPC；不要据此编造标签或预期掉落，尝试 touch 属于探索而不是已确认的搜刮。"
             "touch 可能触发战斗、控制接管或此前未知的房间切换；发生任一情况时停止当前房间的连续探索并重新决策。"
+            "reappeared_battle_trigger 表示同一逻辑房间、对象 ID 和 trigger_script 已确认在战斗胜利后消失并再次可交互。"
+            "不得因为目标刷新为可交互、距离近或需要清点房间而主动选择它；只有明确战斗任务、它是唯一有意义的推进路径，或确实无法绕行时才允许再次接触。"
             "transition_candidate=true 的 touch 应作为有意选择的离房路线，不要为了遍历 touch 而提前进入。"
             "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 inspect_target。"
-            "优先使用 get_navigation、get_room_memory、inspect_target 等结构化证据；只有这些证据无法解释可见房间布局、边界、出口或疑似隐藏通道时，才按需调用一次 inspect_screen。"
+            "运行时会在首次进入本会话尚未成功查看的新逻辑房间时自动提供一次 room_layout 视觉注释。"
+            "优先使用 get_navigation、get_room_memory、inspect_target 等结构化证据；如果自动视觉注释和这些证据仍不足以解释布局、出口、UI 文本或疑似通道，可以按需再次调用 inspect_screen。"
             "inspect_screen 只是低权威 visual_annotation，即使 confidence=high 也不得直接写 Room Memo、创建或确认 transition、修改 task/dialog/observation 事实，"
             "也不得推断 event object ID、speaker identity 或脚本语义。疑似密道必须通过真实 native action、房间变化和现有 transition observation/native trigger 才能确认。"
             "若当前目标 transition_candidate=true、最近对象历史显示它由非传送目标变为传送目标、且 known_destination=false，"
             "应将它视为刚解锁的探索路线并优先建议 enter_transition；解锁动作本身产生的 previously_tried 或 avoid_repeat 不应降低它的优先级。"
             "一旦该传送已有 known destination，则停止使用刚解锁优先级，恢复目的地探索价值、任务和回退风险的正常比较。"
             "当最近建议看起来反复访问同一房间、目标或传送循环时，依据持久 session 中的最近决策和 get_room_memory 判断。"
+            "room_entry_context 表示刚完成的有向跨房传送及其落点；logical_room_id 相同就是回到同一房间，region_key 单独变化不代表进入新房间或取得进展。"
+            "possible_entry_return=true 的传送紧邻新房间落点或已确认返回来源房间；存在其他可执行目标时先探索其他目标。"
+            "recovery_pending 表示发生了未预期的 A→B→A 即时折返；优先选择 recovery_route，不要改走无关目标。"
             "传送目标包含稳定 transition_key、to_semantic_room、confidence、destination_exploration、traversal_context 和 returns_to_recent_room。"
             "frontier>0 只提供温和的正向探索价值；frontier=0 仅表示当前没有未走邻格，不能据此声称目的地是死路、噪音或剧情已经耗尽。"
             "任务是 agent 从对话和事件推断的记忆，不是引擎事实；结构化任务账本是任务状态的唯一权威来源，压缩摘要不是。"
@@ -11739,7 +12176,9 @@ class DebugState:
             "memo 只记录地点语义、稳定功能和重要人物关系；不要重复坐标、传送列表、拾取记录或结构化探索，行动相关线索必须保留为独立 task。"
             "根据地点语义比较候选入口，或准备给 task 新增、改变非空 room_id 时，必须先查询每个候选房间的 get_room_memory；证据不足则保持 task 未绑定房间。"
             "不要用 memo 代替 task inbox 审查或 task reconciliation。"
-            "发现、调整、完成或作废任务时调用 upsert_task，不要仅凭时间自动关闭任务。创建未知 id 或无 id 任务前，必须在前一模型批次完整分页读取 include_closed=true、detail=summary 的账本，"
+            "发现、调整或改变任务状态时调用 upsert_task。active 表示当前有可验证执行路径；dormant 表示任务未解决但当前没有可验证路径，后续相关证据可恢复 active；"
+            "completed 只用于明确成功，abandoned 只用于明确取消、不可逆失败或错过明确期限。不得因时间久或没有新证据自动关闭或反复确认任务。"
+            "任何状态变化必须提供非空 status_reason 和来自当前 dialog/event/transition/task-inbox 历史的 status_evidence。创建未知 id 或无 id 任务前，必须在前一模型批次完整分页读取 include_closed=true、detail=summary 的账本，"
             "并使用最终页 review_token；只查 active、漏页、账本 revision 变化或同批并行 get_tasks+upsert_task 都不能创建。"
             "若审计发现语义等价的 completed/abandoned 任务，不得创建新 id；确有新证据要求重开则更新原 id，只有不同剧情阶段才创建后继任务并在 rationale 注明前序 id。"
             "task_inbox 是尚未归档为任务结论的持久对话证据，不等于任务；每个说话轮次独立归档。应及时审查 pending 证据；普通同房间探索可以继续，"
@@ -11752,7 +12191,8 @@ class DebugState:
             "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。全部 active 任务完成 upsert 后立即解除对账；"
             "完成前不可 navigate、use_item 或创建任务，对话可继续。"
             "task_review.required=true 表示新剧情证据晚于相关 active task 的上次审计。对话仍可继续 advance_dialog；对话结束后若要 navigate 或 use_item，"
-            "必须先调用 get_tasks，再对 task_review.tasks 中每个 id 调用 upsert_task，选择确认继续、改写、completed 或 abandoned。无字段变化的 upsert_task 表示确认继续。"
+            "必须先调用 get_tasks，再只对 task_review.tasks 中真正受影响的 id 调用 upsert_task，选择确认继续、改写、dormant、completed 或 abandoned。无字段变化的 upsert_task 只刷新 review snapshot，不得改写 rationale。"
+            "现金、背包与角色 sprite 变化只影响 review_watch 显式订阅对应 cash、item id 或 role id 的任务；不得从任务文字或物品名称猜测关联。"
             "新证据改变对象身份或任务阶段时，应关闭或改写旧 task，并按需创建后继 task；把新对话与稳定状态变化写入 rationale，但不要把 sprite 数字硬编码成剧情语义。"
             "背包里没有对应道具，不能否定由相邻对话和稳定 scene_sprite_id 净变化共同证明的剧情携带状态；短暂 sprite 动画若恢复原值则不算阶段变化。"
             "只有 active 任务明确关联到当前可执行对象、当前可达传送，或可达且已知通往任务 room_id 的传送时，才可压过探索策略；不可执行任务不得阻塞探索。"
@@ -12186,6 +12626,49 @@ class DebugState:
             **details,
         }
 
+    def room_entry_navigation_rejection(self, state: dict, target_id: int) -> dict | None:
+        navigation = self.navigation(state)
+        targets = [target for target in navigation.get("targets") or [] if isinstance(target, dict)]
+        selected = next((target for target in targets if int(target.get("id") or 0) == target_id), None)
+        if not isinstance(selected, dict):
+            return None
+        context = navigation.get("entry_context") if isinstance(navigation.get("entry_context"), dict) else None
+        if not isinstance(context, dict):
+            return None
+        task_override = self.active_task_binds_navigation_target(state, target_id)
+        executable = {"reachable", "transition", "blocked_by_interactable"}
+        if selected.get("possible_entry_return") is True and not task_override:
+            alternatives = [
+                target for target in targets
+                if int(target.get("id") or 0) != target_id
+                and target.get("status") in executable
+                and target.get("possible_entry_return") is not True
+                and target.get("agent_priority") not in {
+                    "avoid_repeat", "avoid_backtrack", "avoid_immediate_backtrack",
+                }
+            ]
+            if alternatives:
+                return {
+                    "reason": "immediate_entry_return",
+                    "entry_relation": selected.get("entry_relation"),
+                    "source_room_id": context.get("source_room_id"),
+                    "destination_room_id": context.get("destination_room_id"),
+                    "alternative_target_ids": [int(target.get("id") or 0) for target in alternatives[:10]],
+                }
+        if context.get("status") == "recovery_pending" and selected.get("recovery_route") is not True:
+            recovery = next((
+                target for target in targets
+                if target.get("recovery_route") is True and target.get("status") in executable
+            ), None)
+            if recovery is not None and not task_override:
+                return {
+                    "reason": "transition_recovery_required",
+                    "source_room_id": context.get("source_room_id"),
+                    "destination_room_id": context.get("destination_room_id"),
+                    "recovery_target_id": int(recovery.get("id") or 0),
+                }
+        return None
+
     def validate_agent_decision(self, decision: dict) -> dict:
         action = decision.get("recommended_action") if isinstance(decision.get("recommended_action"), dict) else {}
         tool = action.get("tool")
@@ -12326,6 +12809,21 @@ class DebugState:
         )
         route_status = route.get("status")
         if route_status in {"reachable", "transition", "blocked_by_interactable"}:
+            entry_rejection = self.room_entry_navigation_rejection(latest_state, target_id)
+            if entry_rejection is None:
+                return decision
+            reason = str(entry_rejection.pop("reason"))
+            decision.setdefault("evidence", {})["room_entry_context"] = self.room_entry_navigation_context(latest_state)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": reason, "target_id": target_id, **entry_rejection}
+            )
+            self.reject_agent_decision(decision, reason, target_id=target_id, **entry_rejection)
+            decision["risk"] = (
+                "The navigation would immediately return through the newly entered room's likely entrance."
+                if reason == "immediate_entry_return"
+                else "The navigation would abandon a pending recovery after an immediate room return."
+            )
             return decision
 
         evidence = decision.setdefault("evidence", {})

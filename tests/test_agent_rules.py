@@ -776,6 +776,8 @@ def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
     assert '发生任一情况时停止当前房间的连续探索并重新决策' in policy
     assert 'transition_candidate=true 的 touch 应作为有意选择的离房路线' in policy
     assert '不要为了遍历 touch 而提前进入' in policy
+    assert '运行时会在首次进入本会话尚未成功查看的新逻辑房间时自动提供一次 room_layout 视觉注释' in policy
+    assert '仍不足以解释布局、出口、UI 文本或疑似通道，可以按需再次调用 inspect_screen' in policy
     assert '显式 task 绑定、未知目的地、当前 active task 结构下尚未穿越、非近期回退、目的地 frontier>0' in policy
     assert 'frontier=0 仅表示当前没有未走邻格' in policy
     assert '不能据此声称目的地是死路、噪音或剧情已经耗尽' in policy
@@ -884,13 +886,16 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert context['active_tasks_total'] == 0
     assert set(context) == {
         'state_summary', 'room_memo', 'active_tasks', 'active_tasks_total', 'task_review', 'task_inbox',
-        'task_reconciliation',
+        'task_reconciliation', 'room_entry_context', 'recent_transition_chain',
     }
+    assert context['room_entry_context'] is None
+    assert context['recent_transition_chain'] == []
     assert context['room_memo'] is None
     assert context['task_reconciliation'] == {'pending': False, 'reason': None}
     assert context['task_review'] == {'required': False, 'tasks': []}
     assert context['task_inbox'] == {
-        'pending_total': 0, 'batches': [], 'review_required': False, 'reasons': [],
+        'pending_total': 0, 'active_tasks': [], 'active_tasks_total': 0,
+        'batches': [], 'review_required': False, 'reasons': [],
     }
     assert names[-1] == 'submit_decision'
 
@@ -906,6 +911,112 @@ def test_agent_prompts_require_real_actions_and_leave_waiting_to_runtime(tmp_pat
     assert '运行器内部等待' in policy_prompt
     assert '明确召唤即使准备立刻执行，也必须先建立可恢复的短期 active task' in policy_prompt
     assert 'source_inbox_ids' in policy_prompt
+
+
+def entry_room_state():
+    return make_state(width=7, height=5, start=(1, 1), objects=[
+        {
+            'id': 758, 'x': 32, 'y': 0, 'state': 1, 'sprite_id': 0,
+            'trigger_mode': 4, 'trigger_script': 13773, 'auto_script': 0,
+            'blocking': False, 'interactable': True,
+        },
+        {
+            'id': 767, 'x': 64, 'y': 16, 'state': 1, 'sprite_id': 1,
+            'trigger_mode': 1, 'trigger_script': 13790, 'auto_script': 0,
+            'blocking': False, 'interactable': True,
+        },
+    ])
+
+
+def install_entry_context(debug, state):
+    source = make_state()
+    source['map_id'] = 40
+    state['map_id'] = 70
+    context = {
+        'status': 'entered',
+        'source_room_id': debug.room_identity(source)['id'],
+        'source_target_id': 706,
+        'source_transition_key': '[44,40,1344,592,6,13729]',
+        'destination_room_id': debug.room_identity(state)['id'],
+        'landing_position': dict(state['party_position']),
+        'entered_at': '2026-08-25T14:20:47Z',
+        'entered_frame_sequence': 100,
+    }
+    debug.agent_runtime.state['room_entry_context'] = context
+    return context
+
+
+def test_entry_adjacent_unknown_transition_is_marked_and_rejected_before_movement(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = entry_room_state()
+    context = install_entry_context(debug, state)
+    write_state(debug, state)
+
+    navigation = debug.run_agent_tool('get_navigation', {}, state)['navigation']
+    targets = {target['id']: target for target in navigation['targets']}
+    assert navigation['entry_context'] == context
+    assert targets[758]['possible_entry_return'] is True
+    assert targets[758]['entry_relation'] == 'arrival_adjacent_unknown_transition'
+    assert targets[758]['agent_priority'] == 'avoid_immediate_backtrack'
+    assert 'possible_entry_return' not in targets[767]
+
+    result = debug.run_agent_tool('submit_decision', {
+        'action': 'navigate', 'target_id': 758, 'reason': 'Take the nearest unknown transition.',
+    }, state)
+    decision = result['decision']
+    assert decision['validation']['reason'] == 'immediate_entry_return'
+    assert decision['validation']['alternative_target_ids'] == [767]
+    assert decision['recommended_action']['tool'] == 'no_op'
+    assert not debug.action_path.exists()
+
+
+def test_entry_return_is_allowed_without_alternative_or_with_explicit_task_binding(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = entry_room_state()
+    install_entry_context(debug, state)
+    state['objects'] = [state['objects'][0]]
+    write_state(debug, state)
+    allowed = debug.run_agent_tool('submit_decision', {
+        'action': 'navigate', 'target_id': 758, 'reason': 'It is the only executable route.',
+    }, state)['decision']
+    assert allowed['recommended_action']['tool'] == 'navigation_step'
+
+    state = entry_room_state()
+    install_entry_context(debug, state)
+    write_state(debug, state)
+    created = create_agent_task(debug, {
+        'id': 'task-return',
+        'description': 'Use the explicitly assigned transition.',
+        'rationale': 'The current task binds object 758.',
+        'status': 'active',
+        'object_id': 758,
+    }, state)
+    assert created['ok']
+    task_allowed = debug.run_agent_tool('submit_decision', {
+        'action': 'navigate', 'target_id': 758, 'reason': 'Follow the bound task target.',
+    }, state)['decision']
+    assert task_allowed['recommended_action']['tool'] == 'navigation_step'
+
+
+def test_confirmed_return_to_entry_source_keeps_stronger_entry_priority(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = entry_room_state()
+    context = install_entry_context(debug, state)
+    source = make_state()
+    source['map_id'] = 40
+    return_object = next(obj for obj in state['objects'] if obj['id'] == 758)
+    debug.record_transition_destination(
+        debug.room_identity(state), 758, debug.room_identity(source),
+        from_object=return_object, from_state=state, to_state=source,
+    )
+
+    target = next(
+        target for target in debug.run_agent_tool('get_navigation', {}, state)['navigation']['targets']
+        if target['id'] == 758
+    )
+    assert target['known_destination_room_id'] == context['source_room_id']
+    assert target['entry_relation'] == 'confirmed_entry_return'
+    assert target['agent_priority'] == 'avoid_immediate_backtrack'
 
 
 def test_agent_get_shop_returns_offers_and_equipment_comparison(tmp_path):

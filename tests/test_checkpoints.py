@@ -425,6 +425,28 @@ def test_checkpoint_restores_agent_with_rollback_semantics(tmp_path):
                 'first_seen_at': '2026-07-25T00:00:00Z',
             }],
         },
+        room_inspection={
+            'baseline_required': False,
+            'last_observed_room_id': 'S3/M10:2F2C967F8E00',
+            'pending_room_id': None,
+            'inspected_rooms': {
+                'S3/M10:2F2C967F8E00': {
+                    'inspected_at': '2026-08-25T10:00:00Z',
+                    'frame_sequence': 123,
+                    'visual_hash': 'room-hash',
+                },
+            },
+        },
+        room_entry_context={
+            'status': 'entered',
+            'source_room_id': 'S3/M9:111111111111',
+            'source_target_id': 52,
+            'source_transition_key': '[3,9,32,0,4,4631]',
+            'destination_room_id': 'S3/M10:2F2C967F8E00',
+            'landing_position': {'x': 16, 'y': 8},
+            'entered_at': '2026-08-25T10:00:00Z',
+            'entered_frame_sequence': 123,
+        },
     )
     runtime._persist()
     runtime._submit(runtime._replace_sdk_session_items(source_session_id, [
@@ -467,6 +489,9 @@ def test_checkpoint_restores_agent_with_rollback_semantics(tmp_path):
     assert restored['last_compaction']['retained_budget_exceeded'] is True
     assert restored['compactions'] == 1
     assert restored['equipment_review']['pending'][0]['item_id'] == 201
+    assert restored['room_inspection']['inspected_rooms']['S3/M10:2F2C967F8E00']['frame_sequence'] == 123
+    assert restored['room_entry_context']['source_target_id'] == 52
+    assert restored['room_entry_context']['destination_room_id'] == 'S3/M10:2F2C967F8E00'
     assert restored['task_reconciliation_pending'] is True
     assert restored['task_reconciliation_reason'] == 'checkpoint_restored'
     transcript = runtime._submit(runtime._sdk_session_items(restored['session_id'])).result(timeout=5)

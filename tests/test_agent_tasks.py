@@ -15,6 +15,16 @@ def review_state(*, sprite=2, cash=10, inventory=None):
     return state
 
 
+def change_task_status(debug, task_id, status, state=None, *, reason="Test evidence confirms the lifecycle change."):
+    debug.event_log.append({"time": 10_000.0 + len(debug.event_log), "type": "test_task_status_evidence"})
+    return debug.run_agent_tool("upsert_task", {
+        "id": task_id,
+        "status": status,
+        "status_reason": reason,
+        "status_evidence": [f"event:{len(debug.event_log) - 1}"],
+    }, state)
+
+
 def test_task_ledger_create_update_close_and_filtering(tmp_path):
     debug = make_debug_state(tmp_path)
     created = create_agent_task(debug, {
@@ -30,11 +40,7 @@ def test_task_ledger_create_update_close_and_filtering(tmp_path):
     assert created["task"]["status"] == "active"
     completion_state = review_state()
     completion_state.update({"logical_frame": 321, "raw_frame": 123})
-    updated = debug.run_agent_tool(
-        "upsert_task",
-        {"id": task_id, "status": "completed"},
-        completion_state,
-    )
+    updated = change_task_status(debug, task_id, "completed", completion_state)
     assert updated["ok"]
     assert updated["operation"] == "updated"
     assert updated["task"]["history"][-1]["changes"]["status"]["to"] == "completed"
@@ -63,14 +69,8 @@ def test_completed_tasks_return_most_recent_completion_first_and_recompletion_re
         "priority": 0,
     })["task"]
 
-    debug.run_agent_tool(
-        "upsert_task", {"id": older["id"], "status": "completed"},
-        {"frame": 10, "logical_frame": 110, "raw_frame": 10},
-    )
-    debug.run_agent_tool(
-        "upsert_task", {"id": newer["id"], "status": "completed"},
-        {"frame": 20, "logical_frame": 120, "raw_frame": 20},
-    )
+    change_task_status(debug, older["id"], "completed", {"frame": 10, "logical_frame": 110, "raw_frame": 10})
+    change_task_status(debug, newer["id"], "completed", {"frame": 20, "logical_frame": 120, "raw_frame": 20})
 
     completed = debug.run_agent_tool(
         "get_tasks", {"include_closed": True, "detail": "summary", "limit": 100},
@@ -79,12 +79,11 @@ def test_completed_tasks_return_most_recent_completion_first_and_recompletion_re
     assert [task["completed_frame"] for task in completed] == [120, 110]
     assert [task["id"] for task in debug.agent_tasks_view()["tasks"]] == [newer["id"], older["id"]]
 
-    reopened = debug.run_agent_tool("upsert_task", {"id": older["id"], "status": "active"})["task"]
+    reopened = change_task_status(debug, older["id"], "active")["task"]
     assert reopened["completed_at"] is None
     assert reopened["completed_frame"] is None
-    recompleted = debug.run_agent_tool(
-        "upsert_task", {"id": older["id"], "status": "completed"},
-        {"frame": 30, "logical_frame": 130, "raw_frame": 30},
+    recompleted = change_task_status(
+        debug, older["id"], "completed", {"frame": 30, "logical_frame": 130, "raw_frame": 30},
     )["task"]
     assert recompleted["completed_frame"] == 130
     assert [
@@ -176,6 +175,7 @@ def test_unchanged_upsert_explicitly_reviews_task_and_refreshes_snapshot(tmp_pat
     write_state(debug, state)
     created = create_agent_task(debug, {
         "id": "keep-going", "description": "Keep going", "rationale": "Current evidence.",
+        "review_watch": {"cash": True},
     })["task"]
 
     state["cash"] = 15
@@ -186,7 +186,8 @@ def test_unchanged_upsert_explicitly_reviews_task_and_refreshes_snapshot(tmp_pat
     assert reviewed["operation"] == "updated"
     assert reviewed["task"]["last_reviewed_at"] >= created["last_reviewed_at"]
     assert reviewed["task"]["last_reviewed_agent_turn"] == 0
-    assert reviewed["task"]["history"][-1]["changes"] == {}
+    assert reviewed["task"]["history"] == created["history"]
+    assert reviewed["task"]["rationale"] == "Current evidence."
     assert debug.task_review_context(state) == {"required": False, "tasks": []}
 
 
@@ -220,7 +221,7 @@ def test_get_tasks_defaults_to_active_and_can_include_closed_limit_and_full_fiel
         "rationale": "It was already handled.",
         "priority": 9,
     })["task"]
-    debug.run_agent_tool("upsert_task", {"id": closed["id"], "status": "completed"})
+    change_task_status(debug, closed["id"], "completed")
 
     default = debug.run_agent_tool("get_tasks")
     assert default["include_closed"] is False
@@ -322,7 +323,7 @@ def test_reconciliation_preserves_completed_and_abandons_duplicate_before_moveme
     medicine = create_agent_task(debug, {
         "id": "seek-medicine", "description": "求药", "rationale": "已经取得药物。",
     })["task"]
-    debug.run_agent_tool("upsert_task", {"id": medicine["id"], "status": "completed"})
+    change_task_status(debug, medicine["id"], "completed")
     create_agent_task(debug, {
         "id": "seek-medicine-duplicate", "description": "再次求药", "rationale": "压缩摘要遗漏了完成状态。",
     })
@@ -343,6 +344,8 @@ def test_reconciliation_preserves_completed_and_abandons_duplicate_before_moveme
         "id": "seek-medicine-duplicate", "status": "abandoned",
         "rationale": "Duplicates completed predecessor seek-medicine.",
         "review_token": audited["review_token"],
+        "status_reason": "The completed predecessor proves this is a duplicate.",
+        "status_evidence": ["event:0"],
     }, state, tool_cycle=cycle)
     assert duplicate["ok"] is True
     assert debug.agent_runtime.task_reconciliation_pending() is False
@@ -467,6 +470,7 @@ def test_task_review_detects_transition_and_stable_net_resource_changes(tmp_path
     task = create_agent_task(debug, {
         "id": "travel-task", "description": "Reach upstairs", "rationale": "Known delivery.",
         "transition_key": "stairs", "room_id": "room-upstairs",
+        "review_watch": {"cash": True, "inventory_item_ids": [7]},
     })["task"]
     data = debug.read_exploration()
     data["transitions"] = {"room-lobby": {"stairs": {
@@ -484,12 +488,123 @@ def test_task_review_detects_transition_and_stable_net_resource_changes(tmp_path
     }
 
 
+def test_resource_review_only_notifies_exact_subscriptions(tmp_path):
+    debug = make_debug_state(tmp_path)
+    before = review_state(inventory=[{"item_id": 7, "amount": 1}, {"item_id": 8, "amount": 1}])
+    write_state(debug, before)
+    create_agent_task(debug, {
+        "id": "unwatched", "description": "Unrelated errand", "rationale": "Narrative evidence only.",
+    })
+    create_agent_task(debug, {
+        "id": "cash-watch", "description": "Save money", "rationale": "Exact cash dependency.",
+        "review_watch": {"cash": True},
+    })
+    create_agent_task(debug, {
+        "id": "item-watch", "description": "Use item 7", "rationale": "Exact item dependency.",
+        "review_watch": {"inventory_item_ids": [7]},
+    })
+    after = review_state(cash=20, inventory=[{"item_id": 7, "amount": 2}, {"item_id": 8, "amount": 9}])
+    reviews = {item["id"]: item for item in debug.task_review_context(after)["tasks"]}
+    assert set(reviews) == {"cash-watch", "item-watch"}
+    assert {reason["kind"] for reason in reviews["cash-watch"]["reasons"]} == {"cash_net_changed"}
+    assert reviews["item-watch"]["reasons"] == [{"kind": "inventory_net_changed", "item_ids": ["7"]}]
+
+
+def test_task_status_changes_require_current_evidence_and_dormant_is_reversible(tmp_path):
+    debug = make_debug_state(tmp_path)
+    task = create_agent_task(debug, {
+        "id": "buy-shrimp", "description": "Buy shrimp", "rationale": "The cook requested it.",
+    })["task"]
+    rejected = debug.run_agent_tool("upsert_task", {"id": task["id"], "status": "dormant"})
+    assert rejected["ok"] is False
+    assert "status_reason" in rejected["error"]
+    debug.dialog_history = [{"time": 101.0, "source_key": "market-no-stock", "text": "今天没有鲜虾。"}]
+    dormant = debug.run_agent_tool("upsert_task", {
+        "id": task["id"], "status": "dormant", "status_reason": "No supplier currently has stock.",
+        "status_evidence": ["market-no-stock"],
+    })["task"]
+    assert dormant["status"] == "dormant"
+    assert dormant["dormant_at"] is not None
+    assert debug.run_agent_tool("get_tasks")["tasks"] == []
+    assert debug.run_agent_tool("get_tasks", {"include_closed": True})["tasks"][0]["status"] == "dormant"
+    debug.dialog_history.append({"time": 102.0, "source_key": "new-stock", "text": "刚到了一批鲜虾。"})
+    active = debug.run_agent_tool("upsert_task", {
+        "id": task["id"], "status": "active", "status_reason": "Supply is available again.",
+        "status_evidence": ["new-stock"],
+    })["task"]
+    assert active["status"] == "active"
+    assert active["dormant_at"] is None
+    assert active["origin_evidence"] == []
+    assert [item["ref"] for item in active["recent_evidence"]] == ["market-no-stock", "new-stock"]
+
+
+def test_audited_four_task_fixture_keeps_only_executable_story_task_active(tmp_path):
+    debug = make_debug_state(tmp_path)
+    tasks = {
+        "task-borrow-boat-xianling": "Borrow a boat while following the Hidden Dragon Cave story",
+        "buy-shrimp": "Buy shrimp",
+        "visit-fair": "Visit the temple fair",
+        "find-nest-tomorrow": "Find the bird nest tomorrow",
+    }
+    for task_id, description in tasks.items():
+        create_agent_task(debug, {"id": task_id, "description": description, "rationale": "Visible dialog established it."})
+    completed = create_agent_task(debug, {
+        "id": "already-completed", "description": "Finished errand", "rationale": "Native result confirmed it.",
+    })["task"]
+    debug.dialog_history = [
+        {"time": 101.0, "source_key": "no-shrimp", "text": "市场和船家都没有鲜虾。"},
+        {"time": 102.0, "source_key": "fair-unclear", "text": "已经到了苏州。"},
+        {"time": 103.0, "source_key": "nest-expired", "text": "已经过夜，再见王小虎时谈的是新话题。"},
+        {"time": 104.0, "source_key": "completed-proof", "text": "委托已经办妥。"},
+    ]
+    change_task_status(debug, completed["id"], "completed")
+    for task_id, status, evidence in (
+        ("buy-shrimp", "dormant", "no-shrimp"),
+        ("visit-fair", "dormant", "fair-unclear"),
+        ("find-nest-tomorrow", "abandoned", "nest-expired"),
+    ):
+        result = debug.run_agent_tool("upsert_task", {
+            "id": task_id, "status": status, "status_reason": "Fixture lifecycle evidence.",
+            "status_evidence": [evidence],
+        })
+        assert result["ok"] is True
+    default_ids = [task["id"] for task in debug.run_agent_tool("get_tasks")["tasks"]]
+    assert default_ids == ["task-borrow-boat-xianling"]
+    all_statuses = {task["id"]: task["status"] for task in debug.run_agent_tool(
+        "get_tasks", {"include_closed": True, "limit": 100},
+    )["tasks"]}
+    assert all_statuses == {
+        "task-borrow-boat-xianling": "active", "buy-shrimp": "dormant",
+        "visit-fair": "dormant", "find-nest-tomorrow": "abandoned",
+        "already-completed": "completed",
+    }
+
+
+def test_unchanged_review_preserves_rationale_and_evidence_survives_inbox_pruning(tmp_path):
+    debug = make_debug_state(tmp_path)
+    debug.record_task_inbox_entries([inbox_dialog(source_key="origin-dialog")])
+    inbox_id = debug.task_inbox_pending()[0]["id"]
+    task = create_agent_task(debug, {
+        "id": "origin-task", "description": "Follow the request", "rationale": "Original rationale.",
+        "source_inbox_ids": [inbox_id],
+    })["task"]
+    unchanged = debug.run_agent_tool("upsert_task", {"id": task["id"]})["task"]
+    assert unchanged["rationale"] == "Original rationale."
+    assert unchanged["origin_evidence"][0]["ref"] == inbox_id
+    data = debug.read_exploration()
+    data["task_inbox"] = {}
+    debug.write_exploration(data)
+    persisted = debug.run_agent_tool("get_tasks")["tasks"][0]
+    assert persisted["origin_evidence"][0]["ref"] == inbox_id
+
+
 def test_task_review_uses_net_sprite_state_and_ignores_recovered_animation(tmp_path):
     debug = make_debug_state(tmp_path)
     state = review_state(sprite=2)
     write_state(debug, state)
     create_agent_task(debug, {
         "id": "delivery", "description": "Carry the delivery", "rationale": "Dialog established it.",
+        "review_watch": {"party_role_ids": [0]},
     })
 
     transient = review_state(sprite=193)
@@ -515,6 +630,7 @@ def test_pre_snapshot_task_reconstructs_stable_sprite_net_from_events(tmp_path):
         "id": "legacy-task", "description": "Old task", "rationale": "Old evidence.",
         "priority": 1, "status": "active", "created_at": reviewed_at,
         "updated_at": reviewed_at, "updated_agent_turn": 2, "history": [],
+        "review_watch": {"party_role_ids": [0]},
     }
     debug.write_exploration(data)
     debug.event_log = [{
@@ -994,15 +1110,15 @@ def test_agent_tasks_view_groups_all_statuses_and_returns_compact_records(tmp_pa
     completed = create_agent_task(debug, {
         "description": "Completed task", "rationale": "Already handled.", "priority": 9,
     })["task"]
-    debug.run_agent_tool("upsert_task", {"id": completed["id"], "status": "completed"})
+    change_task_status(debug, completed["id"], "completed")
     abandoned = create_agent_task(debug, {
         "description": "Abandoned task", "rationale": "No longer useful.", "priority": 7,
     })["task"]
-    debug.run_agent_tool("upsert_task", {"id": abandoned["id"], "status": "abandoned"})
+    change_task_status(debug, abandoned["id"], "abandoned")
 
     view = debug.agent_tasks_view()
 
-    assert view["counts"] == {"active": 2, "completed": 1, "abandoned": 1, "total": 4}
+    assert view["counts"] == {"active": 2, "dormant": 0, "completed": 1, "abandoned": 1, "total": 4}
     assert [task["status"] for task in view["tasks"]] == ["active", "active", "completed", "abandoned"]
     assert [task["description"] for task in view["tasks"][:2]] == ["Active high priority", "Active low priority"]
     assert view["tasks"][0] == {
@@ -1086,7 +1202,7 @@ def test_rules_ignores_pending_review_task_and_empty_ledger_still_explores(tmp_p
 
     create_agent_task(debug, {
         "id": "stale-task", "description": "Inspect marked object", "rationale": "Earlier evidence.",
-        "priority": 9, "object_id": 20,
+        "priority": 9, "object_id": 20, "review_watch": {"cash": True},
     })
     state["cash"] = 11
     write_state(debug, state)
@@ -1102,7 +1218,7 @@ def test_delivery_phase_regression_reviews_old_object_task_without_inventory_ite
         "id": "task-drive-beggar",
         "description": "向目标 63 取酒菜",
         "rationale": "较早对话把目标 63 作为取货对象。",
-        "object_id": 63,
+        "object_id": 63, "review_watch": {"party_role_ids": [0]},
     })["task"]
     after = review_state(sprite=208, inventory=[])
     write_state(debug, after)
@@ -1120,11 +1236,10 @@ def test_delivery_phase_regression_reviews_old_object_task_without_inventory_ite
     }
     assert after["inventory"] == []
 
-    create_agent_task(debug, {
-        "id": "task-drive-beggar",
-        "status": "completed",
-        "rationale": "目标 63 的新对话与稳定 sprite 净变化共同表明取货阶段已结束。",
-    })
+    change_task_status(
+        debug, "task-drive-beggar", "completed", after,
+        reason="目标 63 的新对话与稳定 sprite 净变化共同表明取货阶段已结束。",
+    )
     successor = create_agent_task(debug, {
         "id": "deliver-upstairs",
         "description": "把酒菜送给楼上客人",

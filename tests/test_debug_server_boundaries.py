@@ -349,7 +349,9 @@ def test_http_handler_exposes_agent_tasks(http_server):
 
     assert status == 200
     assert payload["ok"] is True
-    assert payload["counts"] == {"active": 1, "completed": 0, "abandoned": 0, "total": 1}
+    assert payload["counts"] == {
+        "active": 1, "dormant": 0, "completed": 0, "abandoned": 0, "total": 1,
+    }
     assert payload["tasks"] == [{
         "id": "inspect-courtyard",
         "description": "Inspect the courtyard",

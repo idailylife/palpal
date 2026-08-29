@@ -244,6 +244,416 @@ def test_runtime_start_feedback_has_no_permanent_macro_goal(tmp_path):
     assert "finish the game" not in feedback_seen[0].lower()
 
 
+def test_new_logical_room_is_automatically_inspected_before_decision(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    baseline = make_state()
+    runtime._observe_room_for_inspection(baseline)
+    destination = {**make_state(), "map_id": 11}
+    destination["_logical_room"] = debug.logical_room_identity(destination)
+    calls = []
+
+    def inspect(name, arguments, state, *, tool_cycle=None):
+        calls.append((name, arguments, state["map_id"], tool_cycle))
+        return {
+            "ok": True,
+            "authority": "visual_annotation",
+            "focus": "room_layout",
+            "frame_sequence": 77,
+            "visual_hash": "abc123",
+            "report": {"summary": "A room with a visible northern exit."},
+        }
+
+    monkeypatch.setattr(debug, "run_agent_tool", inspect)
+    feedback = asyncio.run(runtime._automatic_room_inspection(destination))
+
+    room_id = debug.room_identity(destination)["id"]
+    assert calls[0][0] == "inspect_screen"
+    assert calls[0][1]["focus"] == "room_layout"
+    assert "object IDs, scripts, or confirmed transitions" in calls[0][1]["question"]
+    assert "visual_annotation" in feedback
+    assert runtime.snapshot()["room_inspection"] == {
+        "baseline_required": False,
+        "last_observed_room_id": room_id,
+        "pending_room_id": None,
+        "inspected_rooms": {
+            room_id: {
+                "inspected_at": runtime.snapshot()["room_inspection"]["inspected_rooms"][room_id]["inspected_at"],
+                "frame_sequence": 77,
+                "visual_hash": "abc123",
+            },
+        },
+    }
+    event = next(event for event in runtime.events() if event["phase"] == "automatic_visual_inspection")
+    assert event["details"]["automatic"] is True
+    assert event["details"]["room_id"] == room_id
+
+
+def test_runtime_cannot_decide_before_pending_room_inspection(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime._unsafe_state_reason = lambda _state: None
+    runtime._observe_room_for_inspection(make_state())
+    destination = {**make_state(), "map_id": 11}
+    order = []
+    monkeypatch.setattr(debug, "snapshot", lambda: destination)
+    monkeypatch.setattr(
+        debug,
+        "run_agent_tool",
+        lambda *args, **kwargs: order.append("inspect") or {
+            "ok": True,
+            "authority": "visual_annotation",
+            "focus": "room_layout",
+            "frame_sequence": 88,
+            "visual_hash": "new-room",
+            "report": {"summary": "New room."},
+        },
+    )
+    runtime.decision_provider = (
+        lambda _state, _model, feedback: order.append("decide")
+        or ("Automatic low-authority visual inspection" in feedback and decision())
+    )
+
+    runtime.start(None, 1)
+    paused = wait_for_pause(runtime)
+
+    assert paused["stop_reason"] == "no_reachable_target"
+    assert order == ["inspect", "decide"]
+
+
+def test_automatic_room_inspection_defers_for_overlay_and_failure_remains_retryable(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    runtime._observe_room_for_inspection(make_state())
+    destination = {**make_state(), "map_id": 11, "dialog": {"active": True}}
+    calls = []
+    monkeypatch.setattr(
+        debug,
+        "run_agent_tool",
+        lambda *args, **kwargs: calls.append(args) or {
+            "ok": False,
+            "error": {"code": "frame_stale", "message": "stale"},
+        },
+    )
+
+    assert asyncio.run(runtime._automatic_room_inspection(destination)) is None
+    room_id = debug.room_identity(destination)["id"]
+    assert runtime.snapshot()["room_inspection"]["pending_room_id"] == room_id
+    assert calls == []
+
+    destination["dialog"] = {"active": False}
+    assert asyncio.run(runtime._automatic_room_inspection(destination)) == ""
+    state = runtime.snapshot()
+    assert state["stop_reason"] == "automatic_room_inspection_failed"
+    assert state["room_inspection"]["pending_room_id"] == room_id
+    assert room_id not in state["room_inspection"]["inspected_rooms"]
+
+
+def test_inspected_room_revisit_and_same_room_region_change_do_not_repeat(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    source = make_state()
+    runtime._observe_room_for_inspection(source)
+    destination = {**make_state(), "map_id": 11}
+    calls = []
+    monkeypatch.setattr(
+        debug,
+        "run_agent_tool",
+        lambda *args, **kwargs: calls.append(1) or {
+            "ok": True,
+            "frame_sequence": 90,
+            "visual_hash": "seen",
+            "report": {"summary": "seen"},
+        },
+    )
+    asyncio.run(runtime._automatic_room_inspection(destination))
+
+    same_room_other_region = {**destination, "region_id": 99}
+    assert asyncio.run(runtime._automatic_room_inspection(same_room_other_region)) is None
+    runtime._observe_room_for_inspection(source)
+    assert asyncio.run(runtime._automatic_room_inspection(destination)) is None
+    assert calls == [1]
+
+
+def test_legacy_room_inspection_state_baselines_current_room(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    legacy = runtime.snapshot()
+    legacy.pop("room_inspection")
+    legacy.pop("room_entry_context")
+    runtime._atomic_json(runtime.control_path, legacy)
+    runtime.state = runtime._load_or_create()
+
+    assert runtime._observe_room_for_inspection(make_state())
+    inspection = runtime.snapshot()["room_inspection"]
+    assert inspection["baseline_required"] is False
+    assert inspection["pending_room_id"] is None
+    assert runtime.snapshot()["room_entry_context"] is None
+
+
+def transition_object(object_id, x, y, script):
+    return {
+        "id": object_id, "x": x, "y": y, "state": 1, "sprite_id": 0,
+        "trigger_mode": 4, "trigger_script": script, "auto_script": 0,
+        "blocking": False, "interactable": True,
+    }
+
+
+def test_cross_room_execution_records_entry_context_and_same_room_region_change_does_not(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    source = make_state(objects=[transition_object(706, 32, 0, 13729)], frame=10)
+    source["map_id"] = 40
+    destination = make_state(objects=[transition_object(758, 32, 0, 13773)], frame=20)
+    destination["map_id"] = 70
+
+    runtime._update_room_entry_after_execution(
+        source, destination, "navigation_step", {"id": 706},
+        {"status": "transitioned", "progress": [{"status": "transitioned"}]},
+    )
+    context = runtime.snapshot()["room_entry_context"]
+    assert context["status"] == "entered"
+    assert context["source_room_id"] == debug.room_identity(source)["id"]
+    assert context["destination_room_id"] == debug.room_identity(destination)["id"]
+    assert context["source_target_id"] == 706
+    assert context["source_transition_key"]
+    assert context["landing_position"] == destination["party_position"]
+    assert runtime.recent_transition_chain(destination)[0]["target_id"] == 706
+
+    runtime._set_room_entry_context(None)
+    same_room_other_region = {**source, "region_id": 99, "frame": 11}
+    runtime._update_room_entry_after_execution(
+        source, same_room_other_region, "navigation_step", {"id": 706},
+        {"status": "transitioned", "progress": [{"status": "transitioned"}]},
+    )
+    assert runtime.snapshot()["room_entry_context"] is None
+
+
+def test_immediate_room_return_creates_recovery_route_and_blocks_unrelated_navigation(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    source = make_state(width=7, height=5, start=(1, 1), objects=[
+        transition_object(706, 32, 0, 13729),
+        {
+            "id": 722, "x": 64, "y": 16, "state": 1, "sprite_id": 1,
+            "trigger_mode": 1, "trigger_script": 13740, "auto_script": 0,
+            "blocking": False, "interactable": True,
+        },
+    ], frame=10)
+    source["map_id"] = 40
+    destination = make_state(
+        width=7, height=5, start=(1, 1),
+        objects=[transition_object(758, 32, 0, 13773)], frame=20,
+    )
+    destination["map_id"] = 70
+    runtime._update_room_entry_after_execution(
+        source, destination, "navigation_step", {"id": 706},
+        {"status": "transitioned", "progress": [{"status": "transitioned"}]},
+    )
+    runtime._update_room_entry_after_execution(
+        destination, source, "navigation_step", {"id": 758},
+        {"status": "transitioned", "progress": [{"status": "transitioned"}]},
+    )
+
+    context = runtime.snapshot()["room_entry_context"]
+    assert context["status"] == "recovery_pending"
+    assert context["return_target_id"] == 758
+    assert runtime.recent_transition_chain(source)[-1]["classification"] == "transition_loop"
+    write_state(debug, source)
+    navigation = debug.run_agent_tool("get_navigation", {}, source)["navigation"]
+    targets = {target["id"]: target for target in navigation["targets"]}
+    assert targets[706]["recovery_route"] is True
+    assert targets[706]["agent_priority"] == "resume_interrupted_entry"
+
+    rejected = debug.run_agent_tool("submit_decision", {
+        "action": "navigate", "target_id": 722, "reason": "Choose another target.",
+    }, source)["decision"]
+    assert rejected["validation"]["reason"] == "transition_recovery_required"
+    assert rejected["validation"]["recovery_target_id"] == 706
+    assert not debug.action_path.exists()
+
+    recovered = debug.run_agent_tool("submit_decision", {
+        "action": "navigate", "target_id": 706, "reason": "Recover the room just left.",
+    }, source)["decision"]
+    assert recovered["recommended_action"]["tool"] == "navigation_step"
+
+
+def test_selected_only_entry_return_is_allowed_and_records_normal_entry(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    source = make_state(
+        width=7,
+        height=5,
+        start=(1, 1),
+        objects=[transition_object(706, 32, 0, 13729)],
+        frame=10,
+    )
+    source["map_id"] = 40
+    destination = make_state(
+        width=7,
+        height=5,
+        start=(1, 1),
+        objects=[transition_object(758, 32, 0, 13773)],
+        frame=20,
+    )
+    destination["map_id"] = 70
+    runtime._update_room_entry_after_execution(
+        source,
+        destination,
+        "navigation_step",
+        {"id": 706},
+        {"status": "transitioned", "progress": [{"status": "transitioned"}]},
+    )
+    debug.record_transition_destination(
+        debug.room_identity(destination),
+        758,
+        debug.room_identity(source),
+        from_object=destination["objects"][0],
+        from_state=destination,
+        to_state=source,
+    )
+    write_state(debug, destination)
+    navigation = debug.run_agent_tool("get_navigation", {}, destination)["navigation"]
+    executable = [
+        target for target in navigation["targets"]
+        if target["status"] in {"reachable", "transition", "blocked_by_interactable"}
+    ]
+    assert [target["id"] for target in executable] == [758]
+    assert executable[0]["entry_relation"] == "confirmed_entry_return"
+
+    submitted = debug.run_agent_tool("submit_decision", {
+        "action": "navigate",
+        "target_id": 758,
+        "reason": "Return through the only executable entrance.",
+    }, destination)["decision"]
+
+    assert submitted["recommended_action"]["tool"] == "navigation_step"
+    assert submitted.get("validation", {}).get("status") != "rejected"
+
+    entry_return_checks = []
+    navigation_target_is_entry_return = debug.navigation_target_is_entry_return
+
+    def is_entry_return(state, target_id):
+        entry_return_checks.append((state["map_id"], target_id))
+        return navigation_target_is_entry_return(state, target_id)
+
+    monkeypatch.setattr(debug, "navigation_target_is_entry_return", is_entry_return)
+    monkeypatch.setattr(debug, "snapshot", lambda: destination)
+    monkeypatch.setattr(runtime, "_navigate", lambda *_args: {
+        "ok": True,
+        "status": "transitioned",
+        "progress": [{"status": "transitioned"}],
+    })
+    monkeypatch.setattr(runtime, "_wait_state_quiet", lambda: source)
+
+    runtime._execute_decision(submitted)
+
+    context = runtime.snapshot()["room_entry_context"]
+    assert context["status"] == "entered"
+    assert context["source_room_id"] == debug.room_identity(destination)["id"]
+    assert context["destination_room_id"] == debug.room_identity(source)["id"]
+    assert entry_return_checks == [(70, 758)]
+
+
+def test_recovery_then_selected_entry_return_does_not_rearm_recovery(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    source = make_state(objects=[transition_object(706, 32, 0, 13729)], frame=10)
+    source["map_id"] = 40
+    destination = make_state(objects=[transition_object(758, 32, 0, 13773)], frame=20)
+    destination["map_id"] = 70
+    transitioned = {"status": "transitioned", "progress": [{"status": "transitioned"}]}
+
+    runtime._update_room_entry_after_execution(
+        source, destination, "navigation_step", {"id": 706}, transitioned,
+    )
+    runtime._update_room_entry_after_execution(
+        destination, source, "navigation_step", {"id": 758}, transitioned,
+    )
+    assert runtime.snapshot()["room_entry_context"]["status"] == "recovery_pending"
+
+    runtime._update_room_entry_after_execution(
+        source, destination, "navigation_step", {"id": 706}, transitioned,
+    )
+    recovered = runtime.snapshot()["room_entry_context"]
+    assert recovered["status"] == "entered"
+    assert recovered["recovered_from_loop"] is True
+
+    runtime._update_room_entry_after_execution(
+        destination,
+        source,
+        "navigation_step",
+        {"id": 758},
+        transitioned,
+        entry_return_selected=True,
+    )
+    returned = runtime.snapshot()["room_entry_context"]
+    assert returned["status"] == "entered"
+    assert returned["source_room_id"] == debug.room_identity(destination)["id"]
+    assert returned["destination_room_id"] == debug.room_identity(source)["id"]
+
+
+def test_non_entry_navigation_progress_consumes_immediate_return_guard(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state(objects=[
+        transition_object(758, 32, 0, 13773),
+        {
+            "id": 767, "x": 0, "y": 0, "state": 1, "sprite_id": 1,
+            "trigger_mode": 1, "trigger_script": 13790, "auto_script": 0,
+            "blocking": False, "interactable": True,
+        },
+    ])
+    state["map_id"] = 70
+    source = make_state()
+    source["map_id"] = 40
+    runtime.state["room_entry_context"] = {
+        "status": "entered",
+        "source_room_id": debug.room_identity(source)["id"],
+        "source_target_id": 706,
+        "source_transition_key": "source-key",
+        "destination_room_id": debug.room_identity(state)["id"],
+        "landing_position": dict(state["party_position"]),
+    }
+    runtime._update_room_entry_after_execution(
+        state, state, "navigation_step", {"id": 767},
+        {"status": "arrived", "progress": [{"status": "stepping"}]},
+    )
+    assert runtime.snapshot()["room_entry_context"]["status"] == "progressed"
+    navigation = debug.run_agent_tool("get_navigation", {}, state)["navigation"]
+    target = next(target for target in navigation["targets"] if target["id"] == 758)
+    assert "possible_entry_return" not in target
+
+
+def test_entry_context_survives_overlay_before_any_navigation_progress(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state(objects=[
+        transition_object(758, 32, 0, 13773),
+        {
+            "id": 767, "x": 0, "y": 0, "state": 1, "sprite_id": 1,
+            "trigger_mode": 1, "trigger_script": 13790, "auto_script": 0,
+            "blocking": False, "interactable": True,
+        },
+    ])
+    state["map_id"] = 70
+    source = make_state()
+    source["map_id"] = 40
+    runtime.state["room_entry_context"] = {
+        "status": "entered",
+        "source_room_id": debug.room_identity(source)["id"],
+        "source_target_id": 706,
+        "source_transition_key": "source-key",
+        "destination_room_id": debug.room_identity(state)["id"],
+        "landing_position": dict(state["party_position"]),
+    }
+    runtime._update_room_entry_after_execution(
+        state, state, "navigation_step", {"id": 767},
+        {"status": "interrupted_by_dialog", "progress": [{"status": "in_dialog"}]},
+    )
+    assert runtime.snapshot()["room_entry_context"]["status"] == "entered"
+
+
 def test_runtime_waits_for_game_control_without_consuming_a_turn(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
@@ -508,6 +918,7 @@ def test_battle_summary_falls_back_to_start_roster_and_separates_trigger_context
         "generation": 18,
         "event_object_id": 233,
         "trigger_script": 7100,
+        "logical_room_id": "S3/M10:2F2C967F8E00",
         "source": {"scene_id": 3, "map_id": 10, "x": 16, "y": 8},
         "navigation_target": {"id": 233, "kind": "touch", "status": "reachable"},
     }
@@ -2786,7 +3197,7 @@ def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeyp
     assert set(captured["prompt"]) == {"feedback", "context"}
     assert set(captured["prompt"]["context"]) == {
         "state_summary", "room_memo", "active_tasks", "active_tasks_total", "task_review", "task_inbox",
-        "task_reconciliation",
+        "task_reconciliation", "room_entry_context", "recent_transition_chain",
     }
 
 
