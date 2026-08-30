@@ -77,6 +77,28 @@ PALPAL_AgentBattleEnd(
    INT        iResult
 );
 
+VOID
+PALPAL_AgentVisibleActionBegin(
+   BOOL       fPlayer,
+   WORD       wActorIndex,
+   INT        iActionType,
+   WORD       wObjectID,
+   SHORT      sTarget
+);
+
+VOID
+PALPAL_AgentVisibleActionEnd(
+   VOID
+);
+
+VOID
+PALPAL_AgentVisibleNumber(
+   BOOL       fEnemy,
+   WORD       wTargetIndex,
+   BOOL       fMP,
+   SHORT      sChange
+);
+
 DWORD
 PALPAL_AgentBattleGeneration(
    VOID

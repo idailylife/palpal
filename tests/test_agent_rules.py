@@ -761,6 +761,11 @@ def test_agent_messages_put_stable_policy_before_dynamic_context(tmp_path):
 def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
     policy = make_debug_state(tmp_path).agent_policy_prompt()
 
+    assert 'status=reachable、transition 或 blocked_by_interactable' in policy
+    assert 'blocked_by_transition 和 unreachable_static 不能直接提交' in policy
+    assert 'targets_returned < targets_total' in policy
+    assert '沿 next_offset 连续读取到 complete=true' in policy
+    assert '不能根据部分分页输出声称没有其他候选或证据' in policy
     assert 'fresh、reachable 的非传送 search 目标给予温和正向偏好' in policy
     assert '尚未尝试、fresh、reachable 且 transition_candidate=false 的 touch 目标' in policy
     assert '优先处理仍有价值的 search，再一次只尝试一个 touch' in policy
@@ -857,6 +862,11 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     object_history_properties = by_name['inspect_target']['function']['parameters']['properties']
     assert set(object_history_properties) == {'id', 'limit'}
     assert '紧凑' in by_name['get_navigation']['function']['description']
+    navigation_description = by_name['get_navigation']['function']['description']
+    assert 'status=reachable、transition 或 blocked_by_interactable' in navigation_description
+    assert 'blocked_by_transition 和 unreachable_static 不能直接提交' in navigation_description
+    assert 'targets_returned < targets_total' in navigation_description
+    assert 'limit=40' in navigation_description
     assert '最小 dry-run 动作' in by_name['submit_decision']['function']['description']
     room_memory_description = by_name['get_room_memory']['function']['description']
     assert '指定稳定 logical_room_id' in room_memory_description
@@ -870,6 +880,10 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert 'wait' not in by_name['submit_decision']['function']['parameters']['properties']['action']['enum']
     output_properties = by_name['get_tool_output']['function']['parameters']['properties']
     assert set(output_properties) == {'output_ref', 'offset'}
+    output_description = by_name['get_tool_output']['function']['description']
+    assert 'next_offset' in output_description
+    assert 'complete=true' in output_description
+    assert '部分分页输出' in output_description
     task_query_properties = by_name['get_tasks']['function']['parameters']['properties']
     assert set(task_query_properties) == {'include_closed', 'detail', 'offset', 'limit'}
     assert '未知自选 id' in by_name['upsert_task']['function']['description']

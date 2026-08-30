@@ -84,6 +84,8 @@ class ToolOutputInputFilter:
         newly_seen: set[str] = set()
         for item in model_data.input:
             current = dict(item) if isinstance(item, dict) else item
+            if isinstance(current, dict):
+                current = self.runtime._project_model_transcript_item(current)
             if isinstance(current, dict) and current.get("type") == "function_call_output":
                 call_id = self._call_id(current)
                 output = current.get("output")
@@ -105,6 +107,14 @@ class ToolOutputInputFilter:
 
 class ReplanRequired(RuntimeError):
     """A safe, transient state change invalidated a recommendation."""
+
+
+class BattleStarted(RuntimeError):
+    """A new formal battle superseded ordinary model work without consuming a turn."""
+
+    def __init__(self, state: dict):
+        super().__init__("battle_started")
+        self.state = state
 
 
 def _now() -> float:
@@ -471,6 +481,10 @@ class BattleDelegate:
                 output = {
                     "ok": True,
                     "item": self.debug.player_battle_inventory_item(candidate),
+                    "observed_effects": self.debug.combat_experience(
+                        latest.get("battle") if isinstance(latest.get("battle"), dict) else None,
+                        item_id=item_id,
+                    ).get("actions", []),
                 }
                 battle = latest.get("battle") if isinstance(latest.get("battle"), dict) else {}
                 legal_actions = [
@@ -619,10 +633,13 @@ class BattleDelegate:
                 "effects from names alone. Player status_effects and poisons are current friendly "
                 "effects; enemy internal effects remain hidden. Item and magic descriptions are "
                 "player-visible menu text and may guide your choice, but vague wording does not "
-                "establish an exact element, damage amount, or weakness. Use outcomes observed in "
-                "this battle when available. "
-                "Preserve scarce MP and consumables when a normal "
-                "attack is sufficient; use healing or stronger actions when survival needs it. "
+                "establish an exact element, damage amount, or weakness. Treat observed outcomes "
+                "and experience as samples, not deterministic rules. Balance survival risk, attack "
+                "and magic samples, MP cost, and resource scarcity. When the party is safe and no "
+                "relevant sample exists, try one lowest-cost currently legal offensive magic early; "
+                "judge safety from visible HP/MP, status, recent incoming damage, and healing reserves, "
+                "not a fixed threshold. Use a consumable only when menu text or prior visible samples "
+                "support its intended effect; never blind-test a scarce item. "
                 "Never invent targets or actions. Choose target_index from the action's "
                 "submission_target_indices and submit exactly one current legal action."
             ),
@@ -646,7 +663,10 @@ class BattleDelegate:
             "feedback": feedback,
             "battle": player_battle,
             "active_tasks": self.debug.active_task_summary(),
-            "resource_policy": "Prefer attacks; spend MP/items only for survival or material advantage.",
+            "resource_policy": (
+                "Use visible samples and current risk. Safely probe one lowest-cost unobserved "
+                "offensive magic when useful; do not guess consumable effects from names."
+            ),
         }, ensure_ascii=False, separators=(",", ":"))
         for attempt in range(2):
             stream = Runner.run_streamed(
@@ -778,7 +798,10 @@ class BattleDelegate:
                 {
                     "role": "user",
                     "content": json.dumps(
-                        {"battle": battle, "instruction": int(self._control().get("instruction_count") or 0) + 1},
+                        {
+                            "battle": self.debug.player_battle_view({"battle": battle}),
+                            "instruction": int(self._control().get("instruction_count") or 0) + 1,
+                        },
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ),
@@ -1576,6 +1599,35 @@ class AgentRuntime:
                     if len(result) >= limit:
                         break
         return result
+
+    def _project_model_transcript_item(self, item: dict) -> dict:
+        """Filter legacy battle audit payloads at model-input time only."""
+        def project(value: Any) -> Any:
+            if isinstance(value, list):
+                return [project(entry) for entry in value]
+            if not isinstance(value, dict):
+                return value
+            projected = {}
+            for key, entry in value.items():
+                if key == "battle" and isinstance(entry, dict):
+                    projected[key] = self.debug.player_battle_view({"battle": entry})
+                else:
+                    projected[key] = project(entry)
+            return projected
+
+        current = dict(item)
+        content = current.get("content")
+        if isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                return current
+            projected = project(parsed)
+            if projected != parsed:
+                current["content"] = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+        elif isinstance(content, (dict, list)):
+            current["content"] = project(content)
+        return current
 
     def wait_for_events(
         self,
@@ -2527,6 +2579,44 @@ class AgentRuntime:
             + json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         )
 
+    def _formal_battle_generation(self, state: dict) -> int:
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        if state.get("in_battle") is not True or battle is None:
+            return 0
+        if self.debug.prebattle_interaction(state) is not None:
+            return 0
+        return int(battle.get("generation") or 0)
+
+    async def _sanitize_main_session_after_takeover(self) -> None:
+        try:
+            from agents import SQLiteSession
+            session = SQLiteSession(self.state["session_id"], self.sqlite_path)
+            await self._sanitize_sdk_session(session)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            return
+
+    async def _decide_with_battle_watch(self, state: dict, feedback: str) -> dict:
+        baseline = self._formal_battle_generation(state)
+        task = asyncio.create_task(self._decide(state, feedback))
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=0.05)
+            if done:
+                break
+            latest = await asyncio.to_thread(self.debug.snapshot)
+            current = self._formal_battle_generation(latest)
+            if current > 0 and current != baseline:
+                stream = self.active_stream
+                if stream is not None and callable(getattr(stream, "cancel", None)):
+                    stream.cancel("immediate")
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, RuntimeError):
+                    pass
+                await self._sanitize_main_session_after_takeover()
+                raise BattleStarted(latest)
+        return await task
+
     async def _run(self, generation: int, *, decide_only: bool) -> None:
         feedback = "Inspect the latest stable game state and choose the next useful local action."
         replans = 0
@@ -2609,7 +2699,11 @@ class AgentRuntime:
                     "Requesting the next recommendation.",
                     request_details,
                 )
-                decision = await self._decide(before, feedback)
+                try:
+                    decision = await self._decide_with_battle_watch(before, feedback)
+                except BattleStarted:
+                    feedback = "A formal battle started; hand control to the Battle Agent."
+                    continue
                 if self.cancel_event.is_set() or generation != self.generation:
                     self.emit("interrupt", "cancelled", "A late model result was discarded.")
                     self._pause("interrupted")
@@ -2617,6 +2711,9 @@ class AgentRuntime:
                 latest = await asyncio.to_thread(self.debug.snapshot)
                 if self._game_control_active(latest):
                     latest = await asyncio.to_thread(self._wait_for_control)
+                if self._formal_battle_generation(latest) > 0:
+                    feedback = "A formal battle started; discard the ordinary recommendation."
+                    continue
                 validation_rejection = self._decision_validation_rejection(decision)
                 if validation_rejection:
                     replans += 1
@@ -2681,6 +2778,14 @@ class AgentRuntime:
                 self._persist()
                 try:
                     result = await asyncio.to_thread(self._execute_decision, decision)
+                except BattleStarted:
+                    with self.lock:
+                        self.state["turn"] = max(0, int(self.state.get("turn") or 0) - 1)
+                        self.state["run_turn"] = max(0, int(self.state.get("run_turn") or 0) - 1)
+                        self.state["pending_decision"] = None
+                        self._persist()
+                    feedback = "A formal battle started; hand control to the Battle Agent."
+                    continue
                 except ReplanRequired as exc:
                     replans += 1
                     with self.lock:
@@ -3607,6 +3712,8 @@ exploration value, and maintained local tasks to choose the next action.
             raise RuntimeError("interrupted")
         if self._game_control_active(before):
             before = self._wait_for_control()
+        if self._formal_battle_generation(before) > 0:
+            raise BattleStarted(before)
         reason = self._unsafe_state_reason(before)
         if reason and reason != "not_in_main_game":
             raise RuntimeError(reason)
@@ -3668,6 +3775,13 @@ exploration value, and maintained local tasks to choose the next action.
                 **self.debug.item_object_effect_observation(before, after, matched_item_object),
                 **({"result": native_result} if isinstance(native_result, dict) else {}),
             }
+            if args.get("role_id") is not None and not before.get("in_battle"):
+                self.debug.observe_visible_item_use(
+                    before,
+                    after,
+                    int(args.get("item_id") or 0),
+                    int(args.get("role_id")),
+                )
         elif tool == "equip_item":
             action_result = self.debug.write_equip_item_action(
                 args.get("item_id"),

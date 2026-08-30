@@ -166,6 +166,79 @@ def test_compact_navigation_representative_history_stays_under_ten_kb_and_halves
     assert all('history' not in target['previous_interaction_outcome'] for target in compact['targets'])
 
 
+def test_compact_navigation_sorts_before_default_limit_so_fresh_search_is_not_crowded_out(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    targets = [
+        {
+            'id': target_id,
+            'kind': 'touch',
+            'status': 'unreachable_static',
+            'steps': None,
+            'interaction_state': 'fresh',
+            'agent_priority': 'normal',
+        }
+        for target_id in range(1, 24)
+    ]
+    targets.append({
+        'id': 24,
+        'kind': 'search',
+        'status': 'reachable',
+        'steps': 1,
+        'interaction_state': 'fresh',
+        'agent_priority': 'normal',
+    })
+    debug.navigation = lambda _state: {'status': 'ok', 'targets': targets}
+
+    compact = debug.compact_agent_navigation(state)
+
+    assert compact['targets_returned'] == 20
+    assert compact['targets_total'] == 24
+    assert compact['targets'][0]['id'] == 24
+    assert compact['fresh_search_target_ids'] == [24]
+    assert compact['executable_target_ids'] == [24]
+
+
+def test_compact_navigation_layers_targets_and_summaries_ignore_detail_limit(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    targets = [
+        {'id': 91, 'kind': 'touch', 'status': 'unreachable_static', 'steps': 1},
+        {'id': 81, 'kind': 'touch', 'status': 'blocked_by_transition', 'steps': None},
+        {'id': 72, 'kind': 'touch', 'status': 'reachable', 'steps': None, 'agent_priority': 'avoid_repeat'},
+        {'id': 71, 'kind': 'touch', 'status': 'reachable', 'steps': 3, 'agent_priority': 'avoid_repeat'},
+        {'id': 63, 'kind': 'transition', 'status': 'transition', 'steps': None, 'agent_priority': 'normal'},
+        {'id': 62, 'kind': 'touch', 'status': 'reachable', 'steps': 4, 'agent_priority': 'normal'},
+        {'id': 61, 'kind': 'touch', 'status': 'blocked_by_interactable', 'steps': 2, 'agent_priority': 'normal'},
+        {'id': 52, 'kind': 'search', 'status': 'reachable', 'steps': None, 'interaction_state': 'fresh', 'agent_priority': 'normal'},
+        {'id': 51, 'kind': 'search', 'status': 'reachable', 'steps': 2, 'interaction_state': 'fresh', 'agent_priority': 'normal'},
+        {'id': 50, 'kind': 'search', 'status': 'reachable', 'steps': 2, 'interaction_state': 'fresh', 'agent_priority': 'normal'},
+        {'id': 99, 'kind': 'transition', 'status': 'transition', 'steps': None, 'recovery_route': True},
+    ]
+    targets.extend({
+        'id': target_id,
+        'kind': 'touch',
+        'status': 'reachable',
+        'steps': target_id,
+        'agent_priority': 'normal',
+    } for target_id in range(100, 113))
+    debug.navigation = lambda _state: {'status': 'ok', 'targets': targets}
+
+    compact = debug.compact_agent_navigation(state, limit=5)
+    full = debug.compact_agent_navigation(state, limit=40)
+
+    assert [target['id'] for target in full['targets'][:11]] == [
+        99, 50, 51, 52, 61, 62, 100, 101, 102, 103, 104,
+    ]
+    assert [target['id'] for target in full['targets'][-4:]] == [71, 72, 81, 91]
+    assert compact['targets_returned'] == 5
+    assert compact['targets_total'] == 24
+    assert full['targets_returned'] == full['targets_total'] == 24
+    assert 112 in compact['executable_target_ids']
+    assert compact['fresh_search_target_ids'] == [50, 51, 52]
+    assert compact['executable_target_ids'] == full['executable_target_ids']
+
+
 def test_item_requirement_exposes_reachable_approach_without_interacting(tmp_path):
     debug = make_debug_state(tmp_path)
     state = make_state(width=8, height=8, start=(7, 7), objects=[approach_object()])

@@ -62,6 +62,8 @@ static PALPALAGENTTRIGGEROBSERVATION g_agent_trigger_observation;
 #define PALPAL_AGENT_MAX_ACTION_STEPS 64
 #define PALPAL_AGENT_DIALOG_EVENT_CAPACITY 32
 #define PALPAL_AGENT_OBJECT_DESC_CHARS 512
+#define PALPAL_AGENT_VISIBLE_OUTCOME_CAPACITY 32
+#define PALPAL_AGENT_VISIBLE_NUMBER_CAPACITY 32
 
 typedef struct tagPALPALAGENTOBJECTDESC
 {
@@ -152,6 +154,40 @@ typedef struct tagPALPALAGENTBATTLE
    DWORD started_ticks;
 } PALPALAGENTBATTLE;
 
+typedef struct tagPALPALAGENTVISIBLEOUTCOME
+{
+   BOOL valid;
+   DWORD sequence;
+   BOOL player_actor;
+   WORD actor_index;
+   WORD actor_role;
+   INT action_type;
+   WORD object_id;
+   SHORT target_index;
+   WORD target_object_id;
+   INT mp_cost;
+   WORD player_hp_before[MAX_PLAYERS_IN_PARTY];
+   WORD player_hp_after[MAX_PLAYERS_IN_PARTY];
+   WORD player_hp_max[MAX_PLAYERS_IN_PARTY];
+   WORD player_mp_before[MAX_PLAYERS_IN_PARTY];
+   WORD player_mp_after[MAX_PLAYERS_IN_PARTY];
+   WORD player_mp_max[MAX_PLAYERS_IN_PARTY];
+   WORD player_status_before[MAX_PLAYERS_IN_PARTY][kStatusAll];
+   WORD player_status_after[MAX_PLAYERS_IN_PARTY][kStatusAll];
+   WORD player_poison_before[MAX_PLAYERS_IN_PARTY][MAX_POISONS];
+   WORD player_poison_after[MAX_PLAYERS_IN_PARTY][MAX_POISONS];
+   WORD enemy_object_id[MAX_ENEMIES_IN_TEAM];
+   WORD enemy_hp_before[MAX_ENEMIES_IN_TEAM];
+   WORD enemy_hp_after[MAX_ENEMIES_IN_TEAM];
+   struct {
+      BOOL enemy;
+      WORD target_index;
+      BOOL mp;
+      SHORT change;
+   } numbers[PALPAL_AGENT_VISIBLE_NUMBER_CAPACITY];
+   int number_count;
+} PALPALAGENTVISIBLEOUTCOME;
+
 typedef struct tagPALPALAGENTLASTBATTLE
 {
    BOOL valid;
@@ -173,10 +209,16 @@ typedef struct tagPALPALAGENTLASTBATTLE
    WORD player_status_before[MAX_PLAYERS_IN_PARTY][kStatusAll];
    WORD player_status_after[MAX_PLAYERS_IN_PARTY][kStatusAll];
    WORD player_new_magics[MAX_PLAYERS_IN_PARTY][MAX_PLAYER_MAGICS];
+   PALPALAGENTVISIBLEOUTCOME visible_outcomes[PALPAL_AGENT_VISIBLE_OUTCOME_CAPACITY];
+   int visible_outcome_count;
 } PALPALAGENTLASTBATTLE;
 
 static PALPALAGENTBATTLE g_agent_battle;
 static PALPALAGENTLASTBATTLE g_agent_last_battle;
+static PALPALAGENTVISIBLEOUTCOME g_agent_visible_outcomes[PALPAL_AGENT_VISIBLE_OUTCOME_CAPACITY];
+static PALPALAGENTVISIBLEOUTCOME g_agent_visible_active;
+static int g_agent_visible_outcome_count = 0;
+static DWORD g_agent_visible_sequence = 0;
 
 typedef enum tagPALPALAGENTSLOTCOMMAND
 {
@@ -2965,6 +3007,10 @@ PALPAL_AgentBattleBegin(
    int i;
 
    memset(&g_agent_battle, 0, sizeof(g_agent_battle));
+   memset(g_agent_visible_outcomes, 0, sizeof(g_agent_visible_outcomes));
+   memset(&g_agent_visible_active, 0, sizeof(g_agent_visible_active));
+   g_agent_visible_outcome_count = 0;
+   g_agent_visible_sequence = 0;
    g_agent_battle.generation = generation ? generation : 1;
    g_agent_battle.phase = kPalpalAgentBattlePreBattle;
    g_agent_battle.started_ticks = SDL_GetTicks();
@@ -3003,6 +3049,139 @@ PALPAL_AgentBattleBegin(
          g_agent_battle.player_role[i] = 0xFFFF;
       }
    }
+}
+
+VOID
+PALPAL_AgentVisibleActionBegin(
+   BOOL fPlayer,
+   WORD wActorIndex,
+   INT iActionType,
+   WORD wObjectID,
+   SHORT sTarget
+)
+{
+   int i;
+   if (!PALPAL_AgentEnabled() || !gpGlobals || !gpGlobals->fInBattle)
+      return;
+   if (g_agent_visible_active.valid)
+      PALPAL_AgentVisibleActionEnd();
+   memset(&g_agent_visible_active, 0, sizeof(g_agent_visible_active));
+   g_agent_visible_active.valid = TRUE;
+   g_agent_visible_active.sequence = ++g_agent_visible_sequence;
+   g_agent_visible_active.player_actor = fPlayer;
+   g_agent_visible_active.actor_index = wActorIndex;
+   g_agent_visible_active.action_type = iActionType;
+   g_agent_visible_active.object_id = fPlayer ? wObjectID : 0;
+   g_agent_visible_active.target_index = sTarget;
+   g_agent_visible_active.mp_cost = 0;
+   if (fPlayer && wActorIndex <= gpGlobals->wMaxPartyMemberIndex)
+   {
+      WORD role = gpGlobals->rgParty[wActorIndex].wPlayerRole;
+      g_agent_visible_active.actor_role = role;
+      if (iActionType == kBattleActionMagic && wObjectID > 0 && wObjectID < MAX_OBJECTS)
+      {
+         WORD number = gpGlobals->g.rgObject[wObjectID].magic.wMagicNumber;
+         if (number < gpGlobals->g.nMagic)
+            g_agent_visible_active.mp_cost = gpGlobals->g.lprgMagic[number].wCostMP;
+      }
+      if (sTarget >= 0 && sTarget <= g_Battle.wMaxEnemyIndex)
+      {
+         BOOL enemy_target = iActionType == kBattleActionAttack ||
+            iActionType == kBattleActionThrowItem ||
+            iActionType == kBattleActionCoopMagic;
+         if (iActionType == kBattleActionMagic && wObjectID > 0 && wObjectID < MAX_OBJECTS)
+            enemy_target = (gpGlobals->g.rgObject[wObjectID].magic.wFlags &
+               kMagicFlagUsableToEnemy) != 0;
+         if (enemy_target)
+            g_agent_visible_active.target_object_id = g_Battle.rgEnemy[sTarget].wObjectID;
+      }
+   }
+   for (i = 0; i < MAX_PLAYERS_IN_PARTY; i++)
+   {
+      if (i <= gpGlobals->wMaxPartyMemberIndex)
+      {
+         WORD role = gpGlobals->rgParty[i].wPlayerRole;
+         g_agent_visible_active.player_hp_before[i] = gpGlobals->g.PlayerRoles.rgwHP[role];
+         g_agent_visible_active.player_mp_before[i] = gpGlobals->g.PlayerRoles.rgwMP[role];
+         g_agent_visible_active.player_hp_max[i] = gpGlobals->g.PlayerRoles.rgwMaxHP[role];
+         g_agent_visible_active.player_mp_max[i] = gpGlobals->g.PlayerRoles.rgwMaxMP[role];
+         memcpy(g_agent_visible_active.player_status_before[i], gpGlobals->rgPlayerStatus[role],
+            sizeof(g_agent_visible_active.player_status_before[i]));
+         {
+            int j;
+            for (j = 0; j < MAX_POISONS; j++)
+               g_agent_visible_active.player_poison_before[i][j] =
+                  gpGlobals->rgPoisonStatus[j][i].wPoisonID;
+         }
+      }
+   }
+   for (i = 0; i < MAX_ENEMIES_IN_TEAM; i++)
+   {
+      g_agent_visible_active.enemy_object_id[i] = g_Battle.rgEnemy[i].wObjectID;
+      g_agent_visible_active.enemy_hp_before[i] = g_Battle.rgEnemy[i].e.wHealth;
+   }
+}
+
+VOID
+PALPAL_AgentVisibleActionEnd(
+   VOID
+)
+{
+   int i, index;
+   PALPALAGENTVISIBLEOUTCOME *outcome;
+   if (!g_agent_visible_active.valid || !gpGlobals)
+      return;
+   for (i = 0; i < MAX_PLAYERS_IN_PARTY; i++)
+   {
+      if (i <= gpGlobals->wMaxPartyMemberIndex)
+      {
+         WORD role = gpGlobals->rgParty[i].wPlayerRole;
+         g_agent_visible_active.player_hp_after[i] = gpGlobals->g.PlayerRoles.rgwHP[role];
+         g_agent_visible_active.player_mp_after[i] = gpGlobals->g.PlayerRoles.rgwMP[role];
+         memcpy(g_agent_visible_active.player_status_after[i], gpGlobals->rgPlayerStatus[role],
+            sizeof(g_agent_visible_active.player_status_after[i]));
+         {
+            int j;
+            for (j = 0; j < MAX_POISONS; j++)
+               g_agent_visible_active.player_poison_after[i][j] =
+                  gpGlobals->rgPoisonStatus[j][i].wPoisonID;
+         }
+      }
+   }
+   for (i = 0; i < MAX_ENEMIES_IN_TEAM; i++)
+      g_agent_visible_active.enemy_hp_after[i] = g_Battle.rgEnemy[i].e.wHealth;
+   if (g_agent_visible_outcome_count < PALPAL_AGENT_VISIBLE_OUTCOME_CAPACITY)
+   {
+      index = g_agent_visible_outcome_count++;
+   }
+   else
+   {
+      memmove(&g_agent_visible_outcomes[0], &g_agent_visible_outcomes[1],
+         sizeof(g_agent_visible_outcomes[0]) * (PALPAL_AGENT_VISIBLE_OUTCOME_CAPACITY - 1));
+      index = PALPAL_AGENT_VISIBLE_OUTCOME_CAPACITY - 1;
+   }
+   outcome = &g_agent_visible_outcomes[index];
+   memcpy(outcome, &g_agent_visible_active, sizeof(*outcome));
+   memset(&g_agent_visible_active, 0, sizeof(g_agent_visible_active));
+}
+
+VOID
+PALPAL_AgentVisibleNumber(
+   BOOL fEnemy,
+   WORD wTargetIndex,
+   BOOL fMP,
+   SHORT sChange
+)
+{
+   int index;
+   if (!g_agent_visible_active.valid || sChange == 0 ||
+       g_agent_visible_active.number_count >= PALPAL_AGENT_VISIBLE_NUMBER_CAPACITY)
+      return;
+   index = g_agent_visible_active.number_count++;
+   g_agent_visible_active.numbers[index].enemy = fEnemy;
+   g_agent_visible_active.numbers[index].target_index = wTargetIndex;
+   g_agent_visible_active.numbers[index].mp = fMP;
+   g_agent_visible_active.numbers[index].change = sChange;
 }
 
 VOID
@@ -3083,6 +3262,8 @@ PALPAL_AgentBattleEnd(
 {
    int i;
 
+   PALPAL_AgentVisibleActionEnd();
+
    memset(&g_agent_last_battle, 0, sizeof(g_agent_last_battle));
    g_agent_last_battle.valid = TRUE;
    g_agent_last_battle.generation = g_agent_battle.generation;
@@ -3119,6 +3300,9 @@ PALPAL_AgentBattleEnd(
          g_agent_last_battle.player_level_after[i] = gpGlobals->g.PlayerRoles.rgwLevel[role];
       }
    }
+   g_agent_last_battle.visible_outcome_count = g_agent_visible_outcome_count;
+   memcpy(g_agent_last_battle.visible_outcomes, g_agent_visible_outcomes,
+      sizeof(g_agent_last_battle.visible_outcomes));
    g_agent_battle.phase = kPalpalAgentBattleNone;
    g_agent_battle.awaiting_ack = FALSE;
 }
@@ -3845,6 +4029,171 @@ PALPAL_AgentWriteEnemyPoisons(
    fprintf(fp, "]");
 }
 
+static BOOL
+PALPAL_AgentPoisonListsDiffer(
+   WORD *before,
+   WORD *after
+)
+{
+   int i;
+   for (i = 0; i < MAX_POISONS; i++)
+      if (before[i] != after[i]) return TRUE;
+   return FALSE;
+}
+
+static VOID
+PALPAL_AgentWriteVisiblePoisonIds(
+   FILE *fp,
+   WORD *values
+)
+{
+   int i, first = 1;
+   fprintf(fp, "[");
+   for (i = 0; i < MAX_POISONS; i++)
+   {
+      if (values[i] == 0) continue;
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"poison_id\":%u,\"name\":", values[i]);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(values[i]));
+      fprintf(fp, "}");
+      first = 0;
+   }
+   fprintf(fp, "]");
+}
+
+static VOID
+PALPAL_AgentWriteVisibleOutcome(
+   FILE *fp,
+   PALPALAGENTVISIBLEOUTCOME *outcome
+)
+{
+   int i, first, numeric = outcome->number_count > 0;
+   fprintf(fp, "{\"sequence\":%u,\"actor\":{\"side\":\"%s\",\"index\":%u",
+      (unsigned int)outcome->sequence,
+      outcome->player_actor ? "player" : "enemy", outcome->actor_index);
+   if (outcome->player_actor)
+   {
+      fprintf(fp, ",\"role_id\":%u,\"name\":", outcome->actor_role);
+      PALPAL_AgentWriteJsonWideString(fp,
+         PAL_GetWord(gpGlobals->g.PlayerRoles.rgwName[outcome->actor_role]));
+   }
+   else
+   {
+      WORD enemy_object_id = outcome->actor_index < MAX_ENEMIES_IN_TEAM
+         ? outcome->enemy_object_id[outcome->actor_index] : 0;
+      fprintf(fp, ",\"object_id\":%u,\"name\":", enemy_object_id);
+      PALPAL_AgentWriteJsonWideString(fp, enemy_object_id ? PAL_GetWord(enemy_object_id) : L"");
+   }
+   fprintf(fp, "},\"action\":{\"action_type\":\"%s\"",
+      outcome->player_actor
+         ? PALPAL_AgentBattleActionName((BATTLEACTIONTYPE)outcome->action_type)
+         : "enemy_action");
+   if (outcome->player_actor && outcome->object_id)
+   {
+      fprintf(fp, ",\"object_id\":%u,\"name\":", outcome->object_id);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(outcome->object_id));
+   }
+   if (outcome->player_actor && outcome->mp_cost > 0)
+      fprintf(fp, ",\"mp_cost\":%d", outcome->mp_cost);
+   fprintf(fp, "},\"target\":{\"index\":%d", outcome->target_index);
+   if (outcome->target_object_id)
+   {
+      fprintf(fp, ",\"side\":\"enemy\",\"object_id\":%u,\"name\":",
+         outcome->target_object_id);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(outcome->target_object_id));
+   }
+   else if (outcome->target_index == -1)
+      fprintf(fp, ",\"mode\":\"all\"");
+   fprintf(fp, "},\"player_changes\":[");
+   first = 1;
+   for (i = 0; i < MAX_PLAYERS_IN_PARTY; i++)
+   {
+      BOOL status_changed = memcmp(outcome->player_status_before[i],
+         outcome->player_status_after[i], sizeof(outcome->player_status_before[i])) != 0;
+      BOOL poison_changed = PALPAL_AgentPoisonListsDiffer(
+         outcome->player_poison_before[i], outcome->player_poison_after[i]);
+      if (outcome->player_hp_before[i] == outcome->player_hp_after[i] &&
+          outcome->player_mp_before[i] == outcome->player_mp_after[i] &&
+          !status_changed && !poison_changed) continue;
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"index\":%d,\"hp\":{\"before\":%u,\"after\":%u,\"max\":%u},"
+         "\"mp\":{\"before\":%u,\"after\":%u,\"max\":%u},\"knocked_out\":%s,"
+         "\"status_before\":",
+         i, outcome->player_hp_before[i], outcome->player_hp_after[i],
+         outcome->player_hp_max[i], outcome->player_mp_before[i],
+         outcome->player_mp_after[i], outcome->player_mp_max[i],
+         outcome->player_hp_after[i] == 0 ? "true" : "false");
+      PALPAL_AgentWriteStatusEffects(fp, outcome->player_status_before[i]);
+      fprintf(fp, ",\"status_after\":");
+      PALPAL_AgentWriteStatusEffects(fp, outcome->player_status_after[i]);
+      fprintf(fp, ",\"poisons_before\":");
+      PALPAL_AgentWriteVisiblePoisonIds(fp, outcome->player_poison_before[i]);
+      fprintf(fp, ",\"poisons_after\":");
+      PALPAL_AgentWriteVisiblePoisonIds(fp, outcome->player_poison_after[i]);
+      fprintf(fp, "}");
+      first = 0;
+   }
+   fprintf(fp, "],\"enemy_changes\":[");
+   first = 1;
+   for (i = 0; i < MAX_ENEMIES_IN_TEAM; i++)
+   {
+      int delta;
+      if (!outcome->enemy_object_id[i] ||
+          outcome->enemy_hp_before[i] == outcome->enemy_hp_after[i]) continue;
+      delta = (SHORT)(outcome->enemy_hp_after[i] - outcome->enemy_hp_before[i]);
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"slot_index\":%d,\"object_id\":%u,\"name\":",
+         i, outcome->enemy_object_id[i]);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(outcome->enemy_object_id[i]));
+      fprintf(fp, ",\"amount\":%d,\"kind\":\"%s\"}",
+         delta < 0 ? -delta : delta, delta < 0 ? "damage" : "recovery");
+      first = 0;
+   }
+   fprintf(fp, "],\"numbers\":[");
+   for (i = 0; i < outcome->number_count; i++)
+   {
+      SHORT change = outcome->numbers[i].change;
+      WORD index = outcome->numbers[i].target_index;
+      if (i > 0) fprintf(fp, ",");
+      fprintf(fp, "{\"side\":\"%s\",\"target_index\":%u,\"stat\":\"%s\","
+         "\"amount\":%d,\"kind\":\"%s\"",
+         outcome->numbers[i].enemy ? "enemy" : "player", index,
+         outcome->numbers[i].mp ? "mp" : "hp",
+         change < 0 ? -change : change, change < 0 ? "damage" : "recovery");
+      if (outcome->numbers[i].enemy && index < MAX_ENEMIES_IN_TEAM &&
+          outcome->enemy_object_id[index])
+      {
+         fprintf(fp, ",\"object_id\":%u,\"name\":", outcome->enemy_object_id[index]);
+         PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(outcome->enemy_object_id[index]));
+      }
+      else if (!outcome->numbers[i].enemy && index <= gpGlobals->wMaxPartyMemberIndex)
+      {
+         WORD role = gpGlobals->rgParty[index].wPlayerRole;
+         fprintf(fp, ",\"role_id\":%u,\"name\":", role);
+         PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(gpGlobals->g.PlayerRoles.rgwName[role]));
+      }
+      fprintf(fp, "}");
+   }
+   fprintf(fp, "],\"no_numeric_change_observed\":%s}", numeric ? "false" : "true");
+}
+
+static VOID
+PALPAL_AgentWriteVisibleOutcomes(
+   FILE *fp,
+   PALPALAGENTVISIBLEOUTCOME *outcomes,
+   int count
+)
+{
+   int i;
+   fprintf(fp, "\"visible_outcomes\":[");
+   for (i = 0; i < count; i++)
+   {
+      if (i > 0) fprintf(fp, ",");
+      PALPAL_AgentWriteVisibleOutcome(fp, &outcomes[i]);
+   }
+   fprintf(fp, "]");
+}
+
 static VOID
 PALPAL_AgentWriteBattleTargets(
    FILE *fp,
@@ -4275,6 +4624,9 @@ PALPAL_AgentWriteBattle(
    }
    fprintf(fp, "],");
    PALPAL_AgentWriteBattleActions(fp);
+   fprintf(fp, ",");
+   PALPAL_AgentWriteVisibleOutcomes(fp, g_agent_visible_outcomes,
+      g_agent_visible_outcome_count);
    fprintf(fp, "}");
 }
 
@@ -4348,7 +4700,10 @@ PALPAL_AgentWriteLastBattle(
       fprintf(fp, "]}");
       first = 0;
    }
-   fprintf(fp, "]}");
+   fprintf(fp, "],");
+   PALPAL_AgentWriteVisibleOutcomes(fp, g_agent_last_battle.visible_outcomes,
+      g_agent_last_battle.visible_outcome_count);
+   fprintf(fp, "}");
 }
 
 static const char *

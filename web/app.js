@@ -35,6 +35,7 @@ const goalsClose = document.getElementById("goalsClose");
 const goalsSummary = document.getElementById("goalsSummary");
 const goalsContent = document.getElementById("goalsContent");
 const roomMemoDialog = document.getElementById("roomMemoDialog");
+const roomMemoTitle = document.getElementById("roomMemoTitle");
 const roomMemoClose = document.getElementById("roomMemoClose");
 const roomMemoRoom = document.getElementById("roomMemoRoom");
 const roomMemoContent = document.getElementById("roomMemoContent");
@@ -121,6 +122,8 @@ let roomMemoLoading = false;
 let roomMemoError = null;
 let roomMemoRequestId = 0;
 let roomMemoDialogTrigger = null;
+let memoMode = "room";
+let battleMemo = null;
 let selectedStateTab = localStorage.getItem("palpal.stateTab") === "agent" ? "agent" : "normal";
 let agentMaxTurns = Math.max(1, Math.min(Number(localStorage.getItem("palpal.agentMaxTurns") || 10), 100));
 let checkpoints = [];
@@ -2544,6 +2547,12 @@ function render(state) {
     if (cachedNavigation) state._navigation = cachedNavigation;
   }
   latestState = state;
+  const nextMemoMode = state.in_battle ? "battle" : "room";
+  if (roomMemoDialog?.open && memoMode !== nextMemoMode) {
+    memoMode = nextMemoMode;
+    battleMemo = null;
+    refreshRoomMemo();
+  }
   renderStatusBar(state);
   renderJson(state);
   renderSummary(state);
@@ -2852,11 +2861,14 @@ function renderAgentSession() {
         <button data-session-action="execute" ${running || !pending ? "disabled" : ""}>Execute</button>
         <button data-session-action="reset" ${running ? "disabled" : ""}>Reset Session</button>
         <button data-goals-open>Goals (<span data-goals-count>…</span>)</button>
-        <button class="roomMemoButton" data-room-memo-open>Room Memo</button>
+        <button class="roomMemoButton" data-room-memo-open>${inBattle ? "Battle Memo" : "Room Memo"}</button>
       </div>`;
     agentSessionControlsRenderKey = controlsRenderKey;
   }
   renderGoalsButtonCount();
+  if (roomMemoDialog?.open) {
+    roomMemoDialogTrigger = agentSessionControlsEl.querySelector("[data-room-memo-open]") || roomMemoDialogTrigger;
+  }
   renderAgentTimeline();
 }
 
@@ -2934,6 +2946,59 @@ function closeGoalsDialog() {
 
 function renderRoomMemoDialog() {
   if (!roomMemoRoom || !roomMemoContent) return;
+  const battleMode = memoMode === "battle";
+  if (roomMemoTitle) roomMemoTitle.textContent = battleMode ? "Battle Memo" : "Room Memo";
+  if (roomMemoClose) roomMemoClose.setAttribute("aria-label", battleMode ? "Close battle memo" : "Close room memo");
+  if (battleMode) {
+    const enemies = battleMemo?.enemies || [];
+    roomMemoRoom.textContent = battleMemo
+      ? `${enemies.map((enemy) => `${enemy.name || "Enemy"} (#${Number(enemy.object_id || 0)})`).join(" · ")} · ${battleMemo.signature || "-"}`
+      : "Current encounter";
+    if (roomMemoLoading) {
+      roomMemoContent.innerHTML = '<div class="goalsMessage">Loading battle memo…</div>';
+      return;
+    }
+    if (roomMemoError) {
+      roomMemoContent.innerHTML = `<div class="goalsError">${escapeHtml(roomMemoError)}<br><button class="goalsRetry" type="button" data-room-memo-retry>Retry</button></div>`;
+      return;
+    }
+    const actions = battleMemo?.action_experience || [];
+    const outcomes = battleMemo?.recent_outcomes || [];
+    const encounterSamples = battleMemo?.encounter_experience?.samples || [];
+    if (!actions.length && !outcomes.length && !encounterSamples.length) {
+      roomMemoContent.innerHTML = '<div class="goalsEmpty">尚无玩家可见的战斗经验</div>';
+      return;
+    }
+    const changeText = (sample) => {
+      const numbers = (sample.numbers || []).map((number) => `${number.name || number.side || "target"} ${number.stat || "value"} ${number.kind || "change"} ${Number(number.amount || 0)}`);
+      const enemy = (sample.enemy_changes || []).map((change) => `${change.name || `#${change.object_id}`} ${change.kind || "change"} ${Number(change.amount || 0)}`);
+      const party = (sample.player_changes || []).flatMap((change) => {
+        const values = [];
+        if (change.hp && change.hp.before !== change.hp.after) values.push(`HP ${Number(change.hp.before)}→${Number(change.hp.after)}/${Number(change.hp.max || 0)}`);
+        if (change.mp && change.mp.before !== change.mp.after) values.push(`MP ${Number(change.mp.before)}→${Number(change.mp.after)}/${Number(change.mp.max || 0)}`);
+        return values;
+      });
+      return [...(numbers.length ? numbers : enemy), ...party].join(" · ") || (sample.no_numeric_change_observed ? "No numeric change observed" : "Visible status change");
+    };
+    const actionCards = actions.map((entry) => {
+      const samples = entry.samples || [];
+      const latest = samples[samples.length - 1] || {};
+      const mp = latest.mp_cost == null ? "" : ` · ${Number(latest.mp_cost)} MP`;
+      return `<article class="roomMemoCard"><strong>${escapeHtml(entry.actor_name || `Role #${entry.actor_role_id}`)} · ${escapeHtml(entry.name || entry.action_type || "action")}${mp}</strong><p>${escapeHtml(changeText(latest))}</p><div class="muted">${samples.length} visible sample${samples.length === 1 ? "" : "s"}</div></article>`;
+    }).join("");
+    const outcomeCards = outcomes.map((sample) => `<article class="roomMemoCard"><strong>${escapeHtml(sample.actor?.name || sample.actor_side || "Actor")} · ${escapeHtml(sample.name || sample.action_type || "action")}</strong><p>${escapeHtml(changeText(sample))}</p></article>`).join("");
+    const counts = encounterSamples.reduce((result, sample) => {
+      const key = ["won", "lost", "fled"].includes(sample.result) ? sample.result : "other";
+      result[key] = (result[key] || 0) + 1;
+      return result;
+    }, {});
+    const recentTactics = encounterSamples.length ? (encounterSamples[encounterSamples.length - 1].tactics || []).map((sample) => `${sample.actor?.name || "Player"}: ${sample.name || sample.action_type || "action"} (${changeText(sample)})`).join(" · ") : "";
+    roomMemoContent.innerHTML = `
+      <section class="roomMemoSection"><h3>Current visible outcomes</h3>${outcomeCards || '<div class="goalsEmpty">No completed visible action yet.</div>'}</section>
+      <section class="roomMemoSection"><h3>Relevant action samples</h3>${actionCards || '<div class="goalsEmpty">No action samples for this encounter.</div>'}</section>
+      <section class="roomMemoSection"><h3>Encounter history</h3>${encounterSamples.length ? `<p>Won ${Number(counts.won || 0)} · Lost ${Number(counts.lost || 0)} · Fled ${Number(counts.fled || 0)}</p>${recentTactics ? `<p>${escapeHtml(recentTactics)}</p>` : ""}` : '<div class="goalsEmpty">No history for this complete enemy lineup.</div>'}</section>`;
+    return;
+  }
   roomMemoRoom.textContent = roomMemoRoomId || "Current room unavailable";
   if (roomMemoLoading) {
     roomMemoContent.innerHTML = '<div class="goalsMessage">Loading room memo…</div>';
@@ -2972,22 +3037,32 @@ function renderRoomMemoDialog() {
 
 async function refreshRoomMemo() {
   const requestId = ++roomMemoRequestId;
+  const requestedMode = memoMode;
   roomMemoLoading = true;
   roomMemoError = null;
   renderRoomMemoDialog();
   try {
-    const response = await fetch("/agent/room-memo");
+    const response = await fetch(requestedMode === "battle" ? "/agent/battle-memo" : "/agent/room-memo");
     const result = await response.json().catch(() => ({}));
-    if (!response.ok || !result.ok) throw new Error(result.error || `room memo unavailable: ${response.status}`);
-    if (requestId !== roomMemoRequestId) return;
-    roomMemoRoomId = result.room_id || null;
-    roomMemo = result.memo || null;
-    roomMemoRecent = Array.isArray(result.recent_memos) ? result.recent_memos.slice(0, 5) : [];
+    if (requestId !== roomMemoRequestId || requestedMode !== memoMode) return;
+    if (requestedMode === "battle" && result.status === "not_in_battle") {
+      memoMode = "room";
+      refreshRoomMemo();
+      return;
+    }
+    if (!response.ok || !result.ok) throw new Error(result.error || `${requestedMode} memo unavailable: ${response.status}`);
+    if (requestedMode === "battle") {
+      battleMemo = result;
+    } else {
+      roomMemoRoomId = result.room_id || null;
+      roomMemo = result.memo || null;
+      roomMemoRecent = Array.isArray(result.recent_memos) ? result.recent_memos.slice(0, 5) : [];
+    }
   } catch (error) {
-    if (requestId !== roomMemoRequestId) return;
+    if (requestId !== roomMemoRequestId || requestedMode !== memoMode) return;
     roomMemoError = error instanceof Error ? error.message : String(error);
   } finally {
-    if (requestId !== roomMemoRequestId) return;
+    if (requestId !== roomMemoRequestId || requestedMode !== memoMode) return;
     roomMemoLoading = false;
     renderRoomMemoDialog();
   }
@@ -2995,12 +3070,20 @@ async function refreshRoomMemo() {
 
 function openRoomMemoDialog(trigger) {
   roomMemoDialogTrigger = trigger || document.activeElement;
+  memoMode = latestState?.in_battle ? "battle" : "room";
   if (!roomMemoDialog?.open) roomMemoDialog?.showModal();
   refreshRoomMemo();
 }
 
 function closeRoomMemoDialog() {
   if (roomMemoDialog?.open) roomMemoDialog.close();
+}
+
+function restoreRoomMemoFocus(trigger) {
+  const focusTarget = trigger?.isConnected
+    ? trigger
+    : agentSessionControlsEl?.querySelector("[data-room-memo-open]");
+  focusTarget?.focus?.();
 }
 
 function eventIcon(event) {
@@ -3226,7 +3309,7 @@ roomMemoDialog?.addEventListener("click", (event) => {
 roomMemoDialog?.addEventListener("close", () => {
   const trigger = roomMemoDialogTrigger;
   roomMemoDialogTrigger = null;
-  trigger?.focus?.();
+  restoreRoomMemoFocus(trigger);
 });
 
 agentSessionControlsEl?.addEventListener("change", (event) => {

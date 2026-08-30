@@ -517,9 +517,9 @@ async function main() {
       || !goalsModalResult.permanentGoalRemoved
       || !goalsModalResult.opened
       || !goalsModalResult.closedFromBackdrop
-      || JSON.stringify(goalsModalResult.groupHeadings) !== JSON.stringify(["Active", "Completed", "Abandoned"])
+      || JSON.stringify(goalsModalResult.groupHeadings) !== JSON.stringify(["Active", "Dormant", "Completed", "Abandoned"])
       || JSON.stringify(goalsModalResult.cardStatuses) !== JSON.stringify(["Active", "Active", "Completed", "Abandoned"])
-      || goalsModalResult.summary !== "2 active · 1 completed · 1 abandoned"
+      || goalsModalResult.summary !== "2 active · 0 dormant · 1 completed · 1 abandoned"
       || !goalsModalResult.countLabel?.includes("Goals (2)")
       || !goalsModalResult.ignoresGameKeys
       || !goalsModalResult.restoredFocus
@@ -603,11 +603,104 @@ async function main() {
     ) {
       throw new Error(`room memo modal smoke failed (${JSON.stringify(roomMemoModalResult)})`);
     }
+    const battleMemoModal = await cdp.send(
+      "Runtime.evaluate",
+      {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const originalFetch = window.fetch;
+          const originalState = latestState;
+          try {
+            window.fetch = async (url, options) => {
+              if (url === "/agent/battle-memo") {
+                return {
+                  ok: true,
+                  json: async () => ({
+                    ok: true,
+                    status: "in_battle",
+                    battle_generation: 7,
+                    enemies: [{ slot_index: 0, object_id: 81, name: "灯笼" }],
+                    signature: "81",
+                    recent_outcomes: [{
+                      actor: { name: "李逍遥" }, actor_side: "player",
+                      action_type: "magic", name: "炎咒", mp_cost: 8,
+                      enemy_changes: [{ object_id: 81, name: "灯笼", amount: 23, kind: "damage" }],
+                      player_changes: [], no_numeric_change_observed: false,
+                    }],
+                    action_experience: [{
+                      actor_role_id: 0, actor_name: "李逍遥", action_type: "magic",
+                      object_id: 327, name: "炎咒", enemy_object_id: 81,
+                      samples: [{
+                        mp_cost: 8,
+                        enemy_changes: [{ object_id: 81, name: "灯笼", amount: 23, kind: "damage" }],
+                        player_changes: [],
+                      }],
+                    }],
+                    encounter_experience: { samples: [{ result: "won", tactics: [] }] },
+                  }),
+                };
+              }
+              return originalFetch(url, options);
+            };
+            render({
+              ...latestState,
+              in_battle: true,
+              battle: {
+                generation: 7, phase: "command", players: [], enemies: [],
+                available_actions: [], visible_outcomes: [],
+              },
+            });
+            const button = [...document.querySelectorAll(".agentSessionButtons button")]
+              .find((item) => item.textContent.includes("Battle Memo"));
+            button?.focus();
+            button?.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const dialog = document.getElementById("roomMemoDialog");
+            const content = document.getElementById("roomMemoContent")?.textContent || "";
+            const result = {
+              buttonLabel: button?.textContent,
+              opened: dialog.open,
+              title: document.getElementById("roomMemoTitle")?.textContent,
+              closeLabel: document.getElementById("roomMemoClose")?.getAttribute("aria-label"),
+              enemySummary: document.getElementById("roomMemoRoom")?.textContent,
+              hasAction: content.includes("炎咒") && content.includes("23"),
+              hasHistory: content.includes("Won 1"),
+              excludesOtherLineups: !content.includes("Recent room memo"),
+            };
+            dialog.click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            result.closedFromBackdrop = !dialog.open;
+            result.restoredFocus = document.activeElement === button;
+            return result;
+          } finally {
+            window.fetch = originalFetch;
+            if (originalState) render(originalState);
+          }
+        })()`,
+      },
+      sessionId
+    );
+    const battleMemoModalResult = battleMemoModal.result?.value;
+    if (
+      !battleMemoModalResult?.buttonLabel?.includes("Battle Memo")
+      || !battleMemoModalResult.opened
+      || battleMemoModalResult.title !== "Battle Memo"
+      || battleMemoModalResult.closeLabel !== "Close battle memo"
+      || !battleMemoModalResult.enemySummary?.includes("灯笼 (#81)")
+      || !battleMemoModalResult.hasAction
+      || !battleMemoModalResult.hasHistory
+      || !battleMemoModalResult.excludesOtherLineups
+      || !battleMemoModalResult.closedFromBackdrop
+      || !battleMemoModalResult.restoredFocus
+    ) {
+      throw new Error(`battle memo modal smoke failed (${JSON.stringify(battleMemoModalResult)})`);
+    }
     if (roomMemoOnly) {
       if (cdp.exceptions.length) {
         throw new Error(`console exceptions: ${cdp.exceptions.join("; ")}`);
       }
-      console.log("room memo visual smoke ok: current room plus 5 recent memos");
+      console.log("memo visual smoke ok: room history and current battle experience");
       ws.close();
       return;
     }

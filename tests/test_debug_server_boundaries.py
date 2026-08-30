@@ -395,6 +395,41 @@ def test_http_handler_exposes_current_room_memo_read_only(http_server):
     ]
 
 
+def test_http_handler_exposes_only_current_battle_memo(http_server):
+    base_url, debug = http_server
+
+    status, _, raw = http_request(base_url, "/agent/battle-memo")
+    assert status == 200
+    assert json.loads(raw) == {"ok": False, "status": "not_in_battle"}
+
+    state = make_state(frame=8)
+    state.update({
+        "game_instance_id": "game-a",
+        "in_battle": True,
+        "battle": {
+            "generation": 3,
+            "phase": "command",
+            "players": [],
+            "enemies": [{"slot_index": 0, "present": True, "object_id": 81, "name": "灯笼", "hp": 999}],
+            "available_actions": [],
+            "visible_outcomes": [],
+        },
+    })
+    write_state(debug, state)
+    status, _, raw = http_request(base_url, "/agent/battle-memo")
+    payload = json.loads(raw)
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["signature"] == "81"
+    assert payload["enemies"] == [{"slot_index": 0, "object_id": 81, "name": "灯笼"}]
+    assert "hp" not in raw.decode("utf-8")
+
+    debug.companion_owner_path.write_text(json.dumps({"session_id": "different"}), encoding="utf-8")
+    status, _, raw = http_request(base_url, "/agent/battle-memo")
+    assert status == 200
+    assert json.loads(raw)["error"] == "companion_owner_mismatch"
+
+
 def test_http_handler_exposes_structured_shop_actions(http_server):
     base_url, debug = http_server
     calls = []

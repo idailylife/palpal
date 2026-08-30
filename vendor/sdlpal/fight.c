@@ -20,6 +20,7 @@
 //
 
 #include "main.h"
+#include "agent.h"
 #include <math.h>
 
 //#define INVINCIBLE 1
@@ -636,6 +637,7 @@ PAL_BattleDisplayStatChange(
          // Show the number of damage
          //
          sDamage = g_Battle.rgEnemy[i].e.wHealth - g_Battle.rgEnemy[i].wPrevHP;
+         PALPAL_AgentVisibleNumber(TRUE, i, FALSE, sDamage);
 
          x = PAL_X(g_Battle.rgEnemy[i].pos) - 9;
          y = PAL_Y(g_Battle.rgEnemy[i].pos) - 115;
@@ -666,6 +668,7 @@ PAL_BattleDisplayStatChange(
       {
          sDamage =
             gpGlobals->g.PlayerRoles.rgwHP[wPlayerRole] - g_Battle.rgPlayer[i].wPrevHP;
+         PALPAL_AgentVisibleNumber(FALSE, i, FALSE, sDamage);
 
          x = PAL_X(g_Battle.rgPlayer[i].pos) - 9;
          y = PAL_Y(g_Battle.rgPlayer[i].pos) - 75;
@@ -705,6 +708,7 @@ PAL_BattleDisplayStatChange(
          //
          if (sDamage > 0)
          {
+            PALPAL_AgentVisibleNumber(FALSE, i, TRUE, sDamage);
             PAL_BattleUIShowNum((WORD)(sDamage), PAL_XY(x, y), kNumColorCyan);
          }
 
@@ -3612,6 +3616,9 @@ PAL_BattlePlayerPerformAction(
    PAL_BattleBackupStat();
 
    sTarget = g_Battle.rgPlayer[wPlayerIndex].action.sTarget;
+   PALPAL_AgentVisibleActionBegin(TRUE, wPlayerIndex,
+      g_Battle.rgPlayer[wPlayerIndex].action.ActionType,
+      g_Battle.rgPlayer[wPlayerIndex].action.wActionID, sTarget);
 
    switch (g_Battle.rgPlayer[wPlayerIndex].action.ActionType)
    {
@@ -4483,6 +4490,7 @@ PAL_BattlePlayerPerformAction(
       }
    }
 #endif
+   PALPAL_AgentVisibleActionEnd();
 }
 
 static INT
@@ -4576,6 +4584,7 @@ PAL_BattleEnemyPerformAction(
    g_Battle.iBlow = 0;
 
    sTarget = PAL_BattleEnemySelectTargetIndex();
+   PALPAL_AgentVisibleActionBegin(FALSE, wEnemyIndex, 0, 0, sTarget);
    wPlayerRole = gpGlobals->rgParty[sTarget].wPlayerRole;
    wMagic = g_Battle.rgEnemy[wEnemyIndex].e.wMagic;
 
@@ -5187,6 +5196,7 @@ end:
 #else
    i = 0; // do nothing
 #endif
+   PALPAL_AgentVisibleActionEnd();
 }
 
 VOID
