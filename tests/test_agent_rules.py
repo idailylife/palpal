@@ -409,6 +409,7 @@ def test_interaction_no_effect_is_recorded_and_deprioritizes_target(tmp_path):
         75,
         action={'buttons': ['search'], 'frames': 1},
     )
+    debug.pending_interaction_observation['sent_at'] -= 1.0
     next_state = make_state(objects=[target], frame=30)
     debug.observe_pending_interaction_outcome(next_state)
 
@@ -634,6 +635,39 @@ def test_interaction_effect_attributes_object_change_to_search_target(tmp_path):
     assert debug.observations.get(observation_id)['status'] == 'completed'
 
 
+def test_interaction_no_effect_waits_for_delayed_search_effect(tmp_path):
+    target = {
+        'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 2,
+        'trigger_mode': 2, 'trigger_script': 2397, 'auto_script': 0,
+        'blocking': True, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[target], frame=20)
+    state['inventory'] = [{'item_id': 87, 'amount': 1, 'amount_in_use': 0}]
+    observation_id = debug.mark_pending_interaction_observation(
+        state, 75, action={'buttons': ['search'], 'frames': 1},
+    )
+    debug.pending_interaction_observation['sent_at'] -= 0.2
+
+    unchanged = make_state(objects=[target], frame=29)
+    unchanged['inventory'] = [{'item_id': 87, 'amount': 1, 'amount_in_use': 0}]
+    assert debug.observe_pending_interaction_outcome(unchanged) is None
+    assert debug.pending_interaction_observation is not None
+    assert debug.event_log == []
+
+    changed = make_state(
+        objects=[{**target, 'trigger_script': 887}],
+        frame=30,
+    )
+    changed['inventory'] = [{'item_id': 87, 'amount': 2, 'amount_in_use': 0}]
+    outcome = debug.observe_pending_interaction_outcome(changed)
+
+    assert outcome['object_changes']['trigger_script'] == {'from': 2397, 'to': 887}
+    assert outcome['inventory_changes'] == [{'item_id': 87, 'delta': 1, 'amount': 2}]
+    assert debug.event_log[-1]['type'] == 'interaction_effect'
+    assert debug.observations.get(observation_id)['status'] == 'completed'
+
+
 def test_interaction_observation_does_not_finish_before_action_is_armed(tmp_path):
     target = {'id': 75, 'x': 16, 'y': 8, 'state': 1, 'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0, 'blocking': False, 'interactable': True}
     debug = make_debug_state(tmp_path)
@@ -651,6 +685,7 @@ def test_interaction_observation_does_not_finish_before_action_is_armed(tmp_path
     )
     debug.pending_interaction_observation['action'] = {'buttons': ['search'], 'frames': 1}
     debug.pending_interaction_observation['armed'] = True
+    debug.pending_interaction_observation['sent_at'] -= 1.0
     debug.observe_pending_interaction_outcome(later)
     assert debug.event_log[-1]['type'] == 'interaction_no_effect'
 

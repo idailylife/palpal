@@ -98,6 +98,7 @@ GAME_CONTROL_TIMEOUT_SECONDS = 30.0
 TRANSITION_STABLE_SNAPSHOTS = 2
 MAX_NAVIGATION_SEGMENT_STEPS = 8
 IMMEDIATE_ENTRY_RETURN_MAX_STEPS = 4
+INTERACTION_NO_EFFECT_MIN_SECONDS = 0.7
 VIEWPORT_WIDTH = 320
 VIEWPORT_HEIGHT = 200
 OPENING_LI_XIAOYAO_MONOLOGUE_MESSAGES = {1956, 1957, 1958, 1962, 1963, 1964}
@@ -3382,7 +3383,8 @@ class DebugState:
 
         elapsed_frames = (current_frame - start_frame) if current_frame is not None and start_frame is not None else None
         elapsed_time = time.time() - float(pending.get("sent_at") or time.time())
-        if (elapsed_frames is not None and elapsed_frames >= 8) or elapsed_time >= 0.7:
+        enough_frames = elapsed_frames is None or elapsed_frames >= 8
+        if enough_frames and elapsed_time >= INTERACTION_NO_EFFECT_MIN_SECONDS:
             payload = {
                 **base_payload,
                 "elapsed_frames": elapsed_frames,
@@ -11094,8 +11096,6 @@ class DebugState:
         if not isinstance(context, dict):
             return targets, None
         status = context.get("status")
-        if status == "progressed":
-            return targets, context
         identity = self.room_identity(state)
         with self.exploration_lock:
             exploration = self.read_exploration()
@@ -11119,7 +11119,7 @@ class DebugState:
                         "agent_priority": "resume_interrupted_entry",
                     })
                     target.pop("deprioritize_reason", None)
-            elif status == "entered" and target.get("transition_candidate") is True:
+            elif status in {"entered", "progressed"} and target.get("transition_candidate") is True:
                 known_return = bool(
                     target.get("known_destination")
                     and target.get("known_destination_room_id") == context.get("source_room_id")

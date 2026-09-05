@@ -593,13 +593,13 @@ def test_recovery_then_selected_entry_return_does_not_rearm_recovery(tmp_path):
     assert returned["destination_room_id"] == debug.room_identity(source)["id"]
 
 
-def test_non_entry_navigation_progress_consumes_immediate_return_guard(tmp_path):
+def test_non_entry_navigation_progress_preserves_entry_return_guard(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
-    state = make_state(objects=[
+    state = make_state(width=7, height=5, objects=[
         transition_object(758, 32, 0, 13773),
         {
-            "id": 767, "x": 0, "y": 0, "state": 1, "sprite_id": 1,
+            "id": 767, "x": 64, "y": 16, "state": 1, "sprite_id": 1,
             "trigger_mode": 1, "trigger_script": 13790, "auto_script": 0,
             "blocking": False, "interactable": True,
         },
@@ -615,6 +615,27 @@ def test_non_entry_navigation_progress_consumes_immediate_return_guard(tmp_path)
         "destination_room_id": debug.room_identity(state)["id"],
         "landing_position": dict(state["party_position"]),
     }
+    return_target = debug.transition_observation_from_state(state, 758)
+    exploration = debug.read_exploration()
+    exploration.setdefault("transitions", {}).setdefault(
+        runtime.state["room_entry_context"]["source_room_id"], {}
+    )["source-key"] = {
+        "transition_key": "source-key",
+        "object_id": 706,
+        "from_room_id": runtime.state["room_entry_context"]["source_room_id"],
+        "to_room_id": runtime.state["room_entry_context"]["destination_room_id"],
+        "confirmation": "native_trigger",
+        "destination_entry_candidate": {
+            "entry_relation": "inferred_entry_return",
+            "object_id": 758,
+            "transition_key": return_target["transition_key"],
+            "transition_key_fields": return_target["transition_key_fields"],
+            "candidate_return_room_id": runtime.state["room_entry_context"]["source_room_id"],
+            "source_transition_key": "source-key",
+            "evidence": {"kind": "native_landing_proximity", "steps": 3, "max_steps": 4},
+        },
+    }
+    debug.write_exploration(exploration)
     runtime._update_room_entry_after_execution(
         state, state, "navigation_step", {"id": 767},
         {"status": "arrived", "progress": [{"status": "stepping"}]},
@@ -622,7 +643,17 @@ def test_non_entry_navigation_progress_consumes_immediate_return_guard(tmp_path)
     assert runtime.snapshot()["room_entry_context"]["status"] == "progressed"
     navigation = debug.run_agent_tool("get_navigation", {}, state)["navigation"]
     target = next(target for target in navigation["targets"] if target["id"] == 758)
-    assert "possible_entry_return" not in target
+    assert target["possible_entry_return"] is True
+    assert target["entry_relation"] == "inferred_entry_return"
+    assert target["agent_priority"] == "avoid_immediate_backtrack"
+
+    write_state(debug, state)
+    rejected = debug.run_agent_tool("submit_decision", {
+        "action": "navigate", "target_id": 758, "reason": "Take the nearest transition.",
+    }, state)["decision"]
+    assert rejected["validation"]["reason"] == "immediate_entry_return"
+    assert rejected["validation"]["alternative_target_ids"] == [767]
+    assert rejected["recommended_action"]["tool"] == "no_op"
 
 
 def test_entry_context_survives_overlay_before_any_navigation_progress(tmp_path):
