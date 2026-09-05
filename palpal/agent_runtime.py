@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -24,11 +25,6 @@ CHECKPOINT_BUNDLE_VERSION = 2
 DEFAULT_COMPACT_AT_TOKENS = 200_000
 DEFAULT_COMPACT_RETAIN_TOKENS = 24_000
 TOOL_OUTPUT_FULL_TOKENS = 8_000
-MODEL_REPLAY_FULL_TOKENS = 2_000
-MODEL_REPLAY_PREVIEW_CHARS = 500
-TOOL_OUTPUT_PRESSURE_TOKENS = 96_000
-TOOL_OUTPUT_PRESSURE_TARGET_TOKENS = 80_000
-TOOL_OUTPUT_RECENT_FULL = 6
 TOOL_OUTPUT_PAGE_CHARS = 6_000
 TOOL_OUTPUT_REF_RE = re.compile(r"tool-[0-9a-f]{32}\.txt")
 EVENT_CACHE_SIZE = 1_000
@@ -39,70 +35,6 @@ AGENT_REASONING_EFFORT = "high"
 SUMMARY_REASONING_EFFORT = "low"
 
 PROVIDER_USAGE_SCOPES = ("main_decision", "battle", "compaction", "vision")
-
-
-class ToolOutputInputFilter:
-    """Show new tool results once, then use stable reloadable previews."""
-
-    def __init__(self, runtime: "AgentRuntime", historical_call_ids: set[str] | None = None):
-        self.runtime = runtime
-        self.seen_call_ids = set(historical_call_ids or ())
-        self.previews: dict[str, str] = {}
-
-    @staticmethod
-    def _call_id(item: dict) -> str:
-        return str(item.get("call_id") or item.get("id") or "")
-
-    def preview(self, call_id: str, output: str, *, reason: str = "replayed_tool_output") -> str:
-        cached = self.previews.get(call_id)
-        if cached is not None:
-            return cached
-        existing_output_ref = None
-        try:
-            parsed = json.loads(output)
-        except json.JSONDecodeError:
-            parsed = None
-        if (
-            isinstance(parsed, dict)
-            and parsed.get("full_result_archived") is True
-            and self.runtime._valid_output_ref(parsed.get("output_ref"))
-        ):
-            existing_output_ref = parsed["output_ref"]
-        preview = self.runtime._archived_tool_output_preview(
-            output,
-            reason=reason,
-            head_chars=MODEL_REPLAY_PREVIEW_CHARS,
-            tail_chars=MODEL_REPLAY_PREVIEW_CHARS,
-            output_ref=existing_output_ref,
-        )
-        self.previews[call_id] = preview
-        return preview
-
-    def __call__(self, data: Any) -> Any:
-        model_data = data.model_data
-        replacement: list[Any] = []
-        newly_seen: set[str] = set()
-        for item in model_data.input:
-            current = dict(item) if isinstance(item, dict) else item
-            if isinstance(current, dict):
-                current = self.runtime._project_model_transcript_item(current)
-            if isinstance(current, dict) and current.get("type") == "function_call_output":
-                call_id = self._call_id(current)
-                output = current.get("output")
-                if (
-                    call_id
-                    and call_id in self.seen_call_ids
-                    and isinstance(output, str)
-                    and self.runtime._estimate_text_tokens(output) > MODEL_REPLAY_FULL_TOKENS
-                    and not self.runtime._is_archived_tool_preview(output)
-                ):
-                    current["output"] = self.preview(call_id, output)
-                if call_id:
-                    newly_seen.add(call_id)
-            replacement.append(current)
-        # Update only after the whole batch so parallel results are all visible once.
-        self.seen_call_ids.update(newly_seen)
-        return model_data.__class__(input=replacement, instructions=model_data.instructions)
 
 
 class ReplanRequired(RuntimeError):
@@ -383,7 +315,7 @@ class BattleDelegate:
         if provider is None:
             return await self._sdk_action(state, feedback)
         player_state = dict(state)
-        player_state["battle"] = self.debug.player_battle_view(state)
+        player_state["battle"] = self.debug.current_player_battle_view(state)
         player_state["inventory"] = [
             self.debug.player_battle_inventory_item(item)
             for item in state.get("inventory") or []
@@ -407,7 +339,6 @@ class BattleDelegate:
             )
             return action
         try:
-            import agents as agents_sdk
             from agents import (Agent, AsyncOpenAI, FunctionTool, ModelSettings,
                                 OpenAIResponsesModel, Runner, SQLiteSession,
                                 set_tracing_disabled)
@@ -419,7 +350,7 @@ class BattleDelegate:
         submitted: dict | None = None
         runtime = self.runtime
         frozen_window = self._command_window(state)
-        player_battle = self.debug.player_battle_view(state)
+        player_battle = self.debug.current_player_battle_view(state)
 
         async def get_battle(_context: Any, _raw: str) -> str:
             self._emit(
@@ -429,7 +360,7 @@ class BattleDelegate:
             )
             try:
                 latest = self.debug.snapshot()
-                output = {"ok": True, "battle": self.debug.player_battle_view(latest)}
+                output = {"ok": True, "battle": self.debug.current_player_battle_view(latest)}
             except Exception as exc:
                 self._emit(
                     "tool_output",
@@ -442,7 +373,7 @@ class BattleDelegate:
                 "get_battle returned the latest battle state.",
                 {"tool": "get_battle", "output": output},
             )
-            return json.dumps(output, ensure_ascii=False)
+            return runtime._final_model_tool_output(output)
 
         async def get_item_details(_context: Any, raw: str) -> str:
             try:
@@ -511,7 +442,7 @@ class BattleDelegate:
                 ),
                 {"tool": "get_item_details", "output": output},
             )
-            return json.dumps(output, ensure_ascii=False)
+            return runtime._final_model_tool_output(output)
 
         async def submit(_context: Any, raw: str) -> str:
             nonlocal submitted
@@ -654,11 +585,7 @@ class BattleDelegate:
             reset_tool_choice=False,
         )
         session = SQLiteSession(self._control()["child_session_id"], runtime.sqlite_path)
-        input_filter = ToolOutputInputFilter(
-            runtime,
-            runtime._historical_tool_call_ids(await runtime._session_items_or_empty(session)),
-        )
-        run_config = runtime._sdk_run_config(agents_sdk, input_filter)
+        await runtime._migrate_sdk_session_history(session)
         prompt = json.dumps({
             "feedback": feedback,
             "battle": player_battle,
@@ -670,7 +597,7 @@ class BattleDelegate:
         }, ensure_ascii=False, separators=(",", ":"))
         for attempt in range(2):
             stream = Runner.run_streamed(
-                agent, prompt, session=session, max_turns=6, run_config=run_config,
+                agent, prompt, session=session, max_turns=6,
             )
             runtime.active_stream = stream
             try:
@@ -699,14 +626,10 @@ class BattleDelegate:
                     "required queries. Do not end with plain text."
                 )
         if submitted is None:
-            if callable(getattr(session, "get_items", None)):
-                await runtime._sanitize_sdk_session(session, input_filter=input_filter)
             raise RuntimeError(
                 "submit_battle_action_protocol_error: no accepted submit_battle_action "
                 "after correction retry"
             )
-        if callable(getattr(session, "get_items", None)):
-            await runtime._sanitize_sdk_session(session, input_filter=input_filter)
         return submitted
 
     def _summary(self, state: dict, instruction_count: int) -> dict:
@@ -799,7 +722,7 @@ class BattleDelegate:
                     "role": "user",
                     "content": json.dumps(
                         {
-                            "battle": self.debug.player_battle_view({"battle": battle}),
+                            "battle": self.debug.current_player_battle_view({"battle": battle}),
                             "instruction": int(self._control().get("instruction_count") or 0) + 1,
                         },
                         ensure_ascii=False,
@@ -1331,6 +1254,17 @@ class AgentRuntime:
             projected["full_result_archived"] = True
         return projected
 
+    def _final_model_tool_output(self, result: Any) -> str:
+        """Serialize the exact result that the SDK will persist and replay."""
+        output = (
+            result
+            if isinstance(result, str)
+            else json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        )
+        if self._tool_output_needs_archive(output):
+            return self._archived_tool_output_preview(output, reason="output_limit")
+        return output
+
     def _persist(self, value: dict | None = None) -> None:
         value = value or self.state
         value["updated_at"] = _stamp()
@@ -1600,8 +1534,8 @@ class AgentRuntime:
                         break
         return result
 
-    def _project_model_transcript_item(self, item: dict) -> dict:
-        """Filter legacy battle audit payloads at model-input time only."""
+    def _migrate_model_transcript_item(self, item: dict) -> dict:
+        """Purely remove hidden battle fields from one legacy persisted item."""
         def project(value: Any) -> Any:
             if isinstance(value, list):
                 return [project(entry) for entry in value]
@@ -1610,7 +1544,12 @@ class AgentRuntime:
             projected = {}
             for key, entry in value.items():
                 if key == "battle" and isinstance(entry, dict):
-                    projected[key] = self.debug.player_battle_view({"battle": entry})
+                    visible = self.debug.player_battle_view({"battle": entry}) or {}
+                    if isinstance(entry.get("recent_outcomes"), list):
+                        visible["recent_outcomes"] = copy.deepcopy(entry["recent_outcomes"])
+                    if isinstance(entry.get("experience"), dict):
+                        visible["experience"] = copy.deepcopy(entry["experience"])
+                    projected[key] = visible
                 else:
                     projected[key] = project(entry)
             return projected
@@ -1718,6 +1657,104 @@ class AgentRuntime:
         session = SQLiteSession(session_id, self.sqlite_path)
         return list(await session.get_items())
 
+    def _migrate_sqlite_history(self, session_id: str) -> bool:
+        """Atomically migrate one SQLite transcript, returning whether it ran."""
+        connection = sqlite3.connect(str(self.sqlite_path))
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS palpal_session_migrations (
+                    session_id TEXT NOT NULL,
+                    migration TEXT NOT NULL,
+                    migrated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, migration)
+                )
+                """
+            )
+            migration = "append_only_history_v1"
+            if connection.execute(
+                "SELECT 1 FROM palpal_session_migrations WHERE session_id = ? AND migration = ?",
+                (session_id, migration),
+            ).fetchone():
+                connection.rollback()
+                return False
+            rows = connection.execute(
+                "SELECT id, message_data FROM agent_messages WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            for row_id, raw in rows:
+                try:
+                    item = json.loads(raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                migrated = self._migrate_model_transcript_item(item)
+                if migrated != item:
+                    connection.execute(
+                        "UPDATE agent_messages SET message_data = ? WHERE id = ? AND session_id = ?",
+                        (json.dumps(migrated, ensure_ascii=False), row_id, session_id),
+                    )
+            connection.execute(
+                "INSERT INTO palpal_session_migrations (session_id, migration, migrated_at) VALUES (?, ?, ?)",
+                (session_id, migration, _stamp()),
+            )
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    async def _migrate_sdk_session_history(self, session: Any) -> bool:
+        """Run the one-time history migration before a persisted session is used."""
+        session_id = getattr(session, "session_id", None)
+        db_path = getattr(session, "db_path", None)
+        if not isinstance(session_id, str) or not session_id or db_path is None:
+            return False
+        if Path(db_path).resolve() != self.sqlite_path.resolve():
+            return False
+        migrated = await asyncio.to_thread(self._migrate_sqlite_history, session_id)
+        if migrated:
+            details = None
+            control = self.state.get("battle_delegate")
+            if (
+                isinstance(control, dict)
+                and str(control.get("child_session_id") or "") == session_id
+            ):
+                details = {
+                    "battle_delegate": {
+                        "child_session_id": session_id,
+                        "battle_generation": int(control.get("battle_generation") or 0),
+                        "group_id": self.battle_delegate._group_id(control),
+                        "depth": 1,
+                        "status": control.get("status"),
+                    },
+                }
+            self.emit(
+                "session",
+                "history_migrated",
+                "Session history migrated.",
+                details,
+            )
+        return migrated
+
+    def _clear_history_migration_marker(self, session_id: str) -> None:
+        try:
+            connection = sqlite3.connect(str(self.sqlite_path))
+            try:
+                connection.execute(
+                    "DELETE FROM palpal_session_migrations WHERE session_id = ?",
+                    (session_id,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+        except sqlite3.OperationalError:
+            return
+
     async def _replace_sdk_session_items(self, session_id: str, items: list[dict]) -> None:
         try:
             from agents import SQLiteSession
@@ -1729,6 +1766,7 @@ class AgentRuntime:
         await session.clear_session()
         if items:
             await session.add_items(items)
+        self._clear_history_migration_marker(session_id)
 
     async def _clear_sdk_session(self, session_id: str) -> bool:
         try:
@@ -1737,6 +1775,7 @@ class AgentRuntime:
             return False
         session = SQLiteSession(session_id, self.sqlite_path)
         await session.clear_session()
+        self._clear_history_migration_marker(session_id)
         return True
 
     def _checkpoint_tool_outputs(self, checkpoint_dir: Path, session_id: str) -> list[dict]:
@@ -2587,11 +2626,11 @@ class AgentRuntime:
             return 0
         return int(battle.get("generation") or 0)
 
-    async def _sanitize_main_session_after_takeover(self) -> None:
+    async def _migrate_main_session_after_takeover(self) -> None:
         try:
             from agents import SQLiteSession
             session = SQLiteSession(self.state["session_id"], self.sqlite_path)
-            await self._sanitize_sdk_session(session)
+            await self._migrate_sdk_session_history(session)
         except (ImportError, OSError, RuntimeError, TypeError, ValueError):
             return
 
@@ -2613,7 +2652,7 @@ class AgentRuntime:
                     await task
                 except (asyncio.CancelledError, RuntimeError):
                     pass
-                await self._sanitize_main_session_after_takeover()
+                await self._migrate_main_session_after_takeover()
                 raise BattleStarted(latest)
         return await task
 
@@ -2870,7 +2909,6 @@ class AgentRuntime:
     async def _sdk_decide(self, state: dict, feedback: str) -> dict:
         """Use the Agents SDK's streamed Responses runner and local SQLiteSession."""
         try:
-            import agents as agents_sdk
             from agents import (Agent, AsyncOpenAI, FunctionTool, ModelSettings,
                                 OpenAIResponsesModel, Runner, SQLiteSession,
                                 set_tracing_disabled)
@@ -2940,7 +2978,7 @@ class AgentRuntime:
                     submitted_decision = result["decision"]
                     return json.dumps({"ok": True, "accepted": True}, ensure_ascii=False)
                 projected = runtime._model_tool_result(name, result)
-                return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+                return runtime._final_model_tool_output(projected)
 
             return FunctionTool(
                 name=name,
@@ -2992,11 +3030,7 @@ exploration value, and maintained local tasks to choose the next action.
             reset_tool_choice=False,
         )
         session = SQLiteSession(self.state["session_id"], self.sqlite_path)
-        input_filter = ToolOutputInputFilter(
-            self,
-            self._historical_tool_call_ids(await self._session_items_or_empty(session)),
-        )
-        run_config = self._sdk_run_config(agents_sdk, input_filter)
+        await self._migrate_sdk_session_history(session)
         def current_prompt() -> str:
             return json.dumps({
                 "feedback": feedback,
@@ -3009,7 +3043,7 @@ exploration value, and maintained local tasks to choose the next action.
         streams = []
         for attempt in range(2):
             stream = Runner.run_streamed(
-                agent, prompt, session=session, max_turns=16, run_config=run_config,
+                agent, prompt, session=session, max_turns=16,
             )
             streams.append(stream)
             self.active_stream = stream
@@ -3045,7 +3079,6 @@ exploration value, and maintained local tasks to choose the next action.
                     "required maintenance or queries. Do not end with plain text."
                 )
         if submitted_decision is None:
-            await self._sanitize_sdk_session(session, input_filter=input_filter)
             raise RuntimeError(
                 "submit_decision_protocol_error: no accepted submit_decision "
                 "after correction retry"
@@ -3066,12 +3099,10 @@ exploration value, and maintained local tasks to choose the next action.
             output["usage"] = request_usage
             self.state["last_request_usage"] = request_usage
             self._persist()
-        await self._sanitize_sdk_session(session, input_filter=input_filter)
         output = self.debug.attach_decision_context(state, output)
         return output
 
     async def _maybe_compact_sdk(self, session: Any, client: Any, next_prompt: str) -> bool:
-        await self._sanitize_sdk_session(session, next_prompt=next_prompt)
         threshold = self._compact_at_tokens()
         retain_budget = self._compact_retain_tokens()
         observed_tokens = self.state.get("last_prompt_tokens")
@@ -3372,32 +3403,6 @@ exploration value, and maintained local tasks to choose the next action.
         return entries
 
     @staticmethod
-    def _historical_tool_call_ids(items: list[dict]) -> set[str]:
-        return {
-            str(item.get("call_id") or item.get("id"))
-            for item in items
-            if isinstance(item, dict)
-            and item.get("type") == "function_call_output"
-            and (item.get("call_id") or item.get("id"))
-        }
-
-    @staticmethod
-    async def _session_items_or_empty(session: Any) -> list[dict]:
-        getter = getattr(session, "get_items", None)
-        if not callable(getter):
-            return []
-        items = await getter()
-        return items if isinstance(items, list) else []
-
-    @staticmethod
-    def _sdk_run_config(agents_module: Any, input_filter: ToolOutputInputFilter) -> Any:
-        run_config = getattr(agents_module, "RunConfig", None)
-        if callable(run_config):
-            return run_config(call_model_input_filter=input_filter)
-        # Test doubles predating RunConfig only inspect the supplied object.
-        return type("RunConfig", (), {"call_model_input_filter": input_filter})()
-
-    @staticmethod
     def _last_prompt_tokens_from_usage(usage: Any) -> int | None:
         """Return the provider count for the final model request in one Agent run."""
         entries = getattr(usage, "request_usage_entries", None)
@@ -3519,67 +3524,6 @@ exploration value, and maintained local tasks to choose the next action.
         if not isinstance(value, dict):
             raise ValueError("tool arguments must be a JSON object")
         return value
-
-    async def _sanitize_sdk_session(
-        self,
-        session: Any,
-        next_prompt: str = "",
-        *,
-        input_filter: ToolOutputInputFilter | None = None,
-    ) -> None:
-        """Archive oversized/old tool evidence while retaining reloadable previews."""
-        items = await session.get_items()
-        changed = False
-        replacement: list[dict] = []
-        for item in items:
-            current = dict(item)
-            if current.get("type") == "function_call_output":
-                output = current.get("output")
-                call_id = ToolOutputInputFilter._call_id(current)
-                if (
-                    input_filter is not None
-                    and call_id in input_filter.seen_call_ids
-                    and isinstance(output, str)
-                    and self._estimate_text_tokens(output) > MODEL_REPLAY_FULL_TOKENS
-                    and not self._is_archived_tool_preview(output)
-                ):
-                    current["output"] = input_filter.preview(call_id, output)
-                    changed = True
-                elif isinstance(output, str) and self._tool_output_needs_archive(output):
-                    current["output"] = self._archived_tool_output_preview(output, reason="output_limit")
-                    changed = True
-            replacement.append(current)
-
-        fixed_overhead = self.debug.agent_system_prompt() + self.debug.agent_policy_prompt() + json.dumps(self.debug.agent_tool_specs(), ensure_ascii=False)
-        estimate = self._estimate_context_tokens(replacement, next_prompt + fixed_overhead)
-        if estimate >= TOOL_OUTPUT_PRESSURE_TOKENS:
-            output_indices = [
-                index for index, item in enumerate(replacement)
-                if item.get("type") == "function_call_output" and isinstance(item.get("output"), str)
-            ]
-            protected = set(output_indices[-TOOL_OUTPUT_RECENT_FULL:])
-            for index in output_indices:
-                if estimate <= TOOL_OUTPUT_PRESSURE_TARGET_TOKENS:
-                    break
-                if index in protected:
-                    continue
-                output = replacement[index].get("output")
-                if not isinstance(output, str) or self._is_archived_tool_preview(output):
-                    continue
-                replacement[index] = dict(replacement[index])
-                replacement[index]["output"] = self._archived_tool_output_preview(output, reason="context_pressure")
-                changed = True
-                estimate = self._estimate_context_tokens(replacement, next_prompt + fixed_overhead)
-
-        if not changed:
-            return
-        try:
-            await session.clear_session()
-            await session.add_items(replacement)
-        except Exception:
-            await session.clear_session()
-            await session.add_items(items)
-            raise
 
     def _tool_output_needs_archive(self, output: str) -> bool:
         return (

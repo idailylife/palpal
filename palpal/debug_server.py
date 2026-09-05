@@ -8464,7 +8464,7 @@ class DebugState:
                 "status": "memory_unavailable",
                 "error": "companion_owner_mismatch",
             }
-        view = self.player_battle_view(state) or {}
+        view = self.current_player_battle_view(state) or {}
         experience = view.get("experience") if isinstance(view.get("experience"), dict) else {}
         enemies = [
             {
@@ -9794,10 +9794,12 @@ class DebugState:
             if stop_status == "dialog_inactive":
                 payload = request.get("payload", {})
                 if not payload.get("inactive_started"):
-                    self.observations.reschedule(
-                        observation_id,
-                        DIALOG_ADVANCE_VISIBILITY_TIMEOUT,
-                    )
+                    # Inactive confirmation is a separate phase from waiting for
+                    # a visible page.  A snapshot can spend longer than the
+                    # visibility timeout finalizing a room transition, so do not
+                    # let that work expire the gate before its owner can collect
+                    # the required stable inactive samples.
+                    self.observations.suspend_timeout(observation_id)
                     self.observations.update_payload(
                         observation_id,
                         inactive_started=True,
@@ -9840,6 +9842,63 @@ class DebugState:
                     {"status": "ready", "state": state},
                 )
 
+    def dialog_advance_reconcile_visibility_timeout(
+        self,
+        state: dict,
+    ) -> tuple[dict, str | None]:
+        """Recheck a timed-out dialog gate without sending another action."""
+        samples: list[dict] = []
+        inactive_polls = 0
+        observed_state = state
+        recovered_status: str | None = None
+
+        for poll in range(DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS):
+            if poll:
+                time.sleep(DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL)
+            if self.dialog_advance_cancel.is_set():
+                return observed_state, "cancelled"
+
+            observed_state = self.read_live_state()
+            state_info = self.live_info("state")
+            observed_state.setdefault("_debug", {})["runtime_stale"] = bool(
+                state_info.get("stale", True)
+            )
+            stop_status = self.dialog_advance_stop_status(observed_state)
+            visible = self.dialog_advance_visible(observed_state)
+            samples.append({
+                "status": stop_status or ("ready" if visible else "not_visible"),
+                "scene_id": observed_state.get("scene_id"),
+                "map_id": observed_state.get("map_id"),
+                "frame": observed_state.get("frame"),
+                "entering_scene": bool(observed_state.get("entering_scene")),
+            })
+
+            if stop_status == "dialog_inactive":
+                inactive_polls += 1
+                if inactive_polls >= DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS:
+                    recovered_status = "dialog_inactive"
+                    break
+                continue
+            inactive_polls = 0
+            if stop_status:
+                recovered_status = stop_status
+                break
+            if visible:
+                recovered_status = "ready"
+                break
+
+        if recovered_status is not None:
+            self.append_navigation_diagnostic(
+                "dialog_visibility_timeout_recovered",
+                {"recovered_status": recovered_status, "samples": samples},
+                observed_state,
+            )
+            return (
+                observed_state,
+                None if recovered_status == "ready" else recovered_status,
+            )
+        return observed_state, "dialog_visibility_timeout"
+
     def dialog_advance_wait_for_visible(self, state: dict) -> tuple[dict, str | None]:
         observation_id = self.observations.register(
             "dialog_gate",
@@ -9863,7 +9922,7 @@ class DebugState:
                     return observed_state, None if observed_status == "ready" else observed_status
                 if status == "timed_out":
                     self.observations.consume(observation_id, owner="dialog_advance")
-                    return state, "dialog_visibility_timeout"
+                    return self.dialog_advance_reconcile_visibility_timeout(state)
                 if status == "cancelled":
                     self.observations.consume(observation_id, owner="dialog_advance")
                     return state, "cancelled"
@@ -11262,7 +11321,7 @@ class DebugState:
         return result
 
     def player_battle_view(self, state: dict) -> dict | None:
-        """Project native battle debug data onto facts visible to a player."""
+        """Purely project one native battle value onto player-visible facts."""
         battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
         if battle is None:
             return None
@@ -11328,28 +11387,40 @@ class DebugState:
             if action.get("action_type") == "magic" and "mp_cost" in action:
                 visible["mp_cost"] = action.get("mp_cost")
             view["available_actions"].append(visible)
-        view["recent_outcomes"] = [
-            self._visible_outcome_sample(outcome, 0)
-            | {
-                "actor_side": str((outcome.get("actor") or {}).get("side") or ""),
-                "enemy_changes": [
-                    {
-                        key: change.get(key)
-                        for key in ("slot_index", "object_id", "name", "amount", "kind")
-                        if key in change
-                    }
-                    for change in outcome.get("enemy_changes") or []
-                    if isinstance(change, dict)
-                ],
-                "target": {
-                    key: (outcome.get("target") or {}).get(key)
-                    for key in ("index", "side", "object_id", "name", "mode")
-                    if key in (outcome.get("target") or {})
-                },
-            }
-            for outcome in (battle.get("visible_outcomes") or [])[-8:]
-            if isinstance(outcome, dict)
-        ]
+        existing_outcomes = battle.get("recent_outcomes")
+        if isinstance(existing_outcomes, list):
+            view["recent_outcomes"] = copy.deepcopy(existing_outcomes[-8:])
+        else:
+            view["recent_outcomes"] = [
+                self._visible_outcome_sample(outcome, 0)
+                | {
+                    "actor_side": str((outcome.get("actor") or {}).get("side") or ""),
+                    "enemy_changes": [
+                        {
+                            key: change.get(key)
+                            for key in ("slot_index", "object_id", "name", "amount", "kind")
+                            if key in change
+                        }
+                        for change in outcome.get("enemy_changes") or []
+                        if isinstance(change, dict)
+                    ],
+                    "target": {
+                        key: (outcome.get("target") or {}).get(key)
+                        for key in ("index", "side", "object_id", "name", "mode")
+                        if key in (outcome.get("target") or {})
+                    },
+                }
+                for outcome in (battle.get("visible_outcomes") or [])[-8:]
+                if isinstance(outcome, dict)
+            ]
+        return view
+
+    def current_player_battle_view(self, state: dict) -> dict | None:
+        """Build the current-turn battle prompt, including knowledge known right now."""
+        view = self.player_battle_view(state)
+        if view is None:
+            return None
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
         view["experience"] = self.combat_experience(battle)
         return view
 

@@ -64,6 +64,56 @@ def test_visible_outcomes_are_projected_without_enemy_internal_state(tmp_path):
     assert "magic_id" not in encoded
 
 
+def test_player_battle_projection_is_pure_idempotent_and_knowledge_free(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = battle_state()
+    debug.observe_combat_knowledge(state)
+
+    first = debug.player_battle_view(state)
+    second = debug.player_battle_view({"battle": state["battle"]})
+
+    assert first == second
+    assert "experience" not in first
+    assert debug.player_battle_view({"battle": first}) == first
+    assert "hp" not in first["enemies"][0]
+    assert "magic_id" not in json.dumps(first)
+    assert "experience" in debug.current_player_battle_view(state)
+
+
+def test_new_combat_knowledge_is_only_added_in_the_new_sqlite_turn(tmp_path):
+    from agents import SQLiteSession
+
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    session = SQLiteSession("battle-history", runtime.sqlite_path)
+
+    async def append_prompt(state):
+        prompt = {
+            "feedback": "next command",
+            "battle": debug.current_player_battle_view(state),
+        }
+        await session.add_items([{
+            "role": "user",
+            "content": json.dumps(prompt, ensure_ascii=False, separators=(",", ":")),
+        }])
+        return prompt
+
+    first_state = battle_state(sequence=1)
+    debug.observe_combat_knowledge(first_state)
+    first_prompt = asyncio.run(append_prompt(first_state))
+    prefix_before = asyncio.run(session.get_items())
+    prefix_bytes = json.dumps(prefix_before, ensure_ascii=False, separators=(",", ":")).encode()
+
+    second_state = battle_state(sequence=2)
+    debug.observe_combat_knowledge(second_state)
+    second_prompt = asyncio.run(append_prompt(second_state))
+    history = asyncio.run(session.get_items())
+
+    assert json.dumps(history[:1], ensure_ascii=False, separators=(",", ":")).encode() == prefix_bytes
+    assert first_prompt["battle"]["experience"] != second_prompt["battle"]["experience"]
+    assert len(history) == 2
+
+
 def test_combat_knowledge_deduplicates_and_retains_recent_samples(tmp_path):
     debug = make_debug_state(tmp_path)
     for sequence in range(1, COMBAT_SAMPLE_CAPACITY + 4):
@@ -222,7 +272,7 @@ def test_legacy_raw_battle_audit_is_projected_only_for_model_input(tmp_path):
     raw = battle_state()["battle"]
     item = {"role": "user", "content": json.dumps({"battle": raw}, ensure_ascii=False)}
 
-    projected = runtime._project_model_transcript_item(item)
+    projected = runtime._migrate_model_transcript_item(item)
 
     assert json.loads(item["content"])["battle"]["enemies"][0]["hp"] == 999
     visible = json.loads(projected["content"])["battle"]

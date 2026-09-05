@@ -1485,6 +1485,8 @@ def test_advance_dialog_starting_held_waits_without_pressing(tmp_path, monkeypat
 
 def test_advance_dialog_visibility_timeout_does_not_press(tmp_path, monkeypatch):
     debug = make_debug_state(tmp_path)
+    monkeypatch.setattr(debug, "read_live_state", lambda: held_dialog_state())
+    monkeypatch.setattr(debug, "live_info", lambda _kind: {"stale": False})
     result, written = run_dialog_scenario(
         debug,
         monkeypatch,
@@ -1497,7 +1499,7 @@ def test_advance_dialog_visibility_timeout_does_not_press(tmp_path, monkeypatch)
     assert written == []
 
 
-def test_background_snapshot_starts_fresh_dialog_inactive_confirmation_near_deadline(
+def test_background_snapshot_suspends_dialog_inactive_confirmation_near_deadline(
     tmp_path,
     monkeypatch,
 ):
@@ -1518,8 +1520,13 @@ def test_background_snapshot_starts_fresh_dialog_inactive_confirmation_near_dead
         debug.observe_dialog_gates(inactive)
     request = debug.observations.get(observation_id)
     assert request["status"] == "pending"
-    assert request["deadline"] == pytest.approx(now[0] + 2)
+    assert request["deadline"] is None
     assert request["payload"] == {"inactive_started": True, "inactive_polls": 0}
+
+    # Room-entry processing may outlast the old visibility deadline.  The
+    # inactive phase must remain available for its owner to confirm afterward.
+    now[0] += 10
+    assert debug.observations.get(observation_id)["status"] == "pending"
 
     for expected_polls in range(1, 3):
         debug.observe_dialog_gates(inactive, confirm_inactive=True)
@@ -1530,6 +1537,116 @@ def test_background_snapshot_starts_fresh_dialog_inactive_confirmation_near_dead
     assert debug.observations.get(observation_id)["status"] == "completed"
     completed = debug.observations.consume(observation_id, owner="dialog_advance")
     assert completed["result"]["status"] == "dialog_inactive"
+
+
+def test_dialog_visibility_timeout_reconciles_completed_transition_without_pressing(
+    tmp_path,
+    monkeypatch,
+):
+    debug = make_debug_state(tmp_path)
+    destination = {
+        **make_state(),
+        "scene_id": 44,
+        "map_id": 40,
+        "frame": 783257,
+        "entering_scene": False,
+        "dialog": {"active": False, "visible": False, "held": False},
+    }
+    samples = iter([destination, destination, destination])
+    monkeypatch.setattr(debug, "read_live_state", lambda: next(samples))
+    monkeypatch.setattr(debug, "live_info", lambda _kind: {"stale": False})
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    diagnostics = []
+    monkeypatch.setattr(
+        debug,
+        "append_navigation_diagnostic",
+        lambda event_type, payload=None, state=None: diagnostics.append(
+            (event_type, payload, state)
+        ),
+    )
+
+    state, stop_status = debug.dialog_advance_reconcile_visibility_timeout(
+        held_dialog_state("還磨菇什麼，走嘛！")
+    )
+
+    assert stop_status == "dialog_inactive"
+    assert state["scene_id"] == 44
+    assert state["map_id"] == 40
+    assert diagnostics[0][0] == "dialog_visibility_timeout_recovered"
+    assert diagnostics[0][1]["recovered_status"] == "dialog_inactive"
+    assert len(diagnostics[0][1]["samples"]) == 3
+
+
+def test_dialog_visibility_timeout_reconciliation_does_not_mask_held_dialog(
+    tmp_path,
+    monkeypatch,
+):
+    debug = make_debug_state(tmp_path)
+    monkeypatch.setattr(debug, "read_live_state", lambda: held_dialog_state())
+    monkeypatch.setattr(debug, "live_info", lambda _kind: {"stale": False})
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    diagnostics = []
+    monkeypatch.setattr(
+        debug,
+        "append_navigation_diagnostic",
+        lambda *args, **kwargs: diagnostics.append((args, kwargs)),
+    )
+
+    _state, stop_status = debug.dialog_advance_reconcile_visibility_timeout(
+        held_dialog_state()
+    )
+
+    assert stop_status == "dialog_visibility_timeout"
+    assert diagnostics == []
+
+
+@pytest.mark.parametrize(
+    ("recovered_state", "expected_status"),
+    [
+        (visible_dialog_state("next"), None),
+        (
+            {
+                **make_state(),
+                "choice": {"active": True, "generation": 7, "options": []},
+            },
+            "choice_active",
+        ),
+        (
+            {
+                **make_state(),
+                "in_battle": True,
+                "battle": {"generation": 8, "phase": "command"},
+            },
+            "in_battle",
+        ),
+    ],
+)
+def test_dialog_visibility_timeout_reconciliation_recovers_terminal_or_visible_state(
+    tmp_path,
+    monkeypatch,
+    recovered_state,
+    expected_status,
+):
+    debug = make_debug_state(tmp_path)
+    monkeypatch.setattr(debug, "read_live_state", lambda: recovered_state)
+    monkeypatch.setattr(debug, "live_info", lambda _kind: {"stale": False})
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    diagnostics = []
+    monkeypatch.setattr(
+        debug,
+        "append_navigation_diagnostic",
+        lambda event_type, payload=None, state=None: diagnostics.append(
+            (event_type, payload, state)
+        ),
+    )
+
+    state, stop_status = debug.dialog_advance_reconcile_visibility_timeout(
+        held_dialog_state()
+    )
+
+    assert state is recovered_state
+    assert stop_status == expected_status
+    assert diagnostics[0][0] == "dialog_visibility_timeout_recovered"
 
 
 def test_dialog_inactive_confirmation_resets_to_visibility_phase(tmp_path, monkeypatch):

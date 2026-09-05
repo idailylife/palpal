@@ -11,10 +11,8 @@ from tests.support import make_debug_state, make_state, write_state
 from palpal.agent_runtime import (
     DEFAULT_COMPACT_AT_TOKENS,
     DEFAULT_COMPACT_RETAIN_TOKENS,
-    TOOL_OUTPUT_PRESSURE_TARGET_TOKENS,
     AgentRuntime,
     ReplanRequired,
-    ToolOutputInputFilter,
 )
 
 
@@ -123,47 +121,6 @@ def test_provider_usage_marks_missing_details_partial_and_legacy_history_incompl
     runtime._atomic_json(runtime.control_path, legacy)
     runtime.state = runtime._load_or_create()
     assert runtime.snapshot()["provider_usage"]["incomplete_before_tracking"] is True
-
-
-def test_tool_input_filter_shows_parallel_batch_once_then_stable_previews(tmp_path):
-    runtime = make_debug_state(tmp_path).agent_runtime
-    input_filter = ToolOutputInputFilter(runtime, {"old"})
-    large_a = json.dumps({"ok": True, "id": "a", "data": "甲" * 2500}, ensure_ascii=False)
-    large_b = json.dumps({"ok": True, "id": "b", "data": "乙" * 2500}, ensure_ascii=False)
-
-    class ModelInputData:
-        def __init__(self, input, instructions):
-            self.input = input
-            self.instructions = instructions
-
-    def apply(items):
-        data = types.SimpleNamespace(model_data=ModelInputData(items, "system"))
-        return input_filter(data).input
-
-    first = apply([
-        {"type": "function_call_output", "call_id": "new-a", "output": large_a},
-        {"type": "function_call_output", "call_id": "new-b", "output": large_b},
-    ])
-    assert [item["output"] for item in first] == [large_a, large_b]
-    second = apply([
-        {"type": "function_call_output", "call_id": "new-a", "output": large_a},
-        {"type": "function_call_output", "call_id": "new-b", "output": large_b},
-    ])
-    previews = [json.loads(item["output"]) for item in second]
-    assert all(value["archived"] is True for value in previews)
-    assert all(len(value["head"]) == 500 and len(value["tail"]) == 500 for value in previews)
-    refs = [value["output_ref"] for value in previews]
-    third = apply([
-        {"type": "function_call_output", "call_id": "new-a", "output": large_a},
-        {"type": "function_call_output", "call_id": "new-b", "output": large_b},
-    ])
-    assert [json.loads(item["output"])["output_ref"] for item in third] == refs
-
-    session = MemorySession([
-        {"type": "function_call_output", "call_id": "new-a", "output": large_a},
-    ])
-    asyncio.run(runtime._sanitize_sdk_session(session, input_filter=input_filter))
-    assert json.loads(session.items[0]["output"])["output_ref"] == refs[0]
 
 
 def test_old_control_goal_is_silently_removed(tmp_path):
@@ -1606,7 +1563,7 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
     assert captured["agent_kwargs"]["reset_tool_choice"] is False
     assert [run["max_turns"] for run in captured["runs"]] == [6, 6]
     initial_prompt = json.loads(captured["runs"][0]["prompt"])
-    assert initial_prompt["battle"] == debug.player_battle_view(state)
+    assert initial_prompt["battle"] == debug.current_player_battle_view(state)
     assert "Item and magic descriptions are player-visible menu text" in captured["agent_kwargs"]["instructions"]
     assert "without an accepted submit_battle_action" in captured["runs"][1]["prompt"]
     events = [event for event in runtime.events() if event["type"] == "battle"]
@@ -2844,7 +2801,7 @@ def test_sdk_responses_adapter_uses_streaming_tools_and_sqlite(tmp_path, monkeyp
     assert captured["sqlite"] == (runtime.snapshot()["session_id"], runtime.sqlite_path)
     assert captured["run"]["session"].__class__ is SQLiteSession
     assert captured["run"]["max_turns"] == 16
-    assert isinstance(captured["run"]["run_config"].call_model_input_filter, ToolOutputInputFilter)
+    assert "run_config" not in captured["run"]
     assert captured["tracing"] == {"disabled": True}
     assert result["usage"]["total_tokens"] == 22
     assert runtime.snapshot()["last_prompt_tokens"] == 11
@@ -2914,7 +2871,7 @@ def test_sdk_plain_text_end_retries_once_in_same_session_and_requires_submit(tmp
     assert result["recommended_intent"] == "advance_dialog"
     assert len(captured["runs"]) == 2
     assert captured["runs"][0]["session"] is captured["runs"][1]["session"]
-    assert captured["runs"][0]["run_config"] is captured["runs"][1]["run_config"]
+    assert all("run_config" not in run for run in captured["runs"])
     assert "without an accepted submit_decision" in captured["runs"][1]["prompt"]
     tracked = runtime.snapshot()["provider_usage"]["scopes"]["main_decision"]
     assert tracked["requests"] == 2
@@ -2996,6 +2953,142 @@ def test_responses_adapter_accepts_legacy_chat_items_from_sqlite_session(tmp_pat
     ]
     assert request["previous_response_id"].__class__.__name__ == "Omit"
     assert request["conversation"].__class__.__name__ == "Omit"
+
+
+def test_legacy_sqlite_history_migration_is_atomic_idempotent_and_snapshot_preserving(tmp_path):
+    import sqlite3
+    from agents import SQLiteSession
+
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    session_id = runtime.snapshot()["session_id"]
+    raw_battle = {
+        "generation": 4,
+        "phase": "command",
+        "players": [{"index": 0, "name": "hero", "hp": 10, "max_hp": 20}],
+        "enemies": [{"slot_index": 0, "object_id": 81, "name": "enemy", "hp": 999}],
+        "recent_outcomes": [{"sequence": 1, "enemy_changes": [{"amount": 7}]}],
+        "experience": {"signature": "81", "snapshot": "old"},
+    }
+
+    async def exercise():
+        session = SQLiteSession(session_id, runtime.sqlite_path)
+        await session.add_items([{
+            "role": "user",
+            "content": json.dumps({"battle": raw_battle}, ensure_ascii=False),
+        }])
+        assert await runtime._migrate_sdk_session_history(session) is True
+        first = await session.get_items()
+        first_bytes = json.dumps(first, ensure_ascii=False, separators=(",", ":")).encode()
+        assert await runtime._migrate_sdk_session_history(session) is False
+        second = await session.get_items()
+        return first, first_bytes, second
+
+    first, first_bytes, second = asyncio.run(exercise())
+    migrated_battle = json.loads(first[0]["content"])["battle"]
+    assert "hp" not in migrated_battle["enemies"][0]
+    assert migrated_battle["recent_outcomes"] == raw_battle["recent_outcomes"]
+    assert migrated_battle["experience"] == raw_battle["experience"]
+    assert json.dumps(second, ensure_ascii=False, separators=(",", ":")).encode() == first_bytes
+    events = [event for event in runtime.events() if event["phase"] == "history_migrated"]
+    assert len(events) == 1
+    assert events[0]["details"] == {}
+    with sqlite3.connect(runtime.sqlite_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM palpal_session_migrations WHERE session_id = ?", (session_id,),
+        ).fetchone()[0] == 1
+
+
+def test_battle_child_history_migration_is_grouped_with_battle_events(tmp_path):
+    from agents import SQLiteSession
+
+    runtime = make_debug_state(tmp_path).agent_runtime
+    command = {
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "in_battle": True,
+        "battle": {
+            "generation": 5,
+            "command_generation": 9,
+            "phase": "command",
+            "enemies": [],
+        },
+    }
+    control = runtime.battle_delegate._begin(command)
+    child_id = control["child_session_id"]
+    session = SQLiteSession(child_id, runtime.sqlite_path)
+
+    assert asyncio.run(runtime._migrate_sdk_session_history(session)) is True
+
+    event = next(event for event in runtime.events() if event["phase"] == "history_migrated")
+    metadata = event["details"]["battle_delegate"]
+    assert metadata == {
+        "child_session_id": child_id,
+        "battle_generation": 5,
+        "group_id": runtime.battle_delegate._group_id(control),
+        "depth": 1,
+        "status": "running",
+    }
+
+
+def test_legacy_sqlite_history_migration_failure_rolls_back_everything(tmp_path, monkeypatch):
+    import sqlite3
+    from agents import SQLiteSession
+
+    runtime = make_debug_state(tmp_path).agent_runtime
+    session_id = runtime.snapshot()["session_id"]
+
+    async def seed():
+        session = SQLiteSession(session_id, runtime.sqlite_path)
+        await session.add_items([{"role": "user", "content": '{"battle":{"secret":1}}'}])
+        return session
+
+    session = asyncio.run(seed())
+    with sqlite3.connect(runtime.sqlite_path) as connection:
+        before = connection.execute(
+            "SELECT id, message_data FROM agent_messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    monkeypatch.setattr(runtime, "_migrate_model_transcript_item", lambda _item: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(runtime._migrate_sdk_session_history(session))
+
+    with sqlite3.connect(runtime.sqlite_path) as connection:
+        after = connection.execute(
+            "SELECT id, message_data FROM agent_messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        table_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'palpal_session_migrations'"
+        ).fetchone()
+        marker = (
+            connection.execute(
+                "SELECT count(*) FROM palpal_session_migrations WHERE session_id = ?", (session_id,),
+            ).fetchone()[0]
+            if table_exists else 0
+        )
+    assert after == before
+    assert marker == 0
+
+
+def test_restored_transcript_invalidates_history_migration_marker(tmp_path):
+    from agents import SQLiteSession
+
+    runtime = make_debug_state(tmp_path).agent_runtime
+    session_id = runtime.snapshot()["session_id"]
+
+    async def exercise():
+        session = SQLiteSession(session_id, runtime.sqlite_path)
+        assert await runtime._migrate_sdk_session_history(session) is True
+        await runtime._replace_sdk_session_items(session_id, [
+            {"role": "user", "content": '{"battle":{"enemies":[{"hp":999}]}}'},
+        ])
+        assert await runtime._migrate_sdk_session_history(session) is True
+        return await session.get_items()
+
+    items = asyncio.run(exercise())
+    assert "hp" not in items[0]["content"]
 
 
 def test_last_prompt_tokens_uses_single_request_usage_only_as_exact_fallback():
@@ -4340,7 +4433,7 @@ def test_navigation_in_dialog_before_execution_still_requests_replan(tmp_path):
         runtime._execute_decision(recommendation)
 
 
-def test_sub_limit_query_tool_outputs_remain_verbatim(tmp_path):
+def test_sub_limit_query_tool_outputs_are_serialized_verbatim(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
     outputs = [
@@ -4348,11 +4441,10 @@ def test_sub_limit_query_tool_outputs_remain_verbatim(tmp_path):
         json.dumps({"ok": True, "dialogs": [{"text": "观察" * 100}]} , ensure_ascii=False),
         json.dumps({"ok": True, "inventory": [{"item_id": index} for index in range(100)]}),
     ]
-    session = MemorySession([
-        {"type": "function_call_output", "output": output} for output in outputs
-    ])
-    asyncio.run(runtime._sanitize_sdk_session(session))
-    assert [item["output"] for item in session.items] == outputs
+    assert [runtime._final_model_tool_output(json.loads(output)) for output in outputs] == [
+        json.dumps(json.loads(output), ensure_ascii=False, separators=(",", ":"))
+        for output in outputs
+    ]
 
 
 @pytest.mark.parametrize(
@@ -4364,16 +4456,19 @@ def test_sub_limit_query_tool_outputs_remain_verbatim(tmp_path):
 )
 def test_large_tool_outputs_archive_preview_and_page_exact_content(tmp_path, raw, expected_format):
     runtime = make_debug_state(tmp_path).agent_runtime
-    session = MemorySession([{"type": "function_call_output", "output": raw}])
-    asyncio.run(runtime._sanitize_sdk_session(session))
-
-    preview = json.loads(session.items[0]["output"])
+    value = json.loads(raw) if expected_format == "json" else raw
+    persisted = runtime._final_model_tool_output(value)
+    preview = json.loads(persisted)
+    archived_raw = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if expected_format == "json" else value
+    )
     assert preview["truncated"] is True
     assert preview["archived"] is True
     assert preview["ok"] is True
     assert preview["format"] == expected_format
-    assert preview["head"] == raw[:2000]
-    assert preview["tail"] == raw[-2000:]
+    assert preview["head"] == archived_raw[:2000]
+    assert preview["tail"] == archived_raw[-2000:]
     if expected_format == "json":
         assert preview["key_fields"]["status"] == "complete"
         assert preview["key_fields"]["events_count"] == 1
@@ -4389,7 +4484,7 @@ def test_large_tool_outputs_archive_preview_and_page_exact_content(tmp_path, raw
             assert page["next_offset"] is None
             break
         offset = page["next_offset"]
-    assert "".join(parts) == raw
+    assert "".join(parts) == archived_raw
 
 
 def test_tool_output_refs_reject_paths_missing_and_cross_session_access(tmp_path):
@@ -4404,45 +4499,20 @@ def test_tool_output_refs_reject_paths_missing_and_cross_session_access(tmp_path
     assert runtime.get_tool_output(output_ref)["error"] == "tool_output_not_found"
 
 
-def test_tool_output_pressure_cleanup_has_hysteresis_and_keeps_recent_six(tmp_path, monkeypatch):
-    debug = make_debug_state(tmp_path)
-    runtime = debug.agent_runtime
-    monkeypatch.setattr(debug, "agent_system_prompt", lambda: "")
-    monkeypatch.setattr(debug, "agent_policy_prompt", lambda: "")
-    monkeypatch.setattr(debug, "agent_tool_specs", lambda: [])
-    raw_outputs = [json.dumps({"ok": True, "index": index, "data": "x" * 19900}) for index in range(18)]
-    session = MemorySession([
-        {"type": "function_call_output", "output": output} for output in raw_outputs
-    ])
+def test_large_tool_output_is_stable_from_first_model_visible_result(tmp_path):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    result = {"ok": True, "data": "甲" * 9000}
 
-    asyncio.run(runtime._sanitize_sdk_session(session))
-    parsed = [json.loads(item["output"]) for item in session.items]
-    assert any(value.get("archived") is True for value in parsed[:-6])
-    assert [item["output"] for item in session.items[-6:]] == raw_outputs[-6:]
-    assert runtime._estimate_context_tokens(session.items, "") <= TOOL_OUTPUT_PRESSURE_TARGET_TOKENS
-    refs = [value["output_ref"] for value in parsed[:-6] if value.get("archived") is True]
-    files_before = sorted(path.name for path in runtime._session_tool_outputs_dir().iterdir())
+    first = runtime._final_model_tool_output(result)
+    preview = json.loads(first)
+    archived = runtime.get_tool_output(preview["output_ref"])["content"]
+    session = MemorySession([{"type": "function_call_output", "output": first}])
+    prefix = json.dumps(session.items, ensure_ascii=False, separators=(",", ":")).encode()
+    asyncio.run(session.add_items([{"role": "user", "content": "next turn"}]))
 
-    asyncio.run(runtime._sanitize_sdk_session(session))
-    parsed_again = [json.loads(item["output"]) for item in session.items]
-    assert [value["output_ref"] for value in parsed_again[:-6] if value.get("archived") is True] == refs
-    assert sorted(path.name for path in runtime._session_tool_outputs_dir().iterdir()) == files_before
-
-
-def test_tool_output_pressure_cleanup_waits_until_96k(tmp_path, monkeypatch):
-    debug = make_debug_state(tmp_path)
-    runtime = debug.agent_runtime
-    monkeypatch.setattr(debug, "agent_system_prompt", lambda: "")
-    monkeypatch.setattr(debug, "agent_policy_prompt", lambda: "")
-    monkeypatch.setattr(debug, "agent_tool_specs", lambda: [])
-    raw_outputs = [json.dumps({"ok": True, "data": "x" * 19900}) for _ in range(13)]
-    session = MemorySession([
-        {"type": "function_call_output", "output": output} for output in raw_outputs
-    ])
-
-    asyncio.run(runtime._sanitize_sdk_session(session))
-    assert [item["output"] for item in session.items] == raw_outputs
-    assert not runtime._session_tool_outputs_dir().exists()
+    assert preview["archived"] is True
+    assert archived.startswith('{"ok":true,"data":"')
+    assert json.dumps(session.items[:1], ensure_ascii=False, separators=(",", ":")).encode() == prefix
 
 
 def test_prune_sessions_removes_non_live_session_data(tmp_path):
