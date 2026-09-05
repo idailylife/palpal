@@ -24,6 +24,9 @@ EXECUTABLE_TOOLS = {
 CHECKPOINT_BUNDLE_VERSION = 2
 DEFAULT_COMPACT_AT_TOKENS = 200_000
 DEFAULT_COMPACT_RETAIN_TOKENS = 24_000
+BATTLE_EXPERIENCE_SAMPLE_LIMIT = 3
+BATTLE_EXPERIENCE_ACTION_LIMIT = 24
+BATTLE_ENCOUNTER_SAMPLE_LIMIT = 2
 TOOL_OUTPUT_FULL_TOKENS = 8_000
 TOOL_OUTPUT_PAGE_CHARS = 6_000
 TOOL_OUTPUT_REF_RE = re.compile(r"tool-[0-9a-f]{32}\.txt")
@@ -120,6 +123,217 @@ class BattleDelegate:
             })
         return enemies
 
+    @staticmethod
+    def _compact_player_change(change: dict) -> dict:
+        compact = {
+            key: change.get(key)
+            for key in ("index", "role_id", "knocked_out")
+            if key in change and (key != "knocked_out" or change.get(key))
+        }
+        for stat in ("hp", "mp"):
+            value = change.get(stat)
+            if not isinstance(value, dict):
+                continue
+            try:
+                before = int(value.get("before") or 0)
+                after = int(value.get("after") or 0)
+            except (TypeError, ValueError):
+                continue
+            if before != after:
+                compact[f"{stat}_delta"] = after - before
+        for prefix in ("status", "poisons"):
+            before = change.get(f"{prefix}_before")
+            after = change.get(f"{prefix}_after")
+            if before != after:
+                compact[f"{prefix}_before"] = before or []
+                compact[f"{prefix}_after"] = after or []
+        return compact
+
+    @classmethod
+    def _compact_outcome(cls, outcome: dict, *, include_identity: bool = True) -> dict:
+        compact: dict[str, Any] = {}
+        if "sequence" in outcome:
+            compact["sequence"] = int(outcome.get("sequence") or 0)
+        if include_identity:
+            actor = outcome.get("actor") if isinstance(outcome.get("actor"), dict) else {}
+            compact["actor"] = {
+                key: actor.get(key) for key in ("index", "role_id", "name") if key in actor
+            }
+            for key in ("action_type", "object_id", "name", "mp_cost", "actor_side"):
+                if key in outcome:
+                    compact[key] = outcome.get(key)
+            target = outcome.get("target") if isinstance(outcome.get("target"), dict) else {}
+            if target:
+                compact["target"] = {
+                    key: target.get(key)
+                    for key in ("index", "side", "object_id", "name", "mode")
+                    if key in target
+                }
+        enemy_changes = [
+            {
+                key: change.get(key)
+                for key in ("slot_index", "object_id", "amount", "kind")
+                if key in change
+            }
+            for change in outcome.get("enemy_changes") or []
+            if isinstance(change, dict)
+        ]
+        if enemy_changes:
+            compact["enemy_changes"] = enemy_changes
+        player_changes = [
+            cls._compact_player_change(change)
+            for change in outcome.get("player_changes") or []
+            if isinstance(change, dict)
+        ]
+        player_changes = [change for change in player_changes if len(change) > 1]
+        if player_changes:
+            compact["player_changes"] = player_changes
+        if outcome.get("no_numeric_change_observed"):
+            compact["no_numeric_change_observed"] = True
+        return compact
+
+    @classmethod
+    def _compact_experience(cls, battle: dict, experience: dict) -> dict:
+        available = {
+            (str(action.get("action_type") or ""), int(action.get("object_id") or 0))
+            for action in battle.get("available_actions") or []
+            if isinstance(action, dict)
+        }
+        party_role_ids = {
+            int(player.get("role_id") or 0)
+            for player in battle.get("players") or []
+            if isinstance(player, dict)
+        }
+        actions = []
+        current_generation = int(battle.get("generation") or 0)
+        for entry in experience.get("actions") or []:
+            if not isinstance(entry, dict):
+                continue
+            action_type = str(entry.get("action_type") or "")
+            object_id = int(entry.get("object_id") or 0)
+            actor_role_id = int(entry.get("actor_role_id") or 0)
+            if action_type in {"use_item", "throw_item"}:
+                if (action_type, object_id) not in available:
+                    continue
+            elif actor_role_id not in party_role_ids:
+                continue
+            historical_samples = [
+                sample
+                for sample in entry.get("samples") or []
+                if isinstance(sample, dict)
+                and int(sample.get("battle_generation") or 0) != current_generation
+            ]
+            if not historical_samples:
+                continue
+            samples = [
+                cls._compact_outcome(sample, include_identity=False)
+                for sample in historical_samples[-BATTLE_EXPERIENCE_SAMPLE_LIMIT:]
+            ]
+            actions.append({
+                key: entry.get(key)
+                for key in (
+                    "actor_role_id", "actor_name", "action_type", "object_id", "name",
+                    "enemy_object_id",
+                )
+                if key in entry
+            } | {
+                "sample_count": len(historical_samples),
+                "recent_samples": samples,
+            })
+            if len(actions) >= BATTLE_EXPERIENCE_ACTION_LIMIT:
+                break
+        encounter = experience.get("encounter")
+        compact_encounter = None
+        if isinstance(encounter, dict):
+            samples = []
+            for sample in (encounter.get("samples") or [])[-BATTLE_ENCOUNTER_SAMPLE_LIMIT:]:
+                if not isinstance(sample, dict):
+                    continue
+                tactics = []
+                for tactic in (sample.get("tactics") or [])[-12:]:
+                    if not isinstance(tactic, dict):
+                        continue
+                    actor = tactic.get("actor") if isinstance(tactic.get("actor"), dict) else {}
+                    tactics.append({
+                        "actor_role_id": int(actor.get("role_id") or 0),
+                        "action_type": str(tactic.get("action_type") or ""),
+                        "object_id": int(tactic.get("object_id") or 0),
+                    })
+                samples.append({"result": sample.get("result"), "tactics": tactics})
+            compact_encounter = {
+                "sample_count": len(encounter.get("samples") or []),
+                "recent_samples": samples,
+            }
+        return {
+            "available": bool(experience.get("available")),
+            "enemy_object_ids": experience.get("enemy_object_ids") or [],
+            "signature": experience.get("signature") or "",
+            "actions": actions,
+            "encounter": compact_encounter,
+        }
+
+    @staticmethod
+    def _compact_action(action: dict) -> dict:
+        compact = {
+            key: action.get(key)
+            for key in (
+                "action_type", "object_id", "name", "target_side", "target_mode",
+                "description", "mp_cost",
+            )
+            if key in action
+        }
+        if "submission_target_indices" in action:
+            compact["submission_target_indices"] = action.get("submission_target_indices") or []
+        elif action.get("target_mode") == "all":
+            compact["submission_target_indices"] = [-1]
+        elif action.get("target_mode") == "none":
+            compact["submission_target_indices"] = [-2]
+        else:
+            compact["submission_target_indices"] = action.get("valid_target_indices") or []
+        return compact
+
+    @classmethod
+    def _agent_battle_view(
+        cls,
+        view: dict,
+        *,
+        include_experience: bool,
+        after_outcome_sequence: int,
+    ) -> dict:
+        compact = {
+            key: copy.deepcopy(value)
+            for key, value in view.items()
+            if key not in {"available_actions", "recent_outcomes", "experience"}
+        }
+        compact["available_actions"] = [
+            cls._compact_action(action)
+            for action in view.get("available_actions") or []
+            if isinstance(action, dict)
+        ]
+        new_outcomes = [
+            cls._compact_outcome(outcome)
+            for outcome in view.get("recent_outcomes") or []
+            if isinstance(outcome, dict)
+            and int(outcome.get("sequence") or 0) > after_outcome_sequence
+        ]
+        if new_outcomes:
+            compact["new_outcomes"] = new_outcomes
+        experience = view.get("experience")
+        if include_experience and isinstance(experience, dict):
+            compact["experience"] = cls._compact_experience(view, experience)
+        return compact
+
+    @staticmethod
+    def _max_outcome_sequence(battle: dict) -> int:
+        return max(
+            (
+                int(outcome.get("sequence") or 0)
+                for outcome in battle.get("new_outcomes") or []
+                if isinstance(outcome, dict)
+            ),
+            default=0,
+        )
+
     def _trigger_context(self, state: dict) -> dict | None:
         observation = (
             state.get("trigger_observation")
@@ -192,6 +406,13 @@ class BattleDelegate:
         )
         child_id = str(existing["child_session_id"]) if reusable else uuid.uuid4().hex
         instruction_count = int(existing.get("instruction_count") or 0) if reusable else 0
+        last_prompt_tokens = existing.get("last_prompt_tokens") if reusable else None
+        experience_sent = bool(existing.get("experience_sent")) if reusable else False
+        last_sent_outcome_sequence = (
+            int(existing.get("last_sent_outcome_sequence") or 0) if reusable else 0
+        )
+        compactions = int(existing.get("compactions") or 0) if reusable else 0
+        last_compaction = existing.get("last_compaction") if reusable else None
         self.before = json.loads(json.dumps(battle, ensure_ascii=False))
         self.actions = list(existing.get("actions") or []) if reusable else []
         encounter_enemies = (
@@ -209,6 +430,11 @@ class BattleDelegate:
             phase=str(battle.get("phase") or "resolving"),
             instruction_count=instruction_count,
             instruction_limit=BATTLE_INSTRUCTION_LIMIT,
+            last_prompt_tokens=last_prompt_tokens,
+            experience_sent=experience_sent,
+            last_sent_outcome_sequence=last_sent_outcome_sequence,
+            compactions=compactions,
+            last_compaction=last_compaction,
             stop_reason=None,
             started_at=existing.get("started_at") if reusable else _stamp(),
             ended_at=None,
@@ -350,9 +576,17 @@ class BattleDelegate:
         submitted: dict | None = None
         runtime = self.runtime
         frozen_window = self._command_window(state)
-        player_battle = self.debug.current_player_battle_view(state)
+        control = self._control()
+        full_player_battle = self.debug.current_player_battle_view(state) or {}
+        player_battle = self._agent_battle_view(
+            full_player_battle,
+            include_experience=not bool(control.get("experience_sent")),
+            after_outcome_sequence=int(control.get("last_sent_outcome_sequence") or 0),
+        )
+        prompt_outcome_sequence = self._max_outcome_sequence(player_battle)
 
         async def get_battle(_context: Any, _raw: str) -> str:
+            nonlocal prompt_outcome_sequence
             self._emit(
                 "tool_called",
                 "Battle Agent called get_battle.",
@@ -360,7 +594,21 @@ class BattleDelegate:
             )
             try:
                 latest = self.debug.snapshot()
-                output = {"ok": True, "battle": self.debug.current_player_battle_view(latest)}
+                latest_view = self.debug.current_player_battle_view(latest) or {}
+                output = {
+                    "ok": True,
+                    "battle": self._agent_battle_view(
+                        latest_view,
+                        include_experience=not bool(self._control().get("experience_sent")),
+                        after_outcome_sequence=int(
+                            self._control().get("last_sent_outcome_sequence") or 0
+                        ),
+                    ),
+                }
+                prompt_outcome_sequence = max(
+                    prompt_outcome_sequence,
+                    self._max_outcome_sequence(output["battle"]),
+                )
             except Exception as exc:
                 self._emit(
                     "tool_output",
@@ -497,7 +745,10 @@ class BattleDelegate:
 
         get_tool = FunctionTool(
             name="get_battle",
-            description="Read the latest structured battle state and legal actions.",
+            description=(
+                "Refresh the structured battle state only when the supplied snapshot may be stale; "
+                "the current prompt already contains the current legal actions."
+            ),
             params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
             on_invoke_tool=get_battle,
             strict_json_schema=False,
@@ -571,6 +822,8 @@ class BattleDelegate:
                 "judge safety from visible HP/MP, status, recent incoming damage, and healing reserves, "
                 "not a fixed threshold. Use a consumable only when menu text or prior visible samples "
                 "support its intended effect; never blind-test a scarce item. "
+                "The supplied battle snapshot is current; do not call get_battle unless it may have "
+                "become stale. Do not narrate before acting. "
                 "Never invent targets or actions. Choose target_index from the action's "
                 "submission_target_indices and submit exactly one current legal action."
             ),
@@ -586,32 +839,43 @@ class BattleDelegate:
         )
         session = SQLiteSession(self._control()["child_session_id"], runtime.sqlite_path)
         await runtime._migrate_sdk_session_history(session)
-        prompt = json.dumps({
-            "feedback": feedback,
-            "battle": player_battle,
-            "active_tasks": self.debug.active_task_summary(),
-            "resource_policy": (
-                "Use visible samples and current risk. Safely probe one lowest-cost unobserved "
-                "offensive magic when useful; do not guess consumable effects from names."
-            ),
-        }, ensure_ascii=False, separators=(",", ":"))
+        prompt_value = {"battle": player_battle}
+        if feedback:
+            prompt_value["feedback"] = feedback
+        prompt = json.dumps(prompt_value, ensure_ascii=False, separators=(",", ":"))
+        await self._maybe_compact_sdk(session, prompt)
         for attempt in range(2):
             stream = Runner.run_streamed(
                 agent, prompt, session=session, max_turns=6,
             )
             runtime.active_stream = stream
+            request_completed = False
             try:
                 async for _event in stream.stream_events():
                     if runtime.cancel_event.is_set():
                         stream.cancel("immediate")
+                request_completed = True
             finally:
                 usage = getattr(getattr(stream, "context_wrapper", None), "usage", None)
                 if usage is not None:
-                    runtime._record_provider_usage(
+                    entries = runtime._record_provider_usage(
                         usage,
                         "battle",
                         model=runtime.state.get("model"),
                     )
+                    if entries and entries[-1]["input_tokens"] > 0:
+                        self._persist_control(last_prompt_tokens=entries[-1]["input_tokens"])
+                if request_completed:
+                    updates: dict[str, Any] = {}
+                    if "experience" in player_battle:
+                        updates["experience_sent"] = True
+                    if prompt_outcome_sequence:
+                        updates["last_sent_outcome_sequence"] = max(
+                            prompt_outcome_sequence,
+                            int(self._control().get("last_sent_outcome_sequence") or 0),
+                        )
+                    if updates:
+                        self._persist_control(**updates)
             if submitted is not None:
                 break
             if attempt == 0:
@@ -713,41 +977,146 @@ class BattleDelegate:
             "cash_gained": int(last.get("cash_gained") or 0),
         }
 
-    async def _audit_action(self, battle: dict, action: dict, result: dict) -> None:
+    def _compact_at_tokens(self) -> int:
+        raw = self.debug.config_value("PALPAL_BATTLE_COMPACT_AT_TOKENS", "")
+        if not raw:
+            raw = self.debug.config_value(
+                "PALPAL_AGENT_COMPACT_AT_TOKENS", str(DEFAULT_COMPACT_AT_TOKENS)
+            )
         try:
-            from agents import SQLiteSession
-            session = SQLiteSession(self._control()["child_session_id"], self.runtime.sqlite_path)
-            await session.add_items([
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "battle": self.debug.current_player_battle_view({"battle": battle}),
-                            "instruction": int(self._control().get("instruction_count") or 0) + 1,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                },
-                {
-                    "role": "assistant",
-                    "content": json.dumps(
-                        {"submitted_battle_action": action, "native_result": result.get("result")},
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                },
-            ])
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
-            # The action audit is also retained in control.json; a transcript
-            # storage failure must not send a second game action.
-            return
+            threshold = int(raw or DEFAULT_COMPACT_AT_TOKENS)
+        except (TypeError, ValueError):
+            return DEFAULT_COMPACT_AT_TOKENS
+        return threshold if threshold > 0 else DEFAULT_COMPACT_AT_TOKENS
+
+    def _compact_retain_tokens(self) -> int:
+        raw = self.debug.config_value("PALPAL_BATTLE_COMPACT_RETAIN_TOKENS", "")
+        if not raw:
+            raw = self.debug.config_value(
+                "PALPAL_AGENT_COMPACT_RETAIN_TOKENS", str(DEFAULT_COMPACT_RETAIN_TOKENS)
+            )
+        try:
+            budget = int(raw or DEFAULT_COMPACT_RETAIN_TOKENS)
+        except (TypeError, ValueError):
+            return DEFAULT_COMPACT_RETAIN_TOKENS
+        return budget if budget > 0 else DEFAULT_COMPACT_RETAIN_TOKENS
+
+    async def _maybe_compact_sdk(self, session: Any, next_prompt: str) -> bool:
+        control = self._control()
+        observed_tokens = control.get("last_prompt_tokens")
+        threshold = self._compact_at_tokens()
+        retain_budget = self._compact_retain_tokens()
+        if not isinstance(observed_tokens, int) or observed_tokens < max(1000, threshold):
+            return False
+        items = await session.get_items()
+        if len(items) < 6:
+            return False
+        recent_start, retained_cycles = self.runtime._compaction_retained_start(
+            items, retain_budget
+        )
+        if recent_start <= 0:
+            return False
+        retained_items = items[recent_start:]
+        before = self._context_estimate_breakdown(items, next_prompt)
+        retained_estimated_tokens = self.runtime._estimate_items_tokens(retained_items)
+        starting_details = {
+            "observed_prompt_tokens": observed_tokens,
+            "compact_at_tokens": threshold,
+            "retain_tokens": retain_budget,
+            "items": len(items),
+        }
+        self._emit(
+            "compression_started",
+            "Battle context compression started.",
+            starting_details,
+        )
+        summary = {
+            "battle_history_summary": {
+                "game_instance_id": control.get("game_instance_id"),
+                "battle_generation": int(control.get("battle_generation") or 0),
+                "instruction_count": int(control.get("instruction_count") or 0),
+                "submitted_actions": copy.deepcopy(control.get("actions") or self.actions),
+                "note": (
+                    "Older model transcript was compacted. The newest battle prompt and "
+                    "player-visible outcomes are authoritative."
+                ),
+            }
+        }
+        replacement = [
+            {
+                "role": "user",
+                "content": json.dumps(summary, ensure_ascii=False, separators=(",", ":")),
+            },
+            {
+                "role": "assistant",
+                "content": "I will use the current battle snapshot and legal actions.",
+            },
+            *retained_items,
+        ]
+        replacement_breakdown = self._context_estimate_breakdown(
+            replacement, next_prompt
+        )
+        transcript_replaced = False
+        try:
+            await session.clear_session()
+            transcript_replaced = True
+            await session.add_items(replacement)
+        except asyncio.CancelledError:
+            if transcript_replaced:
+                await session.clear_session()
+                await session.add_items(items)
+            self._emit(
+                "compression_cancelled",
+                "Battle context compression cancelled.",
+                starting_details,
+            )
+            raise
+        except Exception as exc:
+            if transcript_replaced:
+                await session.clear_session()
+                await session.add_items(items)
+            self._emit(
+                "compression_failed",
+                f"Battle context compression failed: {exc}",
+                {**starting_details, "error": str(exc)},
+            )
+            raise RuntimeError("battle_context_compaction_failed") from exc
+        details = {
+            **starting_details,
+            "before_estimated_tokens": before["estimated_tokens"],
+            "before_composition": before["composition"],
+            "retained_cycles": retained_cycles,
+            "retained_items": len(retained_items),
+            "retained_estimated_tokens": retained_estimated_tokens,
+            "retained_budget_exceeded": retained_estimated_tokens > retain_budget,
+            "replacement_estimated_tokens": replacement_breakdown["estimated_tokens"],
+            "replacement_composition": replacement_breakdown["composition"],
+        }
+        self._persist_control(
+            last_prompt_tokens=None,
+            compactions=int(control.get("compactions") or 0) + 1,
+            last_compaction=details,
+        )
+        self._emit(
+            "compression_completed",
+            "Battle context compression completed.",
+            details,
+        )
+        return True
+
+    def _context_estimate_breakdown(self, items: list[dict], next_prompt: str) -> dict:
+        composition = self.runtime._item_estimate_composition(items)
+        composition["next_prompt"] = self.runtime._estimate_text_tokens(next_prompt)
+        return {
+            "estimated_tokens": sum(composition.values()),
+            "composition": composition,
+        }
 
     async def run(self, initial_state: dict) -> dict:
         control = self._begin(initial_state)
         generation = int(control["battle_generation"])
         invalid = 0
-        feedback = "Choose one legal action for the current command window."
+        feedback = ""
         while True:
             state = await asyncio.to_thread(self._wait_for_control_or_end, generation)
             battle = self._battle_from(state)
@@ -784,7 +1153,9 @@ class BattleDelegate:
             if count >= BATTLE_INSTRUCTION_LIMIT:
                 raise RuntimeError("battle_instruction_limit")
             self._persist_control(phase=str(battle.get("phase") or "resolving"))
-            request_details = {"instruction": count + 1, "feedback": feedback}
+            request_details = {"instruction": count + 1}
+            if feedback:
+                request_details["feedback"] = feedback
             if (
                 self.runtime.battle_decision_provider is None
                 and self.debug.config_value("DEEPSEEK_API_KEY")
@@ -893,7 +1264,6 @@ class BattleDelegate:
                     "action_type", "object_id", "target_index",
                 )
             }
-            await self._audit_action(battle, action, result)
             self.actions.append(action)
             self._persist_control(
                 instruction_count=count,
@@ -905,10 +1275,7 @@ class BattleDelegate:
                 generation,
                 int(frozen_window["command_generation"]),
             )
-            feedback = (
-                "The previous action was accepted. A new command window is ready now; "
-                "reread the current battle and submit exactly one legal action."
-            )
+            feedback = ""
 
 
 class AgentRuntime:

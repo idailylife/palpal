@@ -304,6 +304,19 @@ compression summary does not replace it. After compression or checkpoint
 restore, the next Agent run must reconcile a compact index of active,
 completed, and abandoned tasks before navigation or item use resumes.
 
+Each formal battle generation has its own child SDK session. Battle prompts use
+a compact player-visible projection: cross-battle combat experience is included
+once, later command windows append only newly visible outcomes, and native
+action audits remain in Agent control/events rather than duplicating the battle
+snapshot in the model transcript. Battle sessions retain exact provider token
+counts independently from the main Agent. Set
+`PALPAL_BATTLE_COMPACT_AT_TOKENS` or
+`PALPAL_BATTLE_COMPACT_RETAIN_TOKENS` to override their explicit compression
+threshold and retained-tail budget; when unset they inherit the corresponding
+`PALPAL_AGENT_COMPACT_*` values. Ordinary battle turns remain append-only, while
+threshold-triggered compression atomically replaces older child history with a
+structured action summary and recent complete command cycles.
+
 The persistent model sees fourteen tools: `upsert_task`, `upsert_room_memo`, `get_tasks`,
 `get_navigation`, `inspect_target`, `get_observations`, `get_shop`,
 `get_equipment`, `get_inventory`, `get_room_memory`, `inspect_screen`,

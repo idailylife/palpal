@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import sys
 import threading
 import time
@@ -890,6 +891,19 @@ def test_battle_delegate_uses_child_budget_and_returns_one_summary(tmp_path):
     assert {event["turn"] for event in battle_events} == {0}
     assert battle_events[2]["details"]["tool"] == "native_battle_action"
     assert battle_events[3]["details"]["output"]["action_type"] == "attack"
+    assert "feedback" not in battle_events[1]["details"]
+    with sqlite3.connect(runtime.sqlite_path) as connection:
+        has_messages = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_messages'"
+        ).fetchone()
+        child_items = (
+            connection.execute(
+                "SELECT COUNT(*) FROM agent_messages WHERE session_id = ?",
+                (paused["battle_delegate"]["child_session_id"],),
+            ).fetchone()[0]
+            if has_messages else 0
+        )
+    assert child_items == 0
     summary = battle_events[-1]["details"]["summary"]
     assert summary["enemies"] == ["苗人"]
     assert summary["enemy_details"] == [{"object_id": 10, "name": "苗人"}]
@@ -1071,8 +1085,7 @@ def test_battle_delegate_requests_action_immediately_in_next_command_window(tmp_
 
     assert summary["result"] == "won"
     assert len(feedback) == 2
-    assert "new command window is ready now" in feedback[1]
-    assert "Wait for the next control window" not in feedback[1]
+    assert feedback == ["", ""]
 
 
 def test_battle_delegate_flee_reentry_completes_old_generation_and_uses_new_child(tmp_path):
@@ -1531,6 +1544,9 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
     class Stream:
         def __init__(self, attempt):
             self.attempt = attempt
+            self.context_wrapper = types.SimpleNamespace(
+                usage=provider_usage(100 + attempt, 0, 5, 3),
+            )
 
         async def stream_events(self):
             if self.attempt == 1:
@@ -1594,9 +1610,17 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
     assert captured["agent_kwargs"]["reset_tool_choice"] is False
     assert [run["max_turns"] for run in captured["runs"]] == [6, 6]
     initial_prompt = json.loads(captured["runs"][0]["prompt"])
-    assert initial_prompt["battle"] == debug.current_player_battle_view(state)
+    assert initial_prompt["battle"]["generation"] == 5
+    assert "recent_outcomes" not in initial_prompt["battle"]
+    assert "valid_target_indices" not in initial_prompt["battle"]["available_actions"][1]
+    assert initial_prompt["battle"]["available_actions"][1]["description"] == "灼熱火焰\n攻擊敵人"
+    assert set(initial_prompt) == {"battle", "feedback"}
     assert "Item and magic descriptions are player-visible menu text" in captured["agent_kwargs"]["instructions"]
+    assert "do not call get_battle unless" in captured["agent_kwargs"]["instructions"]
     assert "without an accepted submit_battle_action" in captured["runs"][1]["prompt"]
+    control = runtime.snapshot()["battle_delegate"]
+    assert control["last_prompt_tokens"] == 102
+    assert control["experience_sent"] is True
     events = [event for event in runtime.events() if event["type"] == "battle"]
     assert [event["phase"] for event in events] == [
         "started", "protocol_retry", "tool_called", "tool_output", "tool_called", "tool_output",
@@ -1789,6 +1813,164 @@ def test_battle_delegate_reuses_child_session_for_same_generation(tmp_path):
 
     assert second["child_session_id"] == first["child_session_id"]
     assert second["battle_generation"] == 5
+
+
+def test_battle_agent_view_compacts_experience_and_only_sends_new_outcomes(tmp_path):
+    delegate = make_debug_state(tmp_path).agent_runtime.battle_delegate
+    verbose_sample = {
+        "sequence": 3,
+        "actor": {"index": 0, "role_id": 0, "name": "hero"},
+        "action_type": "magic",
+        "object_id": 345,
+        "name": "spell",
+        "mp_cost": 10,
+        "game_instance_id": "game",
+        "battle_generation": 3,
+        "enemy_changes": [{
+            "slot_index": 0, "object_id": 81, "name": "enemy",
+            "amount": 90, "kind": "damage",
+        }],
+        "player_changes": [{
+            "index": 0,
+            "hp": {"before": 100, "after": 100, "max": 100},
+            "mp": {"before": 50, "after": 40, "max": 50},
+            "status_before": [], "status_after": [],
+            "poisons_before": [], "poisons_after": [],
+        }],
+        "numbers": [{"side": "enemy", "amount": 90, "kind": "damage"}],
+    }
+    view = {
+        "generation": 4,
+        "command_generation": 2,
+        "current_player_index": 0,
+        "players": [{"index": 0, "role_id": 0, "name": "hero"}],
+        "enemies": [{"slot_index": 0, "object_id": 81, "name": "enemy"}],
+        "available_actions": [{
+            "action_type": "magic", "object_id": 345, "name": "spell",
+            "target_side": "enemy", "target_mode": "single",
+            "valid_target_indices": [0], "submission_target_indices": [0],
+            "mp_cost": 10,
+        }],
+        "recent_outcomes": [
+            {**verbose_sample, "sequence": 1},
+            {**verbose_sample, "sequence": 2},
+        ],
+        "experience": {
+            "available": True,
+            "enemy_object_ids": [81],
+            "signature": "81",
+            "actions": [{
+                "actor_role_id": 0, "actor_name": "hero", "action_type": "magic",
+                "object_id": 345, "name": "spell", "enemy_object_id": 81,
+                "samples": [{**verbose_sample, "sequence": value} for value in range(1, 6)],
+            }, {
+                "actor_role_id": 2, "actor_name": "other", "action_type": "magic",
+                "object_id": 999, "name": "other spell", "enemy_object_id": 81,
+                "samples": [verbose_sample],
+            }],
+            "encounter": {
+                "samples": [{
+                    "result": "won",
+                    "tactics": [verbose_sample],
+                }],
+            },
+        },
+    }
+
+    compact = delegate._agent_battle_view(
+        view, include_experience=True, after_outcome_sequence=1,
+    )
+
+    assert compact["new_outcomes"] == [delegate._compact_outcome({**verbose_sample, "sequence": 2})]
+    assert "valid_target_indices" not in compact["available_actions"][0]
+    assert compact["available_actions"][0]["submission_target_indices"] == [0]
+    assert len(compact["experience"]["actions"]) == 1
+    action = compact["experience"]["actions"][0]
+    assert action["sample_count"] == 5
+    assert len(action["recent_samples"]) == 3
+    assert all("numbers" not in sample for sample in action["recent_samples"])
+    assert all("actor" not in sample for sample in action["recent_samples"])
+    assert action["recent_samples"][-1]["player_changes"] == [{"index": 0, "mp_delta": -10}]
+    later = delegate._agent_battle_view(
+        view, include_experience=False, after_outcome_sequence=2,
+    )
+    assert "experience" not in later
+    assert "new_outcomes" not in later
+
+
+def test_battle_context_compaction_is_battle_local_and_atomic(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    delegate = runtime.battle_delegate
+    delegate._begin({
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "battle": {"generation": 5, "phase": "command", "enemies": []},
+    })
+    delegate._persist_control(
+        last_prompt_tokens=1000,
+        instruction_count=3,
+        actions=[{"battle_generation": 5, "command_generation": 1, "action_type": "attack"}],
+    )
+    monkeypatch.setenv("PALPAL_BATTLE_COMPACT_AT_TOKENS", "1000")
+    monkeypatch.setenv("PALPAL_BATTLE_COMPACT_RETAIN_TOKENS", "1")
+    original = [
+        {"role": "user", "content": "old one"},
+        {"role": "assistant", "content": "done one"},
+        {"role": "user", "content": "old two"},
+        {"role": "assistant", "content": "done two"},
+        {"role": "user", "content": "latest"},
+        {"role": "assistant", "content": "done latest"},
+    ]
+    session = MemorySession(original)
+
+    assert asyncio.run(delegate._maybe_compact_sdk(session, '{"battle":{}}')) is True
+
+    summary = json.loads(session.items[0]["content"])["battle_history_summary"]
+    assert summary["battle_generation"] == 5
+    assert summary["submitted_actions"][0]["action_type"] == "attack"
+    assert session.items[-2:] == original[-2:]
+    control = runtime.snapshot()["battle_delegate"]
+    assert control["last_prompt_tokens"] is None
+    assert control["compactions"] == 1
+    assert control["last_compaction"]["retained_cycles"] == 1
+    phases = [event["phase"] for event in runtime.events() if event["type"] == "battle"]
+    assert phases[-2:] == ["compression_started", "compression_completed"]
+
+
+def test_battle_context_compaction_restores_history_on_failure(tmp_path, monkeypatch):
+    runtime = make_debug_state(tmp_path).agent_runtime
+    delegate = runtime.battle_delegate
+    delegate._begin({
+        **make_state(),
+        "game_instance_id": "battle-game",
+        "battle": {"generation": 5, "phase": "command", "enemies": []},
+    })
+    delegate._persist_control(last_prompt_tokens=1000)
+    monkeypatch.setenv("PALPAL_BATTLE_COMPACT_AT_TOKENS", "1000")
+    original = [
+        {"role": "user", "content": f"turn {index}"}
+        if index % 2 == 0 else {"role": "assistant", "content": f"done {index}"}
+        for index in range(6)
+    ]
+
+    class FailingSession(MemorySession):
+        def __init__(self, items):
+            super().__init__(items)
+            self.fail_once = True
+
+        async def add_items(self, items):
+            if self.fail_once:
+                self.fail_once = False
+                raise OSError("write failed")
+            await super().add_items(items)
+
+    session = FailingSession(original)
+    with pytest.raises(RuntimeError, match="battle_context_compaction_failed"):
+        asyncio.run(delegate._maybe_compact_sdk(session, '{"battle":{}}'))
+
+    assert session.items == original
+    assert runtime.snapshot()["battle_delegate"]["compactions"] == 0
+    assert runtime.events()[-1]["phase"] == "compression_failed"
 
 
 def test_decide_once_is_disabled_in_battle(tmp_path):
