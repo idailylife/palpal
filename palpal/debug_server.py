@@ -52,11 +52,13 @@ VALID_BUTTONS = {
 }
 STALE_AFTER_SECONDS = 2.0
 EXPLORATION_VERSION = 11
-COMBAT_KNOWLEDGE_VERSION = 1
+COMBAT_KNOWLEDGE_VERSION = 2
 COMBAT_ACTION_KEY_CAPACITY = 256
-COMBAT_ENCOUNTER_KEY_CAPACITY = 128
+COMBAT_ENEMY_KEY_CAPACITY = 128
+COMBAT_ACTIVE_BATTLE_CAPACITY = 16
 COMBAT_SAMPLE_CAPACITY = 8
 COMBAT_SEEN_CAPACITY = 4096
+COMBAT_HP_TRACKING_VERSION = 2
 LOGICAL_ROOM_ID_RE = re.compile(r"^S\d+/M\d+:[0-9A-F]{12}$")
 MAX_OBJECT_INTERACTION_HISTORY = 20
 MAX_INTERACTION_CONTEXT_EVIDENCE = 40
@@ -3786,6 +3788,9 @@ class DebugState:
             "combat_knowledge": {
                 "version": COMBAT_KNOWLEDGE_VERSION,
                 "actions": {},
+                "enemies": {},
+                "active_battles": {},
+                "hp_tracking_version": COMBAT_HP_TRACKING_VERSION,
                 "encounters": {},
                 "seen": [],
             },
@@ -3854,12 +3859,27 @@ class DebugState:
         if not isinstance(battle_reappearances, dict):
             data["battle_reappearances"] = {}
         knowledge = data.get("combat_knowledge")
-        if not isinstance(knowledge, dict) or knowledge.get("version") != COMBAT_KNOWLEDGE_VERSION:
+        if not isinstance(knowledge, dict):
             data["combat_knowledge"] = self.empty_exploration()["combat_knowledge"]
         else:
-            for key in ("actions", "encounters"):
+            # v1 stored useful per-action samples and legacy lineup encounters.
+            # Keep both intact, but v2 no longer reads or writes encounters.
+            if knowledge.get("version") == 1:
+                knowledge["version"] = COMBAT_KNOWLEDGE_VERSION
+                knowledge.setdefault("enemies", {})
+                knowledge.setdefault("active_battles", {})
+            elif knowledge.get("version") != COMBAT_KNOWLEDGE_VERSION:
+                data["combat_knowledge"] = self.empty_exploration()["combat_knowledge"]
+                knowledge = data["combat_knowledge"]
+            for key in ("actions", "enemies", "active_battles", "encounters"):
                 if not isinstance(knowledge.get(key), dict):
                     knowledge[key] = {}
+            if knowledge.get("hp_tracking_version") != COMBAT_HP_TRACKING_VERSION:
+                for enemy in knowledge["enemies"].values():
+                    if isinstance(enemy, dict):
+                        enemy["hp_samples"] = []
+                knowledge["active_battles"] = {}
+                knowledge["hp_tracking_version"] = COMBAT_HP_TRACKING_VERSION
             if not isinstance(knowledge.get("seen"), list):
                 knowledge["seen"] = []
         observable_context = data.get("interaction_observable_context")
@@ -3890,17 +3910,6 @@ class DebugState:
         )
 
     @staticmethod
-    def battle_enemy_signature(battle: dict | None) -> tuple[list[int], str]:
-        ids = sorted(
-            int(enemy.get("object_id") or 0)
-            for enemy in (battle or {}).get("enemies") or []
-            if isinstance(enemy, dict)
-            and enemy.get("present", True) is not False
-            and int(enemy.get("object_id") or 0) > 0
-        )
-        return ids, ",".join(str(value) for value in ids)
-
-    @staticmethod
     def _combat_trim_keys(values: dict, capacity: int) -> None:
         while len(values) > capacity:
             oldest = min(
@@ -3921,7 +3930,7 @@ class DebugState:
             "sequence": int(outcome.get("sequence") or 0),
             "actor": {
                 key: actor.get(key)
-                for key in ("index", "role_id", "name") if key in actor
+                for key in ("index", "role_id", "object_id", "name") if key in actor
             },
             "action_type": str(action.get("action_type") or ""),
             "object_id": int(action.get("object_id") or 0),
@@ -3931,7 +3940,7 @@ class DebugState:
             "enemy_changes": [
                 {
                     key: change.get(key)
-                    for key in ("slot_index", "object_id", "name", "amount", "kind")
+                    for key in ("slot_index", "object_id", "name", "amount", "kind", "defeated")
                     if key in change
                 }
                 for change in outcome.get("enemy_changes") or []
@@ -3962,6 +3971,69 @@ class DebugState:
             "no_numeric_change_observed": bool(outcome.get("no_numeric_change_observed")),
         }
 
+    @staticmethod
+    def _single_enemy_win_hp_fallback(source: dict) -> dict | None:
+        """Infer one defeated life only from an unambiguous completed win log."""
+        if source.get("result") != "won":
+            return None
+        enemies = [
+            enemy for enemy in source.get("enemies") or []
+            if isinstance(enemy, dict) and int(enemy.get("object_id") or 0) > 0
+        ]
+        if len(enemies) != 1:
+            return None
+        enemy_id = int(enemies[0].get("object_id") or 0)
+        outcomes = sorted(
+            (outcome for outcome in source.get("visible_outcomes") or [] if isinstance(outcome, dict)),
+            key=lambda outcome: int(outcome.get("sequence") or 0),
+        )
+        sequences = [int(outcome.get("sequence") or 0) for outcome in outcomes]
+        if not sequences or sequences != list(range(1, sequences[-1] + 1)):
+            return None
+        changes = [
+            (int(outcome.get("sequence") or 0), change)
+            for outcome in outcomes
+            for change in outcome.get("enemy_changes") or []
+            if isinstance(change, dict)
+        ]
+        if not changes or any(change.get("defeated") is True for _, change in changes):
+            return None
+        identities = {
+            (int(change.get("slot_index") or 0), int(change.get("object_id") or 0))
+            for _, change in changes
+        }
+        if len(identities) != 1 or next(iter(identities))[1] != enemy_id:
+            return None
+        final_sequence, final_change = changes[-1]
+        if (
+            final_sequence != sequences[-1]
+            or final_change.get("kind") != "damage"
+            or int(final_change.get("amount") or 0) <= 0
+        ):
+            return None
+        net_damage = 0
+        lower = 0
+        for sequence, change in changes:
+            amount = max(0, int(change.get("amount") or 0))
+            if sequence == final_sequence and change is final_change:
+                lower = net_damage
+            if change.get("kind") == "damage":
+                net_damage += amount
+            elif change.get("kind") == "recovery":
+                net_damage = max(0, net_damage - amount)
+            else:
+                return None
+        if net_damage <= lower:
+            return None
+        return {
+            "object_id": enemy_id,
+            "name": str(enemies[0].get("name") or final_change.get("name") or ""),
+            "lower_exclusive": lower,
+            "upper_inclusive": net_damage,
+            "defeat_confirmation": "completed_single_enemy_win",
+            "tracking_version": COMBAT_HP_TRACKING_VERSION,
+        }
+
     def observe_combat_knowledge(self, state: dict) -> None:
         if not self.companion_owner_matches():
             return
@@ -3985,13 +4057,120 @@ class DebugState:
             changed = False
             for source, completed in sources:
                 generation = int(source.get("generation") or 0)
-                enemy_ids, signature = self.battle_enemy_signature(source)
-                for outcome in source.get("visible_outcomes") or []:
+                if generation <= 0:
+                    continue
+                battle_key = f"{instance_id}:{generation}"
+                outcomes = sorted(
+                    (outcome for outcome in source.get("visible_outcomes") or [] if isinstance(outcome, dict)),
+                    key=lambda outcome: int(outcome.get("sequence") or 0),
+                )
+                active = knowledge["active_battles"].get(battle_key)
+                if not isinstance(active, dict):
+                    first_sequence = int(outcomes[0].get("sequence") or 0) if outcomes else 0
+                    active = {
+                        "game_instance_id": instance_id,
+                        "battle_generation": generation,
+                        "last_sequence": 0,
+                        "complete_from_start": first_sequence in (0, 1),
+                        "lives": {},
+                        "pending_hp_samples": [],
+                        "updated_at": time.time(),
+                    }
+                    knowledge["active_battles"][battle_key] = active
+                    changed = True
+                lives = active.setdefault("lives", {})
+                last_sequence = int(active.get("last_sequence") or 0)
+                pending_change_keys = {
+                    f"{int(change.get('slot_index') or 0)}:{int(change.get('object_id') or 0)}"
+                    for outcome in outcomes
+                    if int(outcome.get("sequence") or 0) > last_sequence
+                    for change in outcome.get("enemy_changes") or []
+                    if isinstance(change, dict) and int(change.get("object_id") or 0) > 0
+                }
+                present_keys = set()
+                if not completed:
+                    for enemy in source.get("enemies") or []:
+                        if not isinstance(enemy, dict) or enemy.get("present", True) is False:
+                            continue
+                        slot = int(enemy.get("slot_index") or 0)
+                        enemy_id = int(enemy.get("object_id") or 0)
+                        if enemy_id <= 0:
+                            continue
+                        life_key = f"{slot}:{enemy_id}"
+                        present_keys.add(life_key)
+                        life = lives.get(life_key)
+                        if isinstance(life, dict) and life.pop("temporarily_absent", False):
+                            life["net_damage"] = 0
+                            changed = True
+                        else:
+                            lives.setdefault(life_key, {
+                                "slot_index": slot,
+                                "object_id": enemy_id,
+                                "name": str(enemy.get("name") or ""),
+                                "net_damage": 0,
+                            })
+                for life_key in list(lives):
+                    slot_text = life_key.split(":", 1)[0]
+                    replaced = any(
+                        key.split(":", 1)[0] == slot_text and key != life_key
+                        for key in present_keys
+                    )
+                    if replaced or (completed and life_key not in pending_change_keys):
+                        lives.pop(life_key, None)
+                        changed = True
+                    elif life_key not in present_keys and life_key not in pending_change_keys:
+                        lives[life_key]["temporarily_absent"] = True
+                        changed = True
+                for outcome in outcomes:
                     if not isinstance(outcome, dict):
                         continue
                     sequence = int(outcome.get("sequence") or 0)
                     token = f"{instance_id}:{generation}:{sequence}"
-                    if generation <= 0 or sequence <= 0 or token in seen:
+                    if sequence <= 0:
+                        continue
+                    if sequence > last_sequence:
+                        if sequence != last_sequence + 1:
+                            active["complete_from_start"] = False
+                            active["pending_hp_samples"] = []
+                            for life in lives.values():
+                                if isinstance(life, dict):
+                                    life["net_damage"] = 0
+                        for change in outcome.get("enemy_changes") or []:
+                            if not isinstance(change, dict):
+                                continue
+                            slot = int(change.get("slot_index") or 0)
+                            enemy_id = int(change.get("object_id") or 0)
+                            if enemy_id <= 0:
+                                continue
+                            life_key = f"{slot}:{enemy_id}"
+                            life = lives.setdefault(life_key, {
+                                "slot_index": slot,
+                                "object_id": enemy_id,
+                                "name": str(change.get("name") or ""),
+                                "net_damage": 0,
+                            })
+                            before_final = max(0, int(life.get("net_damage") or 0))
+                            amount = max(0, int(change.get("amount") or 0))
+                            if change.get("kind") == "damage":
+                                life["net_damage"] = before_final + amount
+                            elif change.get("kind") == "recovery":
+                                life["net_damage"] = max(0, before_final - amount)
+                            if change.get("defeated") is True:
+                                after_final = max(0, int(life.get("net_damage") or 0))
+                                if active.get("complete_from_start") and after_final > before_final:
+                                    active["pending_hp_samples"].append({
+                                        "object_id": enemy_id,
+                                        "name": str(change.get("name") or life.get("name") or ""),
+                                        "lower_exclusive": before_final,
+                                        "upper_inclusive": after_final,
+                                        "tracking_version": COMBAT_HP_TRACKING_VERSION,
+                                    })
+                                lives.pop(life_key, None)
+                        active["last_sequence"] = sequence
+                        active["updated_at"] = time.time()
+                        last_sequence = sequence
+                        changed = True
+                    if token in seen:
                         continue
                     actor = outcome.get("actor") if isinstance(outcome.get("actor"), dict) else {}
                     action = outcome.get("action") if isinstance(outcome.get("action"), dict) else {}
@@ -4026,50 +4205,81 @@ class DebugState:
                             sample.update(game_instance_id=instance_id, battle_generation=generation)
                             entry["samples"] = (entry.get("samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):] + [sample]
                             entry["updated_at"] = time.time()
+                    elif actor.get("side") == "enemy":
+                        enemy_id = int(actor.get("object_id") or 0)
+                        if enemy_id > 0:
+                            enemy = knowledge["enemies"].setdefault(str(enemy_id), {
+                                "object_id": enemy_id,
+                                "name": str(actor.get("name") or ""),
+                                "hp_samples": [],
+                                "enemy_effect_samples": [],
+                            })
+                            sample = self._visible_outcome_sample(outcome, 0)
+                            sample["object_id"] = 0
+                            sample["name"] = ""
+                            sample.pop("mp_cost", None)
+                            sample["enemy_changes"] = []
+                            sample["numbers"] = []
+                            sample.update(game_instance_id=instance_id, battle_generation=generation)
+                            enemy["enemy_effect_samples"] = (
+                                (enemy.get("enemy_effect_samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):]
+                                + [sample]
+                            )
+                            enemy["updated_at"] = time.time()
                     seen.add(token)
                     seen_list.append(token)
                     changed = True
                 result_token = f"{instance_id}:{generation}:result"
-                if completed and generation > 0 and signature and result_token not in seen:
-                    entry = knowledge["encounters"].setdefault(signature, {
-                        "signature": signature,
-                        "enemy_object_ids": enemy_ids,
-                        "samples": [],
-                    })
-                    tactics = []
-                    for outcome in source.get("visible_outcomes") or []:
-                        if not (
-                            isinstance(outcome, dict)
-                            and isinstance(outcome.get("actor"), dict)
-                            and outcome["actor"].get("side") == "player"
-                        ):
+                if completed and result_token not in seen:
+                    for hp_sample in active.get("pending_hp_samples") or []:
+                        enemy_id = int(hp_sample.get("object_id") or 0)
+                        if enemy_id <= 0:
                             continue
-                        tactic = self._visible_outcome_sample(outcome, 0)
-                        tactic["enemy_changes"] = [
-                            {
-                                key: change.get(key)
-                                for key in ("slot_index", "object_id", "name", "amount", "kind")
-                                if key in change
-                            }
-                            for change in outcome.get("enemy_changes") or []
-                            if isinstance(change, dict)
-                        ]
-                        tactics.append(tactic)
-                    sample = {
-                        "game_instance_id": instance_id,
-                        "battle_generation": generation,
-                        "result": str(source.get("result") or ""),
-                        "tactics": tactics[-32:],
-                    }
-                    entry["samples"] = (entry.get("samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):] + [sample]
-                    entry["updated_at"] = time.time()
+                        enemy = knowledge["enemies"].setdefault(str(enemy_id), {
+                            "object_id": enemy_id,
+                            "name": str(hp_sample.get("name") or ""),
+                            "hp_samples": [],
+                            "enemy_effect_samples": [],
+                        })
+                        sample = dict(hp_sample)
+                        sample.update(game_instance_id=instance_id, battle_generation=generation)
+                        enemy["hp_samples"] = (
+                            (enemy.get("hp_samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):] + [sample]
+                        )
+                        enemy["updated_at"] = time.time()
                     seen.add(result_token)
                     seen_list.append(result_token)
+                    knowledge["active_battles"].pop(battle_key, None)
                     changed = True
+                elif completed and battle_key in knowledge["active_battles"]:
+                    knowledge["active_battles"].pop(battle_key, None)
+                    changed = True
+                fallback_token = f"{instance_id}:{generation}:hp-fallback-single-win"
+                if completed and fallback_token not in seen:
+                    hp_sample = self._single_enemy_win_hp_fallback(source)
+                    if hp_sample is not None:
+                        enemy_id = int(hp_sample["object_id"])
+                        enemy = knowledge["enemies"].setdefault(str(enemy_id), {
+                            "object_id": enemy_id,
+                            "name": str(hp_sample.get("name") or ""),
+                            "hp_samples": [],
+                            "enemy_effect_samples": [],
+                        })
+                        sample = dict(hp_sample)
+                        sample.update(game_instance_id=instance_id, battle_generation=generation)
+                        enemy["hp_samples"] = (
+                            (enemy.get("hp_samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):]
+                            + [sample]
+                        )
+                        enemy["updated_at"] = time.time()
+                        seen.add(fallback_token)
+                        seen_list.append(fallback_token)
+                        changed = True
             if changed:
                 knowledge["seen"] = seen_list[-COMBAT_SEEN_CAPACITY:]
                 self._combat_trim_keys(knowledge["actions"], COMBAT_ACTION_KEY_CAPACITY)
-                self._combat_trim_keys(knowledge["encounters"], COMBAT_ENCOUNTER_KEY_CAPACITY)
+                self._combat_trim_keys(knowledge["enemies"], COMBAT_ENEMY_KEY_CAPACITY)
+                self._combat_trim_keys(knowledge["active_battles"], COMBAT_ACTIVE_BATTLE_CAPACITY)
                 self.write_exploration(data)
 
     def observe_visible_item_use(
@@ -4163,8 +4373,19 @@ class DebugState:
             return {"available": False, "isolation_error": "companion_owner_mismatch"}
         with self.exploration_lock:
             knowledge = self.read_exploration().get("combat_knowledge") or {}
-        enemy_ids, signature = self.battle_enemy_signature(battle)
-        actions = []
+        current_enemies = {}
+        for enemy in (battle or {}).get("enemies") or []:
+            if not isinstance(enemy, dict) or enemy.get("present", True) is False:
+                continue
+            enemy_id = int(enemy.get("object_id") or 0)
+            if enemy_id <= 0:
+                continue
+            current = current_enemies.setdefault(enemy_id, {
+                "object_id": enemy_id, "name": str(enemy.get("name") or ""), "current_count": 0,
+            })
+            current["current_count"] += 1
+        grouped_actions = {enemy_id: [] for enemy_id in current_enemies}
+        support_actions = []
         for entry in (knowledge.get("actions") or {}).values():
             if not isinstance(entry, dict):
                 continue
@@ -4172,17 +4393,65 @@ class DebugState:
             if item_id is not None:
                 if int(entry.get("object_id") or 0) != int(item_id):
                     continue
-            elif enemy_id not in set(enemy_ids) and enemy_id != 0:
+            if enemy_id not in current_enemies and enemy_id != 0:
                 continue
-            actions.append(entry)
-        actions.sort(key=lambda entry: float(entry.get("updated_at") or 0), reverse=True)
-        encounter = (knowledge.get("encounters") or {}).get(signature) if signature else None
+            (support_actions if enemy_id == 0 else grouped_actions[enemy_id]).append(entry)
+        support_actions.sort(key=lambda entry: float(entry.get("updated_at") or 0), reverse=True)
+        enemy_memories = []
+        for enemy_id, current in current_enemies.items():
+            stored = (knowledge.get("enemies") or {}).get(str(enemy_id))
+            stored = stored if isinstance(stored, dict) else {}
+            hp_samples = [sample for sample in stored.get("hp_samples") or [] if isinstance(sample, dict)]
+            if not hp_samples:
+                hp_estimate = {"status": "unknown"}
+            else:
+                lower = max(int(sample.get("lower_exclusive") or 0) for sample in hp_samples)
+                upper = min(int(sample.get("upper_inclusive") or 0) for sample in hp_samples)
+                hp_estimate = (
+                    {"status": "estimated", "lower_exclusive": lower, "upper_inclusive": upper,
+                     "sample_count": len(hp_samples)}
+                    if lower < upper else
+                    {"status": "inconsistent", "sample_count": len(hp_samples), "samples": [
+                        {
+                            "lower_exclusive": int(sample.get("lower_exclusive") or 0),
+                            "upper_inclusive": int(sample.get("upper_inclusive") or 0),
+                        }
+                        for sample in hp_samples
+                    ]}
+                )
+            actions = grouped_actions[enemy_id]
+            actions.sort(key=lambda entry: float(entry.get("updated_at") or 0), reverse=True)
+            enemy_memories.append({
+                **current,
+                "hp_estimate": hp_estimate,
+                "player_actions": actions,
+                "enemy_effects": [
+                    {
+                        "sequence": int(sample.get("sequence") or 0),
+                        "battle_generation": int(sample.get("battle_generation") or 0),
+                        "actor": {
+                            key: (sample.get("actor") or {}).get(key)
+                            for key in ("index", "object_id", "name")
+                            if key in (sample.get("actor") or {})
+                        },
+                        "player_changes": copy.deepcopy(sample.get("player_changes") or []),
+                        "no_numeric_change_observed": bool(
+                            sample.get("no_numeric_change_observed")
+                        ),
+                    }
+                    for sample in stored.get("enemy_effect_samples") or []
+                    if isinstance(sample, dict)
+                ],
+            })
         return {
             "available": True,
-            "enemy_object_ids": enemy_ids,
-            "signature": signature,
-            "actions": actions,
-            "encounter": encounter if isinstance(encounter, dict) else None,
+            "enemy_memories": enemy_memories,
+            "support_actions": support_actions,
+            **({"matching_actions": support_actions + [
+                action
+                for memory in enemy_memories
+                for action in memory.get("player_actions") or []
+            ]} if item_id is not None else {}),
         }
 
     @staticmethod
@@ -7505,10 +7774,14 @@ class DebugState:
         position_changed = (from_pos.get("x"), from_pos.get("y")) != (to_pos.get("x"), to_pos.get("y"))
         same_room = to_identity["id"] == from_identity.get("id")
         if same_room and not position_changed:
+            trigger_completed = (
+                pending.get("owner") == "navigation"
+                and native.get("completed") is True
+            )
             self.terminate_pending_transition_observation(
                 pending,
-                "no_position_change",
-                "no_position_change",
+                "trigger_completed" if trigger_completed else "no_position_change",
+                "trigger_completed" if trigger_completed else "no_position_change",
             )
             return None
         frame = self.int_frame(state.get("logical_frame", state.get("frame")))
@@ -7816,6 +8089,59 @@ class DebugState:
                 or current != expected_node
             ):
                 return None
+            return dict(last_route)
+
+    def consume_completed_touch_route(self, state: dict, target_id: int) -> dict | None:
+        """Consume native proof that the final touch route already triggered its script."""
+        identity = self.room_identity(state)
+        grid = decode_nav_grid(state)
+        if identity is None or grid is None:
+            return None
+        pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        try:
+            current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
+        except (TypeError, ValueError):
+            return None
+        if current is None:
+            return None
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = (data.get("rooms") or {}).get(identity["id"])
+            last_route = room.get("last_route") if isinstance(room, dict) else None
+            if not isinstance(last_route, dict):
+                return None
+            try:
+                remembered_target_id = int(last_route.get("target_id") or 0)
+                remaining_steps = int(last_route.get("remaining_steps") or 0)
+                expected = (
+                    last_route.get("expected_node")
+                    if isinstance(last_route.get("expected_node"), dict)
+                    else {}
+                )
+                expected_node = (
+                    int(expected.get("grid_x", -1)),
+                    int(expected.get("grid_y", -1)),
+                )
+            except (TypeError, ValueError):
+                return None
+            selection = (
+                last_route.get("target_selection")
+                if isinstance(last_route.get("target_selection"), dict)
+                else {}
+            )
+            if (
+                remembered_target_id != int(target_id)
+                or remaining_steps != 0
+                or selection.get("kind") != "touch"
+                or last_route.get("outcome") != "trigger_completed"
+                or last_route.get("completion_reported_at") is not None
+                or current != expected_node
+            ):
+                return None
+            last_route["completion_reported_at"] = time.time()
+            room["updated_at"] = last_route["completion_reported_at"]
+            self.write_exploration(data)
             return dict(last_route)
 
     def exploration_safe_and_reachable(
@@ -8480,11 +8806,11 @@ class DebugState:
             "ok": True,
             "status": "in_battle",
             "battle_generation": int(view.get("generation") or 0),
-            "enemies": enemies,
-            "signature": experience.get("signature") or "",
+            "is_boss": view.get("is_boss") is True,
+            "current_enemies": enemies,
+            "enemy_memories": experience.get("enemy_memories") or [],
+            "support_experience": experience.get("support_actions") or [],
             "recent_outcomes": view.get("recent_outcomes") or [],
-            "action_experience": experience.get("actions") or [],
-            "encounter_experience": experience.get("encounter"),
         }
 
     def goal_nodes(self, state: dict, grid: dict, target: dict) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int]]:
@@ -8770,7 +9096,7 @@ class DebugState:
                             "blocker": interaction["blocker"],
                             **destination_payload,
                         }
-            return {
+            result = {
                 "ok": True,
                 "target_id": target_id,
                 "status": "unreachable_static",
@@ -8778,6 +9104,18 @@ class DebugState:
                 "blocked_by_transition": avoid_transitions,
                 **destination_payload,
             }
+            if avoid_transitions:
+                relaxed = self.route_to_object(
+                    state,
+                    target_id,
+                    avoid_transitions=False,
+                    approach_item_id=approach_item_id,
+                    context=context,
+                )
+                if relaxed.get("status") in {"reachable", "transition"}:
+                    result["status"] = "blocked_by_transition"
+                    result["blocked_route"] = relaxed.get("route")
+            return result
 
         action = "touch" if kind == "touch" else "approach" if kind == "approach" else "search"
         result = {
@@ -8914,6 +9252,15 @@ class DebugState:
                         "stable_snapshots": int((pending or {}).get("stable_snapshots") or 0),
                         "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
                     }
+
+        completed_touch = self.consume_completed_touch_route(state, target_id)
+        if completed_touch is not None:
+            return {
+                "ok": True,
+                "status": "arrived",
+                "target_id": target_id,
+                "completion": "trigger_completed",
+            }
 
         route = self.route_to_object(
             state,
@@ -11330,7 +11677,7 @@ class DebugState:
             key: battle.get(key)
             for key in (
                 "generation", "command_generation", "result", "phase",
-                "current_player_index", "awaiting_ack",
+                "current_player_index", "awaiting_ack", "is_boss",
             )
             if key in battle
         }
@@ -11398,7 +11745,7 @@ class DebugState:
                     "enemy_changes": [
                         {
                             key: change.get(key)
-                            for key in ("slot_index", "object_id", "name", "amount", "kind")
+                            for key in ("slot_index", "object_id", "name", "amount", "kind", "defeated")
                             if key in change
                         }
                         for change in outcome.get("enemy_changes") or []
@@ -11425,9 +11772,33 @@ class DebugState:
         return view
 
     @staticmethod
-    def player_battle_inventory_item(item: dict) -> dict:
-        """Return inventory facts available from ordinary battle menus."""
+    def player_battle_item_effect(effect: object) -> dict | None:
+        """Project a native item-script preview onto player-usable effect facts."""
+        if not isinstance(effect, dict):
+            return None
+        visible_effect_keys = (
+            "kind", "conditional", "amount", "apply_to_all", "max_hp_percent",
+            "poison_name", "max_poison_level", "status", "duration",
+        )
+        effects = [
+            {
+                key: entry.get(key)
+                for key in visible_effect_keys
+                if key in entry
+            }
+            for entry in effect.get("effects") or []
+            if isinstance(entry, dict) and entry.get("kind")
+        ]
         return {
+            "source": "dos_script_preview",
+            "preview_complete": effect.get("preview_complete") is True,
+            "effects": effects,
+        }
+
+    @staticmethod
+    def player_battle_inventory_item(item: dict) -> dict:
+        """Return inventory and sanitized DOS handbook-equivalent effect facts."""
+        visible = {
             key: item.get(key)
             for key in (
                 "slot", "item_id", "name", "description", "amount", "amount_in_use",
@@ -11440,6 +11811,11 @@ class DebugState:
                 int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
             ),
         }
+        for key in ("use_effect", "throw_effect"):
+            projected = DebugState.player_battle_item_effect(item.get(key))
+            if projected is not None:
+                visible[key] = projected
+        return visible
 
     @staticmethod
     def compact_inventory_item(item: dict) -> dict:

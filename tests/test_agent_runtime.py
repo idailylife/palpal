@@ -1500,6 +1500,12 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
             "target_mode": "single",
             "valid_target_indices": [0],
             "submission_target_indices": [0],
+        }, {
+            "action_type": "throw_item",
+            "object_id": 99,
+            "target_mode": "single",
+            "valid_target_indices": [0],
+            "submission_target_indices": [0],
         }],
     }
     state = {
@@ -1510,15 +1516,28 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
         "inventory": [{
             "slot": 0, "item_id": 99, "name": "止血草", "amount": 2,
             "description": "恢復少量體力",
-            "amount_in_use": 0, "usable": True, "throwable": False,
+            "amount_in_use": 0, "usable": True, "throwable": True,
             "consuming": True, "apply_to_all": False,
             "use_effect": {
-                "script_entry": 39208, "preview_complete": True,
+                "script_entry": 39208, "preview_complete": False,
+                "requirements_complete": False,
                 "effects": [{
+                    "script_entry": 39208,
                     "kind": "restore_hp", "amount": 50,
                     "conditional": False, "apply_to_all": False,
                 }],
-                "unparsed_effects": [],
+                "requirements": [{"kind": "face_event_object", "event_object_id": 42}],
+                "unparsed_effects": [{"script_entry": 39209, "operation": 66}],
+            },
+            "throw_effect": {
+                "script_entry": 39210, "preview_complete": True,
+                "requirements_complete": True,
+                "effects": [{
+                    "script_entry": 39211,
+                    "kind": "enemy_damage", "amount": 90,
+                    "conditional": False, "apply_to_all": False,
+                }],
+                "requirements": [], "unparsed_effects": [],
             },
         }],
     }
@@ -1564,11 +1583,41 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
             item = json.loads(item_output)
             assert item["item"]["available_amount"] == 2
             assert item["item"]["description"] == "恢復少量體力"
-            assert "use_effect" not in item["item"]
+            assert item["item"]["use_effect"] == {
+                "source": "dos_script_preview",
+                "preview_complete": False,
+                "effects": [{
+                    "kind": "restore_hp", "amount": 50,
+                    "conditional": False, "apply_to_all": False,
+                }],
+            }
+            assert item["item"]["throw_effect"] == {
+                "source": "dos_script_preview",
+                "preview_complete": True,
+                "effects": [{
+                    "kind": "enemy_damage", "amount": 90,
+                    "conditional": False, "apply_to_all": False,
+                }],
+            }
+            serialized_item = json.dumps(item["item"], ensure_ascii=False)
+            for hidden in (
+                "script_entry", "requirements", "requirements_complete",
+                "unparsed_effects", "operation", "event_object_id",
+            ):
+                assert hidden not in serialized_item
             assert "effect_available" not in item["item"]
+            assert item["legal_battle_actions"] == [{
+                "action_type": "use_item", "object_id": 99,
+                "target_mode": "single", "valid_target_indices": [0],
+                "submission_target_indices": [0],
+            }, {
+                "action_type": "throw_item", "object_id": 99,
+                "target_mode": "single", "valid_target_indices": [0],
+                "submission_target_indices": [0],
+            }]
             submit_output = await tools["submit_battle_action"].kwargs["on_invoke_tool"](
                 None,
-                json.dumps({"action_type": "use_item", "object_id": 99, "target_index": 0}),
+                json.dumps({"action_type": "throw_item", "object_id": 99, "target_index": 0}),
             )
             result = types.SimpleNamespace(tool=tools["submit_battle_action"], output=submit_output)
             assert captured["agent"].tool_use_behavior(None, [result]).is_final_output is True
@@ -1600,7 +1649,7 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
 
     action = asyncio.run(runtime.battle_delegate._sdk_action(state, "Choose an action."))
 
-    assert action["action_type"] == "use_item"
+    assert action["action_type"] == "throw_item"
     assert set(captured["model"]) == {"model", "openai_client"}
     assert captured["agent_kwargs"]["model_settings"] == {
         "include_usage": True,
@@ -1615,7 +1664,11 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
     assert "valid_target_indices" not in initial_prompt["battle"]["available_actions"][1]
     assert initial_prompt["battle"]["available_actions"][1]["description"] == "灼熱火焰\n攻擊敵人"
     assert set(initial_prompt) == {"battle", "feedback"}
-    assert "Item and magic descriptions are player-visible menu text" in captured["agent_kwargs"]["instructions"]
+    assert "DOS handbook-equivalent knowledge" in captured["agent_kwargs"]["instructions"]
+    assert "preview_complete is false" in captured["agent_kwargs"]["instructions"]
+    assert "does not justify estimating maximum or remaining HP" in captured["agent_kwargs"]["instructions"]
+    assert "boss flag means the encounter is special" in captured["agent_kwargs"]["instructions"]
+    assert "discard any target plan" in captured["agent_kwargs"]["instructions"]
     assert "do not call get_battle unless" in captured["agent_kwargs"]["instructions"]
     assert "without an accepted submit_battle_action" in captured["runs"][1]["prompt"]
     control = runtime.snapshot()["battle_delegate"]
@@ -1633,7 +1686,7 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
     assert events[3]["details"]["output"]["battle"]["generation"] == 5
     assert events[5]["details"]["output"]["item"]["available_amount"] == 2
     assert events[6]["details"]["arguments"] == {
-        "action_type": "use_item", "object_id": 99, "target_index": 0,
+        "action_type": "throw_item", "object_id": 99, "target_index": 0,
     }
     assert events[7]["details"]["output"] == {"ok": True, "accepted": True}
 
@@ -1815,6 +1868,31 @@ def test_battle_delegate_reuses_child_session_for_same_generation(tmp_path):
     assert second["battle_generation"] == 5
 
 
+def test_battle_delegate_reports_appeared_and_disappeared_enemies_after_first_send(tmp_path):
+    delegate = make_debug_state(tmp_path).agent_runtime.battle_delegate
+    initial = {
+        **make_state(), "game_instance_id": "battle-game", "in_battle": True,
+        "battle": {"generation": 5, "phase": "command", "enemies": [
+            {"slot_index": 0, "object_id": 81, "name": "old", "present": True},
+        ]},
+    }
+    delegate._begin(initial)
+    first = delegate._with_enemy_changes(initial["battle"])
+    assert "enemy_changes" not in first
+    delegate._mark_enemies_sent(first)
+
+    replaced = {
+        **initial["battle"],
+        "enemies": [{"slot_index": 0, "object_id": 82, "name": "new", "present": True}],
+    }
+    changed = delegate._with_enemy_changes(replaced)
+
+    assert changed["enemy_changes"] == {
+        "appeared": [{"slot_index": 0, "object_id": 82, "name": "new"}],
+        "disappeared": [{"slot_index": 0, "object_id": 81, "name": "old"}],
+    }
+
+
 def test_battle_agent_view_compacts_experience_and_only_sends_new_outcomes(tmp_path):
     delegate = make_debug_state(tmp_path).agent_runtime.battle_delegate
     verbose_sample = {
@@ -1857,23 +1935,25 @@ def test_battle_agent_view_compacts_experience_and_only_sends_new_outcomes(tmp_p
         ],
         "experience": {
             "available": True,
-            "enemy_object_ids": [81],
-            "signature": "81",
-            "actions": [{
-                "actor_role_id": 0, "actor_name": "hero", "action_type": "magic",
-                "object_id": 345, "name": "spell", "enemy_object_id": 81,
-                "samples": [{**verbose_sample, "sequence": value} for value in range(1, 6)],
-            }, {
-                "actor_role_id": 2, "actor_name": "other", "action_type": "magic",
-                "object_id": 999, "name": "other spell", "enemy_object_id": 81,
-                "samples": [verbose_sample],
-            }],
-            "encounter": {
-                "samples": [{
-                    "result": "won",
-                    "tactics": [verbose_sample],
+            "enemy_memories": [{
+                "object_id": 81, "name": "enemy", "current_count": 1,
+                "hp_estimate": {"status": "estimated", "lower_exclusive": 80,
+                                "upper_inclusive": 90, "sample_count": 2},
+                "player_actions": [{
+                    "actor_role_id": 0, "actor_name": "hero", "action_type": "magic",
+                    "object_id": 345, "name": "spell", "enemy_object_id": 81,
+                    "samples": [{**verbose_sample, "sequence": value} for value in range(1, 6)],
+                }, {
+                    "actor_role_id": 2, "actor_name": "other", "action_type": "magic",
+                    "object_id": 999, "name": "other spell", "enemy_object_id": 81,
+                    "samples": [verbose_sample],
                 }],
-            },
+                "enemy_effects": [{
+                    **verbose_sample,
+                    "actor": {"index": 0, "object_id": 81, "name": "enemy"},
+                }],
+            }],
+            "support_actions": [],
         },
     }
 
@@ -1884,8 +1964,11 @@ def test_battle_agent_view_compacts_experience_and_only_sends_new_outcomes(tmp_p
     assert compact["new_outcomes"] == [delegate._compact_outcome({**verbose_sample, "sequence": 2})]
     assert "valid_target_indices" not in compact["available_actions"][0]
     assert compact["available_actions"][0]["submission_target_indices"] == [0]
-    assert len(compact["experience"]["actions"]) == 1
-    action = compact["experience"]["actions"][0]
+    assert len(compact["experience"]["enemy_memories"]) == 1
+    memory = compact["experience"]["enemy_memories"][0]
+    assert memory["hp_estimate"]["upper_inclusive"] == 90
+    assert memory["enemy_effects"][0]["actor"]["object_id"] == 81
+    action = memory["player_actions"][0]
     assert action["sample_count"] == 5
     assert len(action["recent_samples"]) == 3
     assert all("numbers" not in sample for sample in action["recent_samples"])
@@ -3975,6 +4058,88 @@ def test_navigation_reports_game_requested_interactions_explicitly(
     assert result["ok"] is True
     assert result["status"] == expected
     assert result["steps"] == 1
+
+
+def test_navigation_replans_once_after_mid_route_invalidation_and_recovers(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state()
+    results = [
+        {
+            "ok": True, "status": "stepping", "target_id": 714,
+            "move": "up", "segment_steps": 1, "remaining_steps": 5,
+            "action": {"buttons": ["up"], "frames": 1},
+        },
+        {"ok": False, "status": "blocked_by_transition", "target_id": 714},
+        {
+            "ok": True, "status": "stepping", "target_id": 714,
+            "move": "right", "segment_steps": 1, "remaining_steps": 0,
+            "action": {"buttons": ["right"], "frames": 1},
+        },
+        {"ok": True, "status": "arrived", "target_id": 714},
+    ]
+    debug.snapshot = lambda: state
+    debug.navigation_step = lambda _state, target_id, **_kwargs: results.pop(0)
+    monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: state)
+
+    result = runtime._navigate(714)
+
+    assert result["status"] == "arrived"
+    assert [entry["status"] for entry in result["progress"]] == [
+        "stepping", "blocked_by_transition", "stepping", "arrived",
+    ]
+    diagnostics = [
+        json.loads(line)
+        for line in debug.navigation_log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    replan = next(entry for entry in diagnostics if entry["type"] == "navigation_route_replan")
+    assert replan["target_id"] == 714
+    assert replan["reason"] == "blocked_by_transition"
+    assert replan["attempt"] == 1
+
+
+def test_navigation_returns_route_invalidated_after_single_failed_replan(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state()
+    results = [
+        {
+            "ok": True, "status": "stepping", "target_id": 714,
+            "move": "up", "segment_steps": 1, "remaining_steps": 5,
+            "action": {"buttons": ["up"], "frames": 1},
+        },
+        {"ok": False, "status": "unreachable_static", "target_id": 714},
+        {"ok": False, "status": "blocked_by_transition", "target_id": 714},
+    ]
+    debug.snapshot = lambda: state
+    debug.navigation_step = lambda _state, target_id, **_kwargs: results.pop(0)
+    monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: state)
+
+    result = runtime._navigate(714)
+
+    assert result["ok"] is True
+    assert result["status"] == "route_invalidated"
+    assert result["reason"] == "blocked_by_transition"
+    assert result["steps"] == 3
+    assert results == []
+
+
+def test_navigation_does_not_retry_initial_static_unreachable(tmp_path):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    state = make_state()
+    calls = {"count": 0}
+
+    def navigation_step(_state, target_id, **_kwargs):
+        calls["count"] += 1
+        return {"ok": False, "status": "unreachable_static", "target_id": target_id}
+
+    debug.snapshot = lambda: state
+    debug.navigation_step = navigation_step
+
+    with pytest.raises(RuntimeError, match="navigation_unreachable_static"):
+        runtime._navigate(714)
+    assert calls["count"] == 1
 
 
 def test_obj189_consecutive_confirms_require_two_explicit_model_choices(tmp_path):

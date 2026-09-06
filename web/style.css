@@ -81,6 +81,28 @@ body {
   margin-bottom: 12px;
 }
 
+.toolbarTitle {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 10px;
+}
+
+.paneToggle {
+  min-height: 30px;
+  padding: 4px 9px;
+  color: #c6d3de;
+  font-size: 0.78rem;
+}
+
+.layout.navigation-hidden {
+  grid-template-columns: minmax(520px, 1fr) 480px;
+}
+
+.layout.navigation-hidden .navigationPane {
+  display: none;
+}
+
 .statusBar {
   display: grid;
   flex: 1 1 auto;
@@ -1645,6 +1667,10 @@ pre {
     grid-template-columns: 300px minmax(520px, 1fr);
   }
 
+  .layout.navigation-hidden {
+    grid-template-columns: minmax(520px, 1fr);
+  }
+
   .statePane {
     grid-column: 1 / -1;
     border-left: 0;
@@ -1662,6 +1688,10 @@ pre {
 
 @media (max-width: 920px) {
   .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .layout.navigation-hidden {
     grid-template-columns: 1fr;
   }
 
@@ -1728,6 +1758,11 @@ pre {
     align-items: flex-start;
     flex-direction: column;
     gap: 8px;
+  }
+
+  .toolbarTitle {
+    justify-content: space-between;
+    width: 100%;
   }
 
   .statusBar {

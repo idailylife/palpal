@@ -420,9 +420,12 @@ def test_http_handler_exposes_only_current_battle_memo(http_server):
     payload = json.loads(raw)
     assert status == 200
     assert payload["ok"] is True
-    assert payload["signature"] == "81"
-    assert payload["enemies"] == [{"slot_index": 0, "object_id": 81, "name": "灯笼"}]
-    assert "hp" not in raw.decode("utf-8")
+    assert payload["is_boss"] is False
+    assert payload["current_enemies"] == [{"slot_index": 0, "object_id": 81, "name": "灯笼"}]
+    assert payload["enemy_memories"][0]["hp_estimate"] == {"status": "unknown"}
+    assert "signature" not in payload
+    assert '"hp": 999' not in raw.decode("utf-8")
+    assert "max_hp" not in raw.decode("utf-8")
 
     debug.companion_owner_path.write_text(json.dumps({"session_id": "different"}), encoding="utf-8")
     status, _, raw = http_request(base_url, "/agent/battle-memo")
@@ -703,7 +706,7 @@ def test_battle_player_view_exposes_only_human_visible_facts(tmp_path):
     assert view["enemies"] == [{
         "slot_index": 0, "present": True, "object_id": 81, "name": "燈籠",
     }]
-    assert "is_boss" not in view
+    assert view["is_boss"] is True
     assert view["available_actions"][0]["mp_cost"] == 8
     assert view["available_actions"][0]["description"] == "灼熱火焰\n攻擊敵人"
     assert "base_damage" not in view["available_actions"][0]
@@ -716,6 +719,74 @@ def test_battle_player_view_exposes_only_human_visible_facts(tmp_path):
     snapshot = debug.snapshot()
     assert snapshot["battle"]["enemies"][0]["hp"] == 70
     assert snapshot["_debug"]["battle_player_view"] == view
+
+
+def test_player_battle_item_effects_are_sanitized_for_every_supported_kind(tmp_path):
+    debug = make_debug_state(tmp_path)
+    item = {
+        "slot": 3,
+        "item_id": 127,
+        "name": "忘魂花",
+        "amount": 2,
+        "amount_in_use": 0,
+        "usable": True,
+        "throwable": True,
+        "use_effect": {
+            "script_entry": 39404,
+            "preview_complete": False,
+            "requirements_complete": False,
+            "effects": [
+                {"kind": "restore_hp", "amount": 50, "apply_to_all": False, "script_entry": 1},
+                {"kind": "restore_mp", "amount": 30, "apply_to_all": True, "script_entry": 2},
+                {"kind": "restore_hp_mp", "amount": 20, "apply_to_all": False, "script_entry": 3},
+                {"kind": "revive", "max_hp_percent": 10, "apply_to_all": False, "script_entry": 4},
+                {"kind": "apply_poison", "poison_id": 551, "poison_name": "赤毒", "script_entry": 5},
+                {"kind": "cure_poison", "poison_id": 551, "poison_name": "赤毒", "script_entry": 6},
+                {"kind": "cure_poison_level", "max_poison_level": 3, "apply_to_all": True, "script_entry": 7},
+                {"kind": "apply_status", "status_id": 2, "status": "sleep", "duration": 3, "script_entry": 8},
+                {"kind": "remove_status", "status_id": 3, "status": "silence", "script_entry": 9},
+                {"kind": "drain_hp", "amount": 80, "conditional": True, "script_entry": 10},
+            ],
+            "requirements": [{"kind": "face_event_object", "event_object_id": 42}],
+            "unparsed_effects": [{"script_entry": 11, "operation": 66, "operands": [1, 2, 3]}],
+        },
+        "throw_effect": {
+            "script_entry": 39407,
+            "preview_complete": True,
+            "effects": [{
+                "kind": "enemy_damage", "amount": 90, "apply_to_all": False,
+                "conditional": False, "script_entry": 12, "enemy_hp": 999,
+            }],
+        },
+    }
+
+    visible = debug.player_battle_inventory_item(item)
+
+    assert visible["use_effect"]["source"] == "dos_script_preview"
+    assert visible["use_effect"]["preview_complete"] is False
+    assert [effect["kind"] for effect in visible["use_effect"]["effects"]] == [
+        "restore_hp", "restore_mp", "restore_hp_mp", "revive", "apply_poison",
+        "cure_poison", "cure_poison_level", "apply_status", "remove_status", "drain_hp",
+    ]
+    assert visible["use_effect"]["effects"][3]["max_hp_percent"] == 10
+    assert visible["use_effect"]["effects"][4]["poison_name"] == "赤毒"
+    assert visible["use_effect"]["effects"][7] == {
+        "kind": "apply_status", "status": "sleep", "duration": 3,
+    }
+    assert visible["throw_effect"] == {
+        "source": "dos_script_preview",
+        "preview_complete": True,
+        "effects": [{
+            "kind": "enemy_damage", "conditional": False,
+            "amount": 90, "apply_to_all": False,
+        }],
+    }
+    serialized = json.dumps(visible, ensure_ascii=False)
+    for hidden in (
+        "script_entry", "requirements", "requirements_complete", "unparsed_effects",
+        "operation", "operands", "event_object_id", "poison_id", "status_id", "enemy_hp",
+    ):
+        assert hidden not in serialized
 
 
 def test_agent_state_views_expose_nonbattle_party_effects(tmp_path):

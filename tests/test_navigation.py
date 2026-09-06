@@ -641,6 +641,9 @@ def test_navigation_touch_target_does_not_route_through_another_trigger(tmp_path
     assert by_id[51]['steps'] == 1
     assert by_id[52]['status'] == 'blocked_by_transition'
     assert by_id[52]['steps'] is None
+    route = debug.route_to_object(state, target_id=52)
+    assert route['status'] == 'blocked_by_transition'
+    assert route['blocked_route']['steps'] == 2
 
 
 def test_navigation_does_not_report_noninteractable_blocker_as_actionable(tmp_path):
@@ -944,6 +947,67 @@ def test_dynamic_touch_native_trigger_is_handed_to_navigation_request(tmp_path):
     assert owner['expected_position'] == {'x': 96, 'y': 0}
     assert owner['source_position'] == {'x': 96, 'y': 0}
     assert owner['association_rejected_reason'] is None
+
+
+def test_completed_touch_script_at_final_node_finishes_navigation_without_retry(tmp_path):
+    target = {
+        'id': 781, 'x': 96, 'y': 0, 'sprite_id': 146, 'state': 2,
+        'trigger_mode': 7, 'trigger_script': 13997, 'auto_script': 0,
+        'blocking': True, 'interactable': True,
+    }
+    debug = make_debug_state(tmp_path)
+    source = make_state(width=9, height=9, start=(0, 8), objects=[target], frame=10)
+    source.update({'scene_id': 47, 'map_id': 43, 'room': {'key': 'cave'}})
+    route = debug.route_to_object(source, target_id=781)
+    assert route['status'] == 'reachable'
+    identity = debug.room_identity(source)
+    debug.remember_navigation_route(
+        source, 781, route['route'], route['route']['steps'], 0, 'reachable',
+    )
+
+    expected = route['route']['nodes'][-1]
+    reached = make_state(
+        width=9, height=9,
+        start=(expected['x'] // 16, expected['y'] // 8),
+        objects=[target], frame=11,
+    )
+    reached.update({'scene_id': 47, 'map_id': 43, 'room': {'key': 'cave'}})
+    write_state(debug, reached)
+    debug.snapshot()
+
+    completed = json.loads(json.dumps(reached))
+    completed['frame'] = 12
+    completed['objects'][0]['trigger_mode'] = 0
+    completed['trigger_observation'] = {
+        'generation': 6,
+        'event_object_id': 781,
+        'trigger_script': 13997,
+        'completed': True,
+        'source': {
+            'scene_id': 47, 'map_id': 43,
+            'x': expected['x'], 'y': expected['y'],
+        },
+    }
+    write_state(debug, completed)
+    debug.snapshot()
+
+    last_route = debug.read_exploration()['rooms'][identity['id']]['last_route']
+    assert last_route['pending'] is False
+    assert last_route['outcome'] == 'trigger_completed'
+
+    result = debug.navigation_step(completed, target_id=781)
+    assert result == {
+        'ok': True,
+        'status': 'arrived',
+        'target_id': 781,
+        'completion': 'trigger_completed',
+    }
+    assert not debug.action_path.exists()
+    consumed = debug.read_exploration()['rooms'][identity['id']]['last_route']
+    assert consumed['completion_reported_at'] >= consumed['completed_at']
+
+    repeated = debug.navigation_step(completed, target_id=781)
+    assert repeated['status'] == 'unreachable_static'
 
 
 def test_dynamic_touch_delayed_trigger_keeps_final_route_for_navigation(tmp_path):

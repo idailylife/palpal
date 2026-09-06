@@ -620,24 +620,29 @@ async function main() {
                     ok: true,
                     status: "in_battle",
                     battle_generation: 7,
-                    enemies: [{ slot_index: 0, object_id: 81, name: "灯笼" }],
-                    signature: "81",
+                    is_boss: true,
+                    current_enemies: [{ slot_index: 0, object_id: 81, name: "灯笼" }],
                     recent_outcomes: [{
                       actor: { name: "李逍遥" }, actor_side: "player",
                       action_type: "magic", name: "炎咒", mp_cost: 8,
                       enemy_changes: [{ object_id: 81, name: "灯笼", amount: 23, kind: "damage" }],
                       player_changes: [], no_numeric_change_observed: false,
                     }],
-                    action_experience: [{
-                      actor_role_id: 0, actor_name: "李逍遥", action_type: "magic",
-                      object_id: 327, name: "炎咒", enemy_object_id: 81,
-                      samples: [{
-                        mp_cost: 8,
-                        enemy_changes: [{ object_id: 81, name: "灯笼", amount: 23, kind: "damage" }],
-                        player_changes: [],
+                    enemy_memories: [{
+                      object_id: 81, name: "灯笼", current_count: 1,
+                      hp_estimate: { status: "estimated", lower_exclusive: 100, upper_inclusive: 123, sample_count: 1 },
+                      player_actions: [{
+                        actor_role_id: 0, actor_name: "李逍遥", action_type: "magic",
+                        object_id: 327, name: "炎咒", enemy_object_id: 81,
+                        samples: [{
+                          mp_cost: 8,
+                          enemy_changes: [{ object_id: 81, name: "灯笼", amount: 23, kind: "damage" }],
+                          player_changes: [],
+                        }],
                       }],
+                      enemy_effects: [],
                     }],
-                    encounter_experience: { samples: [{ result: "won", tactics: [] }] },
+                    support_experience: [],
                   }),
                 };
               }
@@ -665,7 +670,9 @@ async function main() {
               closeLabel: document.getElementById("roomMemoClose")?.getAttribute("aria-label"),
               enemySummary: document.getElementById("roomMemoRoom")?.textContent,
               hasAction: content.includes("炎咒") && content.includes("23"),
-              hasHistory: content.includes("Won 1"),
+              hasHpEstimate: content.includes("100 < HP ≤ 123"),
+              hasSupport: content.includes("Support actions"),
+              excludesEncounterHistory: !content.includes("Encounter history"),
               excludesOtherLineups: !content.includes("Recent room memo"),
             };
             dialog.click();
@@ -687,9 +694,11 @@ async function main() {
       || !battleMemoModalResult.opened
       || battleMemoModalResult.title !== "Battle Memo"
       || battleMemoModalResult.closeLabel !== "Close battle memo"
-      || !battleMemoModalResult.enemySummary?.includes("灯笼 (#81)")
+      || !battleMemoModalResult.enemySummary?.includes("Boss · 1 current enemy")
       || !battleMemoModalResult.hasAction
-      || !battleMemoModalResult.hasHistory
+      || !battleMemoModalResult.hasHpEstimate
+      || !battleMemoModalResult.hasSupport
+      || !battleMemoModalResult.excludesEncounterHistory
       || !battleMemoModalResult.excludesOtherLineups
       || !battleMemoModalResult.closedFromBackdrop
       || !battleMemoModalResult.restoredFocus
@@ -700,7 +709,7 @@ async function main() {
       if (cdp.exceptions.length) {
         throw new Error(`console exceptions: ${cdp.exceptions.join("; ")}`);
       }
-      console.log("memo visual smoke ok: room history and current battle experience");
+      console.log("memo visual smoke ok: room history and per-enemy battle experience");
       ws.close();
       return;
     }

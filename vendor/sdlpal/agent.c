@@ -4145,8 +4145,13 @@ PALPAL_AgentWriteVisibleOutcome(
       fprintf(fp, "{\"slot_index\":%d,\"object_id\":%u,\"name\":",
          i, outcome->enemy_object_id[i]);
       PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(outcome->enemy_object_id[i]));
-      fprintf(fp, ",\"amount\":%d,\"kind\":\"%s\"}",
+      fprintf(fp, ",\"amount\":%d,\"kind\":\"%s\"",
          delta < 0 ? -delta : delta, delta < 0 ? "damage" : "recovery");
+      /* Match PAL_BattlePostActionCheck: lethal overkill may wrap the WORD HP,
+       * but the game evaluates it as signed before clearing the enemy slot. */
+      if (outcome->enemy_hp_before[i] > 0 && (SHORT)outcome->enemy_hp_after[i] <= 0)
+         fprintf(fp, ",\"defeated\":true");
+      fprintf(fp, "}");
       first = 0;
    }
    fprintf(fp, "],\"numbers\":[");

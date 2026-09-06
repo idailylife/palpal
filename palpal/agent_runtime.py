@@ -26,7 +26,6 @@ DEFAULT_COMPACT_AT_TOKENS = 200_000
 DEFAULT_COMPACT_RETAIN_TOKENS = 24_000
 BATTLE_EXPERIENCE_SAMPLE_LIMIT = 3
 BATTLE_EXPERIENCE_ACTION_LIMIT = 24
-BATTLE_ENCOUNTER_SAMPLE_LIMIT = 2
 TOOL_OUTPUT_FULL_TOKENS = 8_000
 TOOL_OUTPUT_PAGE_CHARS = 6_000
 TOOL_OUTPUT_REF_RE = re.compile(r"tool-[0-9a-f]{32}\.txt")
@@ -123,6 +122,36 @@ class BattleDelegate:
             })
         return enemies
 
+    @classmethod
+    def _enemy_roster(cls, battle: dict) -> list[dict]:
+        return cls._encounter_enemies(battle)
+
+    def _with_enemy_changes(self, battle: dict) -> dict:
+        view = copy.deepcopy(battle)
+        previous = self._control().get("last_sent_enemies")
+        if not isinstance(previous, list):
+            return view
+        current = self._enemy_roster(view)
+        previous_by_key = {
+            (int(enemy.get("slot_index") or 0), int(enemy.get("object_id") or 0)): enemy
+            for enemy in previous if isinstance(enemy, dict)
+        }
+        current_by_key = {
+            (int(enemy.get("slot_index") or 0), int(enemy.get("object_id") or 0)): enemy
+            for enemy in current
+        }
+        appeared = [current_by_key[key] for key in current_by_key.keys() - previous_by_key.keys()]
+        disappeared = [previous_by_key[key] for key in previous_by_key.keys() - current_by_key.keys()]
+        if appeared or disappeared:
+            view["enemy_changes"] = {
+                "appeared": sorted(appeared, key=lambda item: int(item.get("slot_index") or 0)),
+                "disappeared": sorted(disappeared, key=lambda item: int(item.get("slot_index") or 0)),
+            }
+        return view
+
+    def _mark_enemies_sent(self, battle: dict) -> None:
+        self._persist_control(last_sent_enemies=self._enemy_roster(battle))
+
     @staticmethod
     def _compact_player_change(change: dict) -> dict:
         compact = {
@@ -157,7 +186,8 @@ class BattleDelegate:
         if include_identity:
             actor = outcome.get("actor") if isinstance(outcome.get("actor"), dict) else {}
             compact["actor"] = {
-                key: actor.get(key) for key in ("index", "role_id", "name") if key in actor
+                key: actor.get(key)
+                for key in ("index", "role_id", "object_id", "name") if key in actor
             }
             for key in ("action_type", "object_id", "name", "mp_cost", "actor_side"):
                 if key in outcome:
@@ -172,7 +202,7 @@ class BattleDelegate:
         enemy_changes = [
             {
                 key: change.get(key)
-                for key in ("slot_index", "object_id", "amount", "kind")
+                for key in ("slot_index", "object_id", "amount", "kind", "defeated")
                 if key in change
             }
             for change in outcome.get("enemy_changes") or []
@@ -204,72 +234,64 @@ class BattleDelegate:
             for player in battle.get("players") or []
             if isinstance(player, dict)
         }
-        actions = []
         current_generation = int(battle.get("generation") or 0)
-        for entry in experience.get("actions") or []:
-            if not isinstance(entry, dict):
-                continue
-            action_type = str(entry.get("action_type") or "")
-            object_id = int(entry.get("object_id") or 0)
-            actor_role_id = int(entry.get("actor_role_id") or 0)
-            if action_type in {"use_item", "throw_item"}:
-                if (action_type, object_id) not in available:
+        def compact_actions(entries: list) -> list[dict]:
+            actions = []
+            for entry in entries:
+                if not isinstance(entry, dict):
                     continue
-            elif actor_role_id not in party_role_ids:
+                action_type = str(entry.get("action_type") or "")
+                object_id = int(entry.get("object_id") or 0)
+                actor_role_id = int(entry.get("actor_role_id") or 0)
+                if action_type in {"use_item", "throw_item"}:
+                    if (action_type, object_id) not in available:
+                        continue
+                elif actor_role_id not in party_role_ids:
+                    continue
+                historical_samples = [
+                    sample for sample in entry.get("samples") or []
+                    if isinstance(sample, dict)
+                    and int(sample.get("battle_generation") or 0) != current_generation
+                ]
+                if not historical_samples:
+                    continue
+                actions.append({
+                    key: entry.get(key)
+                    for key in ("actor_role_id", "actor_name", "action_type", "object_id", "name")
+                    if key in entry
+                } | {
+                    "sample_count": len(historical_samples),
+                    "recent_samples": [
+                        cls._compact_outcome(sample, include_identity=False)
+                        for sample in historical_samples[-BATTLE_EXPERIENCE_SAMPLE_LIMIT:]
+                    ],
+                })
+                if len(actions) >= BATTLE_EXPERIENCE_ACTION_LIMIT:
+                    break
+            return actions
+
+        enemy_memories = []
+        for memory in experience.get("enemy_memories") or []:
+            if not isinstance(memory, dict):
                 continue
-            historical_samples = [
-                sample
-                for sample in entry.get("samples") or []
+            effects = [
+                cls._compact_outcome(sample)
+                for sample in memory.get("enemy_effects") or []
                 if isinstance(sample, dict)
                 and int(sample.get("battle_generation") or 0) != current_generation
-            ]
-            if not historical_samples:
-                continue
-            samples = [
-                cls._compact_outcome(sample, include_identity=False)
-                for sample in historical_samples[-BATTLE_EXPERIENCE_SAMPLE_LIMIT:]
-            ]
-            actions.append({
-                key: entry.get(key)
-                for key in (
-                    "actor_role_id", "actor_name", "action_type", "object_id", "name",
-                    "enemy_object_id",
-                )
-                if key in entry
+            ][-BATTLE_EXPERIENCE_SAMPLE_LIMIT:]
+            enemy_memories.append({
+                key: copy.deepcopy(memory.get(key))
+                for key in ("object_id", "name", "current_count", "hp_estimate")
+                if key in memory
             } | {
-                "sample_count": len(historical_samples),
-                "recent_samples": samples,
+                "player_actions": compact_actions(memory.get("player_actions") or []),
+                "enemy_effects": effects,
             })
-            if len(actions) >= BATTLE_EXPERIENCE_ACTION_LIMIT:
-                break
-        encounter = experience.get("encounter")
-        compact_encounter = None
-        if isinstance(encounter, dict):
-            samples = []
-            for sample in (encounter.get("samples") or [])[-BATTLE_ENCOUNTER_SAMPLE_LIMIT:]:
-                if not isinstance(sample, dict):
-                    continue
-                tactics = []
-                for tactic in (sample.get("tactics") or [])[-12:]:
-                    if not isinstance(tactic, dict):
-                        continue
-                    actor = tactic.get("actor") if isinstance(tactic.get("actor"), dict) else {}
-                    tactics.append({
-                        "actor_role_id": int(actor.get("role_id") or 0),
-                        "action_type": str(tactic.get("action_type") or ""),
-                        "object_id": int(tactic.get("object_id") or 0),
-                    })
-                samples.append({"result": sample.get("result"), "tactics": tactics})
-            compact_encounter = {
-                "sample_count": len(encounter.get("samples") or []),
-                "recent_samples": samples,
-            }
         return {
             "available": bool(experience.get("available")),
-            "enemy_object_ids": experience.get("enemy_object_ids") or [],
-            "signature": experience.get("signature") or "",
-            "actions": actions,
-            "encounter": compact_encounter,
+            "enemy_memories": enemy_memories,
+            "support_actions": compact_actions(experience.get("support_actions") or []),
         }
 
     @staticmethod
@@ -441,6 +463,7 @@ class BattleDelegate:
             summary=None,
             actions=self.actions,
             encounter_enemies=encounter_enemies,
+            last_sent_enemies=(existing.get("last_sent_enemies") if reusable else None),
             trigger_context=trigger_context,
         )
         self._emit(
@@ -538,10 +561,12 @@ class BattleDelegate:
 
     async def _provider_action(self, state: dict, feedback: str) -> dict:
         provider = self.runtime.battle_decision_provider
+        full_battle = self.debug.current_player_battle_view(state) or {}
+        decision_battle = self._with_enemy_changes(full_battle)
         if provider is None:
-            return await self._sdk_action(state, feedback)
+            return await self._sdk_action(state, feedback, battle_view=decision_battle)
         player_state = dict(state)
-        player_state["battle"] = self.debug.current_player_battle_view(state)
+        player_state["battle"] = decision_battle
         player_state["inventory"] = [
             self.debug.player_battle_inventory_item(item)
             for item in state.get("inventory") or []
@@ -553,9 +578,12 @@ class BattleDelegate:
             value = await value
         if not isinstance(value, dict):
             raise RuntimeError("invalid_battle_submission")
+        self._mark_enemies_sent(decision_battle)
         return value.get("args") if isinstance(value.get("args"), dict) else value
 
-    async def _sdk_action(self, state: dict, feedback: str) -> dict:
+    async def _sdk_action(
+        self, state: dict, feedback: str, *, battle_view: dict | None = None,
+    ) -> dict:
         if not self.debug.config_value("DEEPSEEK_API_KEY"):
             action = self._default_action(state["battle"])
             self._emit(
@@ -577,16 +605,19 @@ class BattleDelegate:
         runtime = self.runtime
         frozen_window = self._command_window(state)
         control = self._control()
-        full_player_battle = self.debug.current_player_battle_view(state) or {}
+        full_player_battle = battle_view or self._with_enemy_changes(
+            self.debug.current_player_battle_view(state) or {}
+        )
         player_battle = self._agent_battle_view(
             full_player_battle,
             include_experience=not bool(control.get("experience_sent")),
             after_outcome_sequence=int(control.get("last_sent_outcome_sequence") or 0),
         )
+        latest_sent_battle = full_player_battle
         prompt_outcome_sequence = self._max_outcome_sequence(player_battle)
 
         async def get_battle(_context: Any, _raw: str) -> str:
-            nonlocal prompt_outcome_sequence
+            nonlocal latest_sent_battle, prompt_outcome_sequence
             self._emit(
                 "tool_called",
                 "Battle Agent called get_battle.",
@@ -594,7 +625,9 @@ class BattleDelegate:
             )
             try:
                 latest = self.debug.snapshot()
-                latest_view = self.debug.current_player_battle_view(latest) or {}
+                latest_view = self._with_enemy_changes(
+                    self.debug.current_player_battle_view(latest) or {}
+                )
                 output = {
                     "ok": True,
                     "battle": self._agent_battle_view(
@@ -609,6 +642,8 @@ class BattleDelegate:
                     prompt_outcome_sequence,
                     self._max_outcome_sequence(output["battle"]),
                 )
+                self._mark_enemies_sent(latest_view)
+                latest_sent_battle = latest_view
             except Exception as exc:
                 self._emit(
                     "tool_output",
@@ -663,7 +698,7 @@ class BattleDelegate:
                     "observed_effects": self.debug.combat_experience(
                         latest.get("battle") if isinstance(latest.get("battle"), dict) else None,
                         item_id=item_id,
-                    ).get("actions", []),
+                    ).get("matching_actions", []),
                 }
                 battle = latest.get("battle") if isinstance(latest.get("battle"), dict) else {}
                 legal_actions = [
@@ -684,7 +719,7 @@ class BattleDelegate:
             self._emit(
                 "tool_output",
                 (
-                    "get_item_details returned player-visible inventory facts."
+                    "get_item_details returned player-usable inventory facts and sanitized effects."
                     if output.get("ok")
                     else "get_item_details could not find the item."
                 ),
@@ -756,9 +791,9 @@ class BattleDelegate:
         item_tool = FunctionTool(
             name="get_item_details",
             description=(
-                "Read player-visible inventory count, menu description, and legal battle uses "
-                "for one item_id. Hidden scripted effects are intentionally unavailable; rely "
-                "on explicit menu wording rather than inferring effects from the item name."
+                "Read inventory count, menu description, sanitized DOS item-effect summaries, "
+                "and legal battle uses for one item_id. An effect with preview_complete=false "
+                "is only a partial summary; do not infer missing effects from the item name."
             ),
             params_json_schema={
                 "type": "object",
@@ -815,13 +850,23 @@ class BattleDelegate:
                 "effects from names alone. Player status_effects and poisons are current friendly "
                 "effects; enemy internal effects remain hidden. Item and magic descriptions are "
                 "player-visible menu text and may guide your choice, but vague wording does not "
-                "establish an exact element, damage amount, or weakness. Treat observed outcomes "
-                "and experience as samples, not deterministic rules. Balance survival risk, attack "
+                "establish an exact element, damage amount, or weakness. Sanitized item effects "
+                "from get_item_details are DOS handbook-equivalent knowledge; when "
+                "preview_complete is false, treat listed effects as incomplete and do not guess "
+                "the missing branches. Treat observed outcomes "
+                "and experience as samples, not deterministic rules. An HP estimate with status "
+                "unknown does not justify estimating maximum or remaining HP, or claiming that an "
+                "enemy is near defeat. A boss flag means the encounter is special and cannot be "
+                "fled; it does not imply high HP. Plan unknown-duration fights around whole-round "
+                "damage, visible statuses, recovery reserves, and area resources. If enemy_changes "
+                "is present and nonempty, discard any target plan based on the prior enemy set and "
+                "replan from the current legal targets. Balance survival risk, attack "
                 "and magic samples, MP cost, and resource scarcity. When the party is safe and no "
                 "relevant sample exists, try one lowest-cost currently legal offensive magic early; "
                 "judge safety from visible HP/MP, status, recent incoming damage, and healing reserves, "
-                "not a fixed threshold. Use a consumable only when menu text or prior visible samples "
-                "support its intended effect; never blind-test a scarce item. "
+                "not a fixed threshold. Use a consumable only when menu text, a sanitized effect "
+                "summary, or prior visible samples support its intended effect; never blind-test "
+                "a scarce item. "
                 "The supplied battle snapshot is current; do not call get_battle unless it may have "
                 "become stale. Do not narrate before acting. "
                 "Never invent targets or actions. Choose target_index from the action's "
@@ -874,6 +919,7 @@ class BattleDelegate:
                             prompt_outcome_sequence,
                             int(self._control().get("last_sent_outcome_sequence") or 0),
                         )
+                    self._mark_enemies_sent(latest_sent_battle)
                     if updates:
                         self._persist_control(**updates)
             if submitted is not None:
@@ -4323,6 +4369,8 @@ exploration value, and maintained local tasks to choose the next action.
         terminal = {"arrived", "approached", "transitioned", "interacting"}
         no_progress_key = None
         no_progress_count = 0
+        movement_started = False
+        route_replan_used = False
         step = 0
         while step < 240:
             if self.cancel_event.is_set():
@@ -4386,6 +4434,35 @@ exploration value, and maintained local tasks to choose the next action.
                     "progress": progress[-20:],
                 }
             if not result.get("ok"):
+                if (
+                    movement_started
+                    and not route_replan_used
+                    and status in {"blocked_by_transition", "unreachable_static"}
+                ):
+                    route_replan_used = True
+                    self.debug.append_navigation_diagnostic(
+                        "navigation_route_replan",
+                        {
+                            "target_id": target_id,
+                            "reason": status,
+                            "attempt": 1,
+                        },
+                        state=state,
+                    )
+                    continue
+                if (
+                    movement_started
+                    and route_replan_used
+                    and status in {"blocked_by_transition", "unreachable_static"}
+                ):
+                    return {
+                        "ok": True,
+                        "status": "route_invalidated",
+                        "reason": status,
+                        "steps": step,
+                        "target_id": target_id,
+                        "progress": progress[-20:],
+                    }
                 raise RuntimeError(f"navigation_{status or 'failed'}")
             if result.get("action"):
                 before_position = (state.get("party_position") or {}).copy()
@@ -4439,6 +4516,8 @@ exploration value, and maintained local tasks to choose the next action.
                         )
                         if no_progress_count > 1:
                             raise RuntimeError("navigation_no_progress")
+                if status == "stepping":
+                    movement_started = True
             if status == "interacting":
                 transition_observation_id = self.debug.navigation_transition_requests.get(target_id)
                 if transition_observation_id:
@@ -4454,6 +4533,8 @@ exploration value, and maintained local tasks to choose the next action.
                 }
                 if result.get("observation_id"):
                     terminal_result["observation_id"] = result["observation_id"]
+                if result.get("completion"):
+                    terminal_result["completion"] = result["completion"]
                 if status == "approached":
                     if isinstance(result.get("approach"), dict):
                         terminal_result["approach"] = result["approach"]

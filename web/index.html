@@ -11,8 +11,8 @@
       <strong id="disconnectMessage"></strong>
       <button id="disconnectRefresh" type="button">Refresh Page</button>
     </div>
-    <main class="layout">
-      <aside class="navigationPane">
+    <main id="layout" class="layout">
+      <aside id="navigationPane" class="navigationPane">
         <section>
           <h2>Exploration</h2>
           <div id="exploration" class="exploration"></div>
@@ -24,7 +24,10 @@
       </aside>
       <section class="screenPane">
         <div class="toolbar">
-          <strong>PALPAL Debug</strong>
+          <div class="toolbarTitle">
+            <strong>PALPAL Debug</strong>
+            <button id="navigationPaneToggle" class="paneToggle" type="button" aria-controls="navigationPane" aria-expanded="true">Hide sidebar</button>
+          </div>
           <div id="statusBar" class="statusBar" aria-label="Runtime status">
             <div class="statusChip" data-status-kind="state" data-tone="pending" title="State: Reconnecting">
               <span>State</span>

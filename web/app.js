@@ -3,6 +3,8 @@ const jsonDetailsEl = document.getElementById("jsonDetails");
 const jsonLiveEl = document.getElementById("jsonLive");
 const jsonRefreshEl = document.getElementById("jsonRefresh");
 const jsonStatusEl = document.getElementById("jsonStatus");
+const layoutEl = document.getElementById("layout");
+const navigationPaneToggleEl = document.getElementById("navigationPaneToggle");
 const agentEl = document.getElementById("agent");
 const normalTabEl = document.getElementById("normalTab");
 const agentTabEl = document.getElementById("agentTab");
@@ -124,6 +126,7 @@ let roomMemoRequestId = 0;
 let roomMemoDialogTrigger = null;
 let memoMode = "room";
 let battleMemo = null;
+let navigationPaneHidden = localStorage.getItem("palpal.navigationPaneHidden") === "true";
 let selectedStateTab = localStorage.getItem("palpal.stateTab") === "agent" ? "agent" : "normal";
 let agentMaxTurns = Math.max(1, Math.min(Number(localStorage.getItem("palpal.agentMaxTurns") || 10), 100));
 let checkpoints = [];
@@ -2609,6 +2612,20 @@ function setupStateTabs() {
   selectStateTab(selectedStateTab);
 }
 
+function setNavigationPaneHidden(hidden, persist = false) {
+  navigationPaneHidden = Boolean(hidden);
+  layoutEl?.classList.toggle("navigation-hidden", navigationPaneHidden);
+  navigationPaneToggleEl?.setAttribute("aria-expanded", String(!navigationPaneHidden));
+  if (navigationPaneToggleEl) {
+    navigationPaneToggleEl.textContent = navigationPaneHidden ? "Show sidebar" : "Hide sidebar";
+  }
+  if (persist) localStorage.setItem("palpal.navigationPaneHidden", String(navigationPaneHidden));
+}
+
+navigationPaneToggleEl?.addEventListener("click", () => {
+  setNavigationPaneHidden(!navigationPaneHidden, true);
+});
+
 function sessionRunning() {
   const status = agentSession?.status || latestState?._debug?.agent_session?.status;
   return status === "running" || status === "interrupting";
@@ -2950,9 +2967,9 @@ function renderRoomMemoDialog() {
   if (roomMemoTitle) roomMemoTitle.textContent = battleMode ? "Battle Memo" : "Room Memo";
   if (roomMemoClose) roomMemoClose.setAttribute("aria-label", battleMode ? "Close battle memo" : "Close room memo");
   if (battleMode) {
-    const enemies = battleMemo?.enemies || [];
+    const enemies = battleMemo?.current_enemies || [];
     roomMemoRoom.textContent = battleMemo
-      ? `${enemies.map((enemy) => `${enemy.name || "Enemy"} (#${Number(enemy.object_id || 0)})`).join(" · ")} · ${battleMemo.signature || "-"}`
+      ? `${battleMemo.is_boss ? "Boss · " : ""}${enemies.length} current enem${enemies.length === 1 ? "y" : "ies"}`
       : "Current encounter";
     if (roomMemoLoading) {
       roomMemoContent.innerHTML = '<div class="goalsMessage">Loading battle memo…</div>';
@@ -2962,10 +2979,10 @@ function renderRoomMemoDialog() {
       roomMemoContent.innerHTML = `<div class="goalsError">${escapeHtml(roomMemoError)}<br><button class="goalsRetry" type="button" data-room-memo-retry>Retry</button></div>`;
       return;
     }
-    const actions = battleMemo?.action_experience || [];
+    const memories = battleMemo?.enemy_memories || [];
+    const support = battleMemo?.support_experience || [];
     const outcomes = battleMemo?.recent_outcomes || [];
-    const encounterSamples = battleMemo?.encounter_experience?.samples || [];
-    if (!actions.length && !outcomes.length && !encounterSamples.length) {
+    if (!memories.length && !support.length && !outcomes.length) {
       roomMemoContent.innerHTML = '<div class="goalsEmpty">尚无玩家可见的战斗经验</div>';
       return;
     }
@@ -2980,23 +2997,27 @@ function renderRoomMemoDialog() {
       });
       return [...(numbers.length ? numbers : enemy), ...party].join(" · ") || (sample.no_numeric_change_observed ? "No numeric change observed" : "Visible status change");
     };
-    const actionCards = actions.map((entry) => {
+    const actionCard = (entry) => {
       const samples = entry.samples || [];
       const latest = samples[samples.length - 1] || {};
       const mp = latest.mp_cost == null ? "" : ` · ${Number(latest.mp_cost)} MP`;
       return `<article class="roomMemoCard"><strong>${escapeHtml(entry.actor_name || `Role #${entry.actor_role_id}`)} · ${escapeHtml(entry.name || entry.action_type || "action")}${mp}</strong><p>${escapeHtml(changeText(latest))}</p><div class="muted">${samples.length} visible sample${samples.length === 1 ? "" : "s"}</div></article>`;
+    };
+    const enemyCards = memories.map((memory) => {
+      const hp = memory.hp_estimate || { status: "unknown" };
+      const hpText = hp.status === "estimated"
+        ? `HP ${Number(hp.lower_exclusive || 0)} < HP ≤ ${Number(hp.upper_inclusive || 0)} (${Number(hp.sample_count || 0)} samples)`
+        : hp.status === "inconsistent" ? `HP samples inconsistent (${Number(hp.sample_count || 0)})` : "HP unknown";
+      const actions = (memory.player_actions || []).map(actionCard).join("");
+      const effects = (memory.enemy_effects || []).map((sample) => `<article class="roomMemoCard"><strong>Enemy visible effect</strong><p>${escapeHtml(changeText(sample))}</p></article>`).join("");
+      return `<section class="roomMemoSection"><h3>${escapeHtml(memory.name || `Enemy #${memory.object_id}`)} ×${Number(memory.current_count || 1)}</h3><p>${escapeHtml(hpText)}</p>${actions || '<div class="goalsEmpty">No player action samples.</div>'}${effects || '<div class="goalsEmpty">No enemy visible-effect samples.</div>'}</section>`;
     }).join("");
+    const supportCards = support.map(actionCard).join("");
     const outcomeCards = outcomes.map((sample) => `<article class="roomMemoCard"><strong>${escapeHtml(sample.actor?.name || sample.actor_side || "Actor")} · ${escapeHtml(sample.name || sample.action_type || "action")}</strong><p>${escapeHtml(changeText(sample))}</p></article>`).join("");
-    const counts = encounterSamples.reduce((result, sample) => {
-      const key = ["won", "lost", "fled"].includes(sample.result) ? sample.result : "other";
-      result[key] = (result[key] || 0) + 1;
-      return result;
-    }, {});
-    const recentTactics = encounterSamples.length ? (encounterSamples[encounterSamples.length - 1].tactics || []).map((sample) => `${sample.actor?.name || "Player"}: ${sample.name || sample.action_type || "action"} (${changeText(sample)})`).join(" · ") : "";
     roomMemoContent.innerHTML = `
       <section class="roomMemoSection"><h3>Current visible outcomes</h3>${outcomeCards || '<div class="goalsEmpty">No completed visible action yet.</div>'}</section>
-      <section class="roomMemoSection"><h3>Relevant action samples</h3>${actionCards || '<div class="goalsEmpty">No action samples for this encounter.</div>'}</section>
-      <section class="roomMemoSection"><h3>Encounter history</h3>${encounterSamples.length ? `<p>Won ${Number(counts.won || 0)} · Lost ${Number(counts.lost || 0)} · Fled ${Number(counts.fled || 0)}</p>${recentTactics ? `<p>${escapeHtml(recentTactics)}</p>` : ""}` : '<div class="goalsEmpty">No history for this complete enemy lineup.</div>'}</section>`;
+      ${enemyCards}
+      <section class="roomMemoSection"><h3>Support actions</h3>${supportCards || '<div class="goalsEmpty">No support-action samples.</div>'}</section>`;
     return;
   }
   roomMemoRoom.textContent = roomMemoRoomId || "Current room unavailable";
@@ -4200,6 +4221,7 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+setNavigationPaneHidden(navigationPaneHidden);
 setupStateTabs();
 refreshAgentSession().catch((error) => console.warn("agent session unavailable", error));
 refreshAgentTasks();
