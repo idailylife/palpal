@@ -182,6 +182,15 @@ Run Python tests:
 .venv/bin/python -m pytest --cov
 ```
 
+The full pytest suite includes isolated TCP and Unix-socket integration tests.
+In an agent sandbox, run the fixed command `.venv/bin/python -m pytest` with
+socket permission from the first attempt so its reusable command approval can
+apply. Do not first run the full suite in the restricted sandbox, and do not
+skip, catch, or weaken socket tests to work around
+`PermissionError: [Errno 1] Operation not permitted`. These tests use ephemeral
+ports and temporary socket paths; they do not touch the user-owned live server
+on port 8765.
+
 Smoke test the server:
 
 ```sh

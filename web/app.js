@@ -222,6 +222,7 @@ window.addEventListener("pageshow", (event) => {
 });
 const navigationSettleMs = 400;
 const fallbackAgentModels = ["deepseek-v4-pro", "deepseek-v4-flash"];
+const hiddenAgentModels = new Set(["deepseek-v4.1-flash-expires-on-0910"]);
 const lastActionAt = new Map();
 const directionButtons = { 2: "up", 3: "right", 0: "down", 1: "left" };
 
@@ -1673,7 +1674,10 @@ function renderAgentProgress(status) {
 
 function agentModelOptions(state) {
   const models = state?._debug?.agent_config?.models;
-  return Array.isArray(models) && models.length ? models : fallbackAgentModels;
+  const visibleModels = Array.isArray(models)
+    ? models.filter((model) => !hiddenAgentModels.has(model))
+    : [];
+  return visibleModels.length ? visibleModels : fallbackAgentModels;
 }
 
 function currentAgentModel(state) {

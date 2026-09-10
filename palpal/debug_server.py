@@ -106,7 +106,9 @@ VIEWPORT_HEIGHT = 200
 OPENING_LI_XIAOYAO_MONOLOGUE_MESSAGES = {1956, 1957, 1958, 1962, 1963, 1964}
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
-ALLOWED_DEEPSEEK_MODELS = frozenset({"deepseek-v4-pro", "deepseek-v4-flash"})
+ALLOWED_DEEPSEEK_MODELS = frozenset({
+    "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash-expires-on-0910",
+})
 DEFAULT_DEEPSEEK_TIMEOUT = 90.0
 MAX_AGENT_TOOL_ROUNDS = 8
 MAX_AGENT_TOOL_CALLS = 40
@@ -11667,7 +11669,7 @@ class DebugState:
             result["equipment_comparisons"] = self.equipment_comparisons(state, candidate)
         return result
 
-    def player_battle_view(self, state: dict) -> dict | None:
+    def player_battle_view(self, state: dict, *, all_outcomes: bool = False) -> dict | None:
         """Purely project one native battle value onto player-visible facts."""
         battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
         if battle is None:
@@ -11690,7 +11692,7 @@ class DebugState:
                 for key in (
                     "index", "role_id", "name", "hp", "max_hp", "mp", "max_mp",
                     "level", "attack_strength", "magic_strength", "defense",
-                    "dexterity", "flee_rate", "defending", "submitted_action",
+                    "dexterity", "flee_rate", "defending", "submitted_action", "command_status",
                 )
                 if key in player
             }
@@ -11736,7 +11738,7 @@ class DebugState:
             view["available_actions"].append(visible)
         existing_outcomes = battle.get("recent_outcomes")
         if isinstance(existing_outcomes, list):
-            view["recent_outcomes"] = copy.deepcopy(existing_outcomes[-8:])
+            view["recent_outcomes"] = copy.deepcopy(existing_outcomes if all_outcomes else existing_outcomes[-8:])
         else:
             view["recent_outcomes"] = [
                 self._visible_outcome_sample(outcome, 0)
@@ -11757,14 +11759,17 @@ class DebugState:
                         if key in (outcome.get("target") or {})
                     },
                 }
-                for outcome in (battle.get("visible_outcomes") or [])[-8:]
+                for outcome in (
+                    (battle.get("visible_outcomes") or [])
+                    if all_outcomes else (battle.get("visible_outcomes") or [])[-8:]
+                )
                 if isinstance(outcome, dict)
             ]
         return view
 
     def current_player_battle_view(self, state: dict) -> dict | None:
         """Build the current-turn battle prompt, including knowledge known right now."""
-        view = self.player_battle_view(state)
+        view = self.player_battle_view(state, all_outcomes=True)
         if view is None:
             return None
         battle = state.get("battle") if isinstance(state.get("battle"), dict) else None

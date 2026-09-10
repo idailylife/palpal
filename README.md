@@ -242,7 +242,8 @@ in-battle Agent run on the OpenAI Agents SDK over DeepSeek's OpenAI-compatible
 Responses endpoint. The debug server needs `DEEPSEEK_API_KEY` to start an Agent
 session or delegate battle commands; `DEEPSEEK_BASE_URL` defaults to
 `https://api.deepseek.com`, `DEEPSEEK_MODEL` to `deepseek-v4-pro` (allowed
-`deepseek-v4-pro` or `deepseek-v4-flash`), and `DEEPSEEK_TIMEOUT` to 90 seconds.
+`deepseek-v4-pro`, `deepseek-v4-flash`, or
+`deepseek-v4.1-flash-expires-on-0910`), and `DEEPSEEK_TIMEOUT` to 90 seconds.
 The debug server also requires `POE_API_KEY` at startup so the exploration Agent
 can call the read-only `inspect_screen` tool when structured evidence cannot
 explain the visible room layout or a suspected passage. `POE_VISION_MODEL`
@@ -400,11 +401,69 @@ and equipment effects remain visible after battle. Exact enemy HP, resistances,
 technique probabilities, and other internal combat values remain omitted. The runtime hands the
 fight to a dedicated battle Agent that exposes `get_battle`, `get_item_details`, and
 `submit_battle_action` and must submit exactly one legal action per command
-round. Its item tool exposes counts, player-visible menu descriptions, and legal
-battle uses but not script-derived effects. Without `DEEPSEEK_API_KEY` it falls back to a conservative default
+window. Its item tool exposes counts, player-visible menu descriptions, sanitized
+DOS handbook-equivalent effects, and legal battle uses, never raw scripts or hidden
+enemy values. Without `DEEPSEEK_API_KEY` it falls back to a conservative default
 policy. Pre-battle prompts are handled by the main exploration Agent before the
 battle Agent takes over. While the battle Agent owns control, manual game actions
 are rejected.
+
+The browser keeps a short recent-outcome list. Battle Agent prompts instead
+deliver every retained outcome after their delivery cursor, with explicit
+`outcome_delivery` missing-sequence ranges if the native 32-outcome buffer has
+overrun. Repeated refreshes do not resend delivered outcomes. The cursor and
+`survival_risk` observation checkpoint advance only after the model request
+completes; existing session messages are not rewritten.
+
+`survival_risk` distinguishes observed HP loss, recovery, and net HP loss between
+decision windows, records enemy action counts, and retains observed damage
+maxima; current friendly statuses live in `players`. These windows can span several rounds
+when characters cannot act. Missing evidence stays explicitly incomplete, and
+observed maxima are not upper damage limits. The Agent is prompted to assess
+survival until its next action without guessing an unknown enemy's remaining
+HP; action validation does not impose a new combat policy.
+
+Classic round-end poison/status settlement now has its own `round_end` outcome
+with an `environment` actor, separate from enemy attacks. `hp_accounting` compares
+window start/end HP with recorded losses and recoveries; `unexplained_hp_delta`
+reports discrepancies without guessing their cause. `outcome_delivery.complete`
+only means sequence delivery is contiguous, not that every effect was captured.
+`decision_feedback` references execution-ordered outcomes and highlights effective
+HP recovery (including zero) and every affected party member. No new effects means
+no new execution evidence, not that a submitted action has succeeded.
+
+Native `command_status` distinguishes `committed`, `selecting`, `unselected` and
+`unable`. Only committed actions enter the model prompt as `committed_action`;
+old retained action fields are not treated as this round's plan. Older native builds
+without this field are explicitly `unknown`. Model-only `enemy_roster_changes`
+describes appearances/disappearances, distinct from per-outcome damage changes.
+The revised prompt allocates survival, recovery, area and single-target actions
+across the whole party rather than prescribing a fixed healer or favorite hero.
+
+Battle `get_item_details` accepts exactly one of `item_id`, `item_ids` (up to 32
+distinct positive IDs), or `cursor`. A batch reads one state/knowledge snapshot,
+deduplicates in request order and returns per-item errors. A large response is
+returned as JSON text fragments: follow `next_cursor` with the same tool until
+`complete=true`, concatenate `text`, then parse the complete JSON. Cursors are
+valid within that decision and retain the original snapshot; no archive-only
+reference or silent truncation is used. Single-item callers retain their result shape.
+
+`python -m scripts.evaluate_battle_team --output /tmp/team-evaluation.json`
+compares the frozen previous prompt/input with the revised version at six team
+decision points, five repetitions each (60 decisions), using
+`deepseek-v4.1-flash-expires-on-0910` by default. It records actions, tool counts,
+provider token usage and latency. It does not add future item samples or invent
+missing poison events; historical discrepancies remain unresolved. Native command
+commitments are reconstructed from observed accepted commands within each unresolved
+window. These observation replays do not establish whole-battle win rates.
+
+`python -m scripts.evaluate_battle_survival --output /tmp/battle-evaluation.json`
+runs an optional external-model replay of three recorded danger points, three
+times per prompt variant. It sends player-visible fixture data to the configured
+DeepSeek endpoint, never to the game, and does not alter live sessions. The replay
+uses observation history without original reasoning; unavailable historical item
+details remain unavailable. Inspect its saved model reasoning as well as actions:
+legal submissions alone do not prove improved decisions or a winning strategy.
 
 ## State Model
 

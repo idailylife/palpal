@@ -87,6 +87,11 @@ PALPAL_AgentVisibleActionBegin(
 );
 
 VOID
+PALPAL_AgentVisibleRoundEndBegin(
+   VOID
+);
+
+VOID
 PALPAL_AgentVisibleActionEnd(
    VOID
 );

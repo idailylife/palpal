@@ -1600,6 +1600,8 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
                 }],
             }
             serialized_item = json.dumps(item["item"], ensure_ascii=False)
+            for hidden in ("slot", "amount", "amount_in_use", "equipped_count", "usable", "throwable", "apply_to_all"):
+                assert hidden not in item["item"]
             for hidden in (
                 "script_entry", "requirements", "requirements_complete",
                 "unparsed_effects", "operation", "event_object_id",
@@ -1607,12 +1609,10 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
                 assert hidden not in serialized_item
             assert "effect_available" not in item["item"]
             assert item["legal_battle_actions"] == [{
-                "action_type": "use_item", "object_id": 99,
-                "target_mode": "single", "valid_target_indices": [0],
+                "action_type": "use_item", "target_mode": "single",
                 "submission_target_indices": [0],
             }, {
-                "action_type": "throw_item", "object_id": 99,
-                "target_mode": "single", "valid_target_indices": [0],
+                "action_type": "throw_item", "target_mode": "single",
                 "submission_target_indices": [0],
             }]
             submit_output = await tools["submit_battle_action"].kwargs["on_invoke_tool"](
@@ -1664,12 +1664,11 @@ def test_battle_sdk_emits_complete_tool_trace(tmp_path, monkeypatch):
     assert "valid_target_indices" not in initial_prompt["battle"]["available_actions"][1]
     assert initial_prompt["battle"]["available_actions"][1]["description"] == "灼熱火焰\n攻擊敵人"
     assert set(initial_prompt) == {"battle", "feedback"}
-    assert "DOS handbook-equivalent knowledge" in captured["agent_kwargs"]["instructions"]
-    assert "preview_complete is false" in captured["agent_kwargs"]["instructions"]
-    assert "does not justify estimating maximum or remaining HP" in captured["agent_kwargs"]["instructions"]
-    assert "boss flag means the encounter is special" in captured["agent_kwargs"]["instructions"]
-    assert "discard any target plan" in captured["agent_kwargs"]["instructions"]
-    assert "do not call get_battle unless" in captured["agent_kwargs"]["instructions"]
+    assert "Unknown enemy HP" in captured["agent_kwargs"]["instructions"]
+    assert "enemy_roster_changes" in captured["agent_kwargs"]["instructions"]
+    assert "committed_action" in captured["agent_kwargs"]["instructions"]
+    assert "use get_battle only if stale" in captured["agent_kwargs"]["instructions"]
+    assert "preview_complete=false" in captured["agent"].tools[1].kwargs["description"]
     assert "without an accepted submit_battle_action" in captured["runs"][1]["prompt"]
     control = runtime.snapshot()["battle_delegate"]
     assert control["last_prompt_tokens"] == 102

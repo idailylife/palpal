@@ -15,6 +15,9 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable
 
+from palpal.battle_observations import decision_feedback, outcome_delta, survival_risk
+from palpal.battle_items import BattleItemDetails, ITEM_DETAILS_DESCRIPTION, ITEM_DETAILS_SCHEMA
+
 
 RUNNING_PHASES = {"running", "interrupting"}
 EXECUTABLE_TOOLS = {
@@ -35,6 +38,52 @@ BATTLE_INSTRUCTION_LIMIT = 100
 BATTLE_CONTROL_TIMEOUT_SECONDS = 30.0
 AGENT_REASONING_EFFORT = "high"
 SUMMARY_REASONING_EFFORT = "low"
+
+# Frozen survival-replay variant only; production uses BATTLE_INSTRUCTIONS below.
+BATTLE_SURVIVAL_INSTRUCTIONS = (
+    "Before attacking, assess whether every living ally can survive until the next "
+    "opportunity to act, including consecutive enemy actions and turns lost to sleep "
+    "or other visible controls. survival_risk summarizes observed decision windows, "
+    "which may span multiple rounds; cumulative HP loss is separate from healing and "
+    "net HP loss. Observed maxima are samples, never upper damage limits. Missing "
+    "outcomes mean unknown additional effects, not zero damage. Consider current legal "
+    "healing, defense and supported item uses, their timing, and recovery reserves. "
+    "Do not accept lethal exposure on the speculation that an unknown-HP enemy is "
+    "nearly defeated. If the party is endangered, prioritize a supported survival "
+    "action over speculative finishing damage."
+)
+
+BATTLE_INSTRUCTIONS = """Goal and evidence
+Win while preserving the whole party's ability to act and recover. Use player-visible
+facts only: names do not establish effects, weaknesses or damage. Unknown enemy HP
+does not justify a near-defeat claim. Observed damage is a sample, not an upper bound.
+
+Review effects
+Current players and legal actions are authoritative. Read new_outcomes in execution
+order and the latest survival_risk window: effective recovery, total incoming damage,
+new controls, poison and knockouts. Delivery completeness concerns sequence delivery
+only; unresolved HP accounting means additional unknown effects, not zero damage.
+An accepted submission is not execution. Reassess when enemy_roster_changes appears.
+
+Team decisions
+Account for allies' committed_action before assigning healing, control recovery,
+area attacks and single-target damage; avoid redundant healing. First reduce death
+and lost-action risk across the party, including consecutive enemy actions and poison.
+If not everyone can be protected, preserve the team's feasible recovery and action
+capacity, not a fixed favored character. Do not rely on a later rescue or speculative
+finishing blow. Compare area damage and removal of enemy actions, not only boss damage;
+value waking an ally and an item's other supported uses as well as direct damage.
+Action order varies with action type and condition; the last round is not a fixed order.
+Waking an ally during resolution does not allow a fresh spell selection that round.
+When safe, purposefully sample a promising untested spell and update comparisons using
+observed effects, MP and consumable scarcity. Saving resources must not override survival.
+
+Tools
+The snapshot is current; use get_battle only if stale. Query only unknown information
+that could change this decision, batching item IDs. Use supported item effects, never
+blind-test scarce items. Choose one current legal action and a target_index from its
+submission_target_indices. Call submit_battle_action without preceding narration.
+"""
 
 PROVIDER_USAGE_SCOPES = ("main_decision", "battle", "compaction", "vision")
 
@@ -162,6 +211,8 @@ class BattleDelegate:
         for stat in ("hp", "mp"):
             value = change.get(stat)
             if not isinstance(value, dict):
+                if f"{stat}_delta" in change:
+                    compact[f"{stat}_delta"] = change[f"{stat}_delta"]
                 continue
             try:
                 before = int(value.get("before") or 0)
@@ -332,14 +383,26 @@ class BattleDelegate:
             for action in view.get("available_actions") or []
             if isinstance(action, dict)
         ]
+        outcomes, delivery = outcome_delta(view.get("recent_outcomes") or [], after_outcome_sequence)
+        compact["outcome_delivery"] = delivery
         new_outcomes = [
             cls._compact_outcome(outcome)
-            for outcome in view.get("recent_outcomes") or []
-            if isinstance(outcome, dict)
-            and int(outcome.get("sequence") or 0) > after_outcome_sequence
+            for outcome in outcomes
         ]
         if new_outcomes:
             compact["new_outcomes"] = new_outcomes
+        if "enemy_changes" in compact:
+            compact["enemy_roster_changes"] = compact.pop("enemy_changes")
+        for player in compact.get("players") or []:
+            old_action = player.pop("submitted_action", None)
+            status = player.setdefault("command_status", "unknown")
+            if status == "committed" and old_action:
+                player["committed_action"] = old_action
+        risk = compact.get("survival_risk")
+        if isinstance(risk, dict):
+            risk["players"] = [{"index": p["index"], "observed_maxima": p["observed_maxima"]}
+                               for p in risk.get("players") or []]
+        compact["decision_feedback"] = decision_feedback(compact, new_outcomes)
         experience = view.get("experience")
         if include_experience and isinstance(experience, dict):
             compact["experience"] = cls._compact_experience(view, experience)
@@ -455,6 +518,7 @@ class BattleDelegate:
             last_prompt_tokens=last_prompt_tokens,
             experience_sent=experience_sent,
             last_sent_outcome_sequence=last_sent_outcome_sequence,
+            survival_observations=(existing.get("survival_observations") if reusable else None),
             compactions=compactions,
             last_compaction=last_compaction,
             stop_reason=None,
@@ -565,6 +629,9 @@ class BattleDelegate:
         decision_battle = self._with_enemy_changes(full_battle)
         if provider is None:
             return await self._sdk_action(state, feedback, battle_view=decision_battle)
+        decision_battle["survival_risk"], risk_checkpoint = survival_risk(
+            decision_battle, self._control().get("survival_observations"),
+        )
         player_state = dict(state)
         player_state["battle"] = decision_battle
         player_state["inventory"] = [
@@ -578,6 +645,7 @@ class BattleDelegate:
             value = await value
         if not isinstance(value, dict):
             raise RuntimeError("invalid_battle_submission")
+        self._persist_control(survival_observations=risk_checkpoint)
         self._mark_enemies_sent(decision_battle)
         return value.get("args") if isinstance(value.get("args"), dict) else value
 
@@ -608,16 +676,22 @@ class BattleDelegate:
         full_player_battle = battle_view or self._with_enemy_changes(
             self.debug.current_player_battle_view(state) or {}
         )
+        full_player_battle["survival_risk"], risk_checkpoint = survival_risk(
+            full_player_battle, control.get("survival_observations"),
+        )
         player_battle = self._agent_battle_view(
             full_player_battle,
             include_experience=not bool(control.get("experience_sent")),
             after_outcome_sequence=int(control.get("last_sent_outcome_sequence") or 0),
         )
         latest_sent_battle = full_player_battle
-        prompt_outcome_sequence = self._max_outcome_sequence(player_battle)
+        prompt_outcome_sequence = max(
+            int(control.get("last_sent_outcome_sequence") or 0),
+            self._max_outcome_sequence(player_battle),
+        )
 
         async def get_battle(_context: Any, _raw: str) -> str:
-            nonlocal latest_sent_battle, prompt_outcome_sequence
+            nonlocal latest_sent_battle, prompt_outcome_sequence, risk_checkpoint
             self._emit(
                 "tool_called",
                 "Battle Agent called get_battle.",
@@ -628,14 +702,21 @@ class BattleDelegate:
                 latest_view = self._with_enemy_changes(
                     self.debug.current_player_battle_view(latest) or {}
                 )
+                # Never mix another battle into this delegate's observation state.
+                if (
+                    str(latest.get("game_instance_id") or "") != str(state.get("game_instance_id") or "")
+                    or latest_view.get("generation") != full_player_battle.get("generation")
+                ):
+                    raise RuntimeError("battle_generation_changed")
+                latest_view["survival_risk"], risk_checkpoint = survival_risk(
+                    latest_view, control.get("survival_observations"),
+                )
                 output = {
                     "ok": True,
                     "battle": self._agent_battle_view(
                         latest_view,
                         include_experience=not bool(self._control().get("experience_sent")),
-                        after_outcome_sequence=int(
-                            self._control().get("last_sent_outcome_sequence") or 0
-                        ),
+                        after_outcome_sequence=prompt_outcome_sequence,
                     ),
                 }
                 prompt_outcome_sequence = max(
@@ -656,76 +737,23 @@ class BattleDelegate:
                 "get_battle returned the latest battle state.",
                 {"tool": "get_battle", "output": output},
             )
-            return runtime._final_model_tool_output(output)
+            # The native outcome buffer is bounded. Deliver it directly: this
+            # child has no get_tool_output tool to retrieve an archived preview.
+            return json.dumps(output, ensure_ascii=False, separators=(",", ":"))
+
+        item_details = BattleItemDetails(self.debug)
 
         async def get_item_details(_context: Any, raw: str) -> str:
+            self._emit("tool_called", "Battle Agent called get_item_details.",
+                       {"tool": "get_item_details", "raw_arguments": raw})
             try:
                 args = runtime._parse_tool_arguments(raw)
-                item_id = int(args.get("item_id") or 0)
+                encoded = item_details.query(args)
             except (TypeError, ValueError):
-                self._emit(
-                    "tool_called",
-                    "Battle Agent called get_item_details.",
-                    {"tool": "get_item_details", "raw_arguments": raw},
-                )
-                output = {"ok": False, "error": "invalid_item_id"}
-                self._emit(
-                    "tool_output",
-                    "get_item_details rejected invalid arguments.",
-                    {"tool": "get_item_details", "output": output},
-                )
-                return json.dumps(output, ensure_ascii=False)
-            self._emit(
-                "tool_called",
-                "Battle Agent called get_item_details.",
-                {"tool": "get_item_details", "arguments": {"item_id": item_id}},
-            )
-            latest = self.debug.snapshot()
-            inventory = latest.get("inventory") if isinstance(latest.get("inventory"), list) else []
-            candidate = next(
-                (
-                    item for item in inventory
-                    if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
-                ),
-                None,
-            )
-            if candidate is None:
-                output = {"ok": False, "error": "item_not_in_inventory", "item_id": item_id}
-            else:
-                output = {
-                    "ok": True,
-                    "item": self.debug.player_battle_inventory_item(candidate),
-                    "observed_effects": self.debug.combat_experience(
-                        latest.get("battle") if isinstance(latest.get("battle"), dict) else None,
-                        item_id=item_id,
-                    ).get("matching_actions", []),
-                }
-                battle = latest.get("battle") if isinstance(latest.get("battle"), dict) else {}
-                legal_actions = [
-                    {
-                        key: action.get(key)
-                        for key in (
-                            "action_type", "object_id", "target_side", "target_mode",
-                            "valid_target_indices", "submission_target_indices",
-                        )
-                        if key in action
-                    }
-                    for action in battle.get("available_actions") or []
-                    if isinstance(action, dict)
-                    and int(action.get("object_id") or 0) == item_id
-                    and action.get("action_type") in {"use_item", "throw_item"}
-                ]
-                output["legal_battle_actions"] = legal_actions
-            self._emit(
-                "tool_output",
-                (
-                    "get_item_details returned player-usable inventory facts and sanitized effects."
-                    if output.get("ok")
-                    else "get_item_details could not find the item."
-                ),
-                {"tool": "get_item_details", "output": output},
-            )
-            return runtime._final_model_tool_output(output)
+                encoded = json.dumps({"ok": False, "error": "invalid_item_arguments"})
+            self._emit("tool_output", "get_item_details returned a directly readable result.",
+                       {"tool": "get_item_details", "output": json.loads(encoded)})
+            return encoded
 
         async def submit(_context: Any, raw: str) -> str:
             nonlocal submitted
@@ -790,17 +818,8 @@ class BattleDelegate:
         )
         item_tool = FunctionTool(
             name="get_item_details",
-            description=(
-                "Read inventory count, menu description, sanitized DOS item-effect summaries, "
-                "and legal battle uses for one item_id. An effect with preview_complete=false "
-                "is only a partial summary; do not infer missing effects from the item name."
-            ),
-            params_json_schema={
-                "type": "object",
-                "properties": {"item_id": {"type": "integer", "minimum": 1}},
-                "required": ["item_id"],
-                "additionalProperties": False,
-            },
+            description=ITEM_DETAILS_DESCRIPTION,
+            params_json_schema=ITEM_DETAILS_SCHEMA,
             on_invoke_tool=get_item_details,
             strict_json_schema=False,
         )
@@ -843,35 +862,7 @@ class BattleDelegate:
         )
         agent = Agent(
             name="PALPAL battle child",
-            instructions=(
-                "You control one PALPAL battle. You have get_battle, get_item_details, and "
-                "submit_battle_action. Battle and item tools intentionally contain only facts "
-                "visible to a human player. Never infer weaknesses, elements, damage, or item "
-                "effects from names alone. Player status_effects and poisons are current friendly "
-                "effects; enemy internal effects remain hidden. Item and magic descriptions are "
-                "player-visible menu text and may guide your choice, but vague wording does not "
-                "establish an exact element, damage amount, or weakness. Sanitized item effects "
-                "from get_item_details are DOS handbook-equivalent knowledge; when "
-                "preview_complete is false, treat listed effects as incomplete and do not guess "
-                "the missing branches. Treat observed outcomes "
-                "and experience as samples, not deterministic rules. An HP estimate with status "
-                "unknown does not justify estimating maximum or remaining HP, or claiming that an "
-                "enemy is near defeat. A boss flag means the encounter is special and cannot be "
-                "fled; it does not imply high HP. Plan unknown-duration fights around whole-round "
-                "damage, visible statuses, recovery reserves, and area resources. If enemy_changes "
-                "is present and nonempty, discard any target plan based on the prior enemy set and "
-                "replan from the current legal targets. Balance survival risk, attack "
-                "and magic samples, MP cost, and resource scarcity. When the party is safe and no "
-                "relevant sample exists, try one lowest-cost currently legal offensive magic early; "
-                "judge safety from visible HP/MP, status, recent incoming damage, and healing reserves, "
-                "not a fixed threshold. Use a consumable only when menu text, a sanitized effect "
-                "summary, or prior visible samples support its intended effect; never blind-test "
-                "a scarce item. "
-                "The supplied battle snapshot is current; do not call get_battle unless it may have "
-                "become stale. Do not narrate before acting. "
-                "Never invent targets or actions. Choose target_index from the action's "
-                "submission_target_indices and submit exactly one current legal action."
-            ),
+            instructions=BATTLE_INSTRUCTIONS,
             model=model,
             tools=[get_tool, item_tool, submit_tool],
             tool_use_behavior=finish,
@@ -912,6 +903,7 @@ class BattleDelegate:
                         self._persist_control(last_prompt_tokens=entries[-1]["input_tokens"])
                 if request_completed:
                     updates: dict[str, Any] = {}
+                    updates["survival_observations"] = risk_checkpoint
                     if "experience" in player_battle:
                         updates["experience_sent"] = True
                     if prompt_outcome_sequence:

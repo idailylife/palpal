@@ -147,7 +147,8 @@ def test_deepseek_timeout_applies_to_each_model_round(tmp_path):
 
 
 
-def test_deepseek_decide_agent_accepts_whitelisted_model(tmp_path):
+@pytest.mark.parametrize('model', ['deepseek-v4-flash', 'deepseek-v4.1-flash-expires-on-0910'])
+def test_deepseek_decide_agent_accepts_whitelisted_model(tmp_path, model):
     debug = make_debug_state(tmp_path)
     state = make_state()
     captured = []
@@ -161,10 +162,10 @@ def test_deepseek_decide_agent_accepts_whitelisted_model(tmp_path):
         captured.append(json.loads(request.data.decode('utf-8')))
         return FakeJSONResponse(response)
     with patch.dict(os.environ, {'DEEPSEEK_API_KEY': 'test-key'}), patch('urllib.request.urlopen', fake_urlopen):
-        decision = debug.deepseek_decide_agent(state, model='deepseek-v4-flash')
-    assert captured[0]['model'] == 'deepseek-v4-flash'
-    assert decision['model'] == 'deepseek-v4-flash'
-    assert debug.read_agent_llm_log(limit=1)[0]['request']['model'] == 'deepseek-v4-flash'
+        decision = debug.deepseek_decide_agent(state, model=model)
+    assert captured[0]['model'] == model
+    assert decision['model'] == model
+    assert debug.read_agent_llm_log(limit=1)[0]['request']['model'] == model
 
 
 

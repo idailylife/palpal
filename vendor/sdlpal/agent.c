@@ -159,6 +159,7 @@ typedef struct tagPALPALAGENTVISIBLEOUTCOME
    BOOL valid;
    DWORD sequence;
    BOOL player_actor;
+   BOOL round_end;
    WORD actor_index;
    WORD actor_role;
    INT action_type;
@@ -3123,6 +3124,16 @@ PALPAL_AgentVisibleActionBegin(
 }
 
 VOID
+PALPAL_AgentVisibleRoundEndBegin(
+   VOID
+)
+{
+   PALPAL_AgentVisibleActionBegin(FALSE, 0xFFFF, 0, 0, -1);
+   if (g_agent_visible_active.valid)
+      g_agent_visible_active.round_end = TRUE;
+}
+
+VOID
 PALPAL_AgentVisibleActionEnd(
    VOID
 )
@@ -4068,7 +4079,11 @@ PALPAL_AgentWriteVisibleOutcome(
 )
 {
    int i, first, numeric = outcome->number_count > 0;
-   fprintf(fp, "{\"sequence\":%u,\"actor\":{\"side\":\"%s\",\"index\":%u",
+   if (outcome->round_end)
+      fprintf(fp, "{\"sequence\":%u,\"actor\":{\"side\":\"environment\"",
+         (unsigned int)outcome->sequence);
+   else
+      fprintf(fp, "{\"sequence\":%u,\"actor\":{\"side\":\"%s\",\"index\":%u",
       (unsigned int)outcome->sequence,
       outcome->player_actor ? "player" : "enemy", outcome->actor_index);
    if (outcome->player_actor)
@@ -4077,7 +4092,7 @@ PALPAL_AgentWriteVisibleOutcome(
       PALPAL_AgentWriteJsonWideString(fp,
          PAL_GetWord(gpGlobals->g.PlayerRoles.rgwName[outcome->actor_role]));
    }
-   else
+   else if (!outcome->round_end)
    {
       WORD enemy_object_id = outcome->actor_index < MAX_ENEMIES_IN_TEAM
          ? outcome->enemy_object_id[outcome->actor_index] : 0;
@@ -4085,7 +4100,7 @@ PALPAL_AgentWriteVisibleOutcome(
       PALPAL_AgentWriteJsonWideString(fp, enemy_object_id ? PAL_GetWord(enemy_object_id) : L"");
    }
    fprintf(fp, "},\"action\":{\"action_type\":\"%s\"",
-      outcome->player_actor
+      outcome->round_end ? "round_end" : outcome->player_actor
          ? PALPAL_AgentBattleActionName((BATTLEACTIONTYPE)outcome->action_type)
          : "enemy_action");
    if (outcome->player_actor && outcome->object_id)
@@ -4584,6 +4599,16 @@ PALPAL_AgentWriteBattle(
       PALPAL_AgentWriteStatusEffects(fp, gpGlobals->rgPlayerStatus[role]);
       fprintf(fp, ",\"poisons\":");
       PALPAL_AgentWritePlayerPoisons(fp, i);
+      /* Action fields survive between rounds. Only kFighterAct is committed;
+       * an incapacitated role cannot receive a fresh command even if recovered
+       * later during this round. Never label the retained old action pending. */
+      fprintf(fp, ",\"command_status\":\"%s\"",
+         gpGlobals->g.PlayerRoles.rgwHP[role] == 0 ||
+         gpGlobals->rgPlayerStatus[role][kStatusSleep] ||
+         gpGlobals->rgPlayerStatus[role][kStatusConfused] ||
+         gpGlobals->rgPlayerStatus[role][kStatusParalyzed] ? "unable" :
+         player->state == kFighterAct ? "committed" :
+         player->state == kFighterCom ? "selecting" : "unselected");
       fprintf(fp,
          ",\"time_meter\":%.2f,\"fighter_state\":\"%s\",\"defending\":%s,"
          "\"submitted_action\":{\"action_type\":\"%s\",\"object_id\":%u,\"target_index\":%d}}",

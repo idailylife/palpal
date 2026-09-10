@@ -1615,6 +1615,7 @@ PAL_BattleStartFrame(
          //
          // Run poison scripts
          //
+         PALPAL_AgentVisibleRoundEndBegin();
          PAL_BattleBackupStat();
 
          for (i = 0; i <= gpGlobals->wMaxPartyMemberIndex; i++)
@@ -1670,6 +1671,7 @@ PAL_BattleStartFrame(
          {
             PAL_BattleDelay(8, 0, TRUE);
          }
+         PALPAL_AgentVisibleActionEnd();
 
          if (g_Battle.iHidingTime > 0)
          {
