@@ -1427,6 +1427,52 @@ async function main() {
       throw new Error(`agent navigation reuse smoke failed (${JSON.stringify(agentNavigationReuseResult)})`);
     }
 
+    const navigationCompletion = await cdp.send("Runtime.evaluate", {
+      awaitPromise: true, returnByValue: true,
+      expression: `(async () => {
+        const savedFetch = window.fetch;
+        const savedState = latestState;
+        const savedRun = activeNavigation;
+        let polls = 0;
+        const state = { game_instance_id: "smoke", party_position: { x: 32, y: 16 },
+          state_info: { available: true, stale: false },
+          control: { phase: "ready", navigation_ready: true },
+          agent_action: { generation: 5, pending: false } };
+        const step = { status: "stepping", expected_node: { x: 32, y: 16 },
+          action: { game_instance_id: "smoke", action_generation_before: 4, action_handshake_supported: true } };
+        let observations = [
+          { ...state, agent_action: { generation: 4, pending: false } },
+          { ...state, agent_action: { generation: 5, pending: true }, control: { phase: "action_pending" } },
+          state,
+        ];
+        try {
+          activeNavigation = { targetId: 810 };
+          window.fetch = async (url, options) => {
+            if (url !== "/navigation/status") return savedFetch(url, options);
+            polls += 1;
+            if (!observations.length) throw new Error("Unexpected navigation status poll");
+            return { ok: true, json: async () => observations.shift() };
+          };
+          const completed = await waitForNavigationProgress(step, "0,0");
+          const completionPolls = polls;
+          observations = [{ ...state, agent_action: { generation: 6, pending: false } }];
+          const superseded = await waitForNavigationProgress(step, "0,0");
+          observations = [{ ...state, control: { phase: "dialog" } }];
+          const dialog = await waitForNavigationProgress(step, "0,0");
+          return { completed, completionPolls, superseded, dialog };
+        } finally {
+          window.fetch = savedFetch;
+          latestState = savedState;
+          activeNavigation = savedRun;
+        }
+      })()`,
+    }, sessionId);
+    const completionResult = navigationCompletion.result?.value;
+    if (!completionResult?.completed || completionResult.completionPolls !== 3
+        || completionResult.superseded || completionResult.dialog) {
+      throw new Error(`navigation completion smoke failed (${JSON.stringify(completionResult)})`);
+    }
+
     const navigationSingleFlight = await cdp.send(
       "Runtime.evaluate",
       {

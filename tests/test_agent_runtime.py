@@ -4017,7 +4017,7 @@ def test_navigation_waits_for_scene_transition_instead_of_failing(tmp_path):
     stable["scene_id"] = 2
     snapshots = [entering, entering, stable]
 
-    debug.snapshot = lambda: snapshots.pop(0) if snapshots else stable
+    debug.navigation_snapshot = debug.snapshot = lambda: snapshots.pop(0) if snapshots else stable
     debug.navigation_step = lambda state, target_id, **_kwargs: {
         "ok": False,
         "status": "entering_scene",
@@ -4045,7 +4045,7 @@ def test_navigation_reports_game_requested_interactions_explicitly(
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
     state = make_state()
-    debug.snapshot = lambda: state
+    debug.navigation_snapshot = debug.snapshot = lambda: state
     debug.navigation_step = lambda _state, target_id, **_kwargs: {
         "ok": False,
         "status": status,
@@ -4077,9 +4077,10 @@ def test_navigation_replans_once_after_mid_route_invalidation_and_recovers(tmp_p
         },
         {"ok": True, "status": "arrived", "target_id": 714},
     ]
-    debug.snapshot = lambda: state
+    debug.navigation_snapshot = debug.snapshot = lambda: state
     debug.navigation_step = lambda _state, target_id, **_kwargs: results.pop(0)
     monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: state)
+    monkeypatch.setattr(runtime, "_wait_action_completion", lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs))
 
     result = runtime._navigate(714)
 
@@ -4110,9 +4111,10 @@ def test_navigation_returns_route_invalidated_after_single_failed_replan(tmp_pat
         {"ok": False, "status": "unreachable_static", "target_id": 714},
         {"ok": False, "status": "blocked_by_transition", "target_id": 714},
     ]
-    debug.snapshot = lambda: state
+    debug.navigation_snapshot = debug.snapshot = lambda: state
     debug.navigation_step = lambda _state, target_id, **_kwargs: results.pop(0)
     monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: state)
+    monkeypatch.setattr(runtime, "_wait_action_completion", lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs))
 
     result = runtime._navigate(714)
 
@@ -4133,7 +4135,7 @@ def test_navigation_does_not_retry_initial_static_unreachable(tmp_path):
         calls["count"] += 1
         return {"ok": False, "status": "unreachable_static", "target_id": target_id}
 
-    debug.snapshot = lambda: state
+    debug.navigation_snapshot = debug.snapshot = lambda: state
     debug.navigation_step = navigation_step
 
     with pytest.raises(RuntimeError, match="navigation_unreachable_static"):
@@ -4235,7 +4237,7 @@ def test_navigation_waits_for_pending_transition_observation(tmp_path, monkeypat
         },
     ]
 
-    debug.snapshot = lambda: state
+    debug.navigation_snapshot = debug.snapshot = lambda: state
     debug.navigation_step = lambda current, target_id, **_kwargs: results.pop(0)
     monkeypatch.setattr("palpal.agent_runtime.time.sleep", lambda _seconds: None)
 
@@ -4273,9 +4275,10 @@ def test_navigation_search_interaction_continues_when_native_transition_is_bound
             "observation_id": observation_id,
         },
     ]
-    debug.snapshot = lambda: state
+    debug.navigation_snapshot = debug.snapshot = lambda: state
     debug.navigation_step = lambda _state, target_id, **_kwargs: results.pop(0)
     monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: state)
+    monkeypatch.setattr(runtime, "_wait_action_completion", lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs))
     monkeypatch.setattr(runtime, "_wait_navigation_observation", lambda *_args: None)
 
     result = runtime._navigate(75)
@@ -4319,7 +4322,7 @@ def test_navigation_observation_polling_does_not_create_extra_steps(tmp_path):
             }
         return {"ok": True, "status": "transitioned", "target_id": target_id}
 
-    debug.snapshot = snapshot
+    debug.navigation_snapshot = debug.snapshot = snapshot
     debug.navigation_step = navigation_step
 
     result = runtime._navigate(48)
@@ -4441,6 +4444,7 @@ def test_navigation_receives_transition_confirmed_during_action_wait(tmp_path, m
         return debug.snapshot()
 
     monkeypatch.setattr(runtime, "_wait_action_and_stable", complete_during_wait)
+    monkeypatch.setattr(runtime, "_wait_action_completion", lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs))
     monkeypatch.setattr("palpal.agent_runtime.time.sleep", lambda _seconds: None)
 
     result = runtime._navigate(48)
@@ -4481,9 +4485,10 @@ def test_navigation_treats_dialog_started_during_navigation_as_success(tmp_path)
         },
     ]
 
-    debug.snapshot = lambda: snapshots.pop(0)
+    debug.navigation_snapshot = debug.snapshot = lambda: snapshots.pop(0)
     debug.navigation_step = lambda state, target_id, **_kwargs: results.pop(0)
     runtime._wait_action_and_stable = lambda **kwargs: dialog
+    runtime._wait_action_completion = lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs)
 
     result = runtime._navigate(57)
     assert result["ok"] is True
@@ -4534,6 +4539,7 @@ def test_dynamic_touch_transition_dialog_interrupt_does_not_fail_navigation(tmp_
         return debug.snapshot()
 
     monkeypatch.setattr(runtime, "_wait_action_and_stable", land_during_action_wait)
+    monkeypatch.setattr(runtime, "_wait_action_completion", lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs))
 
     result = runtime._navigate(117)
 
@@ -4591,6 +4597,7 @@ def test_dynamic_touch_delayed_trigger_stops_agent_before_reverse_step(tmp_path,
         return debug.snapshot()
 
     monkeypatch.setattr(runtime, "_wait_action_and_stable", transition_during_action_wait)
+    monkeypatch.setattr(runtime, "_wait_action_completion", lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs))
 
     result = runtime._navigate(248)
 
@@ -4719,9 +4726,10 @@ def test_navigation_replans_after_partial_segment_execution(tmp_path, monkeypatc
         {"ok": True, "status": "arrived", "target_id": 95},
     ]
 
-    debug.snapshot = lambda: states.pop(0) if states else partial
+    debug.navigation_snapshot = debug.snapshot = lambda: states.pop(0) if states else partial
     debug.navigation_step = lambda state, target_id, **_kwargs: results.pop(0)
     monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: partial)
+    monkeypatch.setattr(runtime, "_wait_action_completion", lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs))
 
     result = runtime._navigate(95)
 
@@ -4735,7 +4743,7 @@ def test_navigation_approach_binds_item_and_finishes_without_item_use(tmp_path):
     state = make_state(start=(4, 4))
     calls = []
 
-    debug.snapshot = lambda: state
+    debug.navigation_snapshot = debug.snapshot = lambda: state
 
     def navigation_step(current, target_id, approach_item_id=None, **_kwargs):
         calls.append((current, target_id, approach_item_id))
@@ -4772,7 +4780,7 @@ def test_navigation_stops_after_one_identical_no_progress_retry(tmp_path, monkey
     }
     writes = []
 
-    debug.snapshot = lambda: stationary
+    debug.navigation_snapshot = debug.snapshot = lambda: stationary
 
     def navigation_step(state, target_id, **_kwargs):
         writes.append((result["move"], result["segment_steps"], result["remaining_steps"]))
@@ -4780,6 +4788,7 @@ def test_navigation_stops_after_one_identical_no_progress_retry(tmp_path, monkey
 
     debug.navigation_step = navigation_step
     monkeypatch.setattr(runtime, "_wait_action_and_stable", lambda **_kwargs: stationary)
+    monkeypatch.setattr(runtime, "_wait_action_completion", lambda action, **kwargs: runtime._wait_action_and_stable(action=action, **kwargs))
 
     with pytest.raises(RuntimeError, match="navigation_no_progress"):
         runtime._navigate(95)

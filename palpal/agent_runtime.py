@@ -4207,7 +4207,7 @@ exploration value, and maintained local tasks to choose the next action.
             if native is not None and native["generation"] != generation_before:
                 received_generation = native["generation"]
                 break
-            time.sleep(0.04)
+            self.debug.wait_navigation_update()
         if received_generation is None:
             self.debug.append_navigation_diagnostic(
                 "action_generation_timeout",
@@ -4265,7 +4265,7 @@ exploration value, and maintained local tasks to choose the next action.
                     state=latest,
                 )
                 return latest
-            time.sleep(0.04)
+            self.debug.wait_navigation_update()
 
         native = self.debug.native_action_status(latest)
         self.debug.append_navigation_diagnostic(
@@ -4367,7 +4367,7 @@ exploration value, and maintained local tasks to choose the next action.
         while step < 240:
             if self.cancel_event.is_set():
                 raise RuntimeError("interrupted")
-            state = self.debug.snapshot()
+            state = self.debug.navigation_snapshot()
             if approach_item_id is None:
                 result = self.debug.navigation_step(
                     state,
@@ -4458,10 +4458,10 @@ exploration value, and maintained local tasks to choose the next action.
                 raise RuntimeError(f"navigation_{status or 'failed'}")
             if result.get("action"):
                 before_position = (state.get("party_position") or {}).copy()
-                after_action = self._wait_action_and_stable(
-                    quiet_window=0.2,
-                    action=result["action"],
-                )
+                if status in {"stepping", "facing"}:
+                    after_action = self._wait_action_completion(result["action"])
+                else:
+                    after_action = self._wait_action_and_stable(quiet_window=0.2, action=result["action"])
                 expected = result.get("expected_node")
                 if isinstance(expected, dict):
                     actual = after_action.get("party_position") or {}

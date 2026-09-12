@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 import zlib
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,10 @@ from urllib.parse import parse_qs, urlparse
 from palpal.agent_runtime import AgentRuntime
 from palpal.observations import ObservationCoordinator
 from palpal.screen_inspection import ScreenInspector, valid_poe_api_key
+
+
+class NavigationStateChanged(Exception):
+    """An unissued navigation action no longer matches the live state."""
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
@@ -663,6 +668,9 @@ class DebugState:
         self.game_binary = game_binary
         self.env_file = read_env_file(ROOT / ".env")
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        # Immutable serialized data only: every reader owns its decoded dictionaries.
+        self.exploration_read_cache: tuple[tuple, str] | None = None
+        self.navigation_timings = threading.local()
         self.action_log: list[dict] = []
         self.event_log: list[dict] = self.read_events()
         if self.events_path.exists():
@@ -697,6 +705,9 @@ class DebugState:
         self.live_png_sequence = 0
         self.live_png_cache: dict[bytes, bytes] = {}
         self.navigation_graph_lock = threading.RLock()
+        self.navigation_component_cache = OrderedDict()
+        self.navigation_room_hash_cache = OrderedDict()
+        self.navigation_target_positions = {}
         self.navigation_graph_cache: OrderedDict[
             tuple[tuple[int, int], tuple[int, int], int, int, str],
             dict[tuple[int, int], tuple[tuple[str, tuple[int, int]], ...]],
@@ -852,6 +863,16 @@ class DebugState:
     ) -> None:
         with self.live_condition:
             next_sequence = sequence if sequence is not None else self.live_state_sequence + 1
+            previous_positions = self.navigation_target_positions
+            positions = {}
+            room = (state.get("game_instance_id"), state.get("scene_id"), state.get("map_id"),
+                    (state.get("room") or {}).get("key"), (state.get("nav_grid") or {}).get("bits"))
+            for obj in state.get("objects") or []:
+                key = (*room, obj.get("id"), obj.get("sprite_id"), obj.get("trigger_script"), obj.get("state"))
+                position = (obj.get("x"), obj.get("y"))
+                previous = previous_positions.get(key)
+                positions[key] = (position, bool(previous and (previous[1] or previous[0] != position)))
+            self.navigation_target_positions = positions
             self.live_state = copy.deepcopy(state)
             self.live_state_received_at = received_at if received_at is not None else time.time()
             self.live_state_sequence = int(next_sequence)
@@ -899,6 +920,26 @@ class DebugState:
                     "message": "no live state received from the game",
                 }
             return copy.deepcopy(self.live_state)
+
+    def navigation_status(self) -> dict:
+        """Small, coherent control observation; never runs exploration or presentation."""
+        with self.live_lock:
+            state = self.read_live_state()
+            sequence = self.live_state_sequence
+            info = self.live_info("state")
+        return {
+            **{key: state.get(key) for key in (
+                "game_instance_id", "frame", "scene_id", "map_id", "party_position",
+                "party_direction", "agent_action", "in_battle", "entering_scene",
+            )},
+            "sequence": sequence,
+            "state_info": info,
+            "control": self.control_state(state, info),
+        }
+
+    def wait_navigation_update(self, timeout: float = 0.04) -> None:
+        with self.live_condition:
+            self.live_condition.wait(timeout=timeout)
 
     @staticmethod
     def native_action_status(state: dict | None) -> dict | None:
@@ -1192,13 +1233,17 @@ class DebugState:
                 self.live_condition.wait(remaining)
             return self.live_frame_sequence
 
-    def atomic_write_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    def atomic_write_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> os.stat_result:
         tmp = path.with_name(
             f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
         )
         try:
-            tmp.write_text(text, encoding=encoding)
-            os.replace(tmp, path)
+            with tmp.open("w", encoding=encoding) as stream:
+                stream.write(text)
+                stream.flush()
+                os.replace(tmp, path)
+                # Stat the file we wrote, even if another writer replaces the path.
+                return os.fstat(stream.fileno())
         finally:
             try:
                 tmp.unlink()
@@ -3632,46 +3677,68 @@ class DebugState:
         return component
 
     def logical_room_component_for_state(self, state: dict, grid: dict) -> tuple[set[tuple[int, int]], set[tuple[int, int]], tuple[int, int] | None]:
-        passable = {
-            (x, y)
-            for y in range(grid["height"])
-            for x in range(grid["width"])
-            if nav_bit(grid, (x, y))
-        }
+        passable = set(self.navigation_graph(grid))
         portal_cut = self.logical_room_cut_nodes(state, grid) & passable
-        stable_nodes = passable - portal_cut
+        stable_nodes, by_node = self.navigation_components(grid, frozenset(portal_cut))
         pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
         current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         seed, _ = self.logical_room_seed(grid, current, stable_nodes)
-        component = self.logical_room_component(grid, seed, stable_nodes) if seed is not None else set()
+        component = set(by_node.get(seed, ()))
         if not component and current in passable:
             component = {current}
         return component, portal_cut, current
 
+    def navigation_components(self, grid: dict, blocked: frozenset = frozenset()) -> tuple:
+        key = (self.navigation_grid_key(grid), blocked)
+        with self.navigation_graph_lock:
+            cached = self.navigation_component_cache.get(key)
+            if cached is not None:
+                self.navigation_component_cache.move_to_end(key)
+        if cached is None:
+            graph = self.navigation_graph(grid)
+            passable = frozenset(graph).difference(blocked)
+            remaining = set(passable)
+            by_node = {}
+            while remaining:
+                seed = next(iter(remaining))
+                component = frozenset(self.logical_room_component(grid, seed, remaining))
+                remaining.difference_update(component)
+                by_node.update(dict.fromkeys(component, component))
+            cached = (passable, by_node)
+            with self.navigation_graph_lock:
+                self.navigation_component_cache[key] = cached
+                while len(self.navigation_component_cache) > NAVIGATION_GRAPH_CACHE_SIZE:
+                    self.navigation_component_cache.popitem(last=False)
+        return cached
+
     def static_room_component_for_state(
-        self,
-        state: dict,
-        grid: dict,
+        self, state: dict, grid: dict,
     ) -> tuple[set[tuple[int, int]], tuple[int, int] | None]:
         """Return the native static walkable component without event-object cuts."""
-        passable = {
-            (x, y)
-            for y in range(grid["height"])
-            for x in range(grid["width"])
-            if nav_bit(grid, (x, y))
-        }
+        passable, by_node = self.navigation_components(grid)
         pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
         current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         seed, _ = self.logical_room_seed(grid, current, passable)
-        component = self.logical_room_component(grid, seed, passable) if seed is not None else set()
+        component = set(by_node.get(seed, ()))
         if not component and current in passable:
             component = {current}
         return component, current
 
     def logical_room_hash(self, scene_id, map_id, grid: dict, nodes: set[tuple[int, int]]) -> str:
+        key = (scene_id, map_id, self.navigation_grid_key(grid), frozenset(nodes))
+        with self.navigation_graph_lock:
+            cached = self.navigation_room_hash_cache.get(key)
+            if cached is not None:
+                self.navigation_room_hash_cache.move_to_end(key)
+                return cached
         absolute_nodes = [list(world_pos(grid, node)) for node in sorted(nodes, key=lambda item: (item[1], item[0]))]
         payload = [scene_id, map_id, absolute_nodes]
-        return hashlib.sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+        result = hashlib.sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+        with self.navigation_graph_lock:
+            self.navigation_room_hash_cache[key] = result
+            while len(self.navigation_room_hash_cache) > NAVIGATION_GRAPH_CACHE_SIZE:
+                self.navigation_room_hash_cache.popitem(last=False)
+        return result
 
     def room_state_stable(self, state: dict) -> bool:
         return (
@@ -3809,10 +3876,48 @@ class DebugState:
         }
 
     def read_exploration(self) -> dict:
+        started = time.monotonic()
+        try:
+            return self._read_exploration_cached()
+        finally:
+            metrics = getattr(self.navigation_timings, "current", None)
+            if metrics is not None:
+                metrics["history_reads"] = metrics.get("history_reads", 0) + 1
+                metrics["history_read_ms"] = metrics.get("history_read_ms", 0) + (time.monotonic() - started) * 1000
+
+    @staticmethod
+    def exploration_file_signature(stat: os.stat_result) -> tuple:
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _read_exploration_cached(self) -> dict:
+        def signature():
+            return self.exploration_file_signature(self.exploration_path.stat())
+
+        try:
+            before = signature()
+        except FileNotFoundError:
+            return self.empty_exploration()
+        cached = self.exploration_read_cache
+        if cached is not None and cached[0] == before:
+            return json.loads(cached[1])
+        data = self._read_exploration()
+        try:
+            if signature() == before:
+                self.exploration_read_cache = (
+                    before, json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                )
+        except FileNotFoundError:
+            pass
+        return data
+
+    def _read_exploration(self) -> dict:
         try:
             data = json.loads(self.exploration_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             return self.empty_exploration()
+        return self.normalize_exploration(data)
+
+    def normalize_exploration(self, data: dict) -> dict:
         if not isinstance(data, dict) or data.get("version") != EXPLORATION_VERSION:
             return self.empty_exploration()
         rooms = data.get("rooms")
@@ -3905,11 +4010,11 @@ class DebugState:
         return data
 
     def write_exploration(self, data: dict) -> None:
-        self.atomic_write_text(
-            self.exploration_path,
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        canonical = self.normalize_exploration(data)
+        text = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+        stat = self.atomic_write_text(self.exploration_path, text, encoding="utf-8")
+        if stat is not None:
+            self.exploration_read_cache = (self.exploration_file_signature(stat), text)
 
     @staticmethod
     def _combat_trim_keys(values: dict, capacity: int) -> None:
@@ -4527,6 +4632,14 @@ class DebugState:
 
     def observe_battle_reappearances(self, state: dict) -> list[dict]:
         """Confirm pending records from a stable, matching, interactable object."""
+        with self.exploration_lock:
+            data = self.read_exploration()
+            confirmed = self.confirm_battle_reappearances(state, data)
+            if confirmed:
+                self.write_exploration(data)
+            return confirmed
+
+    def confirm_battle_reappearances(self, state: dict, data: dict) -> list[dict]:
         if not self.room_state_stable(state):
             return []
         identity = self.room_identity(state)
@@ -4534,35 +4647,32 @@ class DebugState:
             return []
         objects = {str(entry.get("id")): entry for entry in state.get("objects") or [] if isinstance(entry, dict)}
         confirmed = []
-        with self.exploration_lock:
-            data = self.read_exploration()
-            history = data.get("battle_reappearances")
-            room = history.get(identity["id"]) if isinstance(history, dict) else None
-            if not isinstance(room, dict):
-                return []
-            now = time.time()
-            for object_id, scripts in room.items():
-                obj = objects.get(object_id)
-                if obj is None or not isinstance(scripts, dict) or obj.get("interactable") is not True:
-                    continue
-                script = str(obj.get("trigger_script") or 0)
-                entry = scripts.get(script)
-                if not isinstance(entry, dict) or entry.get("status") != "awaiting_reappearance":
-                    continue
-                entry["status"] = "confirmed"
-                entry["reappearance_count"] = int(entry.get("reappearance_count") or 0) + 1
-                entry["last_reappeared_at"] = now
-                confirmed.append(dict(entry))
-            if confirmed:
-                self.write_exploration(data)
+        history = data.get("battle_reappearances")
+        room = history.get(identity["id"]) if isinstance(history, dict) else None
+        if not isinstance(room, dict):
+            return []
+        now = time.time()
+        for object_id, scripts in room.items():
+            obj = objects.get(object_id)
+            if obj is None or not isinstance(scripts, dict) or obj.get("interactable") is not True:
+                continue
+            script = str(obj.get("trigger_script") or 0)
+            entry = scripts.get(script)
+            if not isinstance(entry, dict) or entry.get("status") != "awaiting_reappearance":
+                continue
+            entry["status"] = "confirmed"
+            entry["reappearance_count"] = int(entry.get("reappearance_count") or 0) + 1
+            entry["last_reappeared_at"] = now
+            confirmed.append(dict(entry))
         return confirmed
 
-    def battle_reappearance_for_target(self, state: dict, target_id: int) -> dict | None:
+    def battle_reappearance_for_target(self, state: dict, target_id: int, data: dict | None = None) -> dict | None:
         identity = self.room_identity(state)
         obj = next((entry for entry in state.get("objects") or [] if isinstance(entry, dict) and int(entry.get("id") or 0) == target_id), None)
         if identity is None or obj is None:
             return None
-        data = self.read_exploration()
+        if data is None:
+            data = self.read_exploration()
         history = data.get("battle_reappearances")
         room = history.get(identity["id"]) if isinstance(history, dict) else None
         scripts = room.get(str(target_id)) if isinstance(room, dict) else None
@@ -4781,20 +4891,22 @@ class DebugState:
         with self.exploration_lock:
             data = self.read_exploration()
             initialized = self._ensure_observable_context_locked(data)
-            observable = data.get("interaction_observable_context") or {}
-            context = {
-                "observable_revision": max(0, int(observable.get("revision") or 0)),
-                "narrative_digest": self.narrative_context_digest(),
-                "task_digest": self.active_task_context_digest(data),
-                "captured_at": time.time(),
-            }
-            context["key"] = self.stable_digest({
-                key: context[key]
-                for key in ("observable_revision", "narrative_digest", "task_digest")
-            })
             if initialized:
                 self.write_exploration(data)
-            return context
+            return self.interaction_context_from_data(data)
+
+    def interaction_context_from_data(self, data: dict) -> dict:
+        observable = data.get("interaction_observable_context") or {}
+        context = {
+            "observable_revision": max(0, int(observable.get("revision") or 0)),
+            "narrative_digest": self.narrative_context_digest(),
+            "task_digest": self.active_task_context_digest(data),
+            "captured_at": time.time(),
+        }
+        context["key"] = self.stable_digest({
+            key: context[key] for key in ("observable_revision", "narrative_digest", "task_digest")
+        })
+        return context
 
     @staticmethod
     def task_ledger_revision(data: dict) -> int:
@@ -8095,6 +8207,11 @@ class DebugState:
 
     def consume_completed_touch_route(self, state: dict, target_id: int) -> dict | None:
         """Consume native proof that the final touch route already triggered its script."""
+        exploration = state.get("_exploration")
+        if isinstance(exploration, dict) and "last_route" in exploration:
+            last_route = exploration.get("last_route") or {}
+            if (last_route.get("target_selection") or {}).get("kind") != "touch":
+                return None
         identity = self.room_identity(state)
         grid = decode_nav_grid(state)
         if identity is None or grid is None:
@@ -8159,10 +8276,12 @@ class DebugState:
         if current is not None:
             failed_nodes.discard(current)
         safe.difference_update(failed_nodes)
-        reachable_safe = self.reachable_safe_nodes(grid, current, safe) if current is not None and current in safe else set()
+        reachable_safe = (
+            self.reachable_safe_nodes(grid, current, safe) if failed_nodes else set(safe)
+        ) if current is not None and current in safe else set()
         return safe, reachable_safe, failed_nodes
 
-    def recompute_exploration_room(self, state: dict, grid: dict, room: dict, current: tuple[int, int] | None) -> bool:
+    def recompute_exploration_room(self, state: dict, grid: dict, room: dict, current: tuple[int, int] | None, *, geometry: tuple | None = None) -> bool:
         old = (
             tuple(room.get("visited") or []),
             tuple(room.get("frontier") or []),
@@ -8172,7 +8291,7 @@ class DebugState:
             json.dumps(room.get("last_route"), sort_keys=True),
         )
 
-        safe, reachable_safe, failed_nodes = self.exploration_safe_and_reachable(state, grid, room, current)
+        safe, reachable_safe, failed_nodes = geometry if geometry is not None else self.exploration_safe_and_reachable(state, grid, room, current)
         static_component, _ = self.static_room_component_for_state(state, grid)
         explored = {parse_node_key(key) for key in room.get("visited", [])}
         explored = {node for node in explored if node is not None and node in static_component}
@@ -8265,7 +8384,7 @@ class DebugState:
             return True
         return False
 
-    def update_exploration(self, state: dict) -> dict:
+    def update_exploration(self, state: dict, *, include_view: bool = True, observe_reappearances: bool = False) -> dict:
         grid = decode_nav_grid(state)
         identity = self.room_identity(state)
         if grid is None:
@@ -8278,12 +8397,16 @@ class DebugState:
         with self.exploration_lock:
             data = self.read_exploration()
             room = self.exploration_room(data, identity)
-            changed = self.recompute_exploration_room(state, grid, room, current)
-            if changed:
+            confirmed = self.confirm_battle_reappearances(state, data) if observe_reappearances else []
+            geometry = self.exploration_safe_and_reachable(state, grid, room, current)
+            changed = self.recompute_exploration_room(state, grid, room, current, geometry=geometry)
+            if changed or confirmed:
                 self.write_exploration(data)
-            return self.exploration_view(state, data, grid, room, status="ok")
+            return self.exploration_view(state, data, grid, room, status="ok", geometry=geometry) if include_view else {
+                "status": "ok", "last_route": copy.deepcopy(room.get("last_route")),
+            }
 
-    def exploration_view(self, state: dict, data: dict, grid: dict, room: dict, status: str = "ok") -> dict:
+    def exploration_view(self, state: dict, data: dict, grid: dict, room: dict, status: str = "ok", *, geometry: tuple | None = None) -> dict:
         identity = self.room_identity(state)
         current = None
         current_node = None
@@ -8301,7 +8424,9 @@ class DebugState:
                     nodes.append(node_payload(grid, node))
             return nodes
 
-        _, explorable_nodes, _ = self.exploration_safe_and_reachable(state, grid, room, current_node) if grid is not None else (set(), set(), set())
+        _, explorable_nodes, _ = geometry if geometry is not None else (
+            self.exploration_safe_and_reachable(state, grid, room, current_node) if grid is not None else (set(), set(), set())
+        )
         visited_nodes = nodes_for(room.get("visited") or [])
         frontier_nodes = nodes_for(room.get("frontier") or [])
         explorable_payload = [node_payload(grid, node) for node in sorted(explorable_nodes, key=lambda item: (item[1], item[0]))] if grid is not None else []
@@ -8984,7 +9109,10 @@ class DebugState:
                 "status": "approach_requirement_missing" if approach_item_id is not None else "target_inactive",
                 "target_id": target_id,
             }
-        destination_payload = self.transition_destination_for_state(state, target_id)
+        if context is None:
+            self.attach_logical_room_fields(state)
+            context = {"grid": grid, **self.navigation_transition_context(state)}
+        destination_payload = self.transition_destination_for_state(state, target_id, context=context)
         confirmed_transition = bool(destination_payload.get("known_destination"))
         is_transition = transition_candidate(target) or confirmed_transition
         start = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
@@ -9156,7 +9284,85 @@ class DebugState:
             }
         return result
 
+    @staticmethod
+    def navigation_basis(state: dict) -> tuple:
+        grid = state.get("nav_grid") or {}
+        pos = state.get("party_position") or {}
+        return (
+            state.get("game_instance_id"), state.get("scene_id"), state.get("map_id"),
+            (state.get("room") or {}).get("key"), grid,
+            pos.get("x"), pos.get("y"), state.get("party_direction"),
+            (state.get("agent_action") or {}).get("generation"),
+            tuple(tuple(obj.get(k) for k in (
+                "id", "x", "y", "state", "blocking", "interactable", "sprite_id",
+                "trigger_mode", "trigger_script",
+            )) for obj in state.get("objects") or [] if obj.get("blocking") or obj.get("interactable")),
+        )
+
+    def navigation_segment_limit(self, state: dict, target_id: int, remaining: int) -> int:
+        target = self.target_object(state, target_id) or {}
+        key = (state.get("game_instance_id"), state.get("scene_id"), state.get("map_id"),
+               (state.get("room") or {}).get("key"), (state.get("nav_grid") or {}).get("bits"),
+               target_id, target.get("sprite_id"), target.get("trigger_script"), target.get("state"))
+        with self.live_lock:
+            moving = self.navigation_target_positions.get(key, (None, False))[1]
+        return (1 if remaining <= 2 else 2) if moving else MAX_NAVIGATION_SEGMENT_STEPS
+
+    def navigation_action_basis(self, state: dict, target_id: int, buttons: list[str]) -> tuple:
+        grid = decode_nav_grid(state)
+        if grid is None or "search" in buttons:
+            return self.navigation_basis(state)
+        pos = state.get("party_position") or {}
+        node = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
+        if node is None:
+            return self.navigation_basis(state)
+        corridor = {node}
+        for button in buttons:
+            delta = MOVE_DELTAS.get(button)
+            if delta:
+                node = (node[0] + delta[0], node[1] + delta[1])
+                corridor.add(node)
+        relevant = []
+        for obj in state.get("objects") or []:
+            occupied = grid_node(grid, int(obj.get("x") or 0), int(obj.get("y") or 0))
+            if (obj.get("id") == target_id
+                    or (obj.get("blocking") and occupied in corridor)
+                    or (obj.get("interactable") and self.touch_boundary_nodes_for_object(obj, grid) & corridor)):
+                relevant.append(obj)
+        return self.navigation_basis({**state, "objects": relevant})
+
     def navigation_step(
+        self, state: dict, target_id: int, approach_item_id: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict:
+        with self.measure_navigation("navigation_planning", target_id):
+            return self._validated_navigation_step(state, target_id, approach_item_id, cancel_event)
+
+    def _validated_navigation_step(
+        self, state: dict, target_id: int, approach_item_id: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict:
+        started = time.monotonic()
+        for attempt in range(3):
+            try:
+                result = self._navigation_step(state, target_id, approach_item_id, cancel_event)
+                if result.get("status") in {"arrived", "approached"}:
+                    latest = self.read_live_state()
+                    if (self.navigation_basis(state) != self.navigation_basis(latest)
+                            or not self.control_state(latest, self.live_info("state"))["navigation_ready"]):
+                        raise NavigationStateChanged()
+                self.append_navigation_diagnostic("navigation_planning_completed", {
+                    "target_id": target_id, "attempts": attempt + 1,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+                    "status": result.get("status"),
+                })
+                return result
+            except NavigationStateChanged:
+                state = self.read_live_state()
+                self.attach_logical_room_fields(state)
+        return {"ok": True, "status": "replanning", "target_id": target_id}
+
+    def _navigation_step(
         self,
         state: dict,
         target_id: int,
@@ -9164,10 +9370,22 @@ class DebugState:
         cancel_event: threading.Event | None = None,
     ) -> dict:
         def write_navigation_action(buttons: list[str], frames: int) -> dict | None:
-            with self.navigation_action_lock:
+            with self.navigation_timed_lock(self.navigation_action_lock):
                 if cancel_event is not None and cancel_event.is_set():
                     return None
-                return self.write_action(buttons, frames)
+                latest = self.read_live_state()
+                if (self.navigation_action_basis(state, target_id, buttons) != self.navigation_action_basis(latest, target_id, buttons)
+                        or not self.control_state(latest, self.live_info("state"))["navigation_ready"]):
+                    raise NavigationStateChanged()
+                action = self.write_action(buttons, frames)
+                target = self.target_object(latest, target_id) or {}
+                self.append_navigation_diagnostic("navigation_action_validated", {
+                    "target_id": target_id, "source_frame": state.get("frame"),
+                    "dispatch_frame": latest.get("frame"),
+                    "target_position": {"x": target.get("x"), "y": target.get("y")},
+                    "action_generation_before": action.get("action_generation_before"),
+                })
+                return action
 
         if cancel_event is not None and cancel_event.is_set():
             return {"ok": False, "status": "cancelled", "target_id": target_id}
@@ -9279,7 +9497,7 @@ class DebugState:
                 if move not in MOVE_DELTAS:
                     return {"ok": False, "status": "bad_route", "target_id": target_id}
                 segment_steps = 1
-                for next_move in moves[1:MAX_NAVIGATION_SEGMENT_STEPS]:
+                for next_move in moves[1:self.navigation_segment_limit(state, target_id, len(moves))]:
                     if next_move != move:
                         break
                     segment_steps += 1
@@ -9486,7 +9704,7 @@ class DebugState:
         if move not in MOVE_DELTAS:
             return {"ok": False, "status": "bad_route", "target_id": target_id}
         segment_steps = 1
-        for next_move in moves[1:MAX_NAVIGATION_SEGMENT_STEPS]:
+        for next_move in moves[1:self.navigation_segment_limit(state, target_id, len(moves))]:
             if next_move != move:
                 break
             segment_steps += 1
@@ -9552,17 +9770,15 @@ class DebugState:
         order, distance, _ = self.navigation_distance_field(grid, start, blocked)
         return order, distance
 
+    @staticmethod
+    def navigation_grid_key(grid: dict) -> tuple:
+        return (grid["origin"], grid["step"], int(grid["width"]), int(grid["height"]), str(grid["bits"]))
+
     def navigation_graph(
         self,
         grid: dict,
     ) -> dict[tuple[int, int], tuple[tuple[str, tuple[int, int]], ...]]:
-        key = (
-            grid["origin"],
-            grid["step"],
-            int(grid["width"]),
-            int(grid["height"]),
-            str(grid["bits"]),
-        )
+        key = self.navigation_grid_key(grid)
         with self.navigation_graph_lock:
             cached = self.navigation_graph_cache.get(key)
             if cached is not None:
@@ -9720,7 +9936,7 @@ class DebugState:
 
         interactables = [obj for obj in state.get("objects") or [] if obj.get("interactable")]
         transition_context = self.navigation_transition_context(state)
-        affordance_context = self.navigation_affordance_context(state)
+        affordance_context = self.navigation_affordance_context(state, data=transition_context["data"])
         touch_nodes_by_id = {
             int(obj.get("id") or 0): self.touch_boundary_nodes_for_object(obj, grid)
             for obj in interactables
@@ -9989,16 +10205,47 @@ class DebugState:
             "stale": age > STALE_AFTER_SECONDS,
         }
 
-    def snapshot(self) -> dict:
-        state = self.read_live_state()
-        state_info = self.live_info("state")
-        control = self.control_state(state, state_info)
-        stable_room_state = self.room_state_stable(state)
-        client_stable_room_state = stable_room_state and control["owner"] == "client"
-        if client_stable_room_state:
-            self.attach_logical_room_fields(state)
-        frame_info = self.live_info("frame")
-        with self.state_lock:
+    @contextmanager
+    def measure_navigation(self, phase: str, target_id: int | None = None):
+        previous = getattr(self.navigation_timings, "current", None)
+        metrics = {"target_id": target_id}
+        self.navigation_timings.current = metrics
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.navigation_timings.current = previous
+            metrics["elapsed_ms"] = (time.monotonic() - started) * 1000
+            self.append_navigation_diagnostic(phase, {
+                key: round(value, 2) if isinstance(value, float) else value
+                for key, value in metrics.items()
+            })
+
+    @contextmanager
+    def navigation_timed_lock(self, lock):
+        started = time.monotonic()
+        with lock:
+            metrics = getattr(self.navigation_timings, "current", None)
+            if metrics is not None:
+                metrics["lock_wait_ms"] = metrics.get("lock_wait_ms", 0) + (time.monotonic() - started) * 1000
+            yield
+
+    def navigation_snapshot(self) -> dict:
+        with self.measure_navigation("navigation_observation"):
+            return self.snapshot(navigation_only=True)
+
+    def snapshot(self, *, navigation_only: bool = False) -> dict:
+        with self.navigation_timed_lock(self.state_lock):
+            # Sample after acquiring the observation lock. A queued reader must not
+            # reconcile an older frame after another reader has already advanced it.
+            state = self.read_live_state()
+            state_info = self.live_info("state")
+            control = self.control_state(state, state_info)
+            stable_room_state = self.room_state_stable(state)
+            client_stable_room_state = stable_room_state and control["owner"] == "client"
+            if client_stable_room_state:
+                self.attach_logical_room_fields(state)
+            frame_info = self.live_info("frame")
             if state_info.get("available"):
                 self.reset_history_if_frame_restarted(state)
                 self.observe_combat_knowledge(state)
@@ -10014,13 +10261,15 @@ class DebugState:
                 self.observe_dialog_gates(state)
                 self.observe_pending_interaction_outcome(state)
             if state_info.get("available") and client_stable_room_state:
-                self.observe_battle_reappearances(state)
-                state["_navigation"] = self.lightweight_navigation(state)
                 if self.pending_transition_observation is None:
-                    state["_exploration"] = self.update_exploration(state)
+                    state["_exploration"] = self.update_exploration(
+                        state, include_view=not navigation_only, observe_reappearances=True,
+                    )
                 else:
-                    frozen_source = self.pending_transition_observation.get("frozen_source_state")
-                    state["_exploration"] = self.current_exploration(frozen_source if isinstance(frozen_source, dict) else state)
+                    self.observe_battle_reappearances(state)
+                    if not navigation_only:
+                        frozen_source = self.pending_transition_observation.get("frozen_source_state")
+                        state["_exploration"] = self.current_exploration(frozen_source if isinstance(frozen_source, dict) else state)
             recent_actions = list(self.action_log[-20:])
             recent_events = list(self.event_log[-20:])
             recent_dialogs = list(self.dialog_history[-20:])
@@ -10032,6 +10281,12 @@ class DebugState:
                 "last_logical_frame": self.last_logical_frame,
                 "pending_checkpoint_frame_reset": self.pending_checkpoint_frame_reset is not None,
             }
+        if navigation_only:
+            state["control"] = control
+            state["_debug"] = {"runtime_stale": state_info.get("stale", True), "recent_events": recent_events}
+            return state
+        if state_info.get("available") and client_stable_room_state:
+            state["_navigation"] = self.lightweight_navigation(state)
         state["_debug"] = {
             "runtime_dir": str(self.runtime_dir),
             "asset_dir": str(self.asset_dir),
@@ -10964,6 +11219,10 @@ class DebugState:
         return self.dialog_feedback_by_object(same_room, limit_per_object=limit_per_object)
 
     def dialog_feedback_context(self, state: dict) -> dict:
+        with self.state_lock:
+            return self._dialog_feedback_context(state)
+
+    def _dialog_feedback_context(self, state: dict) -> dict:
         current_turn = self.current_agent_turn()
         same_room: list[dict] = []
         stale_different_room: list[dict] = []
@@ -10988,11 +11247,14 @@ class DebugState:
             ),
         }
 
-    def navigation_affordance_context(self, state: dict) -> dict:
+    def navigation_affordance_context(self, state: dict, *, data: dict | None = None) -> dict:
+        if data is None:
+            data = self.read_exploration()
         return {
+            "exploration_data": data,
             **self.dialog_feedback_context(state),
-            "recently_cleared_target_ids": self.recently_cleared_target_ids(state),
-            "recent_interaction_outcomes_by_target": self.recent_interaction_outcomes_by_target(state),
+            "recently_cleared_target_ids": self.recently_cleared_target_ids(state, data=data),
+            "recent_interaction_outcomes_by_target": self.recent_interaction_outcomes_by_target(state, data=data),
         }
 
     def latest_feedback_agent_turn(self, feedback: list[dict]) -> int | None:
@@ -11181,7 +11443,7 @@ class DebugState:
         except (TypeError, ValueError):
             return False
 
-    def recently_cleared_target_ids(self, state: dict, event_limit: int = 50) -> set[int]:
+    def recently_cleared_target_ids(self, state: dict, event_limit: int = 50, *, data: dict | None = None) -> set[int]:
         objects_by_id = {
             int(obj.get("id") or 0): obj
             for obj in state.get("objects") or []
@@ -11190,7 +11452,8 @@ class DebugState:
         cleared: set[int] = set()
         cleared_scripts: set[int] = set()
         identity = self.room_identity(state)
-        data = self.read_exploration()
+        if data is None:
+            data = self.read_exploration()
         interaction_rooms = data.get("object_interactions") if isinstance(data.get("object_interactions"), dict) else {}
         persistent_objects = (
             interaction_rooms.get(identity["id"])
@@ -11249,11 +11512,16 @@ class DebugState:
                     cleared.add(obj_id)
         return cleared
 
-    def recent_interaction_outcomes_by_target(self, state: dict, event_limit: int = 80) -> dict[int, dict]:
+    def recent_interaction_outcomes_by_target(self, state: dict, event_limit: int = 80, *, data: dict | None = None) -> dict[int, dict]:
         outcomes: dict[int, dict] = {}
         identity = self.room_identity(state)
-        current_context = self.interaction_context_snapshot()
-        data = self.read_exploration()
+        if data is None:
+            data = self.read_exploration()
+        current_context = (
+            self.interaction_context_from_data(data)
+            if isinstance(data.get("interaction_observable_context"), dict)
+            else self.interaction_context_snapshot()
+        )
         interaction_rooms = data.get("object_interactions") if isinstance(data.get("object_interactions"), dict) else {}
         persistent_objects = (
             interaction_rooms.get(identity["id"])
@@ -11324,7 +11592,9 @@ class DebugState:
         return outcomes
 
     def target_affordance(self, state: dict, target_id: int, context: dict | None = None) -> dict:
-        reappearance = self.battle_reappearance_for_target(state, target_id)
+        reappearance = self.battle_reappearance_for_target(
+            state, target_id, data=context.get("exploration_data") if isinstance(context, dict) else None,
+        )
         if reappearance is not None:
             return {
                 "interaction_state": "reappeared_battle_trigger",
@@ -14797,6 +15067,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/navigation/status":
+            self.send_json(self.server.state.navigation_status())
+            return
         if parsed.path == "/state":
             self.send_json(self.server.state.snapshot())
             return
@@ -15119,8 +15392,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_body_json()
                 target = int(payload.get("id") or 0)
                 approach_item = int(payload.get("item_id") or 0) or None
-                state = self.server.state.read_live_state()
-                self.server.state.attach_logical_room_fields(state)
+                state = self.server.state.navigation_snapshot()
                 result = self.server.state.navigation_step(
                     state,
                     target,

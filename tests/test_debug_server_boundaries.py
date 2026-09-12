@@ -99,6 +99,14 @@ def test_http_handler_serves_state_frame_action_and_404(http_server):
     assert payload["frame"] == 7
     assert payload["_debug"]["runtime_dir"] == str(debug.runtime_dir)
 
+    status, _, raw = http_request(base_url, "/navigation/status")
+    lightweight = json.loads(raw)
+    assert status == 200
+    assert lightweight["frame"] == 7
+    assert lightweight["sequence"] == debug.live_state_sequence
+    assert "_exploration" not in lightweight
+    assert "_debug" not in lightweight
+
     status, headers, raw = http_request(base_url, "/frame.png")
     assert status == 200
     assert headers["Content-Type"] == "image/png"

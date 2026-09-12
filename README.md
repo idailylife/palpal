@@ -187,9 +187,25 @@ Read a frame or navigation state:
 ```text
 GET  /frame.png
 GET  /navigation
+GET  /navigation/status        # lightweight native generation, position, and control
 GET  /navigation/route?id=123
 GET  /navigation/transitions
 POST /navigation/step          {"id":123}
+```
+
+Both navigation entrypoints wait for the matching native action generation;
+ordinary movement does not wait for global state quietness. Observed moving
+targets use at most two moves per segment (one near the goal). A route that
+changes repeatedly before dispatch returns `replanning` without writing an
+action. Control boundaries and interaction results still use their normal
+observation lifecycle.
+
+Run the isolated server-gap benchmark with existing history, without operating
+the live game:
+
+```sh
+.venv/bin/python -m scripts.benchmark_navigation --history runtime/exploration.json --concurrent
+node --test tests/navigation_progress.test.mjs
 ```
 
 Room exploration reports `visited`/`explored`, `explorable`, and `frontier`

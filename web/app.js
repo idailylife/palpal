@@ -3739,14 +3739,32 @@ async function waitForNavigationProgress(stepResult, startKey) {
   const expectedKey = routeNodePositionKey(stepResult.expected_node || stepResult.route?.nodes?.[1]);
   let deadline = performance.now() + 2500;
   let controlDeadlineApplied = false;
+  const run = activeNavigation;
   while (performance.now() < deadline) {
     await sleep(35);
-    const response = await fetch("/state");
+    if (activeNavigation !== run) return false;
+    const response = await fetch("/navigation/status");
     const state = await response.json();
-    render(state);
+    if (activeNavigation !== run) return false;
+    if (state.state_info?.stale || !state.state_info?.available) return false;
+    const action = stepResult.action || {};
+    if (action.game_instance_id && state.game_instance_id !== action.game_instance_id) return false;
+    if (["battle", "dialog", "choice", "shop", "unavailable"].includes(state.control?.phase)) return false;
     const key = partyPositionKey(state);
-    if (expectedKey ? key === expectedKey : key !== startKey) {
-      return true;
+    const native = state.agent_action;
+    const expectedGeneration = Number(action.action_generation ?? Number(action.action_generation_before) + 1);
+    if (action.action_handshake_supported && Number(native?.generation) > expectedGeneration) return false;
+    const generationConfirmed = action.action_handshake_supported
+      ? Number(native?.generation) === expectedGeneration && !native?.pending
+      : !native?.pending;
+    if (generationConfirmed && state.control?.navigation_ready) {
+      if (latestState) {
+        latestState = { ...latestState, party_position: state.party_position,
+          party_direction: state.party_direction, agent_action: native, control: state.control };
+      }
+      return stepResult.status === "facing"
+        ? partyDirectionButton(state) === stepResult.required_direction
+        : (expectedKey ? key === expectedKey : false) || key !== startKey;
     }
     if (["action_pending", "game_script", "entering_scene"].includes(state.control?.phase)) {
       if (!controlDeadlineApplied) {
@@ -3754,9 +3772,6 @@ async function waitForNavigationProgress(stepResult, startKey) {
         controlDeadlineApplied = true;
       }
       continue;
-    }
-    if (state._debug?.runtime_stale || state.in_battle) {
-      return false;
     }
   }
   return false;
@@ -3964,6 +3979,8 @@ async function navigateToTarget(targetId, requestedItemId = null) {
 
       navigationSteps += 1;
 
+      if (result.ok && result.status === "replanning") continue;
+
       if (!result.ok) {
         updateNavigationTarget(targetId, {
           status: result.status || "unreachable_static",
@@ -3982,7 +3999,7 @@ async function navigateToTarget(targetId, requestedItemId = null) {
       }
 
       if (result.ok && result.status === "facing") {
-        const faced = await waitForFacing(result.required_direction);
+        const faced = await waitForNavigationProgress(result, startKey);
         if (!faced) {
           unlockNavigation("facing_failed");
           await refreshState();
