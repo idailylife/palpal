@@ -106,7 +106,8 @@ def test_inspect_screen_tool_is_always_registered_with_strict_schema(tmp_path):
     debug = make_debug_state(tmp_path)
     specs = {item["function"]["name"]: item["function"] for item in debug.agent_tool_specs()}
     schema = specs["inspect_screen"]["parameters"]
-    assert schema["properties"]["focus"]["enum"] == ["room_layout", "passage", "ui_text"]
+    assert schema["properties"]["focus"]["enum"] == ["room_layout", "passage", "ui_text", "object"]
+    assert schema["properties"]["target_id"]["minimum"] == 1
     assert schema["properties"]["question"]["maxLength"] == 200
     assert schema["additionalProperties"] is False
     assert "inspect_screen" not in {"get_battle", "get_item_details", "submit_battle_action"}

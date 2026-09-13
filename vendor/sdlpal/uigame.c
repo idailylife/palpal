@@ -1776,6 +1776,8 @@ PAL_SellMenu_OnItemChange(
 {
    WORD x = 100, y = 150;
 
+   PALPAL_AgentObserveSellMenuSelection(wCurrentItem);
+
    //
    // Draw the cash amount
    //
@@ -1819,6 +1821,8 @@ PAL_SellMenu(
 {
    WORD      w;
 
+   PALPAL_AgentBeginSellMenu();
+
    while (TRUE)
    {
       w = PAL_ItemSelectMenu(PAL_SellMenu_OnItemChange, kItemFlagSellable);
@@ -1827,14 +1831,27 @@ PAL_SellMenu(
          break;
       }
 
-      if (PAL_ConfirmMenu())
       {
-         if (PAL_AddItemToInventory(w, -1))
+         DWORD cash_before = gpGlobals->dwCash;
+         int owned_before = PAL_GetItemAmount(w);
+         BOOL sold = FALSE;
+
+         PALPAL_AgentObserveSellMenuPhase(TRUE);
+         if (PAL_ConfirmMenu())
          {
-            gpGlobals->dwCash += gpGlobals->g.rgObject[w].item.wPrice / 2;
+            if (PAL_AddItemToInventory(w, -1))
+            {
+               gpGlobals->dwCash += gpGlobals->g.rgObject[w].item.wPrice / 2;
+               sold = TRUE;
+            }
          }
+         PALPAL_AgentObserveSellMenuPhase(FALSE);
+         PALPAL_AgentObserveSellMenuResult(
+            w, sold, cash_before, gpGlobals->dwCash,
+            owned_before, PAL_GetItemAmount(w));
       }
    }
+   PALPAL_AgentEndSellMenu();
 }
 
 VOID

@@ -1001,7 +1001,14 @@ def test_completed_touch_script_at_final_node_finishes_navigation_without_retry(
         'status': 'arrived',
         'target_id': 781,
         'completion': 'trigger_completed',
+        'trigger_evidence': {
+            'object_id': 781,
+            'source': 'native_trigger_completion',
+            'completed_at': last_route['completed_at'],
+            'object_changes': {'trigger_mode': {'from': 7, 'to': 0}},
+        },
     }
+    assert debug.object_history_view(completed, 781)['interaction_summary']['last_trigger_completion'] == result['trigger_evidence']
     assert not debug.action_path.exists()
     consumed = debug.read_exploration()['rooms'][identity['id']]['last_route']
     assert consumed['completion_reported_at'] >= consumed['completed_at']

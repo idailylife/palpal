@@ -262,11 +262,40 @@ session or delegate battle commands; `DEEPSEEK_BASE_URL` defaults to
 `deepseek-v4.1-flash-expires-on-0910`), and `DEEPSEEK_TIMEOUT` to 90 seconds.
 The debug server also requires `POE_API_KEY` at startup so the exploration Agent
 can call the read-only `inspect_screen` tool when structured evidence cannot
-explain the visible room layout or a suspected passage. `POE_VISION_MODEL`
+explain the visible room layout, a suspected passage, or an object's appearance. `POE_VISION_MODEL`
 defaults to `gemini-3.7-flash`, `POE_VISION_BASE_URL` to
 `https://api.poe.com/v1`, and `POE_VISION_TIMEOUT` to 30 seconds. Values may be
 supplied through the process environment or the project `.env`; keys are never
 persisted in Agent data.
+
+For an object's appearance, call `inspect_screen` with `focus="object"` and
+`target_id`. No approach or interaction is required. The native renderer binds
+IDs to surviving visible pixels in the same frame; the vision model describes
+that marked object, never guesses unmarked IDs or hidden gameplay facts.
+`inspect_target` reports available image evidence and existing appearance notes;
+`get_navigation` includes compact cached appearance hints. These are explicitly
+`visual_annotation`, not confirmed identities, quest outcomes, or Room Memo facts.
+
+First visibility makes no model request. The server retains at most 128 recent
+object crops (8 MiB total) in memory for the current logical room, allowing an
+on-demand historical query after an object runs away. Historical evidence is
+dated and does not establish current location. Only normalized descriptions,
+confidence and provenance persist in `exploration.json` and checkpoints; images
+are cleared on room/instance changes and checkpoint restoration. Changed sprites
+require new evidence. Old native binaries without pixel bindings return
+`object_visual_unavailable`. Ordinary layout and UI inspection remain available.
+
+Native frames retain the existing PFRM image payload and may append a `POBJ`
+trailer: magic, little-endian uint32 JSON length, version-1 JSON capture context
+and object descriptors, then a 320x200 little-endian uint16 pixel-owner mask
+(zero means background or occluder). The trailer travels atomically with its
+image. Frame-repeat detection includes this metadata; PNG decoding and its cache
+use only image bytes. UI-overlaid or otherwise unbound frames omit the trailer.
+
+Navigation completion `trigger_completed` and its observed object changes are
+preserved in Agent results. This means the native trigger completed, rather than
+only reaching a location; it does not by itself establish an object's identity
+or task success.
 
 ```text
 GET  /agent/session
@@ -387,7 +416,7 @@ next decision.
 `submit_decision` accepts only a minimal action plus a short reason.
 `navigate` adds `target_id`; `use_item` adds `item_id` and exactly one of
 `role_id` and `target: "all"`; `equip_item` adds `item_id` and `role_id`;
-`buy_item` adds `item_id`; `select_choice` adds `option_index`; and
+`buy_item` and `sell_item` add `item_id`; `select_choice` adds `option_index`; and
 `advance_dialog` and `leave_shop` need no additional fields. Runtime
 synchronization may still wait internally, but `wait` is not a model action. The
 server derives the internal intent, evidence, risk, and executable preview; the
@@ -491,7 +520,7 @@ inventory, equipment, shop, and battle workflows:
 - viewport and party position
 - party members, HP/MP, level, money, and equipped items
 - inventory entries with item metadata and usable/equippable properties
-- active shop mode, selection phase, offered items, and prices
+- active buy/sell shop mode, selection phase, items, prices, and available quantities
 - battle mode, phase, party/enemy combatants, and legal actions during fights
 - dialog state and recent dialog events
 - current scene event objects

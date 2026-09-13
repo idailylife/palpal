@@ -594,7 +594,7 @@ def test_recovery_then_selected_entry_return_does_not_rearm_recovery(tmp_path):
     assert returned["destination_room_id"] == debug.room_identity(source)["id"]
 
 
-def test_non_entry_navigation_progress_preserves_entry_return_guard(tmp_path):
+def test_non_entry_navigation_progress_allows_entry_return(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
     state = make_state(width=7, height=5, objects=[
@@ -646,15 +646,14 @@ def test_non_entry_navigation_progress_preserves_entry_return_guard(tmp_path):
     target = next(target for target in navigation["targets"] if target["id"] == 758)
     assert target["possible_entry_return"] is True
     assert target["entry_relation"] == "inferred_entry_return"
-    assert target["agent_priority"] == "avoid_immediate_backtrack"
+    assert target["agent_priority"] != "avoid_immediate_backtrack"
 
     write_state(debug, state)
-    rejected = debug.run_agent_tool("submit_decision", {
+    accepted = debug.run_agent_tool("submit_decision", {
         "action": "navigate", "target_id": 758, "reason": "Take the nearest transition.",
     }, state)["decision"]
-    assert rejected["validation"]["reason"] == "immediate_entry_return"
-    assert rejected["validation"]["alternative_target_ids"] == [767]
-    assert rejected["recommended_action"]["tool"] == "no_op"
+    assert accepted.get("validation", {}).get("status") != "rejected"
+    assert accepted["recommended_action"]["args"]["id"] == 758
 
 
 def test_entry_context_survives_overlay_before_any_navigation_progress(tmp_path):
@@ -3724,6 +3723,17 @@ def test_live_shop_allows_only_shop_actions_and_replans_after_exit(tmp_path):
         decision('shop_buy', {'item_id': 201}, 'purchase_shop_item'),
         state,
     ) is None
+    state['shop'] = {
+        'active': True,
+        'mode': 'sell',
+        'phase': 'select',
+        'selected_item_id': 166,
+        'items': [{'item_id': 166, 'sell_price': 100, 'available_count': 1, 'can_sell': True}],
+    }
+    assert runtime._decision_replan_reason(
+        decision('shop_sell', {'item_id': 166}, 'sell_shop_item'),
+        state,
+    ) is None
     state['shop'] = None
     assert runtime._decision_replan_reason(
         decision('shop_leave', {}, 'leave_shop'),
@@ -3766,6 +3776,43 @@ def test_execute_shop_buy_uses_structured_writer(tmp_path, monkeypatch):
     assert result['tool'] == 'shop_buy'
     assert result['delta']['cash'] == {'before': 600, 'after': 200}
     assert result['delta']['inventory_changes'] == [{'item_id': 201, 'before': 0, 'after': 1}]
+
+
+def test_execute_shop_sell_uses_structured_writer(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    before = make_state()
+    before['cash'] = 600
+    before['inventory'] = [{'item_id': 166, 'amount': 2, 'amount_in_use': 0}]
+    before['shop'] = {
+        'active': True,
+        'mode': 'sell',
+        'phase': 'select',
+        'selected_item_id': 166,
+        'items': [{'item_id': 166, 'sell_price': 100, 'available_count': 2, 'can_sell': True}],
+    }
+    after = json.loads(json.dumps(before))
+    after['cash'] = 700
+    after['inventory'][0]['amount'] = 1
+    calls = []
+    debug.snapshot = lambda: before
+    debug.write_shop_action = lambda action, item_id=None: calls.append((action, item_id)) or {
+        'command': action,
+        'item_id': item_id,
+        'result': {'ok': True, 'action': action, 'item_id': item_id, 'status': 'sold'},
+    }
+    monkeypatch.setattr(runtime, '_wait_action_and_stable', lambda **_kwargs: after)
+    recommendation = debug.attach_decision_context(
+        before,
+        decision('shop_sell', {'item_id': 166}, 'sell_shop_item'),
+    )
+
+    result = runtime._execute_decision(recommendation)
+
+    assert calls == [('shop_sell', 166)]
+    assert result['tool'] == 'shop_sell'
+    assert result['delta']['cash'] == {'before': 600, 'after': 700}
+    assert result['delta']['inventory_changes'] == [{'item_id': 166, 'before': 2, 'after': 1}]
 
 
 def test_execute_choice_uses_structured_writer(tmp_path, monkeypatch):

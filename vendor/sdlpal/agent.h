@@ -7,6 +7,12 @@
 
 PAL_C_LINKAGE_BEGIN
 
+/* Pixel provenance for visible scene objects; never exposes hidden sprites. */
+VOID PALPAL_AgentSceneBegin(VOID);
+VOID PALPAL_AgentSceneObject(WORD object_id, BOOL clipped);
+VOID PALPAL_AgentSceneEnd(VOID);
+VOID PALPAL_AgentDrawSpan(SDL_Surface *surface, int x, int y, int count);
+
 BOOL
 PALPAL_AgentEnabled(
    VOID
@@ -181,6 +187,19 @@ VOID
 PALPAL_AgentEndBuyMenu(
    VOID
 );
+
+VOID PALPAL_AgentBeginSellMenu(VOID);
+VOID PALPAL_AgentObserveSellMenuSelection(WORD wSelectedItem);
+VOID PALPAL_AgentObserveSellMenuPhase(BOOL fConfirming);
+VOID PALPAL_AgentObserveSellMenuResult(
+   WORD       wItem,
+   BOOL       fSold,
+   DWORD      dwCashBefore,
+   DWORD      dwCashAfter,
+   INT        iOwnedBefore,
+   INT        iOwnedAfter
+);
+VOID PALPAL_AgentEndSellMenu(VOID);
 
 /* Record that a concrete event object's trigger script ran.  This is used by
  * the companion to attribute a later room change without guessing from map

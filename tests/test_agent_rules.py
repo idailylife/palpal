@@ -1113,6 +1113,84 @@ def test_agent_get_shop_returns_offers_and_equipment_comparison(tmp_path):
     assert comparison['stat_delta']['defense'] == 3
 
 
+@pytest.mark.parametrize('item_id,slot_id', [(211, 2), (172, 3), (177, 3), (240, 4)])
+def test_get_equipment_compares_unowned_shop_offer(tmp_path, item_id, slot_id):
+    debug = make_debug_state(tmp_path)
+    state = shop_state()
+    state['inventory'] = []
+    state['shop']['items'][1].update(equipment_item(
+        item_id, '在售装备', slot_id=slot_id, modifiers={'defense': 5},
+    ))
+    state['party'][0]['equipment'][0]['slot_id'] = slot_id
+    cycle = debug.new_agent_tool_cycle(state)
+
+    result = debug.run_agent_tool('get_equipment', {'item_id': item_id}, state, tool_cycle=cycle)
+    detail = debug.run_agent_tool('get_shop', {'item_id': item_id}, state)
+
+    assert result['ok']
+    assert result['source'] == 'shop'
+    assert result['available_count'] == 0
+    assert result['pending_review'] is None
+    assert result['comparisons'] == detail['equipment_comparisons']
+    assert result['comparisons'][0]['current_item']['item_id'] == 196
+    assert result['comparisons'][0]['stat_delta']['defense'] == 3
+    assert cycle['equipment_review_item_id'] is None
+    write_state(debug, state)
+    assert debug.equip_item_validation_error(state, {'item_id': item_id, 'role_id': 0}) == 'in_shop'
+    state['shop'] = None
+    write_state(debug, state)
+    assert debug.equip_item_validation_error(state, {'item_id': item_id, 'role_id': 0}) == 'not_in_inventory'
+
+
+@pytest.mark.parametrize('shop_change', ['closed', 'absent', 'sell', 'not_offered', 'not_equipment'])
+def test_get_equipment_limits_shop_lookup_to_active_buy_equipment(tmp_path, shop_change):
+    debug = make_debug_state(tmp_path)
+    state = shop_state()
+    state['inventory'] = []
+    if shop_change == 'closed':
+        state['shop']['active'] = False
+    elif shop_change == 'absent':
+        state['shop'] = None
+    elif shop_change == 'sell':
+        state['shop']['mode'] = 'sell'
+    elif shop_change == 'not_offered':
+        state['shop']['items'] = []
+    else:
+        state['shop']['items'][1]['equipable'] = False
+
+    result = debug.run_agent_tool('get_equipment', {'item_id': 201}, state)
+
+    assert not result['ok']
+    assert result['error'] == ('item is not equipable' if shop_change == 'not_equipment'
+                               else 'equipment item was not found')
+
+
+def test_shop_equipment_query_preserves_owned_review_and_lookup_priority(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = shop_state()
+    state['inventory'] = [equipment_item(166, '木劍', slot_id=3)]
+    debug.agent_runtime.state['equipment_review'] = {
+        'ownership_counts': {'166': 1},
+        'pending': [{'item_id': 166, 'name': '木劍', 'new_count': 1}],
+    }
+    cycle = debug.new_agent_tool_cycle(state)
+    owned = debug.run_agent_tool('get_equipment', {}, state, tool_cycle=cycle)
+    assert owned['source'] == 'inventory'
+    assert owned['candidate']['item_id'] == 166
+    assert owned['available_count'] == 1
+    assert cycle['equipment_review_item_id'] == 166
+
+    offered = debug.run_agent_tool('get_equipment', {'item_id': 201}, state, tool_cycle=cycle)
+    assert offered['source'] == 'shop'
+    assert cycle['equipment_review_item_id'] == 166
+    assert debug.agent_runtime.pending_equipment_review()['item_id'] == 166
+
+    state['shop']['items'].append(dict(state['party'][0]['equipment'][0]))
+    equipped = debug.run_agent_tool('get_equipment', {'item_id': 196}, state)
+    assert equipped['source'] == 'equipped'
+    assert equipped['available_count'] == 0
+
+
 def test_agent_shop_decisions_require_active_offered_affordable_item(tmp_path):
     debug = make_debug_state(tmp_path)
     state = shop_state()
@@ -1163,6 +1241,54 @@ def test_active_shop_rejects_non_shop_model_decisions(tmp_path):
     assert result['recommended_action']['tool'] == 'no_op'
     assert result['recommended_action']['args']['required_actions'] == ['buy_item', 'leave_shop']
     assert not debug.action_path.exists()
+
+
+def test_agent_sell_shop_decisions_require_sellable_available_item(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state()
+    state['shop'] = {
+        'active': True,
+        'mode': 'sell',
+        'store_id': None,
+        'phase': 'select',
+        'selected_index': 0,
+        'selected_item_id': 166,
+        'items': [
+            {
+                **equipment_item(166, '木劍', slot_id=3, modifiers={'attack_strength': 2}),
+                'index': 0,
+                'amount': 2,
+                'amount_in_use': 0,
+                'available_count': 2,
+                'sell_price': 100,
+                'can_sell': True,
+                'selected': True,
+            },
+        ],
+    }
+    write_state(debug, state)
+
+    sold = debug.run_agent_tool(
+        'submit_decision',
+        {'action': 'sell_item', 'item_id': 166, 'reason': 'One spare sword is expendable.'},
+        state,
+    )['decision']
+
+    assert sold['recommended_intent'] == 'sell_shop_item'
+    assert sold['recommended_action']['tool'] == 'shop_sell'
+    assert sold['recommended_action']['args'] == {'item_id': 166}
+    assert sold['evidence']['shop_item']['sell_price'] == 100
+
+    state['shop']['items'][0]['available_count'] = 0
+    state['shop']['items'][0]['can_sell'] = False
+    write_state(debug, state)
+    rejected = debug.run_agent_tool(
+        'submit_decision',
+        {'action': 'sell_item', 'item_id': 166, 'reason': 'Try to sell it.'},
+        state,
+    )['decision']
+    assert rejected['validation']['reason'] == 'shop_action_invalid'
+    assert rejected['validation']['error'] == 'item_not_sellable'
 
 
 def test_removed_agent_tool_names_are_rejected(tmp_path):
@@ -1441,7 +1567,7 @@ def test_agent_tool_schema_explains_implicit_event_context_item_target(tmp_path)
     properties = submit['parameters']['properties']
     assert properties['action']['enum'] == [
         'advance_dialog', 'select_choice', 'navigate', 'use_item', 'equip_item',
-        'buy_item', 'leave_shop',
+        'buy_item', 'sell_item', 'leave_shop',
     ]
     assert properties['target']['enum'] == ['all']
     assert submit['parameters']['required'] == ['action', 'reason']

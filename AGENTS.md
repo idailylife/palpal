@@ -145,7 +145,7 @@ interactions, and battle automation:
 - scene/map/region
 - party stats and equipped items
 - inventory and item metadata
-- active shop state, offered items, prices, and purchase results
+- active buy/sell shop state, items, prices, quantities, and transaction results
 - battle mode, phase, party/enemy combatants, and legal battle actions
 - event objects
 - interactable/blocking flags

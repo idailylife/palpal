@@ -426,6 +426,15 @@ PAL_ItemSelectMenu(
       w = PAL_ItemSelectMenuUpdate();
       VIDEO_UpdateScreen(NULL);
 
+      // Leave before polling again: the next queued input belongs to the
+      // caller (for example, the sell confirmation menu).
+      if (w != 0xFFFF)
+      {
+         PAL_ClearKeyState();
+         g_fNoDesc = FALSE;
+         return w;
+      }
+
       PAL_ClearKeyState();
 
       PAL_ProcessEvent();
@@ -440,12 +449,6 @@ PAL_ItemSelectMenu(
       }
 
       dwTime = SDL_GetTicks() + FRAME_TIME;
-
-      if (w != 0xFFFF)
-      {
-         g_fNoDesc = FALSE;
-         return w;
-      }
 
       if (iPrevIndex != gpGlobals->iCurInvMenuItem)
       {

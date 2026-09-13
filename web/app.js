@@ -511,8 +511,8 @@ inventoryEl.addEventListener("click", (event) => {
   const shopEl = event.target.closest("[data-shop-action]");
   if (shopEl && inventoryEl.contains(shopEl)) {
     const action = shopEl.dataset.shopAction;
-    const path = action === "buy" ? "/shop/buy" : "/shop/leave";
-    const payload = action === "buy"
+    const path = action === "buy" ? "/shop/buy" : action === "sell" ? "/shop/sell" : "/shop/leave";
+    const payload = action === "buy" || action === "sell"
       ? { item_id: Number(shopEl.dataset.shopItem) }
       : {};
     fetch(path, {
@@ -1555,7 +1555,7 @@ function agentDecisionContextMatches(decision, state) {
 function agentActionExecutable(action) {
   return [
     "press_buttons", "advance_dialog", "navigation_step", "use_item",
-    "equip_item", "shop_buy", "shop_leave",
+    "equip_item", "shop_buy", "shop_sell", "shop_leave",
   ].includes(action?.tool);
 }
 
@@ -1799,6 +1799,8 @@ function renderInventory(state) {
   const disabled = Boolean(!(state.control?.allowed_actions || []).includes("use_item") || sessionRunning());
   const shopBuyDisabled = sessionRunning()
     || !(state.control?.allowed_actions || []).includes("shop_buy");
+  const shopSellDisabled = sessionRunning()
+    || !(state.control?.allowed_actions || []).includes("shop_sell");
   const shopLeaveDisabled = sessionRunning()
     || !(state.control?.allowed_actions || []).includes("shop_leave");
   const renderKey = JSON.stringify({
@@ -1813,22 +1815,28 @@ function renderInventory(state) {
     disabled,
     ]),
     shop: shopActive ? {
+      mode: shop.mode,
       phase: shop.phase,
       cash: state.cash,
       buyDisabled: shopBuyDisabled,
+      sellDisabled: shopSellDisabled,
       leaveDisabled: shopLeaveDisabled,
       items: (shop.items || []).map((item) => [
-        item.item_id, item.name, item.price, item.affordable, item.owned_count,
+        item.item_id, item.name, item.price, item.sell_price, item.affordable,
+        item.owned_count, item.available_count, item.can_sell,
       ]),
     } : null,
   });
   const shopHtml = shopActive ? `<div class="shopControls">
-    <strong>Shop</strong>
+    <strong>${shop.mode === "sell" ? "Sell items" : "Shop"}</strong>
     ${(shop.items || []).map((item) => `
       <div class="inventoryItem">
-        <span>${escapeHtml(item.name || `#${item.item_id}`)} · ${item.price ?? 0}</span>
-        <button class="miniButton" data-shop-action="buy" data-shop-item="${item.item_id}"
-          ${shopBuyDisabled || item.affordable !== true ? "disabled" : ""}>Buy</button>
+        <span>${escapeHtml(item.name || `#${item.item_id}`)} · ${shop.mode === "sell" ? item.sell_price ?? 0 : item.price ?? 0}</span>
+        ${shop.mode === "sell"
+          ? `<button class="miniButton" data-shop-action="sell" data-shop-item="${item.item_id}"
+              ${shopSellDisabled || item.can_sell !== true ? "disabled" : ""}>Sell</button>`
+          : `<button class="miniButton" data-shop-action="buy" data-shop-item="${item.item_id}"
+              ${shopBuyDisabled || item.affordable !== true ? "disabled" : ""}>Buy</button>`}
       </div>
     `).join("")}
     <button class="miniButton" data-shop-action="leave" ${shopLeaveDisabled ? "disabled" : ""}>Leave shop</button>
@@ -2781,7 +2789,7 @@ function updateExternalControls(state) {
       : button.matches("[data-use-item]")
         ? "use_item"
         : button.matches("[data-shop-action]")
-          ? (button.dataset.shopAction === "buy" ? "shop_buy" : "shop_leave")
+          ? (button.dataset.shopAction === "buy" ? "shop_buy" : button.dataset.shopAction === "sell" ? "shop_sell" : "shop_leave")
         : "navigation_step";
     if (running || !allowed.has(action)) {
       if (!button.dataset.controlDisabled) {

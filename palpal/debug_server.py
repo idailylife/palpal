@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 from palpal.agent_runtime import AgentRuntime
 from palpal.observations import ObservationCoordinator
+from palpal.object_vision import ObjectVision
 from palpal.screen_inspection import ScreenInspector, valid_poe_api_key
 
 
@@ -313,6 +314,22 @@ def search_hits(node: tuple[int, int], direction: int, obj: dict) -> bool:
     return False
 
 
+def first_search_object(node: tuple[int, int], direction: int, objects: list[dict]) -> int | None:
+    """Match PAL_Search: sample order first, then native event-object order."""
+    candidates = sorted(
+        (obj for obj in objects if int(obj.get("state") or 0) > 0
+         and 0 < int(obj.get("trigger_mode") or 0) < 4),
+        key=lambda obj: int(obj.get("id") or 0),
+    )
+    for index, (x, y) in enumerate(search_samples(*node, direction)):
+        key = (x // 32, y // 16, bool(x % 32))
+        for obj in candidates:
+            ox, oy = int(obj.get("x") or 0), int(obj.get("y") or 0)
+            if index <= int(obj["trigger_mode"]) * 6 - 4 and key == (ox // 32, oy // 16, bool(ox % 32)):
+                return int(obj["id"])
+    return None
+
+
 def facing_event_object_hits(
     position: tuple[int, int],
     direction: int,
@@ -539,7 +556,8 @@ def pfrm_png_cache_key(raw: bytes) -> bytes:
     digest = hashlib.sha256()
     if len(raw) >= 24 and raw[:4] == b"PFRM":
         digest.update(raw[:16])
-        digest.update(raw[20:])
+        payload_length = struct.unpack_from("<I", raw, 20)[0]
+        digest.update(raw[20:24 + payload_length])
     else:
         digest.update(raw)
     return digest.digest()
@@ -743,6 +761,7 @@ class DebugState:
         self.recover_object_interactions_from_agent_llm_log()
         self.agent_runtime = AgentRuntime(self, self.runtime_dir)
         self.screen_inspector = ScreenInspector(self)
+        self.object_vision = ObjectVision(self)
 
     def config_value(self, key: str, default: str | None = None) -> str | None:
         return os.environ.get(key) or self.env_file.get(key) or default
@@ -798,6 +817,8 @@ class DebugState:
                 self.record_live_protocol_error("invalid_hello")
                 return
             game_instance_id = str(hello.get("game_instance_id") or "")
+            if game_instance_id and game_instance_id != self.live_game_instance_id:
+                self.object_vision.clear()
             with self.live_condition:
                 if game_instance_id and game_instance_id != self.live_game_instance_id:
                     self.live_state = None
@@ -881,6 +902,7 @@ class DebugState:
             self.live_status["last_sequence"] = int(next_sequence)
             self.live_condition.notify_all()
         self.reconcile_pending_written_action(state)
+        self.object_vision.observe_state(state)
 
     def set_live_frame(
         self,
@@ -911,6 +933,14 @@ class DebugState:
             self.live_status["last_message_at"] = self.live_frame_received_at
             self.live_status["last_sequence"] = int(next_sequence)
             self.live_condition.notify_all()
+            object_state = self.live_state
+        if object_state is not None:
+            try:
+                self.object_vision.capture(frame, int(next_sequence),
+                                           self.live_frame_received_at, object_state)
+            except (ValueError, TypeError, KeyError, struct.error):
+                self.object_vision.clear()
+                self.record_live_protocol_error("invalid_object_frame")
 
     def read_live_state(self) -> dict:
         with self.live_lock:
@@ -1042,7 +1072,9 @@ class DebugState:
         elif dialog_active:
             owner, phase, allowed = "client", "dialog", ["advance_dialog"]
         elif shop_active:
-            owner, phase, allowed = "client", "shop", ["shop_buy", "shop_leave"]
+            shop = state.get("shop") or {}
+            shop_action = "shop_sell" if shop.get("mode") == "sell" else "shop_buy"
+            owner, phase, allowed = "client", "shop", [shop_action, "shop_leave"]
         elif trigger is not None and trigger.get("completed") is not True:
             owner, phase, allowed = "game", "game_script", []
         else:
@@ -1577,6 +1609,8 @@ class DebugState:
             raise RuntimeError("action_pending")
 
     def refresh_companion_caches(self) -> None:
+        if hasattr(self, "object_vision"):
+            self.object_vision.clear()
         self.cancel_runtime_observations("checkpoint_restored")
         self.event_log = self.read_events()
         self.dialog_history = self.read_dialog_history()
@@ -2483,6 +2517,8 @@ class DebugState:
             "event_object_id": event.get("event_object_id"),
             "message_id": event.get("message_id"),
             "message_ids": self.dialog_message_ids(event),
+            "trigger_generation": event.get("trigger_generation"),
+            "game_instance_id": state.get("game_instance_id"),
             "dialog_position": event.get("dialog_position") or dialog.get("position"),
             "speaker_hint": self.dialog_speaker_hint(event),
             "text": str(event.get("text") or ""),
@@ -2516,6 +2552,13 @@ class DebugState:
         for key in ("speaker_hint", "event_object_id", "scene_id", "map_id", "room_id", "room_key", "region_key"):
             if previous.get(key) != current.get(key):
                 return False
+        for key in ("trigger_generation", "game_instance_id"):
+            if previous.get(key) != current.get(key):
+                return False
+        # Repeated messages start another utterance, even on older runtimes
+        # without trigger generations. Sequence adjacency alone is insufficient.
+        if set(previous.get("message_ids") or []) & set(current.get("message_ids") or []):
+            return False
         return self.dialog_events_are_contiguous(previous, current)
 
     def merge_dialog_turn(self, previous: dict, current: dict) -> None:
@@ -3337,6 +3380,8 @@ class DebugState:
             "object": self.object_snapshot_for_interaction(state, int(object_id)),
             "action": action,
             "armed": action is not None,
+            "trigger_generation_before": int((self.native_trigger_generation(state) or {}).get("generation") or 0),
+            "source_position": dict(state.get("party_position") or {}),
         }
         observation_id = self.observations.register(
             "interaction",
@@ -3367,6 +3412,30 @@ class DebugState:
 
         if self.action_pending(state):
             return None
+        native = self.native_trigger_generation(state) or {}
+        source = native.get("source") or {}
+        actual_id = int(native.get("event_object_id") or 0)
+        if (
+            int(native.get("generation") or 0) == int(pending.get("trigger_generation_before") or 0) + 1
+            and actual_id > 0 and actual_id != object_id
+            and source.get("scene_id") == pending.get("scene_id")
+            and source.get("map_id") == pending.get("map_id")
+            and {key: source.get(key) for key in ("x", "y")} == pending.get("source_position")
+            and str(state.get("game_instance_id") or "") == pending.get("game_instance_id", "")
+        ):
+            payload = {
+                "requested_object_id": object_id,
+                "actual_object_id": actual_id,
+                "via_target_id": pending.get("via_target_id"),
+                "trigger_generation": native.get("generation"),
+                "reason": "search_target_mismatch",
+            }
+            self.append_event(state, "interaction_target_mismatch", payload)
+            self.observations.complete(pending.get("observation_id"), {
+                "type": "interaction_target_mismatch", "event": payload,
+            })
+            self.pending_interaction_observation = None
+            return payload
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         if dialog.get("active"):
             return None
@@ -3853,6 +3922,7 @@ class DebugState:
             "room_memos": {},
             "transitions": {},
             "object_interactions": {},
+            "object_visual_annotations": {},
             "battle_reappearances": {},
             "combat_knowledge": {
                 "version": COMBAT_KNOWLEDGE_VERSION,
@@ -3960,6 +4030,8 @@ class DebugState:
         else:
             self.derive_transition_endpoints(data)
         object_interactions = data.get("object_interactions")
+        if not isinstance(data.get("object_visual_annotations"), dict):
+            data["object_visual_annotations"] = {}
         if not isinstance(object_interactions, dict):
             data["object_interactions"] = {}
         battle_reappearances = data.get("battle_reappearances")
@@ -8113,6 +8185,7 @@ class DebugState:
                 "pending": True,
                 "target_id": target_id,
                 "target_selection": target_selection,
+                "started_object": self.object_snapshot_for_interaction(state, target_id),
                 "segment_steps": segment_steps,
                 "remaining_steps": remaining_steps,
                 "expected_node": expected_node,
@@ -8259,6 +8332,19 @@ class DebugState:
             ):
                 return None
             last_route["completion_reported_at"] = time.time()
+            evidence = {
+                "object_id": target_id,
+                "source": "native_trigger_completion",
+                "completed_at": last_route.get("completed_at"),
+                "object_changes": self.object_snapshot_delta(
+                    last_route.get("started_object"),
+                    self.object_snapshot_for_interaction(state, target_id),
+                ) if isinstance(last_route.get("started_object"), dict) else {},
+            }
+            last_route["trigger_evidence"] = evidence
+            objects = data.setdefault("object_interactions", {}).setdefault(identity["id"], {})
+            objects.setdefault(str(target_id), {"object_id": target_id, "room_id": identity["id"]})[
+                "last_trigger_completion"] = evidence
             room["updated_at"] = last_route["completion_reported_at"]
             self.write_exploration(data)
             return dict(last_route)
@@ -8960,7 +9046,9 @@ class DebugState:
                     continue
                 pos = world_pos(grid, node)
                 for direction in (2, 3, 0, 1):
-                    if search_hits(pos, direction, target):
+                    if search_hits(pos, direction, target) and first_search_object(
+                        pos, direction, state.get("objects") or [],
+                    ) == int(target.get("id") or 0):
                         goals.add(node)
                         search_dirs[node] = direction
                         break
@@ -9480,6 +9568,7 @@ class DebugState:
                 "status": "arrived",
                 "target_id": target_id,
                 "completion": "trigger_completed",
+                "trigger_evidence": completed_touch.get("trigger_evidence"),
             }
 
         route = self.route_to_object(
@@ -9633,7 +9722,9 @@ class DebugState:
                 pos = state.get("party_position") or {}
                 current_pos = (int(pos.get("x") or 0), int(pos.get("y") or 0))
                 current_direction = int(state.get("party_direction") or 0)
-                if target is not None and search_hits(current_pos, current_direction, target):
+                if target is not None and first_search_object(
+                    current_pos, current_direction, state.get("objects") or [],
+                ) == target_id:
                     with self.state_lock:
                         observation_id = self.mark_pending_interaction_observation(
                             state,
@@ -11761,8 +11852,11 @@ class DebugState:
                             else "inferred_entry_return"
                         ),
                         "possible_entry_return": True,
-                        "agent_priority": "avoid_immediate_backtrack",
+                        "agent_priority": "avoid_immediate_backtrack" if status == "entered" else target.get("agent_priority", "normal"),
                         "deprioritize_reason": (
+                            "当前房间已有探索进展；可根据剩余目标和任务决定是否经入口离开。"
+                            if status == "progressed"
+                            else
                             "该传送已确认返回刚离开的逻辑房间；先探索当前房间的其他可执行目标。"
                             if known_return
                             else "该未知传送是落点附近唯一可执行传送，可能是刚使用入口的返回侧；先探索其他可执行目标。"
@@ -11901,7 +11995,8 @@ class DebugState:
         compact_keys = (
             "index", "item_id", "name", "price", "inventory_count",
             "equipped_count", "owned_count", "affordable", "selected",
-            "usable", "equipable", "sellable",
+            "usable", "equipable", "sellable", "amount", "amount_in_use",
+            "available_count", "sell_price", "can_sell",
         )
         compact_items = [
             {key: item.get(key) for key in compact_keys if key in item}
@@ -11932,7 +12027,8 @@ class DebugState:
             None,
         )
         if item_id <= 0 or not isinstance(candidate, dict):
-            return {"ok": False, "error": "item_not_offered", "item_id": item_id, "shop": summary}
+            error = "item_not_sellable" if shop.get("mode") == "sell" else "item_not_offered"
+            return {"ok": False, "error": error, "item_id": item_id, "shop": summary}
         detail = dict(candidate)
         result = {"ok": True, "shop": summary, "item": detail}
         if candidate.get("equipable") is True:
@@ -12312,6 +12408,7 @@ class DebugState:
         return comparisons
 
     def agent_equipment(self, state: dict, item_id: int | None = None) -> dict:
+        explicit_item = item_id is not None
         pending = self.agent_runtime.pending_equipment_review()
         if item_id is None and isinstance(pending, dict):
             try:
@@ -12324,6 +12421,23 @@ class DebugState:
             except (TypeError, ValueError):
                 item_id = 0
             candidate = self.equipment_item_by_id(state, item_id)
+            source = "equipped"
+            if any(
+                isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+                for item in state.get("inventory") or []
+            ):
+                source = "inventory"
+            if candidate is None and explicit_item:
+                shop = state.get("shop")
+                if isinstance(shop, dict) and shop.get("active") is True and shop.get("mode") == "buy":
+                    candidate = next(
+                        (
+                            item for item in shop.get("items") or []
+                            if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+                        ),
+                        None,
+                    )
+                    source = "shop"
             if item_id <= 0 or not isinstance(candidate, dict):
                 return {"ok": False, "error": "equipment item was not found"}
             if candidate.get("equipable") is not True:
@@ -12338,7 +12452,8 @@ class DebugState:
                     break
             return {
                 "ok": True,
-                "pending_review": pending if isinstance(pending, dict) and int(pending.get("item_id") or 0) == item_id else None,
+                "pending_review": pending if source != "shop" and isinstance(pending, dict) and int(pending.get("item_id") or 0) == item_id else None,
+                "source": source,
                 "candidate": self.compact_equipment_item(candidate),
                 "available_count": available,
                 "comparisons": self.equipment_comparisons(state, candidate),
@@ -12535,7 +12650,7 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "inspect_target",
-                    "description": "返回一个目标的当前状态、最近交互/对话证据和紧凑路线。",
+                    "description": "返回目标状态、交互证据、路线及已有低权威外观注释；visual 表明是否可按需查看当前或最近可见画面。",
                     "parameters": {
                         "type": "object",
                         "properties": {"id": {"type": "integer", "minimum": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8}},
@@ -12563,8 +12678,8 @@ class DebugState:
                 "function": {
                     "name": "get_shop",
                     "description": (
-                        "查询当前购买菜单。无参数返回商品、价格、持有数和可负担状态；"
-                        "指定 item_id 返回完整商品元数据，装备类商品还会比较各角色当前同槽装备。"
+                        "查询当前购买或出售菜单。无参数返回模式、商品或物品、价格和可操作状态；"
+                        "购买模式下指定 item_id 还会返回装备比较，出售模式返回可出售数量和卖价。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -12578,7 +12693,9 @@ class DebugState:
                 "function": {
                     "name": "get_equipment",
                     "description": (
-                        "比较装备。无参数时优先返回最早待审查的新装备；也可指定背包中的 item_id。"
+                        "比较装备。无参数时优先返回最早待审查的新装备；也可指定背包、已穿戴或当前购买商店中的 item_id。"
+                        "source 标明 inventory/equipped/shop；available_count 只表示背包可用数量，商店商品需先购买才能穿戴。"
+                        "商品价格及购买状态用 get_shop(item_id) 查询；查询失败不代表装备没有收益。"
                         "返回每个可装备角色的当前同槽装备、属性差值、换装后属性和特殊效果变化。"
                         "装备与普通使用是独立能力；usable=true 不排除 equipable=true。"
                     ),
@@ -12653,18 +12770,20 @@ class DebugState:
                     "name": "inspect_screen",
                     "description": (
                         "按需检查当前游戏 PNG 的低权威视觉注释。只有 get_navigation、get_room_memory、inspect_target 等"
-                        "结构化证据无法解释可见布局、房间边界、出口或疑似隐藏通道时调用；每个工具周期最多一次未缓存请求。"
-                        "结果不能确认 transition、对象 ID、说话者、脚本语义、task 或 Room Memo。"
+                        "结构化证据无法解释布局、出口、通道或目标外观时调用；每个工具周期最多一次未缓存请求。"
+                        "focus=object 必须提供 target_id；只描述系统绑定对象的当前或最近可见画面，无需接近或交互。"
+                        "结果不能猜测未标记对象 ID、确认 transition、说话者、脚本语义、task 或 Room Memo。"
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "focus": {
                                 "type": "string",
-                                "enum": ["room_layout", "passage", "ui_text"],
+                                "enum": ["room_layout", "passage", "ui_text", "object"],
                                 "default": "room_layout",
                             },
                             "question": {"type": "string", "maxLength": 200},
+                            "target_id": {"type": "integer", "minimum": 1},
                         },
                         "additionalProperties": False,
                     },
@@ -12701,7 +12820,7 @@ class DebugState:
                                 "type": "string",
                                 "enum": [
                                     "advance_dialog", "select_choice", "navigate", "use_item",
-                                    "equip_item", "buy_item", "leave_shop",
+                                    "equip_item", "buy_item", "sell_item", "leave_shop",
                                 ],
                             },
                             "target_id": {"type": "integer", "minimum": 1},
@@ -12940,6 +13059,9 @@ class DebugState:
         targets = []
         for target in sorted_targets[:limit]:
             compact = {key: target.get(key) for key in target_keys if target.get(key) is not None}
+            annotation = self.object_vision.annotation(state, int(target.get("id") or 0))
+            if annotation:
+                compact["appearance"] = {"authority": "visual_annotation", **annotation["report"]}
             outcome = compact.get("previous_interaction_outcome")
             if isinstance(outcome, dict):
                 compact["previous_interaction_outcome"] = self.compact_interaction_outcome(outcome)
@@ -13133,6 +13255,7 @@ class DebugState:
                 "history": (history.get("history") or [])[-limit:],
                 "history_total": history.get("total", len(history.get("history") or [])),
                 "interaction_summary": history.get("interaction_summary"),
+                "visual": self.object_vision.view(state, target_id),
                 "route": compact_route,
             }
         if name == "get_observations":
@@ -13164,7 +13287,7 @@ class DebugState:
         if name == "get_equipment":
             result = self.agent_equipment(state, arguments.get("item_id"))
             candidate = result.get("candidate") if isinstance(result.get("candidate"), dict) else {}
-            if result.get("ok") and isinstance(tool_cycle, dict) and candidate.get("item_id"):
+            if result.get("ok") and result.get("source") != "shop" and isinstance(tool_cycle, dict) and candidate.get("item_id"):
                 tool_cycle["equipment_review_item_id"] = int(candidate["item_id"])
             return result
         if name == "upsert_room_memo":
@@ -13183,6 +13306,8 @@ class DebugState:
             validated = self.screen_inspector.validate_arguments(arguments)
             if isinstance(validated, dict):
                 return validated
+            if arguments.get("focus") == "object":
+                return self.object_vision.inspect(arguments, state, tool_cycle)
             frame_info = self.live_info("frame")
             if not frame_info.get("available"):
                 return {"ok": False, "error": {"code": "frame_unavailable", "message": "No live frame is available."}}
@@ -13480,8 +13605,9 @@ class DebugState:
             "选择 affordances 中的 item_approach 时提交 "
             "{action:'navigate',target_id:<id>,item_id:<affordance.item_id>,reason:'...'}；"
             "该动作只移动到满足物品脚本距离的站位并调整朝向，完成后仍需另行提交 use_item。"
-            "shop.active=true 时先调用 get_shop；购买一件商品提交 "
-            "{action:'buy_item',item_id:<id>,reason:'...'}，不购买并退出提交 "
+            "shop.active=true 时先调用 get_shop；mode=buy 时购买一件商品提交 "
+            "{action:'buy_item',item_id:<id>,reason:'...'}；mode=sell 时出售一件物品提交 "
+            "{action:'sell_item',item_id:<id>,reason:'...'}；退出提交 "
             "{action:'leave_shop',reason:'...'}。商店选择必须由模型根据现金、持有物和装备比较显式决定。"
             "使用普通队员物品时提交 {action:'use_item',item_id:<id>,role_id:<role>,reason:'...'}；"
             "target_mode=implicit_event_context 时改为 {action:'use_item',item_id:<id>,target:'all',reason:'...'}。"
@@ -13490,7 +13616,7 @@ class DebugState:
             "注意 target:'all' 是兼容字段名：对 target_mode=implicit_event_context 的物品，SDLPAL 实际以 0xFFFF "
             "运行使用脚本并沿用最近事件对象，不一定表示对全体队员生效。"
             "不要提交 intent、recommended_action、evidence、risk、alternatives、dry_run 或原始按键。"
-            "不要用固定价格阈值、物品名称规则或规则后端替代模型的购买/退出决策。"
+            "不要用固定价格阈值、物品名称规则或规则后端替代模型的购买、出售或退出决策。"
             "不要执行游戏控制，不要声称动作已经执行，也不要包含密钥或 prompts。"
         )
 
@@ -13523,6 +13649,10 @@ class DebugState:
             "运行时会在首次进入本会话尚未成功查看的新逻辑房间时自动提供一次 room_layout 视觉注释。"
             "优先使用 get_navigation、get_room_memory、inspect_target 等结构化证据；如果自动视觉注释和这些证据仍不足以解释布局、出口、UI 文本或疑似通道，可以按需再次调用 inspect_screen。"
             "inspect_screen 只是低权威 visual_annotation，即使 confidence=high 也不得直接写 Room Memo、创建或确认 transition、修改 task/dialog/observation 事实，"
+            "目标外观不明时可调用 inspect_screen(focus=object,target_id=目标编号)，无需靠近或成功交互；"
+            "仅系统绑定的对象允许按编号描述，不得猜未标记对象编号。外观可作为行动假设，不能据此确认剧情身份或用途；"
+            "historical 表示曾经看见，不代表当前位置或状态。不要仅为识别外观反复追逐。"
+            "导航 completion=trigger_completed 表示原生已完成目标触发，不能当作仅到达未互动；也不等于任务成功或身份确认。"
             "也不得推断 event object ID、speaker identity 或脚本语义。疑似密道必须通过真实 native action、房间变化和现有 transition observation/native trigger 才能确认。"
             "若当前目标 transition_candidate=true、最近对象历史显示它由非传送目标变为传送目标、且 known_destination=false，"
             "应将它视为刚解锁的探索路线并优先建议 enter_transition；解锁动作本身产生的 previously_tried 或 avoid_repeat 不应降低它的优先级。"
@@ -13574,9 +13704,11 @@ class DebugState:
             "对话反馈可以创建或改变目标，但要从提供的对话和状态推断目标，不要匹配固定剧情短语。"
             "如果 dialog.active 为 true，优先选择 advance_dialog。runtime stale、waiting 或 parse-error 由运行器内部等待，不是可提交动作。"
             "如果 choice.active=true，必须根据问题与选项文本显式选择 select_choice；此时不要推进对话或导航。"
-            "如果 shop.active=true，先用 get_shop 查看商品；装备类候选要查看 equipment_comparisons，"
-            "综合现金、已有数量、角色定位、属性差值、特殊效果和任务上下文后，显式选择买一件或退出。"
-            "不确定商品用途或收益时可以退出，但不得把价格或名称当作固定购买规则。"
+            "如果 shop.active=true，先用 get_shop 查看商品；装备类候选用 get_shop(item_id) 查看 equipment_comparisons，"
+            "也可用 get_equipment(item_id) 查询当前在售装备的 comparisons；查询失败不代表没有收益或没有同类装备可比。"
+            "mode=buy 时综合现金、已有数量、角色定位、属性差值、特殊效果和任务上下文，显式选择买一件或退出；"
+            "mode=sell 时只出售 can_sell=true 且明确值得放弃的一件物品，否则退出。"
+            "不确定物品用途或收益时可以退出，但不得把价格或名称当作固定购买或出售规则。"
             "只有在主游戏、非战斗、非对话状态下才可建议 use_inventory_item。先调用 get_inventory，确认物品 usable、"
             "available_amount 大于零，并严格匹配 apply_to_all 的目标形式。可结合物品名称、队伍 HP/MP、任务与剧情上下文"
             "保守推断用途；用途或收益证据不足时不要仅因 usable=true 就建议使用，并在 reason 中说明关键权衡。"
@@ -13698,9 +13830,17 @@ class DebugState:
             evidence["shop_item"] = shop.get("item")
             evidence["equipment_comparisons"] = shop.get("equipment_comparisons")
             risk = "The active store, offered item, price, and cash will be revalidated before buying exactly one item."
+        elif action == "sell_item":
+            item_id = int(raw["item_id"])
+            args = {"item_id": item_id}
+            shop = self.agent_shop(state, item_id)
+            intent, preview = "sell_shop_item", self.action_preview("shop_sell", args)
+            evidence["item_id"] = item_id
+            evidence["shop_item"] = shop.get("item")
+            risk = "The active sell menu, available quantity, sellable flag, and price will be revalidated before selling exactly one item."
         elif action == "leave_shop":
             intent, preview = "leave_shop", self.action_preview("shop_leave", {})
-            risk = "The active purchase menu will be closed without buying an item."
+            risk = "The active shop menu will be closed without buying or selling an item."
         else:
             item_id = int(raw["item_id"])
             role_id = int(raw["role_id"])
@@ -13740,7 +13880,7 @@ class DebugState:
         action = raw.get("action")
         allowed_actions = {
             "advance_dialog", "select_choice", "navigate", "use_item", "equip_item",
-            "buy_item", "leave_shop",
+            "buy_item", "sell_item", "leave_shop",
         }
         if action not in allowed_actions:
             issues.append({
@@ -13748,7 +13888,7 @@ class DebugState:
                 "code": "invalid_action",
                 "message": (
                     "action must be advance_dialog, select_choice, navigate, use_item, "
-                    "equip_item, buy_item, or leave_shop"
+                    "equip_item, buy_item, sell_item, or leave_shop"
                 ),
             })
         if not isinstance(raw.get("reason"), str) or not raw.get("reason", "").strip():
@@ -13781,8 +13921,8 @@ class DebugState:
                 issues.append({"field": "item_id", "code": "invalid_item_id", "message": "equip_item requires a positive item_id"})
             if positive_int("role_id", allow_zero=True) is None:
                 issues.append({"field": "role_id", "code": "invalid_role_id", "message": "equip_item requires a non-negative role_id"})
-        if action == "buy_item" and positive_int("item_id") is None:
-            issues.append({"field": "item_id", "code": "invalid_item_id", "message": "buy_item requires a positive item_id"})
+        if action in {"buy_item", "sell_item"} and positive_int("item_id") is None:
+            issues.append({"field": "item_id", "code": "invalid_item_id", "message": f"{action} requires a positive item_id"})
         relevant_keys = {
             "advance_dialog": {"action", "reason"},
             "select_choice": {"action", "option_index", "reason"},
@@ -13790,6 +13930,7 @@ class DebugState:
             "use_item": {"action", "item_id", "role_id", "target", "reason"},
             "equip_item": {"action", "item_id", "role_id", "reason"},
             "buy_item": {"action", "item_id", "reason"},
+            "sell_item": {"action", "item_id", "reason"},
             "leave_shop": {"action", "reason"},
         }.get(action)
         if relevant_keys:
@@ -13820,15 +13961,27 @@ class DebugState:
         if self.live_info("state").get("stale", True):
             return "runtime_stale"
         control_error = self.action_control_error(state, action)
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
+        if (
+            control_error == "in_shop"
+            and shop
+            and shop.get("active") is True
+            and action in {"shop_buy", "shop_sell"}
+        ):
+            mode = shop.get("mode")
+            if (action == "shop_buy" and mode != "buy") or (action == "shop_sell" and mode != "sell"):
+                return "shop_mode_mismatch"
         if control_error is not None and (check_pending or control_error != "action_pending"):
             return control_error
-        shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
-        if not shop or shop.get("active") is not True or shop.get("mode") != "buy":
+        if not shop or shop.get("active") is not True:
             return "shop_inactive"
         if action == "shop_leave":
             return None
-        if action != "shop_buy":
+        mode = shop.get("mode")
+        if action not in {"shop_buy", "shop_sell"}:
             return "invalid_shop_action"
+        if (action == "shop_buy" and mode != "buy") or (action == "shop_sell" and mode != "sell"):
+            return "shop_mode_mismatch"
         try:
             item_id = int(args.get("item_id") or 0)
         except (TypeError, ValueError):
@@ -13841,7 +13994,15 @@ class DebugState:
             None,
         )
         if item_id <= 0 or not isinstance(item, dict):
-            return "item_not_offered"
+            return "item_not_sellable" if action == "shop_sell" else "item_not_offered"
+        if action == "shop_sell":
+            try:
+                available_count = int(item.get("available_count") or 0)
+            except (TypeError, ValueError):
+                return "invalid_shop_state"
+            if item.get("can_sell") is not True or available_count <= 0:
+                return "item_not_sellable"
+            return None
         try:
             price = int(item.get("price") or 0)
             cash = int(state.get("cash") or 0)
@@ -14005,14 +14166,15 @@ class DebugState:
             return None
         task_override = self.active_task_binds_navigation_target(state, target_id)
         executable = {"reachable", "transition", "blocked_by_interactable"}
-        if selected.get("entry_relation") == "inferred_entry_return" and not task_override:
+        if (context.get("status") == "entered"
+                and selected.get("entry_relation") == "inferred_entry_return" and not task_override):
             alternatives = [
                 target for target in targets
                 if int(target.get("id") or 0) != target_id
                 and target.get("status") in executable
                 and target.get("possible_entry_return") is not True
                 and target.get("agent_priority") not in {
-                    "avoid_repeat", "avoid_backtrack", "avoid_immediate_backtrack",
+                    "avoid_repeat", "soft_avoid", "avoid_backtrack", "avoid_immediate_backtrack",
                 }
             ]
             if alternatives:
@@ -14066,7 +14228,7 @@ class DebugState:
             )
             decision["risk"] = "A story choice is active; only an explicit select_choice decision is executable."
             return decision
-        if tool in {"shop_buy", "shop_leave"}:
+        if tool in {"shop_buy", "shop_sell", "shop_leave"}:
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
             error = self.shop_action_validation_error(latest_state, tool, args)
             if error is None:
@@ -14088,6 +14250,8 @@ class DebugState:
             ).strip()
             return decision
         if shop_active:
+            mode = shop.get("mode")
+            required_actions = ["sell_item", "leave_shop"] if mode == "sell" else ["buy_item", "leave_shop"]
             self.reject_agent_decision(
                 decision,
                 "in_shop",
@@ -14098,9 +14262,9 @@ class DebugState:
             decision.setdefault("evidence", {})["validation_state_context"] = self.state_context(latest_state)
             decision["recommended_intent"] = "wait_runtime"
             decision["recommended_action"] = self.action_preview(
-                "no_op", {"reason": "in_shop", "required_actions": ["buy_item", "leave_shop"]}
+                "no_op", {"reason": "in_shop", "required_actions": required_actions}
             )
-            decision["risk"] = "A purchase menu is active; only an explicit model buy_item or leave_shop decision is executable."
+            decision["risk"] = f"A {mode or 'shop'} menu is active; only an explicit matching shop decision is executable."
             return decision
         if action.get("tool") == "equip_item":
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
@@ -14297,7 +14461,7 @@ class DebugState:
                 except (TypeError, ValueError):
                     pass
             return result
-        if tool == "shop_buy":
+        if tool in {"shop_buy", "shop_sell"}:
             try:
                 return {"item_id": int(args.get("item_id") or 0)}
             except (TypeError, ValueError):
@@ -14895,13 +15059,13 @@ class DebugState:
         return {**entry, "result": result}
 
     def write_shop_action(self, action: str, item_id: int | None = None) -> dict:
-        if action not in {"shop_buy", "shop_leave"}:
-            raise ValueError("action must be shop_buy or shop_leave")
+        if action not in {"shop_buy", "shop_sell", "shop_leave"}:
+            raise ValueError("action must be shop_buy, shop_sell, or shop_leave")
         try:
             normalized_item_id = int(item_id or 0)
         except (TypeError, ValueError) as exc:
             raise ValueError("item_id must be an integer") from exc
-        args = {"item_id": normalized_item_id} if action == "shop_buy" else {}
+        args = {"item_id": normalized_item_id} if action in {"shop_buy", "shop_sell"} else {}
         start_time = time.time()
         with self.action_lock:
             state = self.read_live_state()
@@ -14921,6 +15085,8 @@ class DebugState:
             line = (
                 f"shop_buy {normalized_item_id}\n"
                 if action == "shop_buy"
+                else f"shop_sell {normalized_item_id}\n"
+                if action == "shop_sell"
                 else "shop_leave 1\n"
             )
             try:
@@ -15291,15 +15457,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
 
-        if self.path in {"/shop/buy", "/shop/leave"}:
+        if self.path in {"/shop/buy", "/shop/sell", "/shop/leave"}:
             if self.reject_if_agent_running():
                 return
             try:
                 payload = self.read_body_json()
-                action = "shop_buy" if self.path == "/shop/buy" else "shop_leave"
+                action = {
+                    "/shop/buy": "shop_buy",
+                    "/shop/sell": "shop_sell",
+                    "/shop/leave": "shop_leave",
+                }[self.path]
                 result = self.server.state.write_shop_action(
                     action,
-                    payload.get("item_id") if action == "shop_buy" else None,
+                    payload.get("item_id") if action in {"shop_buy", "shop_sell"} else None,
                 )
                 self.send_json({"ok": True, "action": result})
             except Exception as exc:

@@ -459,13 +459,22 @@ def test_http_handler_exposes_structured_shop_actions(http_server):
 
     status, _, raw = http_request(
         base_url,
+        "/shop/sell",
+        method="POST",
+        payload={"item_id": 166},
+    )
+    assert status == 200
+    assert json.loads(raw)["action"]["command"] == "shop_sell"
+
+    status, _, raw = http_request(
+        base_url,
         "/shop/leave",
         method="POST",
         payload={},
     )
     assert status == 200
     assert json.loads(raw)["action"]["command"] == "shop_leave"
-    assert calls == [("shop_buy", 201), ("shop_leave", None)]
+    assert calls == [("shop_buy", 201), ("shop_sell", 166), ("shop_leave", None)]
 
 
 def test_http_handler_exposes_structured_battle_action(http_server):
@@ -593,6 +602,12 @@ def test_native_action_handshake_closes_consumed_file_race(tmp_path):
             "shop",
             "client",
             ["shop_buy", "shop_leave"],
+        ),
+        (
+            {"shop": {"active": True, "mode": "sell"}},
+            "shop",
+            "client",
+            ["shop_sell", "shop_leave"],
         ),
     ],
 )
@@ -1048,6 +1063,48 @@ def test_shop_action_writer_uses_structured_native_command(tmp_path, monkeypatch
     assert result["result"]["status"] == "purchased"
 
 
+def test_write_shop_sell_action_uses_structured_command(tmp_path, monkeypatch):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "game_instance_id": "game-a",
+        "agent_action": {
+            "generation": 12,
+            "pending": False,
+            "remaining_steps": 0,
+            "waiting_for_move": False,
+        },
+        "shop": {
+            "active": True,
+            "mode": "sell",
+            "phase": "select",
+            "items": [{
+                "item_id": 166,
+                "sell_price": 100,
+                "available_count": 1,
+                "can_sell": True,
+            }],
+        },
+    }
+    write_state(debug, state)
+    monkeypatch.setattr(
+        debug,
+        "wait_for_shop_action_result",
+        lambda action, item_id, start_time: {
+            "ok": True,
+            "status": "sold",
+            "action": action,
+            "item_id": item_id,
+        },
+    )
+
+    result = debug.write_shop_action("shop_sell", 166)
+
+    assert debug.action_path.read_text(encoding="ascii") == "shop_sell 166\n"
+    assert result["command"] == "shop_sell"
+    assert result["result"]["status"] == "sold"
+
+
 def test_shop_validation_blocks_other_inventory_actions(tmp_path):
     debug = make_debug_state(tmp_path)
     state = {
@@ -1078,6 +1135,28 @@ def test_shop_validation_blocks_other_inventory_actions(tmp_path):
     assert debug.shop_action_validation_error(state, "shop_leave", {}) is None
     assert debug.use_item_validation_error(state, {"item_id": 201, "role_id": 0}) == "in_shop"
     assert debug.equip_item_validation_error(state, {"item_id": 201, "role_id": 0}) == "in_shop"
+
+
+def test_sell_shop_validation_requires_sellable_available_item(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(),
+        "shop": {
+            "active": True,
+            "mode": "sell",
+            "phase": "select",
+            "items": [
+                {"item_id": 166, "available_count": 2, "can_sell": True},
+                {"item_id": 201, "available_count": 0, "can_sell": False},
+            ],
+        },
+    }
+    write_state(debug, state)
+
+    assert debug.shop_action_validation_error(state, "shop_sell", {"item_id": 166}) is None
+    assert debug.shop_action_validation_error(state, "shop_sell", {"item_id": 201}) == "item_not_sellable"
+    assert debug.shop_action_validation_error(state, "shop_buy", {"item_id": 166}) == "shop_mode_mismatch"
+    assert debug.shop_action_validation_error(state, "shop_leave", {}) is None
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,7 @@ from palpal.battle_items import BattleItemDetails, ITEM_DETAILS_DESCRIPTION, ITE
 RUNNING_PHASES = {"running", "interrupting"}
 EXECUTABLE_TOOLS = {
     "press_buttons", "advance_dialog", "choice_select", "navigation_step", "use_item",
-    "equip_item", "shop_buy", "shop_leave",
+    "equip_item", "shop_buy", "shop_sell", "shop_leave",
 }
 CHECKPOINT_BUNDLE_VERSION = 2
 DEFAULT_COMPACT_AT_TOKENS = 200_000
@@ -4030,9 +4030,9 @@ exploration value, and maintained local tasks to choose the next action.
             return "in_dialog"
         if not dialog_active and tool == "advance_dialog":
             return "dialog_inactive"
-        if shop_active and tool not in {"shop_buy", "shop_leave"}:
+        if shop_active and tool not in {"shop_buy", "shop_sell", "shop_leave"}:
             return "in_shop"
-        if not shop_active and tool in {"shop_buy", "shop_leave"}:
+        if not shop_active and tool in {"shop_buy", "shop_sell", "shop_leave"}:
             return "shop_inactive"
         return None
 
@@ -4138,10 +4138,10 @@ exploration value, and maintained local tasks to choose the next action.
                 args.get("expected_slot_item_id"),
             )
             after = self._wait_action_and_stable(action=action_result)
-        elif tool in {"shop_buy", "shop_leave"}:
+        elif tool in {"shop_buy", "shop_sell", "shop_leave"}:
             action_result = self.debug.write_shop_action(
                 tool,
-                args.get("item_id") if tool == "shop_buy" else None,
+                args.get("item_id") if tool in {"shop_buy", "shop_sell"} else None,
             )
             after = self._wait_action_and_stable(action=action_result)
         else:
@@ -4527,6 +4527,8 @@ exploration value, and maintained local tasks to choose the next action.
                     terminal_result["observation_id"] = result["observation_id"]
                 if result.get("completion"):
                     terminal_result["completion"] = result["completion"]
+                if result.get("trigger_evidence"):
+                    terminal_result["trigger_evidence"] = result["trigger_evidence"]
                 if status == "approached":
                     if isinstance(result.get("approach"), dict):
                         terminal_result["approach"] = result["approach"]
@@ -4680,7 +4682,7 @@ exploration value, and maintained local tasks to choose the next action.
         compact = {
             key: result.get(key)
             for key in (
-                "ok", "status", "presses", "steps", "target_id", "frames",
+                "ok", "status", "completion", "trigger_evidence", "presses", "steps", "target_id", "frames",
                 "buttons", "observation_id", "command", "item_id", "role_id",
                 "slot_id", "slot_key", "previous_item_id", "store_id",
                 "price", "cash_before", "cash_after", "owned_before", "owned_after",
