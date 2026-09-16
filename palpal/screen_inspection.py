@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 
-DEFAULT_POE_VISION_MODEL = "gemini-3.7-flash"
+DEFAULT_POE_VISION_MODEL = "gemini-3.8-flash"
 DEFAULT_POE_VISION_BASE_URL = "https://api.poe.com/v1"
 DEFAULT_POE_VISION_TIMEOUT = 30.0
 VISION_CACHE_SIZE = 16

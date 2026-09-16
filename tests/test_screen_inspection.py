@@ -167,7 +167,7 @@ def test_request_uses_poe_chat_image_options_and_bounded_context(tmp_path, monke
 
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=OpenAI))
     response = debug.screen_inspector._request(
-        model="gemini-3.7-flash",
+        model="gemini-3.8-flash",
         png=b"png-bytes",
         focus="passage",
         question="Is there a wall gap?",
@@ -185,7 +185,7 @@ def test_request_uses_poe_chat_image_options_and_bounded_context(tmp_path, monke
         "timeout": DEFAULT_POE_VISION_TIMEOUT,
     }
     request = captured["request"]
-    assert request["model"] == "gemini-3.7-flash"
+    assert request["model"] == "gemini-3.8-flash"
     assert request["stream"] is False
     assert "max_tokens" not in request
     assert request["extra_body"] == {"web_search": False, "thinking_level": "low"}
@@ -280,7 +280,7 @@ def test_cache_uses_visual_hash_and_cycle_allows_only_one_uncached_request(tmp_p
     assert session["provider_usage"]["scopes"]["vision"]["input_tokens"] == 42
     assert session["provider_usage"]["last_request"]["scope"] == "vision"
     assert session["provider_usage"]["last_request"]["provider"] == "poe"
-    assert session["provider_usage"]["last_request"]["model"] == "gemini-3.7-flash"
+    assert session["provider_usage"]["last_request"]["model"] == "gemini-3.8-flash"
     assert session["last_prompt_tokens"] == 777
 
     serialized = json.dumps({"result": first, "session": session})
@@ -308,7 +308,7 @@ def test_vision_cache_is_memory_only_and_bounded_to_sixteen_entries(tmp_path, mo
         )
         assert result["ok"] is True
     assert len(debug.screen_inspector.cache) == 16
-    assert ("gemini-3.7-flash", f"{0:064x}", "room_layout", "") not in debug.screen_inspector.cache
+    assert ("gemini-3.8-flash", f"{0:064x}", "room_layout", "") not in debug.screen_inspector.cache
     assert "cache" not in debug.agent_runtime.snapshot()
 
 
