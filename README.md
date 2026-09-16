@@ -263,7 +263,7 @@ session or delegate battle commands; `DEEPSEEK_BASE_URL` defaults to
 The debug server also requires `POE_API_KEY` at startup so the exploration Agent
 can call the read-only `inspect_screen` tool when structured evidence cannot
 explain the visible room layout, a suspected passage, or an object's appearance. `POE_VISION_MODEL`
-defaults to `gemini-3.7-flash`, `POE_VISION_BASE_URL` to
+defaults to `gemini-3.8-flash`, `POE_VISION_BASE_URL` to
 `https://api.poe.com/v1`, and `POE_VISION_TIMEOUT` to 30 seconds. Values may be
 supplied through the process environment or the project `.env`; keys are never
 persisted in Agent data.
