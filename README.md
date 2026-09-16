@@ -363,8 +363,8 @@ threshold and retained-tail budget; when unset they inherit the corresponding
 threshold-triggered compression atomically replaces older child history with a
 structured action summary and recent complete command cycles.
 
-The persistent model sees fourteen tools: `upsert_task`, `upsert_room_memo`, `get_tasks`,
-`get_navigation`, `inspect_target`, `get_observations`, `get_shop`,
+The persistent model sees these tools: `upsert_task`, `upsert_room_memo`, `get_tasks`,
+`get_navigation`, `inspect_target`, `preview_item_placement`, `get_observations`, `get_shop`,
 `get_equipment`, `get_inventory`, `get_room_memory`, `inspect_screen`,
 `get_tool_output`, `review_task_inbox`, and `submit_decision`. `get_tasks`
 remains backward compatible by defaulting to active tasks with full records, and
@@ -414,13 +414,66 @@ After actions, the runtime requires a two-second quiet state before starting the
 next decision.
 
 `submit_decision` accepts only a minimal action plus a short reason.
-`navigate` adds `target_id`; `use_item` adds `item_id` and exactly one of
+`navigate` adds `target_id`; `move_to` adds world coordinates `x`, `y` and an
+optional `face` (`up`, `down`, `left`, `right`); `use_item` adds `item_id` and exactly one of
 `role_id` and `target: "all"`; `equip_item` adds `item_id` and `role_id`;
 `buy_item` and `sell_item` add `item_id`; `select_choice` adds `option_index`; and
 `advance_dialog` and `leave_shop` need no additional fields. Runtime
 synchronization may still wait internally, but `wait` is not a model action. The
 server derives the internal intent, evidence, risk, and executable preview; the
 former nested decision payload is rejected.
+
+`move_to` plans position and facing together using ordinary movement, without
+searching on arrival. Coordinates must be exact navigation-grid positions;
+blocked destinations and impossible facing are rejected. Crossing a trigger
+boundary or changing rooms ends the movement so the Agent can reassess.
+`preview_item_placement(item_id, x?, y?, face?)` reports the player's stance,
+actual adjacent landing position, terrain validity, and stance reachability.
+Omitted coordinates use the current position; omitted facing checks all four
+directions. A legal placement does not establish task effectiveness. Item action
+results include the placed object's actual coordinates and state changes.
+
+`inspect_target` includes `motion` sampled from native state updates, with
+`motion_offset` / `motion_limit` pagination (default: most recent 32 points).
+Samples preserve turns and trigger changes; they describe observed positions,
+not future scripted routes. The cache retains eight rooms and up to 512 samples
+per object, reports truncation/gaps, and resets on load/restart. Navigation
+trigger completion observes subsequent movement for up to eight seconds,
+stopping after 0.4 seconds without position changes or on a control interruption.
+Action results retain a bounded motion summary; full query output uses the
+existing tool-output archive.
+
+`motion.moved` describes historical movement. `current_status` reports
+`moving`, `stationary`, or `unknown`: stationary requires at least 0.4 seconds
+of continuing state samples at the same position. A stream gap over one second,
+an absent object, or a checkpoint restore invalidates that conclusion.
+`observed_stationary_seconds` measures the continuously observed interval.
+`latest_action_association` and action-result `motion_association` retain the
+action, confirmed native trigger, subsequent movement, and observed stopping.
+They do not predict a future route or autonomous patrol. Agent navigation and
+coordinate movement consume trigger completion once per execution, bound to
+the game instance, room, target, and native generation. Later target movement
+or route invalidation cannot overwrite that confirmed success.
+
+`observe_target(id, seconds=2)` samples for 0.4–5 seconds without sending keys.
+It reports the observation interval, player/target positions, distance in world
+pixels, intervening native triggers, movement (including returning to the
+starting position), and interruption reasons. Missing samples, room changes,
+player movement, or control interruptions prevent a completed observation.
+`motion.observation_windows` retains the latest 16 passive/action observations
+per object for comparison; `movement_rule=not_inferred` explicitly leaves
+mechanism inference to the Agent. No task-specific movement strategy is supplied.
+`inspect_target` refreshes the target from the live state; `position_is_current`,
+`position_is_stationary`, and `sample_frame` qualify its coordinates. Navigation
+action results include `target_observation` after bounded movement observation,
+even when a route fails. This does not guarantee a moving target has stopped.
+
+`scripts/evaluate_spatial_task.py --fixture /path/to/game.rpg` runs three
+independent Agent trials from a copied save. It copies resources and writes all
+runtime evidence to disposable directories, uses the configured external model
+and vision providers, and checks the requested inventory outcome. The default
+goal is obtaining deer antler; `--goal` and `--success-item-id` select another
+inventory-based task. It does not connect to the user-owned debug server.
 
 The checkpoint endpoints above are implemented. These separate root-level
 bridge endpoints remain reserved but are not implemented yet:

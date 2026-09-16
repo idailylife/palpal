@@ -21,7 +21,7 @@ from palpal.battle_items import BattleItemDetails, ITEM_DETAILS_DESCRIPTION, ITE
 
 RUNNING_PHASES = {"running", "interrupting"}
 EXECUTABLE_TOOLS = {
-    "press_buttons", "advance_dialog", "choice_select", "navigation_step", "use_item",
+    "press_buttons", "advance_dialog", "choice_select", "navigation_step", "move_to", "use_item",
     "equip_item", "shop_buy", "shop_sell", "shop_leave",
 }
 CHECKPOINT_BUNDLE_VERSION = 2
@@ -2926,6 +2926,13 @@ class AgentRuntime:
             )
             return
 
+        if (current and current.get("status") == "entered"
+                and current.get("destination_room_id") == after_room_id
+                and before_room_id == after_room_id and tool == "move_to"
+                and self._position_snapshot(before) != self._position_snapshot(after)):
+            current.update(status="progressed", progressed_at=_stamp(), progress_action="move_to")
+            self._set_room_entry_context(current)
+
         if (
             current
             and current.get("status") == "entered"
@@ -4087,6 +4094,7 @@ exploration value, and maintained local tasks to choose the next action.
                 intentional_return=entry_return_selected,
             )
         started = _now()
+        motion_cursor = self.debug.motion_history.serial
         matched_item_object = None
         self.emit("action", "validating", f"Validated {tool}.", {"tool": tool, "args": args})
         if tool == "press_buttons":
@@ -4095,6 +4103,9 @@ exploration value, and maintained local tasks to choose the next action.
                 buttons = [buttons]
             action_result = self.debug.write_action([str(item).lower() for item in buttons], int(args.get("frames") or 1))
             after = self._wait_action_and_stable(action=action_result)
+        elif tool == "move_to":
+            action_result = self._move_to(args)
+            after = self._wait_state_quiet()
         elif tool == "advance_dialog":
             action_result = self.debug.advance_dialog(args)
             if not action_result.get("ok"):
@@ -4150,6 +4161,27 @@ exploration value, and maintained local tasks to choose the next action.
                 int(args.get("item_id") or 0) or None,
             )
             after = self._wait_state_quiet()
+        motion_target = int((action_result.get("trigger_evidence") or {}).get("object_id") or args.get("id") or 0)
+        if (action_result.get("completion") == "trigger_completed"
+                or (tool == "navigation_step" and self.debug.motion_history.view(after, motion_target).get("current_status") == "moving")):
+            after = self._observe_target_motion(after, motion_target)
+        if isinstance(action_result, dict):
+            movement_target = args.get("id") if tool == "navigation_step" else (matched_item_object or {}).get("event_object_id")
+            movement = self.debug.motion_history.changes(before, motion_cursor, movement_target)
+            if movement:
+                action_result["object_movement"] = movement
+            evidence = action_result.get("trigger_evidence")
+            association_target = (evidence or {}).get("object_id") or movement_target
+            if association_target:
+                current_target = self.debug.target_object(after, association_target) or {}
+                action_result["target_observation"] = {
+                    "id": association_target, "x": current_target.get("x"), "y": current_target.get("y"),
+                    **{k: self.debug.motion_history.view(after, association_target).get(k) for k in
+                       ("current_status", "sample_frame", "position_is_current", "position_is_stationary")},
+                }
+                summary = self.debug.motion_history.associate(after, association_target, tool, evidence, motion_cursor, before)
+                if summary:
+                    action_result["motion_association"] = summary
         observation_id = action_result.get("observation_id") if isinstance(action_result, dict) else None
         observation = self.debug.observations.consume(observation_id, owner="navigation")
         if isinstance(action_result, dict) and observation is not None:
@@ -4354,7 +4386,79 @@ exploration value, and maintained local tasks to choose the next action.
             if waited is None or waited.get("status") != "pending":
                 return
 
+    def _observe_target_motion(self, state: dict, target_id: int, timeout: float = 8.0) -> dict:
+        """Retain post-trigger movement without requiring a moving room to become quiet."""
+        room_id = self.debug.room_identity(state).get("id")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            obj = self.debug.target_object(state, target_id)
+            if (not obj or not obj.get("state") or self.debug.room_identity(state).get("id") != room_id
+                    or state.get("in_battle") or (state.get("dialog") or {}).get("active")
+                    or (state.get("choice") or {}).get("active") or (state.get("shop") or {}).get("active")):
+                return state
+            motion = self.debug.motion_history.view(state, target_id, limit=1)
+            if motion.get("current_status") == "stationary":
+                return state
+            self.debug.wait_navigation_update(timeout=0.05)
+            state = self.debug.navigation_snapshot()
+        return state
+
+    def _move_to(self, args: dict) -> dict:
+        with self.debug.spatial_execution_scope("move_to", cancel_event=self.cancel_event):
+            return self._move_to_impl(args)
+
+    def _move_to_impl(self, args: dict) -> dict:
+        initial = self.debug.navigation_snapshot()
+        identity = self.debug.room_identity(initial)
+        trigger = self.debug.native_trigger_generation(initial)
+        stalled = 0
+        for step in range(240):
+            if self.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            state = self.debug.navigation_snapshot()
+            if self.debug.room_identity(state).get("id") != identity.get("id"):
+                return {"ok": True, "status": "route_invalidated", "reason": "room_changed"}
+            receipt = self.debug.consume_spatial_completion(state)
+            if receipt:
+                return {"ok": True, "status": "arrived", "completion": "trigger_completed", **receipt}
+            if self.debug.native_trigger_generation(state) != trigger:
+                return {"ok": True, "status": "interrupted_by_trigger", "trigger": self.debug.native_trigger_generation(state)}
+            result = self.debug.move_to_step(state, args, self.cancel_event)
+            if result.get("status") == "cancelled":
+                raise RuntimeError("interrupted")
+            if result.get("status") == "state_changed":
+                continue
+            if result.get("status") in {"game_script", "action_pending", "entering_scene"}:
+                self._wait_for_control()
+                continue
+            if not result.get("action"):
+                return {**result, "execution_steps": step}
+            after = self._wait_action_completion(result["action"])
+            if self.cancel_event.is_set():
+                raise RuntimeError("interrupted")
+            self.emit("navigation", "progress", "Coordinate movement step completed.",
+                      {"step": step + 1, "result": result, "actual_position": after.get("party_position")})
+            before_pos = (state.get("party_position"), state.get("party_direction"))
+            after_pos = (after.get("party_position"), after.get("party_direction"))
+            stalled = stalled + 1 if before_pos == after_pos else 0
+            if stalled >= 2:
+                return {"ok": False, "status": "no_progress", "actual_position": after.get("party_position")}
+            if result.get("trigger_ids"):
+                settled = self._wait_state_quiet()
+                receipt = self.debug.consume_spatial_completion(settled)
+                if receipt:
+                    return {"ok": True, "status": "arrived", "completion": "trigger_completed", **receipt}
+                return {"ok": True, "status": "trigger_boundary_reached", "trigger_ids": result["trigger_ids"],
+                        "actual_position": after.get("party_position")}
+        return {"ok": False, "status": "movement_step_limit"}
+
     def _navigate(self, target_id: int, approach_item_id: int | None = None) -> dict:
+        with self.debug.spatial_execution_scope("navigate", target_id, self.cancel_event):
+            return self._navigate_impl(target_id, approach_item_id)
+
+    def _navigate_impl(self, target_id: int, approach_item_id: int | None = None) -> dict:
         if target_id <= 0:
             raise RuntimeError("navigation_target_missing")
         progress = []
@@ -4687,7 +4791,8 @@ exploration value, and maintained local tasks to choose the next action.
                 "slot_id", "slot_key", "previous_item_id", "store_id",
                 "price", "cash_before", "cash_after", "owned_before", "owned_after",
                 "approach", "affordance", "matched_event_object_id",
-                "effect_observed", "object_delta",
+                "effect_observed", "object_delta", "object_movement", "motion_association", "target_observation", "cell", "face",
+                "actual_position", "trigger_ids", "reason", "execution_steps",
             )
             if key in result
         }

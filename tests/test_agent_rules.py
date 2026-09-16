@@ -889,13 +889,13 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
         'upsert_task', 'upsert_room_memo', 'get_tasks', 'get_navigation', 'inspect_target',
         'get_observations', 'get_inventory', 'get_shop', 'get_equipment',
         'get_room_memory', 'inspect_screen', 'get_tool_output', 'review_task_inbox',
-        'submit_decision',
+        'submit_decision', 'preview_item_placement', 'observe_target',
     }
     dialog_properties = by_name['get_observations']['function']['parameters']['properties']
     assert 'speaker' in dialog_properties
     assert dialog_properties['speaker']['type'] == 'string'
     object_history_properties = by_name['inspect_target']['function']['parameters']['properties']
-    assert set(object_history_properties) == {'id', 'limit'}
+    assert set(object_history_properties) == {'id', 'limit', 'motion_offset', 'motion_limit'}
     assert '紧凑' in by_name['get_navigation']['function']['description']
     navigation_description = by_name['get_navigation']['function']['description']
     assert 'status=reachable、transition 或 blocked_by_interactable' in navigation_description
@@ -1566,7 +1566,7 @@ def test_agent_tool_schema_explains_implicit_event_context_item_target(tmp_path)
     )
     properties = submit['parameters']['properties']
     assert properties['action']['enum'] == [
-        'advance_dialog', 'select_choice', 'navigate', 'use_item', 'equip_item',
+        'advance_dialog', 'select_choice', 'navigate', 'move_to', 'use_item', 'equip_item',
         'buy_item', 'sell_item', 'leave_shop',
     ]
     assert properties['target']['enum'] == ['all']

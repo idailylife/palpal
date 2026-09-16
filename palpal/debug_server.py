@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from palpal.spatial import MotionHistory, route_to_position, preview_placement, room_key as spatial_room_key
 from palpal.agent_runtime import AgentRuntime
 from palpal.observations import ObservationCoordinator
 from palpal.object_vision import ObjectVision
@@ -695,6 +696,8 @@ class DebugState:
             self.write_events()
         self.dialog_history: list[dict] = self.read_dialog_history()
         self.dialog_source_keys: set[str] = self.dialog_history_source_keys(self.dialog_history)
+        self.motion_history = MotionHistory()
+        self.spatial_execution = None
         self.last_observed_state: dict | None = None
         self.last_stable_room_state: dict | None = None
         self.pending_transition_observation: dict | None = None
@@ -900,6 +903,7 @@ class DebugState:
             self.live_status["state_messages"] += 1
             self.live_status["last_message_at"] = self.live_state_received_at
             self.live_status["last_sequence"] = int(next_sequence)
+            self.motion_history.observe(state)
             self.live_condition.notify_all()
         self.reconcile_pending_written_action(state)
         self.object_vision.observe_state(state)
@@ -1609,6 +1613,7 @@ class DebugState:
             raise RuntimeError("action_pending")
 
     def refresh_companion_caches(self) -> None:
+        self.motion_history.clear()
         if hasattr(self, "object_vision"):
             self.object_vision.clear()
         self.cancel_runtime_observations("checkpoint_restored")
@@ -1622,6 +1627,8 @@ class DebugState:
         self.pending_room_entry_intent = None
 
     def cancel_runtime_observations(self, reason: str) -> None:
+        self.spatial_execution = None
+        self.motion_history.clear()
         self.observations.clear_all(reason)
         self.navigation_transition_requests.clear()
         self.dialog_advance_observation_id = None
@@ -3015,6 +3022,10 @@ class DebugState:
             normalized_item_id = int(item_id)
         except (TypeError, ValueError):
             return None
+        item = next((i for i in state.get("inventory") or [] if i.get("item_id") == normalized_item_id), {})
+        for requirement in (item.get("use_effect") or {}).get("requirements") or []:
+            if requirement.get("kind") == "place_event_object":
+                return {"event_object_id": requirement.get("event_object_id"), "requirement": dict(requirement)}
         pos = state.get("party_position") or {}
         position = (int(pos.get("x") or 0), int(pos.get("y") or 0))
         direction = int(state.get("party_direction") or 0)
@@ -3067,7 +3078,7 @@ class DebugState:
             if obj is None:
                 return None
             return {key: obj.get(key) for key in (
-                "state", "trigger_mode", "trigger_script", "auto_script",
+                "state", "trigger_mode", "trigger_script", "auto_script", "x", "y",
             )}
 
         before_object = object_snapshot(before)
@@ -3080,7 +3091,7 @@ class DebugState:
                     "after": after_object is not None,
                 }
         else:
-            for key in ("state", "trigger_mode", "trigger_script", "auto_script"):
+            for key in ("state", "trigger_mode", "trigger_script", "auto_script", "x", "y"):
                 if before_object.get(key) != after_object.get(key):
                     changed[key] = {
                         "before": before_object.get(key),
@@ -3100,10 +3111,7 @@ class DebugState:
                 "after": after_trigger,
             }
 
-        same_room = (
-            before.get("scene_id") == after.get("scene_id")
-            and before.get("map_id") == after.get("map_id")
-        )
+        same_room = spatial_room_key(before) == spatial_room_key(after)
         effect_observed = True if changed else False if same_room and after_object is not None else None
         return {
             "matched_event_object_id": object_id,
@@ -7326,6 +7334,79 @@ class DebugState:
             return None
         return observation if generation > 0 and object_id > 0 else None
 
+    @contextmanager
+    def spatial_execution_scope(self, action: str, target_id=None, cancel_event=None):
+        state = self.read_live_state()
+        execution = {
+            "id": time.monotonic_ns(), "action": action, "target_id": target_id,
+            "room_id": (self.room_identity(state) or {}).get("id"),
+            "game_instance_id": str(state.get("game_instance_id") or ""),
+            "baseline_generation": (self.native_trigger_generation(state) or {}).get("generation", 0),
+            "cancel_event": cancel_event, "receipt": None,
+        }
+        with self.state_lock:
+            self.spatial_execution = execution
+        try:
+            yield execution
+        finally:
+            with self.state_lock:
+                if self.spatial_execution is execution:
+                    self.spatial_execution = None
+                # A later execution must never inherit an unconsumed success.
+                with self.exploration_lock:
+                    data = self.read_exploration()
+                    route = ((data.get("rooms") or {}).get(execution["room_id"]) or {}).get("last_route")
+                    if isinstance(route, dict) and route.get("execution_id") == execution["id"]:
+                        route["pending"] = False
+                        route["completion_reported_at"] = time.time()
+                        self.write_exploration(data)
+
+    def capture_spatial_completion(self, pending, state):
+        execution = self.spatial_execution
+        native = self.native_trigger_generation(state or {}) or {}
+        if (not execution or pending.get("execution_id") != execution["id"]
+                or pending.get("owner") != "navigation"
+                or (execution["cancel_event"] is not None and execution["cancel_event"].is_set())
+                or str((state or {}).get("game_instance_id") or "") != execution["game_instance_id"]
+                or (pending.get("from_room") or {}).get("id") != execution["room_id"]
+                or native.get("completed") is not True
+                or native.get("event_object_id") != pending.get("object_id")
+                or native.get("generation") != pending.get("trigger_generation")
+                or native.get("generation", 0) <= execution["baseline_generation"]
+                or (execution["target_id"] is not None and execution["target_id"] != pending.get("object_id"))):
+            return
+        if execution.get("receipt") is None and not execution.get("consumed"):
+            execution["receipt"] = {"trigger_evidence": {
+                "source": "native_trigger_completion", "object_id": pending["object_id"],
+                "execution_id": execution["id"], "action": execution["action"],
+                "game_instance_id": execution["game_instance_id"], "room_id": execution["room_id"],
+                "trigger_generation": native["generation"], "completed_at": time.time(),
+                "motion_sequence": self.motion_history.serial,
+                "object_changes": self.object_snapshot_delta(pending.get("execution_started_object"),
+                    self.object_snapshot_for_interaction(state, pending["object_id"])),
+            }}
+
+    def consume_spatial_completion(self, state, target_id=None):
+        with self.state_lock:
+            execution = self.spatial_execution
+            if (not execution or not execution.get("receipt")
+                    or (execution["cancel_event"] is not None and execution["cancel_event"].is_set())
+                    or str(state.get("game_instance_id") or "") != execution["game_instance_id"]
+                    or (self.room_identity(state) or {}).get("id") != execution["room_id"]):
+                return None
+            receipt = execution["receipt"]
+            evidence = receipt["trigger_evidence"]
+            if target_id is not None and evidence["object_id"] != target_id:
+                return None
+            execution["receipt"] = None
+            execution["consumed"] = True
+            with self.exploration_lock:
+                data = self.read_exploration()
+                objects = data.setdefault("object_interactions", {}).setdefault(execution["room_id"], {})
+                objects.setdefault(str(evidence["object_id"]), {})["last_trigger_completion"] = evidence
+                self.write_exploration(data)
+            return copy.deepcopy(receipt)
+
     def terminate_pending_transition_observation(
         self,
         pending: dict,
@@ -7364,6 +7445,8 @@ class DebugState:
             if object_id > 0 and self.navigation_transition_requests.get(object_id) == observation_id:
                 self.navigation_transition_requests.pop(object_id, None)
             self.observations.consume(observation_id, owner=owner)
+            if outcome == "trigger_completed":
+                self.capture_spatial_completion(pending, state)
             self.finish_navigation_route(pending.get("from_room"), object_id, outcome)
             self.pending_transition_observation = None
             if diagnostic_type:
@@ -7414,6 +7497,8 @@ class DebugState:
             "game_instance_id": str(state.get("game_instance_id") or ""),
             "object_id": int(object_id),
             "sent_at": time.time(),
+            "execution_id": (self.spatial_execution or {}).get("id") if owner == "navigation" else None,
+            "execution_started_object": self.object_snapshot_for_interaction(state, object_id),
             "baseline_trigger_generation": baseline_generation,
             "trigger_generation": None,
             "control_started_at": None,
@@ -7580,10 +7665,24 @@ class DebugState:
             details["association_rejected_reason"] = "navigation_source_room_missing"
             return "background", details
 
+        execution = self.spatial_execution or {}
+        armed = execution.get("armed_step") or {}
+        if (execution.get("action") == "move_to" and object_id in armed.get("ids", [])
+                and execution.get("room_id") == identity["id"]
+                and execution.get("game_instance_id") == str(state.get("game_instance_id") or "")
+                and 0 <= time.time() - armed.get("sent_at", 0) <= TRANSITION_OBSERVATION_TIMEOUT_SECONDS
+                and all(armed.get(k) == source.get(k) for k in ("x", "y", "scene_id", "map_id"))):
+            return "navigation", {**details, "owner": "navigation", "association": "coordinate_touch_boundary"}
+
         with self.exploration_lock:
             data = self.read_exploration()
             room = (data.get("rooms") or {}).get(identity["id"])
             last_route = room.get("last_route") if isinstance(room, dict) else None
+
+        if (self.spatial_execution is not None and isinstance(last_route, dict)
+                and last_route.get("execution_id") != self.spatial_execution["id"]):
+            details["association_rejected_reason"] = "navigation_execution_mismatch"
+            return "background", details
 
         if not isinstance(last_route, dict) or not last_route.get("pending"):
             details["association_rejected_reason"] = "navigation_route_not_pending"
@@ -7968,6 +8067,7 @@ class DebugState:
                 pending,
                 "trigger_completed" if trigger_completed else "no_position_change",
                 "trigger_completed" if trigger_completed else "no_position_change",
+                state=state,
             )
             return None
         frame = self.int_frame(state.get("logical_frame", state.get("frame")))
@@ -8183,6 +8283,7 @@ class DebugState:
             room = self.exploration_room(data, identity)
             room["last_route"] = {
                 "pending": True,
+                "execution_id": (self.spatial_execution or {}).get("id"),
                 "target_id": target_id,
                 "target_selection": target_selection,
                 "started_object": self.object_snapshot_for_interaction(state, target_id),
@@ -8280,6 +8381,11 @@ class DebugState:
 
     def consume_completed_touch_route(self, state: dict, target_id: int) -> dict | None:
         """Consume native proof that the final touch route already triggered its script."""
+        receipt = self.consume_spatial_completion(state, target_id)
+        if receipt is not None:
+            return receipt
+        if self.spatial_execution is not None:
+            return None
         exploration = state.get("_exploration")
         if isinstance(exploration, dict) and "last_route" in exploration:
             last_route = exploration.get("last_route") or {}
@@ -9095,6 +9201,34 @@ class DebugState:
                         break
         return goals, directions, details
 
+    def route_to_position(self, state: dict, x: int, y: int, face: str | None = None) -> dict:
+        return route_to_position(self, state, x, y, face)
+
+    def move_to_step(self, state: dict, args: dict, cancel_event=None) -> dict:
+        with self.navigation_timed_lock(self.navigation_action_lock):
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "status": "cancelled"}
+            latest = self.read_live_state()
+            if self.navigation_basis(state) != self.navigation_basis(latest):
+                return {"ok": True, "status": "state_changed"}
+            control = self.control_state(latest, self.live_info("state"))
+            if not control["navigation_ready"]:
+                return {"ok": False, "status": control["phase"]}
+            route = self.route_to_position(latest, **args)
+            if not route["ok"] or not route["path"]:
+                return route
+            step = route["path"][0]
+            if self.spatial_execution is not None:
+                self.spatial_execution["armed_step"] = {
+                    "ids": step["trigger_ids"], "x": step["x"], "y": step["y"],
+                    "scene_id": latest.get("scene_id"), "map_id": latest.get("map_id"),
+                    "sent_at": time.time(),
+                }
+            action = self.write_action([step["move"]], 1)
+            return {"ok": True, "status": "stepping", "action": action,
+                    "expected_position": {"x": step["x"], "y": step["y"]},
+                    "trigger_ids": step["trigger_ids"], "remaining_steps": route["steps"] - 1}
+
     def route_between_nodes(
         self,
         grid: dict,
@@ -9434,7 +9568,10 @@ class DebugState:
         for attempt in range(3):
             try:
                 result = self._navigation_step(state, target_id, approach_item_id, cancel_event)
-                if result.get("status") in {"arrived", "approached"}:
+                # A consumed native completion is a historical fact. Revalidating
+                # target geometry here can discard it as the triggered object moves.
+                if (result.get("status") in {"arrived", "approached"}
+                        and result.get("completion") != "trigger_completed"):
                     latest = self.read_live_state()
                     if (self.navigation_basis(state) != self.navigation_basis(latest)
                             or not self.control_state(latest, self.live_info("state"))["navigation_ready"]):
@@ -11710,6 +11847,11 @@ class DebugState:
             outcomes = self.recent_interaction_outcomes_by_target(state)
         outcome = outcomes.get(target_id)
         if outcome:
+            motion = self.motion_history.view(state, target_id, limit=2)
+            if (motion.get("moved_at") and outcome.get("time")
+                    and motion["moved_at"] > outcome["time"]):
+                return {"interaction_state": "moved_since_interaction", "agent_priority": "normal",
+                        "deprioritize_reason": "该对象在上次交互后发生了位置变化；历史交互位置可能已过时。"}
             no_effect = outcome.get("type") == "interaction_no_effect"
             evidence = outcome.get("interaction_evidence") if isinstance(outcome.get("interaction_evidence"), dict) else {}
             stale_only = (
@@ -12631,6 +12773,20 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
+                    "name": "preview_item_placement",
+                    "description": "预览放置型物品的站位、朝向与实际落点；省略位置使用当前位置，省略 face 返回四方向。合法不代表任务有效。",
+                    "parameters": {
+                        "type": "object", "properties": {
+                            "item_id": {"type": "integer", "minimum": 1},
+                            "x": {"type": "integer"}, "y": {"type": "integer"},
+                            "face": {"type": "string", "enum": ["up", "down", "left", "right"]}},
+                        "required": ["item_id"], "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_navigation",
                     "description": (
                         "返回紧凑的可交互候选、路线成本、交互状态和已知传送目的地。"
@@ -12649,11 +12805,22 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
+                    "name": "observe_target",
+                    "description": "不发送按键，定点观察指定对象 0.4–5 秒，返回最新位置、移动、角色距离、触发事件和中断原因；不推断移动机制。",
+                    "parameters": {"type": "object", "properties": {
+                        "id": {"type": "integer", "minimum": 1},
+                        "seconds": {"type": "number", "minimum": 0.4, "maximum": 5, "default": 2}},
+                        "required": ["id"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "inspect_target",
                     "description": "返回目标状态、交互证据、路线及已有低权威外观注释；visual 表明是否可按需查看当前或最近可见画面。",
                     "parameters": {
                         "type": "object",
-                        "properties": {"id": {"type": "integer", "minimum": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8}},
+                        "properties": {"id": {"type": "integer", "minimum": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8}, "motion_offset": {"type": "integer", "minimum": 0}, "motion_limit": {"type": "integer", "minimum": 1, "maximum": 128}},
                         "required": ["id"],
                     },
                 },
@@ -12819,10 +12986,13 @@ class DebugState:
                             "action": {
                                 "type": "string",
                                 "enum": [
-                                    "advance_dialog", "select_choice", "navigate", "use_item",
+                                    "advance_dialog", "select_choice", "navigate", "move_to", "use_item",
                                     "equip_item", "buy_item", "sell_item", "leave_shop",
                                 ],
                             },
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"},
+                            "face": {"type": "string", "enum": ["up", "down", "left", "right"]},
                             "target_id": {"type": "integer", "minimum": 1},
                             "item_id": {"type": "integer", "minimum": 1},
                             "role_id": {"type": "integer", "minimum": 0},
@@ -13094,6 +13264,79 @@ class DebugState:
             ],
         }
 
+    def observe_target(self, target_id: int, seconds: float) -> dict:
+        if type(target_id) is not int or target_id <= 0 or isinstance(seconds, bool):
+            return {"ok": False, "error": "invalid_observation_arguments"}
+        try:
+            seconds = float(seconds)
+        except (ValueError, TypeError):
+            return {"ok": False, "error": "invalid_observation_arguments"}
+        if not 0.4 <= seconds <= 5.0:
+            return {"ok": False, "error": "seconds_must_be_between_0.4_and_5"}
+        with self.navigation_action_lock:
+            start = self.navigation_snapshot()
+            identity = spatial_room_key(start)
+            obj = self.target_object(start, target_id)
+            if not obj or not obj.get("state"):
+                return {"ok": False, "error": "target_not_present"}
+            cursor = self.motion_history.serial
+            continuity = self.motion_history.view(start, target_id).get("continuity_token")
+            initial_player = start.get("party_position")
+            initial_trigger = (self.native_trigger_generation(start) or {}).get("generation")
+            began = time.monotonic()
+            end = start
+            status = "completed"
+            triggers = []
+            distances = []
+            while True:
+                obj = self.target_object(end, target_id)
+                if self.agent_runtime.cancel_event.is_set():
+                    status = "cancelled"
+                    break
+                if spatial_room_key(end) != identity:
+                    status = "room_or_instance_changed"
+                    break
+                if not obj or not obj.get("state"):
+                    status = "target_disappeared"
+                    break
+                if self.motion_history.view(end, target_id).get("position_is_current") is not True:
+                    status = "observation_unavailable"
+                    break
+                if self.motion_history.view(end, target_id).get("continuity_token") != continuity:
+                    status = "observation_interrupted"
+                    break
+                player = end.get("party_position") or {}
+                distances.append(((obj['x'] - player['x']) ** 2 + (obj['y'] - player['y']) ** 2) ** .5)
+                native = self.native_trigger_generation(end) or {}
+                if native.get("generation") != initial_trigger and native not in triggers:
+                    triggers.append(copy.deepcopy(native))
+                if player != initial_player:
+                    status = "player_moved"
+                    break
+                if (end.get("in_battle") or end.get("entering_scene")
+                        or any((end.get(k) or {}).get("active") for k in ("dialog", "choice", "shop"))
+                        or self.action_pending(end)):
+                    status = "control_interrupted"
+                    break
+                if time.monotonic() - began >= seconds:
+                    break
+                self.wait_navigation_update(timeout=max(0.0, min(.05, seconds - (time.monotonic() - began))))
+                end = self.navigation_snapshot()
+            motion = self.motion_history.view(end, target_id, since=cursor, limit=32)
+            summary = {
+                "action": "observe_target", "status": status, "requested_seconds": seconds,
+                "elapsed_seconds": round(time.monotonic() - began, 3), "buttons_sent": 0,
+                "player_start": initial_player, "player_end": end.get("party_position"),
+                "player_moved": end.get("party_position") != initial_player,
+                "target_start": {k: (self.target_object(start, target_id) or {}).get(k) for k in ("x", "y")},
+                "target_end": {k: (self.target_object(end, target_id) or {}).get(k) for k in ("x", "y")},
+                "trigger_events": triggers, "movement_rule": "not_inferred",
+                "distance_world_pixels": {"min": min(distances), "max": max(distances)} if distances else None,
+                **{k: motion.get(k) for k in ("moved", "current_status", "sample_frame", "observed_stationary_seconds")},
+            }
+            self.motion_history.record_window(start, target_id, summary)
+            return {"ok": status == "completed", "id": target_id, "observation": summary, "motion": motion}
+
     def run_agent_tool(
         self,
         name: str,
@@ -13205,10 +13448,17 @@ class DebugState:
                     with self.exploration_lock:
                         audit["revision"] = self.task_ledger_revision(self.read_exploration())
             return result
+        if name == "observe_target":
+            return self.observe_target(arguments.get("id"), arguments.get("seconds", 2.0))
+        if name == "preview_item_placement":
+            return preview_placement(self, state, **arguments)
         if name == "get_navigation":
             limit = self.agent_tool_limit(arguments.get("limit"), 20, 40)
             return {"ok": True, "navigation": self.compact_agent_navigation(state, limit)}
         if name == "inspect_target":
+            latest = self.read_live_state()
+            if latest.get("game_instance_id") == state.get("game_instance_id") and latest.get("objects") is not None:
+                state = latest
             try:
                 target_id = int(arguments.get("id") or 0)
             except (TypeError, ValueError):
@@ -13255,6 +13505,7 @@ class DebugState:
                 "history": (history.get("history") or [])[-limit:],
                 "history_total": history.get("total", len(history.get("history") or [])),
                 "interaction_summary": history.get("interaction_summary"),
+                "motion": self.motion_history.view(state, target_id, arguments.get("motion_offset"), arguments.get("motion_limit", 32)),
                 "visual": self.object_vision.view(state, target_id),
                 "route": compact_route,
             }
@@ -13354,7 +13605,7 @@ class DebugState:
             reconciliation = self.task_reconciliation_context(tool_cycle)
             if (
                 reconciliation.get("pending")
-                and action in {"navigate", "use_item"}
+                and action in {"navigate", "move_to", "use_item"}
                 and (
                     not reconciliation.get("audit_complete")
                     or reconciliation.get("missing_active_task_ids")
@@ -13365,7 +13616,7 @@ class DebugState:
                     "error": {
                         "code": "task_reconciliation_required",
                         "message": (
-                            "Restore/compaction reconciliation must finish before navigate or use_item. "
+                            "Restore/compaction reconciliation must finish before navigate, move_to or use_item. "
                             "Read the complete closed-inclusive summary ledger, then confirm every active task "
                             "with the returned review_token in a later model batch."
                         ),
@@ -13401,7 +13652,7 @@ class DebugState:
                         "reasons": inbox.get("reasons") or [],
                     },
                 }
-            if action in {"navigate", "use_item"} and isinstance(tool_cycle, dict):
+            if action in {"navigate", "move_to", "use_item"} and isinstance(tool_cycle, dict):
                 required = set(tool_cycle.get("required_task_ids") or [])
                 reviewed = set(tool_cycle.get("reviewed_task_ids") or [])
                 missing = sorted(required - reviewed)
@@ -13717,6 +13968,13 @@ class DebugState:
             "不要因 target_object_id 被拒绝就推断剧情物品只能靠重复 NPC 交互自动使用。进程重启或载入存档不会恢复最近事件对象，"
             "因此应先重新与目标 NPC 交互，再使用这种物品。普通全局效果脚本可能忽略事件上下文，不要把所有 apply_to_all 物品都视为剧情物品。"
             "对于任何明确的 search/touch 或 transition 目标，提交 navigate 和 target_id；"
+            "空间任务可提交 move_to(x,y,face)：精确站位且不自动调查，到达须同时满足位置和朝向。"
+            "放置物品前调用 preview_item_placement 检查实际落点与站位；合法只代表可放置，不代表任务有效。"
+            "inspect_target.motion 是已观察移动轨迹，默认最近一段，可用 motion_offset 从 0 分页读取；不代表未来路线。"
+            "motion.moved 仅指历史移动；current_status 和 observed_stationary_seconds 描述当前观测，unknown 不代表停住。"
+            "observe_target 可在不发送按键的情况下进行短时定点观察；observation_windows 是有限历史样本，不证明对象永远静止或移动的必然原因。"
+            "位置只对 sample_frame 有效；position_is_stationary=false 时不得把坐标当成已确认停留点，执行前可重新查询。"
+            "latest_action_association 仅区分原生确认触发与动作期间观测，不提供移动规则或未来路线。"
             "只有 get_navigation 中 status=reachable、transition 或 blocked_by_interactable 的目标可提交 navigate；"
             "blocked_by_transition 和 unreachable_static 不能直接提交。targets_returned < targets_total 时可用 limit=40 获取更多候选详情。"
             "使用 get_tool_output 时必须沿 next_offset 连续读取到 complete=true；不能根据部分分页输出声称没有其他候选或证据。"
@@ -13776,6 +14034,9 @@ class DebugState:
             })
             evidence["choice"] = {"prompt": choice.get("prompt"), "option": option}
             risk = "The active choice generation and selected option will be revalidated before confirmation."
+        elif action == "move_to":
+            args = {key: raw[key] for key in ("x", "y", "face") if key in raw}
+            intent, preview = "position_player", self.action_preview("move_to", args)
         elif action == "navigate":
             target_id = int(raw["target_id"])
             target = next((item for item in state.get("objects") or [] if str(item.get("id")) == str(target_id)), None)
@@ -13873,13 +14134,13 @@ class DebugState:
     def agent_decision_submission_error(self, raw: dict) -> dict | None:
         """Return a repairable error for the minimal submit_decision contract."""
         issues: list[dict] = []
-        allowed_keys = {"action", "target_id", "item_id", "role_id", "target", "option_index", "reason"}
+        allowed_keys = {"action", "target_id", "item_id", "role_id", "target", "option_index", "reason", "x", "y", "face"}
         for key in raw:
             if key not in allowed_keys:
                 issues.append({"field": key, "code": "unsupported_field", "message": f"{key} is not part of the minimal decision contract"})
         action = raw.get("action")
         allowed_actions = {
-            "advance_dialog", "select_choice", "navigate", "use_item", "equip_item",
+            "advance_dialog", "select_choice", "navigate", "move_to", "use_item", "equip_item",
             "buy_item", "sell_item", "leave_shop",
         }
         if action not in allowed_actions:
@@ -13887,7 +14148,7 @@ class DebugState:
                 "field": "action",
                 "code": "invalid_action",
                 "message": (
-                    "action must be advance_dialog, select_choice, navigate, use_item, "
+                    "action must be advance_dialog, select_choice, navigate, move_to, use_item, "
                     "equip_item, buy_item, sell_item, or leave_shop"
                 ),
             })
@@ -13903,6 +14164,12 @@ class DebugState:
                 return None
             return value if value >= (0 if allow_zero else 1) else None
 
+        if action == "move_to":
+            for key in ("x", "y"):
+                if type(raw.get(key)) is not int:
+                    issues.append({"field": key, "code": "invalid_coordinate", "message": "move_to requires integer world coordinates"})
+            if "face" in raw and raw["face"] not in MOVE_DELTAS:
+                issues.append({"field": "face", "code": "invalid_direction", "message": "face must be up, down, left, or right"})
         if action == "navigate" and positive_int("target_id") is None:
             issues.append({"field": "target_id", "code": "invalid_target_id", "message": "navigate requires a positive target_id"})
         if action == "navigate" and "item_id" in raw and positive_int("item_id") is None:
@@ -13927,6 +14194,7 @@ class DebugState:
             "advance_dialog": {"action", "reason"},
             "select_choice": {"action", "option_index", "reason"},
             "navigate": {"action", "target_id", "item_id", "reason"},
+            "move_to": {"action", "x", "y", "face", "reason"},
             "use_item": {"action", "item_id", "role_id", "target", "reason"},
             "equip_item": {"action", "item_id", "role_id", "reason"},
             "buy_item": {"action", "item_id", "reason"},
@@ -14319,6 +14587,12 @@ class DebugState:
             decision["risk"] = (
                 f"{decision.get('risk') or ''} Latest-state validation rejected item use: {error}."
             ).strip()
+            return decision
+        if tool == "move_to":
+            args = action.get("args") or {}
+            route = self.route_to_position(latest_state, **args)
+            if not route["ok"]:
+                self.reject_agent_decision(decision, "position_invalid", error=route["status"])
             return decision
         if action.get("tool") != "navigation_step":
             return decision
