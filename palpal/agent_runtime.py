@@ -92,6 +92,10 @@ class ReplanRequired(RuntimeError):
     """A safe, transient state change invalidated a recommendation."""
 
 
+class BattleInteraction(RuntimeError):
+    """A battle script needs the main Agent to handle story interaction."""
+
+
 class BattleStarted(RuntimeError):
     """A new formal battle superseded ordinary model work without consuming a turn."""
 
@@ -585,6 +589,14 @@ class BattleDelegate:
                     return state
             elif int(battle.get("generation") or 0) != generation:
                 raise RuntimeError("battle_generation_changed")
+            elif self.debug.battle_interaction(state) is not None:
+                interaction = self.debug.battle_interaction(state)
+                self._persist_control(status="suspended", phase=interaction)
+                self._emit(
+                    "suspended", "Battle Agent yielded to story interaction.",
+                    {"interaction": interaction},
+                )
+                raise BattleInteraction(interaction)
             elif battle.get("phase") == "reward":
                 return state
             elif battle.get("phase") == "command":
@@ -1151,7 +1163,11 @@ class BattleDelegate:
         }
 
     async def run(self, initial_state: dict) -> dict:
-        control = self._begin(initial_state)
+        control = self._control()
+        if self.suspended_battle_ended(initial_state):
+            self.actions = list(control.get("actions") or [])
+        else:
+            control = self._begin(initial_state)
         generation = int(control["battle_generation"])
         invalid = 0
         feedback = ""
@@ -1222,6 +1238,8 @@ class BattleDelegate:
                     if self._matching_last_battle(latest, generation) is not None:
                         continue
                     raise RuntimeError("battle_generation_changed")
+                if self.debug.battle_interaction(latest) is not None:
+                    continue
                 if (
                     latest_window["command_generation"] != frozen_window["command_generation"]
                     or latest_window["player_index"] != frozen_window["player_index"]
@@ -1314,6 +1332,14 @@ class BattleDelegate:
                 int(frozen_window["command_generation"]),
             )
             feedback = ""
+
+    def suspended_battle_ended(self, state: dict) -> bool:
+        control = self._control()
+        return (
+            control.get("status") == "suspended"
+            and str(state.get("game_instance_id") or "") == str(control.get("game_instance_id") or "")
+            and self._matching_last_battle(state, int(control.get("battle_generation") or 0)) is not None
+        )
 
 
 class AgentRuntime:
@@ -3034,7 +3060,7 @@ class AgentRuntime:
         battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
         if state.get("in_battle") is not True or battle is None:
             return 0
-        if self.debug.prebattle_interaction(state) is not None:
+        if self.debug.battle_interaction(state) is not None:
             return 0
         return int(battle.get("generation") or 0)
 
@@ -3084,12 +3110,20 @@ class AgentRuntime:
                     return
                 if inspection_feedback:
                     feedback = feedback + "\n\n" + inspection_feedback
-                if before.get("in_battle") and self.debug.prebattle_interaction(before) is None:
-                    if not isinstance(before.get("battle"), dict):
+                suspended_ended = self.battle_delegate.suspended_battle_ended(before)
+                if suspended_ended or (before.get("in_battle") and self.debug.battle_interaction(before) is None):
+                    if not suspended_ended and not isinstance(before.get("battle"), dict):
                         self._pause("battle_state_unavailable")
                         return
                     try:
                         summary = await self.battle_delegate.run(before)
+                    except BattleInteraction:
+                        feedback = (
+                            "The battle is suspended for a story dialog or choice. "
+                            "Handle the visible interaction; the same Battle Agent will resume afterward. "
+                            "Do not treat this handoff as battle completion."
+                        )
+                        continue
                     except Exception as exc:
                         reason = str(exc) or "battle_delegate_failed"
                         stopped = self.cancel_event.is_set() or reason == "interrupted"
