@@ -13,6 +13,7 @@ from palpal.agent_runtime import (
     DEFAULT_COMPACT_AT_TOKENS,
     DEFAULT_COMPACT_RETAIN_TOKENS,
     AgentRuntime,
+    BattleInteraction,
     ReplanRequired,
 )
 
@@ -1793,7 +1794,8 @@ def test_battle_delegate_failure_and_interrupt_emit_terminal_trace(tmp_path):
     assert interrupted.snapshot()["battle_delegate"]["status"] == "stopped"
 
 
-def test_prebattle_dialog_uses_main_agent_then_delegates_at_command(tmp_path, monkeypatch):
+@pytest.mark.parametrize("phase", ["pre_battle", "resolving", "reward"])
+def test_battle_dialog_uses_main_agent_then_delegates_at_command(tmp_path, monkeypatch, phase):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
     prebattle = {
@@ -1801,9 +1803,9 @@ def test_prebattle_dialog_uses_main_agent_then_delegates_at_command(tmp_path, mo
         "game_instance_id": "battle-game",
         "in_battle": True,
         "battle": {
-            "generation": 5, "phase": "pre_battle", "result": "terminated", "enemies": [],
+            "generation": 5, "phase": phase, "result": "ongoing", "enemies": [],
         },
-        "dialog": {"active": True, "latest_event": {"message_id": 10, "text": "来吧"}},
+        "dialog": {"active": True, "visible": True, "latest_event": {"message_id": 10, "text": "来吧"}},
         "control": {
             "owner": "client", "phase": "dialog",
             "allowed_actions": ["advance_dialog"], "navigation_ready": False,
@@ -1848,6 +1850,91 @@ def test_prebattle_dialog_uses_main_agent_then_delegates_at_command(tmp_path, mo
         event for event in runtime.events()
         if event["type"] == "action" and event["phase"] == "failed"
     ]
+
+
+@pytest.mark.parametrize("ends_in_dialog", [False, True])
+def test_battle_story_handoff_preserves_delegate_and_completes(tmp_path, monkeypatch, ends_in_dialog):
+    debug = make_debug_state(tmp_path)
+    runtime = debug.agent_runtime
+    command = {
+        **make_state(), "game_instance_id": "battle-game", "in_battle": True,
+        "battle": {
+            "generation": 9, "command_generation": 1, "phase": "command",
+            "current_player_index": 0, "enemies": [],
+            "available_actions": [{
+                "action_type": "attack", "object_id": 0,
+                "target_mode": "single", "valid_target_indices": [0],
+            }],
+        },
+    }
+    story = {
+        **command,
+        "battle": {**command["battle"], "phase": "resolving"},
+        "dialog": {"active": True, "visible": True, "latest_event": {
+            "message_id": 12584, "text": "好像不太容易吃到喔．．",
+        }},
+    }
+    ended = {
+        **make_state(), "game_instance_id": "battle-game", "in_battle": False,
+        "last_battle": {"generation": 9, "result": "lost", "players": [], "enemies": []},
+    }
+    current = {"state": command}
+    debug.snapshot = lambda: current["state"]
+    writes = []
+    child_ids = []
+
+    def execute_battle(args):
+        writes.append(args)
+        child_ids.append(runtime.state["battle_delegate"]["child_session_id"])
+        current["state"] = story if len(writes) == 1 else ended
+        return {**args, "status": "submitted"}
+
+    def execute_story(_decision):
+        control = runtime.state["battle_delegate"]
+        assert control["status"] == "suspended"
+        assert control["instruction_count"] == 1
+        assert len(control["actions"]) == 1
+        current["state"] = ended if ends_in_dialog else {
+            **command, "battle": {**command["battle"], "command_generation": 2},
+        }
+        return {"ok": True, "tool": "advance_dialog", "delta": {}}
+
+    runtime.battle_decision_provider = lambda *_args: {
+        "action_type": "attack", "object_id": 0, "target_index": 0,
+    }
+    runtime.decision_provider = lambda *_args: decision(
+        "advance_dialog", {"max_presses": 1}, "advance_dialog",
+    )
+    debug.write_battle_action = execute_battle
+    monkeypatch.setattr(runtime, "_execute_decision", execute_story)
+    runtime.start(None, 2)
+    paused = wait_for_pause(runtime)
+
+    assert paused["stop_reason"] == "battle_lost"
+    control = paused["battle_delegate"]
+    assert control["status"] == "completed"
+    assert control["instruction_count"] == (1 if ends_in_dialog else 2)
+    assert len(set(child_ids)) == 1
+    assert len(control["actions"]) == len(writes)
+    assert len([e for e in runtime.events() if e["type"] == "battle" and e["phase"] == "suspended"]) == 1
+    assert not [e for e in runtime.events() if e["phase"] == "failed"]
+
+
+@pytest.mark.parametrize("interaction", ["dialog", "choice"])
+def test_battle_wait_yields_to_story_without_sending_actions(tmp_path, interaction):
+    debug = make_debug_state(tmp_path)
+    delegate = debug.agent_runtime.battle_delegate
+    state = {
+        **make_state(), "game_instance_id": "battle-game", "in_battle": True,
+        "battle": {"generation": 9, "phase": "resolving", "enemies": []},
+        interaction: {"active": True, "visible": True},
+    }
+    debug.snapshot = lambda: state
+    delegate._begin(state)
+    with pytest.raises(BattleInteraction):
+        delegate._wait_for_control_or_end(9)
+    assert delegate._control()["status"] == "suspended"
+    assert delegate._control()["instruction_count"] == 0
 
 
 def test_battle_delegate_reuses_child_session_for_same_generation(tmp_path):

@@ -1014,16 +1014,20 @@ class DebugState:
         return self.action_path.exists() or local_pending or bool(native and native["pending"])
 
     @staticmethod
-    def prebattle_interaction(state: dict) -> str | None:
-        """Return the client-owned interaction active during native pre-battle."""
+    def battle_interaction(state: dict) -> str | None:
+        """Return a story interaction that temporarily owns battle control."""
         if not state.get("in_battle"):
             return None
         battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
-        if battle is None or battle.get("phase") != "pre_battle":
+        if battle is None or battle.get("phase") not in {"pre_battle", "resolving", "reward"}:
             return None
         if bool((state.get("choice") or {}).get("active")):
             return "choice"
-        if bool((state.get("dialog") or {}).get("active")):
+        dialog = state.get("dialog") or {}
+        if dialog.get("active") and (
+            battle.get("phase") == "pre_battle"
+            or (dialog.get("visible") and not dialog.get("held"))
+        ):
             return "dialog"
         return None
 
@@ -1054,14 +1058,14 @@ class DebugState:
             owner, phase, allowed = "game", "unavailable", []
         elif state.get("in_battle"):
             battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
-            prebattle_interaction = self.prebattle_interaction(state)
+            interaction = self.battle_interaction(state)
             if battle is None:
                 owner, phase, allowed = "game", "battle", []
             elif self.action_pending(state):
                 owner, phase, allowed = "game", "battle", []
-            elif prebattle_interaction == "choice":
+            elif interaction == "choice":
                 owner, phase, allowed = "client", "choice", ["choice_select", "press_buttons"]
-            elif prebattle_interaction == "dialog":
+            elif interaction == "dialog":
                 owner, phase, allowed = "client", "dialog", ["advance_dialog"]
             elif battle.get("phase") in {"command", "reward"}:
                 owner, phase, allowed = "client", "battle", ["battle_action", "press_buttons"]
@@ -10600,7 +10604,7 @@ class DebugState:
             return "state_parse_error"
         if state.get("_debug", {}).get("runtime_stale"):
             return "runtime_stale"
-        if state.get("in_battle") and self.prebattle_interaction(state) not in {"dialog", "choice"}:
+        if state.get("in_battle") and self.battle_interaction(state) not in {"dialog", "choice"}:
             return "in_battle"
         if state.get("in_main_game") is False:
             return "not_in_main_game"
@@ -10804,21 +10808,21 @@ class DebugState:
                 return finish_result("choice_active")
 
             started_in_battle = bool(state.get("in_battle"))
-            initial_prebattle_generation = None
-            if self.prebattle_interaction(state) in {"dialog", "choice"}:
+            initial_interaction_generation = None
+            if self.battle_interaction(state) in {"dialog", "choice"}:
                 try:
-                    initial_prebattle_generation = int(
+                    initial_interaction_generation = int(
                         (state.get("battle") or {}).get("generation") or 0
                     )
                 except (TypeError, ValueError):
-                    initial_prebattle_generation = None
+                    initial_interaction_generation = None
 
             def finish_stop_status(stop_status: str) -> dict | None:
                 nonlocal state
                 if stop_status == "in_battle":
                     stopped_state = state
                     state = self.snapshot()
-                    interaction = self.prebattle_interaction(state)
+                    interaction = self.battle_interaction(state)
                     stopped_battle = (
                         stopped_state.get("battle")
                         if isinstance(stopped_state.get("battle"), dict)
@@ -10840,7 +10844,7 @@ class DebugState:
                         return None
                     valid_handoff = generation > 0 and (
                         not started_in_battle
-                        or generation == initial_prebattle_generation
+                        or generation == initial_interaction_generation
                     )
                     if valid_handoff and battle.get("phase") != "pre_battle":
                         return finish_result("battle_started")
@@ -13591,7 +13595,7 @@ class DebugState:
             if (
                 latest.get("in_battle") is True
                 and latest_battle is not None
-                and self.prebattle_interaction(latest) is None
+                and self.battle_interaction(latest) is None
             ):
                 return {
                     "ok": False,

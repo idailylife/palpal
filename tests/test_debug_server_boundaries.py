@@ -870,6 +870,21 @@ def test_prebattle_interactions_are_client_controlled(
     assert control["battle_state_available"] is True
 
 
+@pytest.mark.parametrize("phase", ["resolving", "reward"])
+@pytest.mark.parametrize("interaction", ["dialog", "choice"])
+def test_battle_story_interactions_are_client_controlled(tmp_path, phase, interaction):
+    debug = make_debug_state(tmp_path)
+    state = {
+        **make_state(), "in_battle": True,
+        "battle": {"generation": 9, "phase": phase},
+        interaction: {"active": True, "visible": True, "held": False},
+    }
+    control = debug.control_state(state)
+    assert control["owner"] == "client"
+    assert control["phase"] == interaction
+    assert "battle_action" not in control["allowed_actions"]
+
+
 def test_terminated_prebattle_dialog_is_client_controlled(tmp_path):
     debug = make_debug_state(tmp_path)
     state = {
@@ -1303,17 +1318,19 @@ def test_advance_dialog_allows_prebattle_and_stops_at_native_termination(
     assert written == [(["search"], 1)]
 
 
-def test_advance_dialog_hands_off_when_prebattle_enters_command(tmp_path, monkeypatch):
+@pytest.mark.parametrize("initial_phase", ["pre_battle", "resolving", "reward"])
+@pytest.mark.parametrize("next_phase", ["command", "resolving", "reward"])
+def test_advance_dialog_hands_off_when_battle_story_ends(tmp_path, monkeypatch, initial_phase, next_phase):
     debug = make_debug_state(tmp_path)
-    active = active_dialog_state("准备战斗")
+    active = visible_dialog_state("准备战斗")
     active.update({
         "in_battle": True,
-        "battle": {"generation": 8, "phase": "pre_battle"},
+        "battle": {"generation": 8, "phase": initial_phase},
     })
     command = {
         **make_state(),
         "in_battle": True,
-        "battle": {"generation": 8, "phase": "command"},
+        "battle": {"generation": 8, "phase": next_phase},
     }
 
     result, written = run_dialog_scenario(
