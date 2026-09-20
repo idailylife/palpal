@@ -2806,6 +2806,7 @@ PAL_InterpretInstruction(
       {
          w = 1;
       }
+      PALPAL_AgentBattleHPRedistributed();
       x = w + 1;
       y = w;
 
