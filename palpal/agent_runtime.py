@@ -64,6 +64,13 @@ order and the latest survival_risk window: effective recovery, total incoming da
 new controls, poison and knockouts. Delivery completeness concerns sequence delivery
 only; unresolved HP accounting means additional unknown effects, not zero damage.
 An accepted submission is not execution. Reassess when enemy_roster_changes appears.
+Read battle_messages as player-visible feedback for that action. An explicit failure
+or no-effect message is negative evidence for that attempt; prefer supported alternatives
+over repeating it unchanged. One failure does not prove permanent immunity.
+no_numeric_change_observed alone does not mean failure: control spells can succeed
+without damage, and unreported enemy status is unknown. enemy_targets lists intended
+recipients, not confirmed effects. Area-action messages do not prove every target failed.
+Apply the same rules to historical samples; missing messages in older samples are unknown.
 
 Team decisions
 Account for allies' committed_action before assigning healing, control recovery,
@@ -275,6 +282,9 @@ class BattleDelegate:
             compact["player_changes"] = player_changes
         if outcome.get("no_numeric_change_observed"):
             compact["no_numeric_change_observed"] = True
+        for key in ("battle_messages", "enemy_targets", "battle_messages_truncated"):
+            if outcome.get(key):
+                compact[key] = copy.deepcopy(outcome[key])
         return compact
 
     @classmethod

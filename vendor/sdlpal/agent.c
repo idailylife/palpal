@@ -64,6 +64,7 @@ static PALPALAGENTTRIGGEROBSERVATION g_agent_trigger_observation;
 #define PALPAL_AGENT_OBJECT_DESC_CHARS 512
 #define PALPAL_AGENT_VISIBLE_OUTCOME_CAPACITY 32
 #define PALPAL_AGENT_VISIBLE_NUMBER_CAPACITY 32
+#define PALPAL_AGENT_VISIBLE_MESSAGE_CAPACITY 8
 
 typedef struct tagPALPALAGENTOBJECTDESC
 {
@@ -146,6 +147,7 @@ typedef struct tagPALPALAGENTBATTLE
 {
    DWORD generation;
    DWORD command_generation;
+   BOOL hp_tracking_safe;
    PALPALAGENTBATTLEPHASE phase;
    BOOL awaiting_ack;
    WORD current_player_index;
@@ -175,6 +177,10 @@ typedef struct tagPALPALAGENTVISIBLEOUTCOME
    SHORT target_index;
    WORD target_object_id;
    INT mp_cost;
+   BOOL enemy_target;
+   WCHAR messages[PALPAL_AGENT_VISIBLE_MESSAGE_CAPACITY][256];
+   int message_count;
+   BOOL messages_truncated;
    WORD player_hp_before[MAX_PLAYERS_IN_PARTY];
    WORD player_hp_after[MAX_PLAYERS_IN_PARTY];
    WORD player_hp_max[MAX_PLAYERS_IN_PARTY];
@@ -200,6 +206,7 @@ typedef struct tagPALPALAGENTVISIBLEOUTCOME
 typedef struct tagPALPALAGENTLASTBATTLE
 {
    BOOL valid;
+   BOOL hp_tracking_safe;
    DWORD generation;
    int result;
    BOOL is_boss;
@@ -3232,6 +3239,12 @@ PALPAL_AgentEndSellMenu(
 }
 
 VOID
+PALPAL_AgentBattleHPRedistributed(VOID)
+{
+   g_agent_battle.hp_tracking_safe = FALSE;
+}
+
+VOID
 PALPAL_AgentBattleBegin(
    VOID
 )
@@ -3245,6 +3258,7 @@ PALPAL_AgentBattleBegin(
    g_agent_visible_outcome_count = 0;
    g_agent_visible_sequence = 0;
    g_agent_battle.generation = generation ? generation : 1;
+   g_agent_battle.hp_tracking_safe = TRUE;
    g_agent_battle.phase = kPalpalAgentBattlePreBattle;
    g_agent_battle.started_ticks = SDL_GetTicks();
    if (gpGlobals == NULL)
@@ -3317,7 +3331,7 @@ PALPAL_AgentVisibleActionBegin(
          if (number < gpGlobals->g.nMagic)
             g_agent_visible_active.mp_cost = gpGlobals->g.lprgMagic[number].wCostMP;
       }
-      if (sTarget >= 0 && sTarget <= g_Battle.wMaxEnemyIndex)
+      if (sTarget >= -1 && sTarget <= g_Battle.wMaxEnemyIndex)
       {
          BOOL enemy_target = iActionType == kBattleActionAttack ||
             iActionType == kBattleActionThrowItem ||
@@ -3325,7 +3339,8 @@ PALPAL_AgentVisibleActionBegin(
          if (iActionType == kBattleActionMagic && wObjectID > 0 && wObjectID < MAX_OBJECTS)
             enemy_target = (gpGlobals->g.rgObject[wObjectID].magic.wFlags &
                kMagicFlagUsableToEnemy) != 0;
-         if (enemy_target)
+         g_agent_visible_active.enemy_target = enemy_target;
+         if (enemy_target && sTarget >= 0)
             g_agent_visible_active.target_object_id = g_Battle.rgEnemy[sTarget].wObjectID;
       }
    }
@@ -3353,6 +3368,18 @@ PALPAL_AgentVisibleActionBegin(
       g_agent_visible_active.enemy_object_id[i] = g_Battle.rgEnemy[i].wObjectID;
       g_agent_visible_active.enemy_hp_before[i] = g_Battle.rgEnemy[i].e.wHealth;
    }
+}
+
+VOID
+PALPAL_AgentVisibleActionTarget(SHORT sTarget)
+{
+   if (!g_agent_visible_active.valid || !g_agent_visible_active.player_actor)
+      return;
+   g_agent_visible_active.target_index = sTarget;
+   g_agent_visible_active.target_object_id = 0;
+   if (g_agent_visible_active.enemy_target && sTarget >= 0 &&
+       sTarget < MAX_ENEMIES_IN_TEAM)
+      g_agent_visible_active.target_object_id = g_Battle.rgEnemy[sTarget].wObjectID;
 }
 
 VOID
@@ -3509,6 +3536,7 @@ PALPAL_AgentBattleEnd(
 
    memset(&g_agent_last_battle, 0, sizeof(g_agent_last_battle));
    g_agent_last_battle.valid = TRUE;
+   g_agent_last_battle.hp_tracking_safe = g_agent_battle.hp_tracking_safe;
    g_agent_last_battle.generation = g_agent_battle.generation;
    g_agent_last_battle.result = iResult;
    g_agent_last_battle.is_boss = g_Battle.fIsBoss;
@@ -4464,6 +4492,26 @@ PALPAL_AgentWriteVisibleOutcome(
       }
       fprintf(fp, "}");
    }
+   fprintf(fp, "],\"battle_messages\":[");
+   for (i = 0; i < outcome->message_count; i++)
+   {
+      if (i) fprintf(fp, ",");
+      PALPAL_AgentWriteJsonWideString(fp, outcome->messages[i]);
+   }
+   fprintf(fp, "],\"battle_messages_truncated\":%s,\"enemy_targets\":[",
+      outcome->messages_truncated ? "true" : "false");
+   first = 1;
+   for (i = 0; i < MAX_ENEMIES_IN_TEAM; i++)
+   {
+      if (!outcome->enemy_target || !outcome->enemy_object_id[i] ||
+          (outcome->target_index != -1 && outcome->target_index != i)) continue;
+      if (!first) fprintf(fp, ",");
+      fprintf(fp, "{\"slot_index\":%d,\"object_id\":%u,\"name\":",
+         i, outcome->enemy_object_id[i]);
+      PALPAL_AgentWriteJsonWideString(fp, PAL_GetWord(outcome->enemy_object_id[i]));
+      fprintf(fp, "}");
+      first = 0;
+   }
    fprintf(fp, "],\"no_numeric_change_observed\":%s}", numeric ? "false" : "true");
 }
 
@@ -4925,6 +4973,7 @@ PALPAL_AgentWriteBattle(
    fprintf(fp, "],");
    PALPAL_AgentWriteBattleActions(fp);
    fprintf(fp, ",");
+   fprintf(fp, "\"hp_tracking_safe\":%s,", g_agent_battle.hp_tracking_safe ? "true" : "false");
    PALPAL_AgentWriteVisibleOutcomes(fp, g_agent_visible_outcomes,
       g_agent_visible_outcome_count);
    fprintf(fp, "}");
@@ -5001,6 +5050,7 @@ PALPAL_AgentWriteLastBattle(
       first = 0;
    }
    fprintf(fp, "],");
+   fprintf(fp, "\"hp_tracking_safe\":%s,", g_agent_last_battle.hp_tracking_safe ? "true" : "false");
    PALPAL_AgentWriteVisibleOutcomes(fp, g_agent_last_battle.visible_outcomes,
       g_agent_last_battle.visible_outcome_count);
    fprintf(fp, "}");
@@ -5130,6 +5180,22 @@ PALPAL_AgentObserveDialogText(
    if (!PALPAL_AgentEnabled() || gpGlobals == NULL || lpszText == NULL || lpszText[0] == 0)
    {
       return;
+   }
+
+   /* Keep player-visible script feedback with the action that produced it.
+    * Text applies to the whole action, not independently to every area target. */
+   if (gpGlobals->fInBattle && g_agent_visible_active.valid)
+   {
+      int index = g_agent_visible_active.message_count;
+      if (index < PALPAL_AGENT_VISIBLE_MESSAGE_CAPACITY)
+      {
+         PALPAL_AgentCopyWideString(g_agent_visible_active.messages[index], 256, lpszText);
+         g_agent_visible_active.message_count++;
+         if (wcslen(lpszText) >= 256)
+            g_agent_visible_active.messages_truncated = TRUE;
+      }
+      else
+         g_agent_visible_active.messages_truncated = TRUE;
    }
 
    if (g_TextLib.nCurrentDialogLine == 0 && PALPAL_AgentIsSpeakerLine(lpszText))

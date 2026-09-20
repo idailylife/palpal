@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from palpal.agent_runtime import BattleStarted
+from palpal.agent_runtime import BattleDelegate, BattleStarted
 from palpal.debug_server import COMBAT_SAMPLE_CAPACITY
 from tests.support import fake_load_command, fake_save_command, make_debug_state, make_state, write_state
 
@@ -38,6 +38,7 @@ def battle_state(*, generation=4, sequence=1, result="ongoing"):
         "in_battle": True,
         "battle": {
             "generation": generation,
+            "hp_tracking_safe": True,
             "command_generation": 2,
             "phase": "command",
             "players": [{"index": 0, "role_id": 0, "name": "李逍遥", "hp": 100, "max_hp": 100, "mp": 12, "max_mp": 30}],
@@ -62,6 +63,74 @@ def test_visible_outcomes_are_projected_without_enemy_internal_state(tmp_path):
     encoded = json.dumps(view, ensure_ascii=False)
     assert '"hp": 999' not in encoded
     assert "magic_id" not in encoded
+
+
+def test_spell_failure_feedback_survives_delivery_and_persistent_memory(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = battle_state()
+    outcome = state["battle"]["visible_outcomes"][0]
+    outcome.update(enemy_changes=[], numbers=[], no_numeric_change_observed=True,
+                   battle_messages=["失敗　沒有效果"], enemy_targets=[
+                       {"slot_index": 0, "object_id": 81, "name": "灯笼", "hp": 999}])
+    debug.observe_combat_knowledge(state)
+    view = debug.current_player_battle_view(state)
+    delivered = BattleDelegate._agent_battle_view(
+        view, include_experience=False, after_outcome_sequence=0)["new_outcomes"][0]
+    assert delivered["battle_messages"] == ["失敗　沒有效果"]
+    assert delivered["target"]["object_id"] == 81
+    assert delivered["enemy_targets"] == [{"slot_index": 0, "object_id": 81, "name": "灯笼"}]
+
+    # A fresh reader and later encounter must retain this evidence in the
+    # compact historical prompt, even though this action caused no damage.
+    restored = make_debug_state(tmp_path)
+    later = battle_state(generation=5)
+    later["battle"]["visible_outcomes"] = []
+    experience = restored.combat_experience(later["battle"])
+    compact = BattleDelegate._compact_experience(later["battle"], experience)
+    sample = compact["enemy_memories"][0]["player_actions"][0]["recent_samples"][0]
+    assert sample["battle_messages"] == ["失敗　沒有效果"]
+    assert sample["no_numeric_change_observed"]
+    assert sample["enemy_targets"] == delivered["enemy_targets"]
+    assert '"hp": 999' not in json.dumps(sample)
+
+
+def test_area_spell_keeps_unaffected_targets_without_claiming_individual_failure(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = battle_state()
+    outcome = state["battle"]["visible_outcomes"][0]
+    targets = [{"slot_index": 0, "object_id": 81, "name": "灯笼"},
+               {"slot_index": 1, "object_id": 82, "name": "另一只"}]
+    state["battle"]["enemies"] = targets
+    outcome.update(target={"index": -1, "mode": "all"}, enemy_targets=targets,
+                   battle_messages=["失敗", "沒有效果"], battle_messages_truncated=True)
+    # First enemy takes damage, second does not; both retain the same action
+    # context without assigning the action-wide text to one individual.
+    debug.observe_combat_knowledge(state)
+    debug.observe_combat_knowledge(state)
+    memories = debug.combat_experience(state["battle"])["enemy_memories"]
+    assert len(memories) == 2
+    for memory in memories:
+        samples = memory["player_actions"][0]["samples"]
+        assert len(samples) == 1
+        assert samples[0]["enemy_targets"] == targets
+        assert samples[0]["battle_messages"] == ["失敗", "沒有效果"]
+        assert samples[0]["battle_messages_truncated"]
+        assert "immune" not in samples[0] and "failed" not in samples[0]
+    assert memories[1]["player_actions"][0]["samples"][0]["enemy_changes"] == []
+
+
+def test_legacy_non_numeric_spell_is_not_promoted_to_explicit_failure(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = battle_state()
+    outcome = state["battle"]["visible_outcomes"][0]
+    outcome.update(enemy_changes=[], numbers=[], no_numeric_change_observed=True)
+    debug.observe_combat_knowledge(state)
+    sample = debug.combat_experience(state["battle"])["enemy_memories"][0]["player_actions"][0]["samples"][0]
+    assert sample["battle_messages"] == []
+    compact = BattleDelegate._compact_outcome(sample)
+    assert compact["no_numeric_change_observed"]
+    assert "battle_messages" not in compact
+    assert "failed" not in compact
 
 
 def test_player_battle_projection_is_pure_idempotent_and_knowledge_free(tmp_path):
@@ -166,7 +235,7 @@ def test_v1_combat_knowledge_migrates_without_using_or_rewriting_encounters(tmp_
     assert migrated["seen"] == ["old"]
     assert migrated["enemies"] == {}
     assert migrated["active_battles"] == {}
-    assert migrated["hp_tracking_version"] == 2
+    assert migrated["hp_tracking_version"] == 3
 
 
 def test_defeated_enemy_hp_interval_is_published_only_after_battle_completion(tmp_path):
@@ -230,7 +299,7 @@ def test_single_enemy_win_log_fills_missing_defeated_marker_and_is_idempotent(tm
         "lower_exclusive": 623,
         "upper_inclusive": 683,
         "defeat_confirmation": "completed_single_enemy_win",
-        "tracking_version": 2,
+        "tracking_version": 3,
         "game_instance_id": "game-a",
         "battle_generation": 4,
     }]
@@ -265,6 +334,61 @@ def test_transient_empty_enemy_slot_before_final_outcome_preserves_accumulated_d
         "status": "estimated", "lower_exclusive": 100,
         "upper_inclusive": 129, "sample_count": 1,
     }
+
+
+@pytest.mark.parametrize("metadata", [False, None])
+def test_redistribution_or_old_runtime_invalidates_pending_hp_only(tmp_path, metadata):
+    debug = make_debug_state(tmp_path)
+    state = battle_state()
+    state["battle"]["visible_outcomes"][0]["enemy_changes"][0]["defeated"] = True
+    debug.observe_combat_knowledge(state)
+    assert debug.read_exploration()["combat_knowledge"]["active_battles"][
+        "game-a:4"
+    ]["pending_hp_samples"]
+
+    # The split may happen between snapshots, after another enemy was defeated.
+    source = state.pop("battle") | {"result": "won"}
+    if metadata is None:
+        source.pop("hp_tracking_safe")
+    else:
+        source["hp_tracking_safe"] = metadata
+    state.update(in_battle=False, last_battle=source)
+    debug.observe_combat_knowledge(state)
+    debug.observe_combat_knowledge(state)
+    knowledge = debug.read_exploration()["combat_knowledge"]
+    assert all(not e.get("hp_samples") for e in knowledge["enemies"].values())
+    assert knowledge["actions"]
+    assert not knowledge["active_battles"]
+
+    # A completed log first encountered after a restart must also be rejected,
+    # including the legacy single-enemy victory fallback.
+    source["visible_outcomes"][0]["enemy_changes"][0].pop("defeated")
+    assert debug._single_enemy_win_hp_fallback(source) is None
+    (tmp_path / "fresh").mkdir()
+    fresh = make_debug_state(tmp_path / "fresh")
+    fresh.observe_combat_knowledge(state)
+    assert all(not e.get("hp_samples") for e in
+               fresh.read_exploration()["combat_knowledge"]["enemies"].values())
+
+
+def test_v2_hp_migration_discards_unverifiable_samples_preserving_other_experience(tmp_path):
+    debug = make_debug_state(tmp_path)
+    data = debug.empty_exploration()
+    knowledge = data["combat_knowledge"]
+    knowledge.update(hp_tracking_version=2, active_battles={"old": {"pending_hp_samples": [{}]}},
+                     actions={"kept": {"samples": [{"amount": 66}]}}, seen=["old:result"])
+    knowledge["enemies"] = {"445": {
+        "hp_samples": [{"lower_exclusive": 0, "upper_inclusive": 65}],
+        "enemy_effect_samples": [{"sequence": 1}],
+    }}
+    debug.write_exploration(data)
+    migrated = debug.read_exploration()["combat_knowledge"]
+    assert migrated["hp_tracking_version"] == 3
+    assert migrated["enemies"]["445"]["hp_samples"] == []
+    assert migrated["enemies"]["445"]["enemy_effect_samples"] == [{"sequence": 1}]
+    assert migrated["actions"] == knowledge["actions"]
+    assert migrated["seen"] == ["old:result"]
+    assert migrated["active_battles"] == {}
 
 
 @pytest.mark.parametrize("mutation", ["multiple_enemies", "sequence_gap", "identity_change"])

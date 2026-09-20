@@ -3870,6 +3870,7 @@ PAL_BattlePlayerPerformAction(
       wMagicNum = gpGlobals->g.rgObject[wObject].magic.wMagicNumber;
 
       sTarget = FIGHT_DetectMagicTargetChange(wMagicNum, sTarget);
+      PALPAL_AgentVisibleActionTarget(sTarget);
 
       if (gpGlobals->g.lprgMagic[wMagicNum].wType == kMagicTypeSummon)
       {
@@ -4189,6 +4190,7 @@ PAL_BattlePlayerPerformAction(
       wMagicNum = gpGlobals->g.rgObject[wObject].magic.wMagicNumber;
 
       sTarget = FIGHT_DetectMagicTargetChange(wMagicNum, sTarget);
+      PALPAL_AgentVisibleActionTarget(sTarget);
 
       PAL_BattleShowPlayerPreMagicAnim(wPlayerIndex,
          (gpGlobals->g.lprgMagic[wMagicNum].wType == kMagicTypeSummon));

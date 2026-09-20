@@ -65,7 +65,7 @@ COMBAT_ENEMY_KEY_CAPACITY = 128
 COMBAT_ACTIVE_BATTLE_CAPACITY = 16
 COMBAT_SAMPLE_CAPACITY = 8
 COMBAT_SEEN_CAPACITY = 4096
-COMBAT_HP_TRACKING_VERSION = 2
+COMBAT_HP_TRACKING_VERSION = 3
 LOGICAL_ROOM_ID_RE = re.compile(r"^S\d+/M\d+:[0-9A-F]{12}$")
 MAX_OBJECT_INTERACTION_HISTORY = 20
 MAX_INTERACTION_CONTEXT_EVIDENCE = 40
@@ -4066,6 +4066,8 @@ class DebugState:
                 if not isinstance(knowledge.get(key), dict):
                     knowledge[key] = {}
             if knowledge.get("hp_tracking_version") != COMBAT_HP_TRACKING_VERSION:
+                # Older samples cannot prove that HP was not redistributed by
+                # division. Invalidate HP only; retain action/effect experience.
                 for enemy in knowledge["enemies"].values():
                     if isinstance(enemy, dict):
                         enemy["hp_samples"] = []
@@ -4114,6 +4116,20 @@ class DebugState:
             values.pop(oldest, None)
 
     @staticmethod
+    def _visible_battle_feedback(outcome: dict) -> dict:
+        # These messages describe the whole action. An area-action message
+        # cannot establish which individual target resisted it.
+        return {
+            "battle_messages": [text for text in outcome.get("battle_messages") or []
+                                if isinstance(text, str)][:8],
+            "battle_messages_truncated": bool(outcome.get("battle_messages_truncated")),
+            "enemy_targets": [
+                {key: target[key] for key in ("slot_index", "object_id", "name") if key in target}
+                for target in outcome.get("enemy_targets") or [] if isinstance(target, dict)
+            ],
+        }
+
+    @staticmethod
     def _visible_outcome_sample(outcome: dict, enemy_object_id: int) -> dict:
         actor = outcome.get("actor") if isinstance(outcome.get("actor"), dict) else {}
         action = outcome.get("action") if isinstance(outcome.get("action"), dict) else {}
@@ -4128,6 +4144,7 @@ class DebugState:
             "name": str(action.get("name") or ""),
             **({"mp_cost": int(action.get("mp_cost") or 0)} if "mp_cost" in action else {}),
             "enemy_object_id": enemy_object_id,
+            **DebugState._visible_battle_feedback(outcome),
             "enemy_changes": [
                 {
                     key: change.get(key)
@@ -4165,7 +4182,7 @@ class DebugState:
     @staticmethod
     def _single_enemy_win_hp_fallback(source: dict) -> dict | None:
         """Infer one defeated life only from an unambiguous completed win log."""
-        if source.get("result") != "won":
+        if source.get("hp_tracking_safe") is not True or source.get("result") != "won":
             return None
         enemies = [
             enemy for enemy in source.get("enemies") or []
@@ -4268,6 +4285,13 @@ class DebugState:
                         "updated_at": time.time(),
                     }
                     knowledge["active_battles"][battle_key] = active
+                    changed = True
+                # Missing metadata from older runtimes cannot establish a safe life.
+                if source.get("hp_tracking_safe") is not True and (
+                    active.get("complete_from_start") or active.get("pending_hp_samples")
+                ):
+                    active["complete_from_start"] = False
+                    active["pending_hp_samples"] = []
                     changed = True
                 lives = active.setdefault("lives", {})
                 last_sequence = int(active.get("last_sequence") or 0)
@@ -4372,6 +4396,11 @@ class DebugState:
                             if isinstance(change, dict) and int(change.get("object_id") or 0) > 0
                         }
                         target = outcome.get("target") if isinstance(outcome.get("target"), dict) else {}
+                        affected_ids.update(
+                            int(target.get("object_id") or 0)
+                            for target in outcome.get("enemy_targets") or []
+                            if isinstance(target, dict) and int(target.get("object_id") or 0) > 0
+                        )
                         if int(target.get("object_id") or 0) > 0:
                             affected_ids.add(int(target["object_id"]))
                         if not affected_ids:
@@ -4629,6 +4658,7 @@ class DebugState:
                         "no_numeric_change_observed": bool(
                             sample.get("no_numeric_change_observed")
                         ),
+                        **self._visible_battle_feedback(sample),
                     }
                     for sample in stored.get("enemy_effect_samples") or []
                     if isinstance(sample, dict)

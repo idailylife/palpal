@@ -59,6 +59,9 @@ PALPAL_AgentAfterFrame(
 );
 
 VOID
+PALPAL_AgentBattleHPRedistributed(VOID);
+
+VOID
 PALPAL_AgentBattleBegin(
    VOID
 );
@@ -96,6 +99,9 @@ VOID
 PALPAL_AgentVisibleRoundEndBegin(
    VOID
 );
+
+VOID
+PALPAL_AgentVisibleActionTarget(SHORT sTarget);
 
 VOID
 PALPAL_AgentVisibleActionEnd(
