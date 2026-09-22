@@ -499,7 +499,9 @@ PAL_Search(
          //
          // Execute the script
          //
+         PALPAL_AgentBeginTriggerScript(k + 1, p->wTriggerScript);
          p->wTriggerScript = PAL_RunTriggerScript(p->wTriggerScript, k + 1);
+         PALPAL_AgentEndTriggerScript(k + 1);
 
          //
          // Clear inputs and delay for a short time
@@ -626,6 +628,11 @@ PAL_WaitForKeyInternal(
 {
    DWORD     dwTimeOut = SDL_GetTicks() + wTimeOut;
 
+   if (gpGlobals != NULL && gpGlobals->fInBattle &&
+       g_Battle.BattleResult == kBattleResultWon)
+   {
+      PALPAL_AgentBattleRewardBegin();
+   }
    PAL_ClearKeyState();
 
    while (wTimeOut == 0 || !SDL_TICKS_PASSED(SDL_GetTicks(), dwTimeOut))

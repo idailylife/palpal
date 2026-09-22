@@ -23,6 +23,7 @@
 //
 
 #include "main.h"
+#include "agent.h"
 
 #define MAX_SPRITE_TO_DRAW         2048
 
@@ -31,6 +32,7 @@ typedef struct tagSPRITE_TO_DRAW
    LPCBITMAPRLE     lpSpriteFrame; // pointer to the frame bitmap
    PAL_POS          pos;           // position on the scene
    int              iLayer;        // logical layer
+   WORD             agentObjectID;
 } SPRITE_TO_DRAW;
 
 static SPRITE_TO_DRAW    g_rgSpriteToDraw[MAX_SPRITE_TO_DRAW];
@@ -69,6 +71,7 @@ PAL_AddSpriteToDraw(
    g_rgSpriteToDraw[g_nSpriteToDraw].lpSpriteFrame = lpSpriteFrame;
    g_rgSpriteToDraw[g_nSpriteToDraw].pos = PAL_XY(x, y);
    g_rgSpriteToDraw[g_nSpriteToDraw].iLayer = iLayer;
+   g_rgSpriteToDraw[g_nSpriteToDraw].agentObjectID = 0;
 
    g_nSpriteToDraw++;
 }
@@ -314,6 +317,7 @@ PAL_SceneDrawSprites(
       // Add it into the array
       //
       PAL_AddSpriteToDraw(lpFrame, x, y, lpEvtObj->sLayer * 8 + 2);
+      g_rgSpriteToDraw[g_nSpriteToDraw - 1].agentObjectID = (WORD)i + 1;
 
       //
       // Calculate covering map tiles
@@ -357,8 +361,12 @@ PAL_SceneDrawSprites(
       x = PAL_X(p->pos);
       y = PAL_Y(p->pos) - PAL_RLEGetHeight(p->lpSpriteFrame) - p->iLayer;
 
+      PALPAL_AgentSceneObject(p->agentObjectID, x < 0 || y < 0 ||
+         x + PAL_RLEGetWidth(p->lpSpriteFrame) > 320 ||
+         y + PAL_RLEGetHeight(p->lpSpriteFrame) > 200);
       PAL_RLEBlitToSurface(p->lpSpriteFrame, gpScreen, PAL_XY(x, y));
    }
+   PALPAL_AgentSceneObject(0, FALSE);
 }
 
 VOID
@@ -488,7 +496,9 @@ PAL_MakeScene(
    //
    // Step 3: Draw all the sprites.
    //
+   PALPAL_AgentSceneBegin();
    PAL_SceneDrawSprites();
+   PALPAL_AgentSceneEnd();
 
 #if PAL_DEBUG_SHOW_SEARCH_TRIGGER_RANGE
    //

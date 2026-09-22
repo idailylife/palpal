@@ -22,6 +22,7 @@
 #include "palcommon.h"
 #include "global.h"
 #include "palcfg.h"
+#include "agent.h"
 
 PAL_FORCE_INLINE
 BYTE
@@ -191,6 +192,7 @@ PAL_RLEBlitToSurfaceWithShadow(
             k = T - j;
             if (lpDstSurface->w - x < k) k = lpDstSurface->w - x;
             if (uiWidth - sx < k) k = uiWidth - sx;
+            PALPAL_AgentDrawSpan(lpDstSurface, x, y, (int)k);
             sx += k;
             p = ((LPBYTE)lpDstSurface->pixels) + y * lpDstSurface->pitch;
             if(bShadow)

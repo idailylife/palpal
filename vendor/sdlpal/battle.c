@@ -20,6 +20,7 @@
 //
 
 #include "main.h"
+#include "agent.h"
 
 BATTLE          g_Battle;
 
@@ -1780,6 +1781,7 @@ PAL_StartBattle(
    g_Battle.fSpriteAddLock = TRUE;
 
    PAL_BattleUpdateFighters();
+   PALPAL_AgentBattleBegin();
 
    //
    // Load the battle effect sprite.
@@ -1810,6 +1812,8 @@ PAL_StartBattle(
       //
       PAL_BattleWon();
    }
+
+   PALPAL_AgentBattleEnding();
 
    //
    // Clear all item-using records
@@ -1844,6 +1848,7 @@ PAL_StartBattle(
    g_Battle.lpBackground = NULL;
    g_Battle.lpSceneBuf = NULL;
 
+   PALPAL_AgentBattleEnd(i);
    gpGlobals->fInBattle = FALSE;
 
    AUDIO_PlayMusic(gpGlobals->wNumMusic, TRUE, 1);

@@ -10,6 +10,7 @@ pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
 set(SDLPAL_DIR "${CMAKE_SOURCE_DIR}/vendor/sdlpal")
 
 set(PALPAL_RUNTIME_DIR "${CMAKE_SOURCE_DIR}/runtime" CACHE PATH "Directory for live state, screenshots, and actions")
+set(PALPAL_AGENT_SOCKET "${PALPAL_RUNTIME_DIR}/live.sock" CACHE FILEPATH "Unix socket for live state and frames")
 set(PALPAL_ASSET_DIR "${CMAKE_SOURCE_DIR}/data/pal" CACHE PATH "Directory containing DOS game resources")
 set(PALPAL_GAME_BIN "${SDLPAL_DIR}/unix/sdlpal" CACHE FILEPATH "Patched SDLPAL executable")
 set(PALPAL_HOST "127.0.0.1" CACHE STRING "Debug server host")
@@ -23,6 +24,7 @@ option(PALPAL_QUIET_VENDOR_WARNINGS "Suppress compiler warnings from vendored SD
 set(PALPAL_ENV
     "PYTHON=${Python3_EXECUTABLE}"
     "PALPAL_RUNTIME_DIR=${PALPAL_RUNTIME_DIR}"
+    "PALPAL_AGENT_SOCKET=${PALPAL_AGENT_SOCKET}"
     "PALPAL_ASSET_DIR=${PALPAL_ASSET_DIR}"
     "PALPAL_GAME_BIN=${PALPAL_GAME_BIN}"
     "PALPAL_HOST=${PALPAL_HOST}"

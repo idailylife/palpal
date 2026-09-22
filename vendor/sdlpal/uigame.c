@@ -20,6 +20,7 @@
 //
 
 #include "main.h"
+#include "agent.h"
 
 static BOOL __buymenu_firsttime_render;
 
@@ -301,7 +302,7 @@ PAL_SelectionMenu(
 	//
 	// Activate the menu
 	//
-	wReturnValue = PAL_ReadMenu(NULL, rgMenuItem, nWords, nDefault, MENUITEM_COLOR);
+	wReturnValue = PAL_ReadMenu(PALPAL_AgentObserveChoiceSelection, rgMenuItem, nWords, nDefault, MENUITEM_COLOR);
 
 	//
 	// Delete the boxes
@@ -1524,6 +1525,8 @@ PAL_BuyMenu_OnItemChange(
    int                 i, j, n, iPlayerID, x, y;
    PAL_LARGE BYTE      bufImage[2048];
 
+   PALPAL_AgentObserveBuyMenuSelection(wCurrentItem);
+
    //
    // Prepare item bakcground box pos
    //
@@ -1670,6 +1673,7 @@ PAL_BuyMenu(
 
    w = 0;
    __buymenu_firsttime_render = TRUE;
+   PALPAL_AgentBeginBuyMenu(wStoreNum, i > 0 ? rgMenuItem[0].wValue : 0);
 
    while (TRUE)
    {
@@ -1682,7 +1686,28 @@ PAL_BuyMenu(
 
       if (gpGlobals->g.rgObject[w].item.wPrice <= gpGlobals->dwCash)
       {
-         if (PAL_ConfirmMenu())
+         DWORD cash_before = gpGlobals->dwCash;
+         int owned_before = PAL_GetItemAmount(w);
+         int owned_after;
+         BOOL purchased;
+         int j;
+
+         for (j = 0; j < MAX_PLAYER_EQUIPMENTS; j++)
+         {
+            int k;
+            for (k = 0; k <= gpGlobals->wMaxPartyMemberIndex; k++)
+            {
+               WORD role = gpGlobals->rgParty[k].wPlayerRole;
+               if (gpGlobals->g.PlayerRoles.rgwEquipment[j][role] == w)
+               {
+                  owned_before++;
+               }
+            }
+         }
+
+         PALPAL_AgentObserveBuyMenuPhase(TRUE);
+         purchased = PAL_ConfirmMenu();
+         if (purchased)
          {
             //
             // Player bought an item
@@ -1690,6 +1715,27 @@ PAL_BuyMenu(
             gpGlobals->dwCash -= gpGlobals->g.rgObject[w].item.wPrice;
             PAL_AddItemToInventory(w, 1);
          }
+         PALPAL_AgentObserveBuyMenuPhase(FALSE);
+         owned_after = PAL_GetItemAmount(w);
+         for (j = 0; j < MAX_PLAYER_EQUIPMENTS; j++)
+         {
+            int k;
+            for (k = 0; k <= gpGlobals->wMaxPartyMemberIndex; k++)
+            {
+               WORD role = gpGlobals->rgParty[k].wPlayerRole;
+               if (gpGlobals->g.PlayerRoles.rgwEquipment[j][role] == w)
+               {
+                  owned_after++;
+               }
+            }
+         }
+         PALPAL_AgentObserveBuyMenuResult(
+            w,
+            purchased,
+            cash_before,
+            gpGlobals->dwCash,
+            owned_before,
+            owned_after);
       }
 
       //
@@ -1704,6 +1750,7 @@ PAL_BuyMenu(
          }
       }
    }
+   PALPAL_AgentEndBuyMenu();
 }
 
 static VOID
@@ -1728,6 +1775,8 @@ PAL_SellMenu_OnItemChange(
 --*/
 {
    WORD x = 100, y = 150;
+
+   PALPAL_AgentObserveSellMenuSelection(wCurrentItem);
 
    //
    // Draw the cash amount
@@ -1772,6 +1821,8 @@ PAL_SellMenu(
 {
    WORD      w;
 
+   PALPAL_AgentBeginSellMenu();
+
    while (TRUE)
    {
       w = PAL_ItemSelectMenu(PAL_SellMenu_OnItemChange, kItemFlagSellable);
@@ -1780,14 +1831,27 @@ PAL_SellMenu(
          break;
       }
 
-      if (PAL_ConfirmMenu())
       {
-         if (PAL_AddItemToInventory(w, -1))
+         DWORD cash_before = gpGlobals->dwCash;
+         int owned_before = PAL_GetItemAmount(w);
+         BOOL sold = FALSE;
+
+         PALPAL_AgentObserveSellMenuPhase(TRUE);
+         if (PAL_ConfirmMenu())
          {
-            gpGlobals->dwCash += gpGlobals->g.rgObject[w].item.wPrice / 2;
+            if (PAL_AddItemToInventory(w, -1))
+            {
+               gpGlobals->dwCash += gpGlobals->g.rgObject[w].item.wPrice / 2;
+               sold = TRUE;
+            }
          }
+         PALPAL_AgentObserveSellMenuPhase(FALSE);
+         PALPAL_AgentObserveSellMenuResult(
+            w, sold, cash_before, gpGlobals->dwCash,
+            owned_before, PAL_GetItemAmount(w));
       }
    }
+   PALPAL_AgentEndSellMenu();
 }
 
 VOID

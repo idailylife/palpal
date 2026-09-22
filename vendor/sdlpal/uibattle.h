@@ -133,6 +133,21 @@ PAL_BattleUIPlayerReady(
    WORD          wPlayerIndex
 );
 
+const char *
+PALPAL_BattleSubmitAction(
+   DWORD         dwBattleGeneration,
+   DWORD         dwCommandGeneration,
+   WORD          wPlayerIndex,
+   const char   *action,
+   WORD          wObjectID,
+   SHORT         sTarget
+);
+
+BOOL
+PALPAL_BattleCoopActionAvailable(
+   VOID
+);
+
 VOID
 PAL_BattleUIUpdate(
    VOID

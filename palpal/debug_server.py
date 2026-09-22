@@ -2,24 +2,38 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import json
 import mimetypes
 import os
 import re
+import select
 import shutil
 import socket
 import struct
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import zlib
-from collections import deque
+from collections import OrderedDict, deque
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from palpal.spatial import MotionHistory, route_to_position, preview_placement, room_key as spatial_room_key
+from palpal.agent_runtime import AgentRuntime
+from palpal.observations import ObservationCoordinator
+from palpal.object_vision import ObjectVision
+from palpal.screen_inspection import ScreenInspector, valid_poe_api_key
+
+
+class NavigationStateChanged(Exception):
+    """An unissued navigation action no longer matches the live state."""
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
@@ -45,18 +59,63 @@ VALID_BUTTONS = {
 }
 STALE_AFTER_SECONDS = 2.0
 EXPLORATION_VERSION = 11
+COMBAT_KNOWLEDGE_VERSION = 2
+COMBAT_ACTION_KEY_CAPACITY = 256
+COMBAT_ENEMY_KEY_CAPACITY = 128
+COMBAT_ACTIVE_BATTLE_CAPACITY = 16
+COMBAT_SAMPLE_CAPACITY = 8
+COMBAT_SEEN_CAPACITY = 4096
+COMBAT_HP_TRACKING_VERSION = 2
 LOGICAL_ROOM_ID_RE = re.compile(r"^S\d+/M\d+:[0-9A-F]{12}$")
 MAX_OBJECT_INTERACTION_HISTORY = 20
+MAX_INTERACTION_CONTEXT_EVIDENCE = 40
 MAX_TASK_HISTORY = 20
+MAX_TASK_EVIDENCE = 20
+MAX_ACTIVE_TASK_CONTEXT = 8
+MAX_ACTIVE_TASK_DESCRIPTION = 160
+MAX_ROOM_MEMO_TEXT = 800
+MAX_TRANSITION_TASK_CONTEXTS = 16
+TRANSITION_ENDPOINT_MATCH_DISTANCE = 32
+MAX_TASK_INBOX_HISTORY = 100
+MAX_TASK_INBOX_CONTEXT = 3
+MAX_TASK_INBOX_REVIEW_BATCHES = 20
+TASK_INBOX_SCHEMA_VERSION = 2
+TASK_INBOX_MAX_PENDING_TURNS = 2
+TASK_INBOX_MAX_PENDING_BATCHES = 3
+TASK_INBOX_DIALOG_TEXT_LIMIT = 500
+TASK_INBOX_NO_FOLLOW_UP_REASONS = frozenset({
+    "chatter",
+    "duplicate_evidence",
+    "already_completed",
+})
+TASK_INBOX_STRUCTURAL_EVENT_TYPES = frozenset({
+    "object_changed",
+    "inventory_changed",
+    "cash_changed",
+    "party_sprite_changed",
+    "equipment_changed",
+})
+OBSERVABLE_CONTEXT_OBJECT_FIELDS = frozenset({
+    "presence",
+    "state",
+    "sprite_id",
+    "blocking",
+    "interactable",
+})
 TRANSITION_OBSERVATION_TIMEOUT_SECONDS = 4.0
+GAME_CONTROL_TIMEOUT_SECONDS = 30.0
 TRANSITION_STABLE_SNAPSHOTS = 2
 MAX_NAVIGATION_SEGMENT_STEPS = 8
+IMMEDIATE_ENTRY_RETURN_MAX_STEPS = 4
+INTERACTION_NO_EFFECT_MIN_SECONDS = 0.7
 VIEWPORT_WIDTH = 320
 VIEWPORT_HEIGHT = 200
 OPENING_LI_XIAOYAO_MONOLOGUE_MESSAGES = {1956, 1957, 1958, 1962, 1963, 1964}
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
-ALLOWED_DEEPSEEK_MODELS = frozenset({"deepseek-v4-pro", "deepseek-v4-flash"})
+ALLOWED_DEEPSEEK_MODELS = frozenset({
+    "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash-expires-on-0910",
+})
 DEFAULT_DEEPSEEK_TIMEOUT = 90.0
 MAX_AGENT_TOOL_ROUNDS = 8
 MAX_AGENT_TOOL_CALLS = 40
@@ -67,8 +126,22 @@ DIALOG_ADVANCE_BUTTON = "search"
 DIALOG_ADVANCE_ACTION_TIMEOUT = 2.5
 DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS = 3
 DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL = 0.25
-CHECKPOINT_MANIFEST_VERSION = 1
+DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL = 0.1
+DIALOG_ADVANCE_VISIBILITY_TIMEOUT = 2.0
+CHECKPOINT_MANIFEST_VERSION = 2
 DEFAULT_CHECKPOINT_SLOT = 99
+LIVE_MAGIC = b"PLIV"
+LIVE_VERSION = 1
+LIVE_HEADER = struct.Struct("<4sHHIIQQ")
+LIVE_MAX_PAYLOAD = 2 * 1024 * 1024
+LIVE_MESSAGE_HELLO = 1
+LIVE_MESSAGE_STATE = 2
+LIVE_MESSAGE_FRAME = 3
+LIVE_MESSAGE_HEARTBEAT = 4
+LIVE_MESSAGE_FRAME_REPEAT = 5
+LIVE_PNG_CACHE_SIZE = 16
+NAVIGATION_GRAPH_CACHE_SIZE = 16
+STATE_STREAM_SNAPSHOT_INTERVAL_SECONDS = 0.5
 
 
 def is_logical_room_id(value: object) -> bool:
@@ -93,6 +166,33 @@ OBJECT_INTERACTION_COMPATIBILITY_FIELDS = (
     "trigger_mode",
     "trigger_script",
 )
+
+
+def vanish_time_phase(value: object) -> int:
+    try:
+        countdown = int(value or 0)
+    except (TypeError, ValueError):
+        countdown = 0
+    return -1 if countdown < 0 else 1 if countdown > 0 else 0
+
+
+def semantic_object_changes(changes: dict) -> dict:
+    semantic = {}
+    for key, change in changes.items():
+        if key == "auto_script":
+            continue
+        if (
+            key == "vanish_time"
+            and isinstance(change, dict)
+            and "from" in change
+            and "to" in change
+            and vanish_time_phase(change.get("from")) == vanish_time_phase(change.get("to"))
+        ):
+            continue
+        semantic[key] = change
+    return semantic
+
+
 TRANSITION_KEY_FIELDS = (
     "scene_id",
     "map_id",
@@ -124,7 +224,7 @@ def read_json(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"status": "waiting_for_game", "message": "state.json not written yet"}
+        return {"status": "waiting_for_game", "message": "JSON file not available yet"}
     except json.JSONDecodeError as exc:
         return {"status": "state_parse_error", "error": str(exc)}
 
@@ -213,6 +313,36 @@ def search_hits(node: tuple[int, int], direction: int, obj: dict) -> bool:
         if dx == ex and dy == ey and dh == eh:
             return True
     return False
+
+
+def first_search_object(node: tuple[int, int], direction: int, objects: list[dict]) -> int | None:
+    """Match PAL_Search: sample order first, then native event-object order."""
+    candidates = sorted(
+        (obj for obj in objects if int(obj.get("state") or 0) > 0
+         and 0 < int(obj.get("trigger_mode") or 0) < 4),
+        key=lambda obj: int(obj.get("id") or 0),
+    )
+    for index, (x, y) in enumerate(search_samples(*node, direction)):
+        key = (x // 32, y // 16, bool(x % 32))
+        for obj in candidates:
+            ox, oy = int(obj.get("x") or 0), int(obj.get("y") or 0)
+            if index <= int(obj["trigger_mode"]) * 6 - 4 and key == (ox // 32, oy // 16, bool(ox % 32)):
+                return int(obj["id"])
+    return None
+
+
+def facing_event_object_hits(
+    position: tuple[int, int],
+    direction: int,
+    obj: dict,
+    distance_limit: int,
+) -> bool:
+    """Mirror script opcode 0x81's facing-object distance predicate."""
+    if int(obj.get("state") or 0) <= 0 or distance_limit <= 0:
+        return False
+    anchor_x = int(obj.get("x") or 0) + (16 if direction in {1, 0} else -16)
+    anchor_y = int(obj.get("y") or 0) + (8 if direction in {1, 2} else -8)
+    return pal_distance(position, (anchor_x, anchor_y)) < distance_limit
 
 
 def decode_nav_grid(state: dict) -> dict | None:
@@ -348,7 +478,46 @@ def rgba_to_png(width: int, height: int, rgba: bytes | memoryview) -> bytes:
     )
 
 
-def pfrm_to_png(raw: bytes) -> bytes:
+def indexed_to_png(
+    width: int,
+    height: int,
+    palette_rgba: bytes | memoryview,
+    pixels: bytes | memoryview,
+) -> bytes:
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid frame dimensions")
+    if len(palette_rgba) == 0 or len(palette_rgba) > 256 * 4 or len(palette_rgba) % 4:
+        raise ValueError("invalid indexed palette")
+    if len(pixels) != width * height:
+        raise ValueError("invalid indexed payload size")
+
+    palette_count = len(palette_rgba) // 4
+    scanlines = bytearray((width + 1) * height)
+    for y in range(height):
+        source_start = y * width
+        target_start = y * (width + 1)
+        scanlines[target_start + 1 : target_start + 1 + width] = pixels[source_start : source_start + width]
+
+    palette = bytearray(palette_count * 3)
+    alpha = bytearray(palette_count)
+    has_alpha = False
+    for index in range(palette_count):
+        palette[index * 3 : index * 3 + 3] = palette_rgba[index * 4 : index * 4 + 3]
+        alpha[index] = palette_rgba[index * 4 + 3]
+        has_alpha = has_alpha or alpha[index] != 0xFF
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 3, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"PLTE", bytes(palette))
+        + (png_chunk(b"tRNS", bytes(alpha)) if has_alpha else b"")
+        + png_chunk(b"IDAT", zlib.compress(bytes(scanlines)))
+        + png_chunk(b"IEND", b"")
+    )
+
+
+def pfrm_layout(raw: bytes) -> tuple[int, int, int, memoryview, memoryview | None]:
     if len(raw) < 24 or raw[:4] != b"PFRM":
         raise ValueError("invalid frame header")
     version = struct.unpack_from("<H", raw, 4)[0]
@@ -356,13 +525,159 @@ def pfrm_to_png(raw: bytes) -> bytes:
     height = struct.unpack_from("<H", raw, 8)[0]
     pixel_format = struct.unpack_from("<H", raw, 10)[0]
     payload_length = struct.unpack_from("<I", raw, 20)[0]
-    if version != 1 or pixel_format != 1:
-        raise ValueError("unsupported frame format")
-    if payload_length != width * height * 4:
-        raise ValueError("invalid frame payload length")
-    if len(raw) < 24 + payload_length:
-        raise ValueError("truncated frame payload")
-    return rgba_to_png(width, height, memoryview(raw)[24 : 24 + payload_length])
+    if version == 1 and pixel_format == 1:
+        if payload_length != width * height * 4:
+            raise ValueError("invalid frame payload length")
+        if len(raw) < 24 + payload_length:
+            raise ValueError("truncated frame payload")
+        payload = memoryview(raw)[24 : 24 + payload_length]
+        return width, height, pixel_format, payload, None
+    if version == 2 and pixel_format == 2:
+        palette_count = struct.unpack_from("<I", raw, 12)[0]
+        palette_size = palette_count * 4
+        if palette_count <= 0 or palette_count > 256 or payload_length != palette_size + width * height:
+            raise ValueError("invalid frame payload length")
+        if len(raw) < 24 + payload_length:
+            raise ValueError("truncated frame payload")
+        payload = memoryview(raw)[24 : 24 + payload_length]
+        return width, height, pixel_format, payload[palette_size:], payload[:palette_size]
+    raise ValueError("unsupported frame format")
+
+
+def pfrm_to_png(raw: bytes) -> bytes:
+    width, height, pixel_format, pixels, palette = pfrm_layout(raw)
+    if pixel_format == 1:
+        return rgba_to_png(width, height, pixels)
+    if palette is None:
+        raise ValueError("invalid indexed palette")
+    return indexed_to_png(width, height, palette, pixels)
+
+
+def pfrm_png_cache_key(raw: bytes) -> bytes:
+    digest = hashlib.sha256()
+    if len(raw) >= 24 and raw[:4] == b"PFRM":
+        digest.update(raw[:16])
+        payload_length = struct.unpack_from("<I", raw, 20)[0]
+        digest.update(raw[20:24 + payload_length])
+    else:
+        digest.update(raw)
+    return digest.digest()
+
+
+class LiveBridge:
+    def __init__(self, state: "DebugState", path: Path):
+        self.state = state
+        self.path = path
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.listener: socket.socket | None = None
+        self.owns_path = False
+
+    def start(self) -> None:
+        if self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self.run, name="palpal-live-bridge", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        listener = self.listener
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+        if self.owns_path:
+            self.path.unlink(missing_ok=True)
+            self.owns_path = False
+
+    def prepare_path(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            return
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.1)
+        try:
+            probe.connect(str(self.path))
+        except OSError:
+            self.path.unlink(missing_ok=True)
+        else:
+            raise RuntimeError(f"live socket is already in use: {self.path}")
+        finally:
+            probe.close()
+
+    def run(self) -> None:
+        try:
+            self.prepare_path()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.listener = listener
+            listener.bind(str(self.path))
+            self.owns_path = True
+            listener.listen(1)
+            listener.settimeout(0.5)
+            self.state.set_live_listener_status(True)
+            while not self.stop_event.is_set():
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                self.handle_connection(connection)
+        except Exception as exc:
+            self.state.set_live_listener_status(False, str(exc))
+        finally:
+            self.state.set_live_connected(False)
+            listener = self.listener
+            self.listener = None
+            if listener is not None:
+                try:
+                    listener.close()
+                except OSError:
+                    pass
+            if self.owns_path:
+                self.path.unlink(missing_ok=True)
+                self.owns_path = False
+
+    def recv_exact(self, connection: socket.socket, size: int) -> bytes | None:
+        data = bytearray()
+        while len(data) < size and not self.stop_event.is_set():
+            try:
+                chunk = connection.recv(size - len(data))
+            except socket.timeout:
+                continue
+            if not chunk:
+                return None
+            data.extend(chunk)
+        return bytes(data) if len(data) == size else None
+
+    def handle_connection(self, connection: socket.socket) -> None:
+        connection.settimeout(0.5)
+        self.state.set_live_connected(True)
+        try:
+            while not self.stop_event.is_set():
+                header = self.recv_exact(connection, LIVE_HEADER.size)
+                if header is None:
+                    return
+                magic, version, message_type, flags, payload_length, sequence, monotonic_ms = LIVE_HEADER.unpack(header)
+                if magic != LIVE_MAGIC or version != LIVE_VERSION:
+                    self.state.record_live_protocol_error("invalid_header")
+                    return
+                if flags != 0 or payload_length > LIVE_MAX_PAYLOAD:
+                    self.state.record_live_protocol_error("invalid_payload_length")
+                    return
+                payload = self.recv_exact(connection, payload_length)
+                if payload is None:
+                    return
+                self.state.ingest_live_message(message_type, sequence, monotonic_ms, payload)
+        finally:
+            self.state.set_live_connected(False)
+            try:
+                connection.close()
+            except OSError:
+                pass
 
 
 class DebugState:
@@ -372,23 +687,73 @@ class DebugState:
         self.game_binary = game_binary
         self.env_file = read_env_file(ROOT / ".env")
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        # Immutable serialized data only: every reader owns its decoded dictionaries.
+        self.exploration_read_cache: tuple[tuple, str] | None = None
+        self.navigation_timings = threading.local()
         self.action_log: list[dict] = []
         self.event_log: list[dict] = self.read_events()
         if self.events_path.exists():
             self.write_events()
         self.dialog_history: list[dict] = self.read_dialog_history()
         self.dialog_source_keys: set[str] = self.dialog_history_source_keys(self.dialog_history)
+        self.motion_history = MotionHistory()
+        self.spatial_execution = None
         self.last_observed_state: dict | None = None
         self.last_stable_room_state: dict | None = None
         self.pending_transition_observation: dict | None = None
         self.pending_interaction_observation: dict | None = None
+        self.pending_room_entry_intent: dict | None = None
+        self.observations = ObservationCoordinator()
+        self.navigation_transition_requests: dict[int, str] = {}
+        self.navigation_action_lock = threading.RLock()
+        self.dialog_advance_observation_id: str | None = None
         self.last_snapshot_frame: int | None = None
         self.logical_frame_offset = 0
         self.last_raw_frame: int | None = None
         self.last_logical_frame: int | None = None
         self.pending_checkpoint_frame_reset: dict | None = None
         self.state_lock = threading.RLock()
-        self.action_lock = threading.Lock()
+        self.live_lock = threading.RLock()
+        self.live_condition = threading.Condition(self.live_lock)
+        self.live_state: dict | None = None
+        self.live_state_received_at: float | None = None
+        self.live_state_sequence = 0
+        self.live_frame: bytes | None = None
+        self.live_frame_received_at: float | None = None
+        self.live_frame_sequence = 0
+        self.live_png: bytes | None = None
+        self.live_png_frame: bytes | None = None
+        self.live_png_sequence = 0
+        self.live_png_cache: dict[bytes, bytes] = {}
+        self.navigation_graph_lock = threading.RLock()
+        self.navigation_component_cache = OrderedDict()
+        self.navigation_room_hash_cache = OrderedDict()
+        self.navigation_target_positions = {}
+        self.navigation_graph_cache: OrderedDict[
+            tuple[tuple[int, int], tuple[int, int], int, int, str],
+            dict[tuple[int, int], tuple[tuple[str, tuple[int, int]], ...]],
+        ] = OrderedDict()
+        self.live_game_instance_id: str | None = None
+        self.live_bridge: LiveBridge | None = None
+        self.state_stream_snapshot_lock = threading.Lock()
+        self.state_stream_snapshot_at = 0.0
+        self.state_stream_snapshot_payload: bytes | None = None
+        self.state_stream_snapshot_action_pending: bool | None = None
+        self.live_status = {
+            "listening": False,
+            "connected": False,
+            "listener_error": None,
+            "connections": 0,
+            "protocol_errors": 0,
+            "last_protocol_error": None,
+            "last_message_at": None,
+            "last_sequence": 0,
+            "state_messages": 0,
+            "frame_messages": 0,
+            "heartbeats": 0,
+        }
+        self.action_lock = threading.RLock()
+        self.pending_written_action: dict | None = None
         self.exploration_lock = threading.Lock()
         self.dialog_advance_lock = threading.Lock()
         self.dialog_advance_cancel = threading.Event()
@@ -397,17 +762,524 @@ class DebugState:
         self.agent_status_lock = threading.Lock()
         self.agent_status = self.empty_agent_status()
         self.recover_object_interactions_from_agent_llm_log()
+        self.agent_runtime = AgentRuntime(self, self.runtime_dir)
+        self.screen_inspector = ScreenInspector(self)
+        self.object_vision = ObjectVision(self)
 
     def config_value(self, key: str, default: str | None = None) -> str | None:
         return os.environ.get(key) or self.env_file.get(key) or default
 
-    def atomic_write_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    @property
+    def live_socket_path(self) -> Path:
+        configured = self.config_value("PALPAL_AGENT_SOCKET")
+        return Path(configured).resolve() if configured else self.runtime_dir / "live.sock"
+
+    def start_live_bridge(self) -> None:
+        if self.live_bridge is not None:
+            return
+        self.live_bridge = LiveBridge(self, self.live_socket_path)
+        self.live_bridge.start()
+
+    def stop_live_bridge(self) -> None:
+        bridge = self.live_bridge
+        self.live_bridge = None
+        if bridge is not None:
+            bridge.stop()
+
+    def set_live_listener_status(self, listening: bool, error: str | None = None) -> None:
+        with self.live_condition:
+            self.live_status["listening"] = listening
+            self.live_status["listener_error"] = error
+            self.live_condition.notify_all()
+
+    def set_live_connected(self, connected: bool) -> None:
+        with self.live_condition:
+            if connected and not self.live_status["connected"]:
+                self.live_status["connections"] += 1
+            self.live_status["connected"] = connected
+            self.live_condition.notify_all()
+
+    def record_live_protocol_error(self, reason: str) -> None:
+        with self.live_condition:
+            self.live_status["protocol_errors"] += 1
+            self.live_status["last_protocol_error"] = reason
+            self.live_condition.notify_all()
+
+    def ingest_live_message(
+        self,
+        message_type: int,
+        sequence: int,
+        monotonic_ms: int,
+        payload: bytes,
+    ) -> None:
+        now = time.time()
+        if message_type == LIVE_MESSAGE_HELLO:
+            try:
+                hello = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.record_live_protocol_error("invalid_hello")
+                return
+            game_instance_id = str(hello.get("game_instance_id") or "")
+            if game_instance_id and game_instance_id != self.live_game_instance_id:
+                self.object_vision.clear()
+            with self.live_condition:
+                if game_instance_id and game_instance_id != self.live_game_instance_id:
+                    self.live_state = None
+                    self.live_state_received_at = None
+                    self.live_state_sequence = 0
+                    self.live_frame = None
+                    self.live_frame_received_at = None
+                    self.live_frame_sequence = 0
+                    self.live_png = None
+                    self.live_png_frame = None
+                    self.live_png_sequence = 0
+                    self.live_png_cache.clear()
+                self.live_game_instance_id = game_instance_id or None
+                self.live_status["last_message_at"] = now
+                self.live_status["last_sequence"] = sequence
+                self.live_condition.notify_all()
+            return
+        if message_type == LIVE_MESSAGE_STATE:
+            try:
+                state = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.record_live_protocol_error("invalid_state_json")
+                return
+            if not isinstance(state, dict):
+                self.record_live_protocol_error("invalid_state_type")
+                return
+            self.set_live_state(state, sequence=sequence, received_at=now)
+            return
+        if message_type == LIVE_MESSAGE_FRAME:
+            try:
+                pfrm_layout(payload)
+            except ValueError:
+                self.record_live_protocol_error("invalid_frame")
+                return
+            self.set_live_frame(payload, sequence=sequence, received_at=now)
+            return
+        if message_type == LIVE_MESSAGE_FRAME_REPEAT:
+            if payload:
+                self.record_live_protocol_error("invalid_frame_repeat")
+                return
+            with self.live_lock:
+                frame = self.live_frame
+            if frame is None:
+                self.record_live_protocol_error("frame_repeat_without_frame")
+                return
+            self.set_live_frame(frame, sequence=sequence, received_at=now)
+            return
+        if message_type == LIVE_MESSAGE_HEARTBEAT:
+            with self.live_condition:
+                self.live_status["heartbeats"] += 1
+                self.live_status["last_message_at"] = now
+                self.live_status["last_sequence"] = sequence
+                self.live_condition.notify_all()
+            return
+        self.record_live_protocol_error("unknown_message_type")
+
+    def set_live_state(
+        self,
+        state: dict,
+        *,
+        sequence: int | None = None,
+        received_at: float | None = None,
+    ) -> None:
+        with self.live_condition:
+            next_sequence = sequence if sequence is not None else self.live_state_sequence + 1
+            previous_positions = self.navigation_target_positions
+            positions = {}
+            room = (state.get("game_instance_id"), state.get("scene_id"), state.get("map_id"),
+                    (state.get("room") or {}).get("key"), (state.get("nav_grid") or {}).get("bits"))
+            for obj in state.get("objects") or []:
+                key = (*room, obj.get("id"), obj.get("sprite_id"), obj.get("trigger_script"), obj.get("state"))
+                position = (obj.get("x"), obj.get("y"))
+                previous = previous_positions.get(key)
+                positions[key] = (position, bool(previous and (previous[1] or previous[0] != position)))
+            self.navigation_target_positions = positions
+            self.live_state = copy.deepcopy(state)
+            self.live_state_received_at = received_at if received_at is not None else time.time()
+            self.live_state_sequence = int(next_sequence)
+            self.live_status["state_messages"] += 1
+            self.live_status["last_message_at"] = self.live_state_received_at
+            self.live_status["last_sequence"] = int(next_sequence)
+            self.motion_history.observe(state)
+            self.live_condition.notify_all()
+        self.reconcile_pending_written_action(state)
+        self.object_vision.observe_state(state)
+
+    def set_live_frame(
+        self,
+        frame: bytes,
+        *,
+        sequence: int | None = None,
+        received_at: float | None = None,
+    ) -> None:
+        frame = bytes(frame)
+        png_cache_key = pfrm_png_cache_key(frame)
+        with self.live_condition:
+            next_sequence = sequence if sequence is not None else self.live_frame_sequence + 1
+            self.live_frame = frame
+            self.live_frame_received_at = received_at if received_at is not None else time.time()
+            self.live_frame_sequence = int(next_sequence)
+            cached_png = self.live_png_cache.get(png_cache_key)
+            if cached_png is not None:
+                self.live_png_cache.pop(png_cache_key)
+                self.live_png_cache[png_cache_key] = cached_png
+                self.live_png = cached_png
+                self.live_png_frame = png_cache_key
+                self.live_png_sequence = int(next_sequence)
+            else:
+                self.live_png = None
+                self.live_png_frame = None
+                self.live_png_sequence = 0
+            self.live_status["frame_messages"] += 1
+            self.live_status["last_message_at"] = self.live_frame_received_at
+            self.live_status["last_sequence"] = int(next_sequence)
+            self.live_condition.notify_all()
+            object_state = self.live_state
+        if object_state is not None:
+            try:
+                self.object_vision.capture(frame, int(next_sequence),
+                                           self.live_frame_received_at, object_state)
+            except (ValueError, TypeError, KeyError, struct.error):
+                self.object_vision.clear()
+                self.record_live_protocol_error("invalid_object_frame")
+
+    def read_live_state(self) -> dict:
+        with self.live_lock:
+            if self.live_state is None:
+                return {
+                    "status": "waiting_for_game",
+                    "message": "no live state received from the game",
+                }
+            return copy.deepcopy(self.live_state)
+
+    def navigation_status(self) -> dict:
+        """Small, coherent control observation; never runs exploration or presentation."""
+        with self.live_lock:
+            state = self.read_live_state()
+            sequence = self.live_state_sequence
+            info = self.live_info("state")
+        return {
+            **{key: state.get(key) for key in (
+                "game_instance_id", "frame", "scene_id", "map_id", "party_position",
+                "party_direction", "agent_action", "in_battle", "entering_scene",
+            )},
+            "sequence": sequence,
+            "state_info": info,
+            "control": self.control_state(state, info),
+        }
+
+    def wait_navigation_update(self, timeout: float = 0.04) -> None:
+        with self.live_condition:
+            self.live_condition.wait(timeout=timeout)
+
+    @staticmethod
+    def native_action_status(state: dict | None) -> dict | None:
+        action = state.get("agent_action") if isinstance(state, dict) else None
+        if not isinstance(action, dict):
+            return None
+        try:
+            generation = int(action.get("generation"))
+            remaining_steps = max(0, int(action.get("remaining_steps") or 0))
+        except (TypeError, ValueError):
+            return None
+        return {
+            "generation": generation,
+            "pending": bool(action.get("pending")),
+            "remaining_steps": remaining_steps,
+            "waiting_for_move": bool(action.get("waiting_for_move")),
+        }
+
+    def reconcile_pending_written_action(self, state: dict) -> None:
+        with self.action_lock:
+            pending = self.pending_written_action
+            if not isinstance(pending, dict):
+                return
+            instance_id = str(state.get("game_instance_id") or "")
+            if instance_id != str(pending.get("game_instance_id") or ""):
+                self.pending_written_action = None
+                return
+            native = self.native_action_status(state)
+            if native is not None and native["generation"] != pending.get("generation_before"):
+                self.pending_written_action = None
+
+    def action_pending(self, state: dict | None = None) -> bool:
+        if state is None:
+            state = self.read_live_state()
+        native = self.native_action_status(state)
+        with self.action_lock:
+            local_pending = isinstance(self.pending_written_action, dict)
+        return self.action_path.exists() or local_pending or bool(native and native["pending"])
+
+    @staticmethod
+    def prebattle_interaction(state: dict) -> str | None:
+        """Return the client-owned interaction active during native pre-battle."""
+        if not state.get("in_battle"):
+            return None
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        if battle is None or battle.get("phase") != "pre_battle":
+            return None
+        if bool((state.get("choice") or {}).get("active")):
+            return "choice"
+        if bool((state.get("dialog") or {}).get("active")):
+            return "dialog"
+        return None
+
+    def control_state(self, state: dict, state_info: dict | None = None) -> dict:
+        """Derive the client/game control contract from the compatible native fields."""
+        has_transport_info = isinstance(state_info, dict)
+        state_info = state_info if has_transport_info else {}
+        trigger = self.native_trigger_generation(state)
+        trigger_details = {}
+        if trigger is not None:
+            trigger_details = {
+                "trigger_generation": int(trigger.get("generation") or 0),
+                "event_object_id": int(trigger.get("event_object_id") or 0),
+            }
+
+        unavailable = (
+            (has_transport_info and (
+                not state_info.get("available")
+                or state_info.get("stale", True)
+            ))
+            or state.get("status") in {"waiting_for_game", "state_parse_error", "startup_waiting"}
+            or state.get("in_main_game") is False
+        )
+        dialog_active = bool((state.get("dialog") or {}).get("active"))
+        choice_active = bool((state.get("choice") or {}).get("active"))
+        shop_active = bool((state.get("shop") or {}).get("active"))
+        if unavailable:
+            owner, phase, allowed = "game", "unavailable", []
+        elif state.get("in_battle"):
+            battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+            prebattle_interaction = self.prebattle_interaction(state)
+            if battle is None:
+                owner, phase, allowed = "game", "battle", []
+            elif self.action_pending(state):
+                owner, phase, allowed = "game", "battle", []
+            elif prebattle_interaction == "choice":
+                owner, phase, allowed = "client", "choice", ["choice_select", "press_buttons"]
+            elif prebattle_interaction == "dialog":
+                owner, phase, allowed = "client", "dialog", ["advance_dialog"]
+            elif battle.get("phase") in {"command", "reward"}:
+                owner, phase, allowed = "client", "battle", ["battle_action", "press_buttons"]
+            else:
+                owner, phase, allowed = "game", "battle", []
+        elif state.get("entering_scene"):
+            owner, phase, allowed = "game", "entering_scene", []
+        elif self.action_pending(state):
+            owner, phase, allowed = "game", "action_pending", []
+        elif choice_active:
+            owner, phase, allowed = "client", "choice", ["choice_select", "press_buttons"]
+        elif dialog_active:
+            owner, phase, allowed = "client", "dialog", ["advance_dialog"]
+        elif shop_active:
+            shop = state.get("shop") or {}
+            shop_action = "shop_sell" if shop.get("mode") == "sell" else "shop_buy"
+            owner, phase, allowed = "client", "shop", [shop_action, "shop_leave"]
+        elif trigger is not None and trigger.get("completed") is not True:
+            owner, phase, allowed = "game", "game_script", []
+        else:
+            owner, phase, allowed = (
+                "client",
+                "ready",
+                ["press_buttons", "navigation_step", "use_item", "equip_item"],
+            )
+        control = {
+            "owner": owner,
+            "phase": phase,
+            "allowed_actions": allowed,
+            "navigation_ready": phase == "ready",
+        }
+        if state.get("in_battle"):
+            control["battle_state_available"] = isinstance(state.get("battle"), dict)
+        if phase == "game_script":
+            control.update(trigger_details)
+        return control
+
+    @staticmethod
+    def game_control_progress_signature(state: dict) -> tuple:
+        """Return meaningful control progress without treating frame ticks as progress."""
+        trigger = state.get("trigger_observation") if isinstance(state.get("trigger_observation"), dict) else {}
+        destination = trigger.get("destination") if isinstance(trigger.get("destination"), dict) else {}
+        action = state.get("agent_action") if isinstance(state.get("agent_action"), dict) else {}
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        dialog_event = dialog.get("latest_event") if isinstance(dialog.get("latest_event"), dict) else {}
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else {}
+        position = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        return (
+            str(state.get("game_instance_id") or ""),
+            int(trigger.get("generation") or 0),
+            int(trigger.get("event_object_id") or 0),
+            bool(trigger.get("completed")),
+            destination.get("scene_id"),
+            destination.get("map_id"),
+            destination.get("x"),
+            destination.get("y"),
+            int(action.get("generation") or 0),
+            bool(action.get("pending")),
+            int(action.get("remaining_steps") or 0),
+            bool(action.get("waiting_for_move")),
+            state.get("scene_id"),
+            state.get("map_id"),
+            bool(state.get("entering_scene")),
+            position.get("x"),
+            position.get("y"),
+            bool(dialog.get("active")),
+            dialog_event.get("sequence"),
+            dialog_event.get("message_id"),
+            bool(state.get("in_battle")),
+            battle.get("generation"),
+            battle.get("command_generation"),
+            battle.get("phase"),
+            bool(shop.get("active")),
+        )
+
+    def action_control_error(
+        self,
+        state: dict,
+        action: str,
+        state_info: dict | None = None,
+    ) -> str | None:
+        control = self.control_state(state, state_info)
+        if state.get("in_battle") and control.get("battle_state_available") is False:
+            return "battle_state_unavailable"
+        if action in control["allowed_actions"]:
+            return None
+        phase = str(control["phase"])
+        return {
+            "unavailable": "runtime_stale",
+            "battle": "in_battle",
+            "battle_state_unavailable": "battle_state_unavailable",
+            "entering_scene": "entering_scene",
+            "action_pending": "action_pending",
+            "dialog": "in_dialog",
+            "choice": "in_choice",
+            "shop": "in_shop",
+            "game_script": "game_controlled",
+        }.get(phase, "action_not_allowed")
+
+    def action_handshake(self, state: dict | None = None) -> dict:
+        state = state if isinstance(state, dict) else self.read_live_state()
+        native = self.native_action_status(state)
+        return {
+            "supported": native is not None,
+            "game_instance_id": str(state.get("game_instance_id") or ""),
+            "generation": native["generation"] if native is not None else None,
+        }
+
+    def begin_written_action(self, entry: dict) -> None:
+        handshake = self.action_handshake()
+        entry.update(
+            {
+                "game_instance_id": handshake["game_instance_id"],
+                "action_generation_before": handshake["generation"],
+                "action_handshake_supported": handshake["supported"],
+            }
+        )
+        self.pending_written_action = (
+            {
+                "game_instance_id": handshake["game_instance_id"],
+                "generation_before": handshake["generation"],
+                "written_at": entry["time"],
+            }
+            if handshake["supported"]
+            else None
+        )
+        if not handshake["supported"]:
+            self.append_navigation_diagnostic(
+                "action_handshake_compatibility_mode",
+                {"game_instance_id": handshake["game_instance_id"]},
+            )
+
+    def live_info(self, kind: str) -> dict:
+        with self.live_lock:
+            if kind == "state":
+                received_at = self.live_state_received_at
+                sequence = self.live_state_sequence
+                available = self.live_state is not None
+            elif kind == "frame":
+                received_at = self.live_frame_received_at
+                sequence = self.live_frame_sequence
+                available = self.live_frame is not None
+            else:
+                raise ValueError(f"unknown live info kind: {kind}")
+        if not available or received_at is None:
+            return {"available": False, "sequence": sequence}
+        age = max(0.0, time.time() - received_at)
+        return {
+            "available": True,
+            "mtime": received_at,
+            "received_at": received_at,
+            "sequence": sequence,
+            "age_seconds": age,
+            "stale": age > STALE_AFTER_SECONDS,
+        }
+
+    def live_transport_snapshot(self) -> dict:
+        with self.live_lock:
+            status = dict(self.live_status)
+            status.update(
+                {
+                    "socket_path": str(self.live_socket_path),
+                    "game_instance_id": self.live_game_instance_id,
+                    "state_sequence": self.live_state_sequence,
+                    "frame_sequence": self.live_frame_sequence,
+                }
+            )
+            return status
+
+    def latest_frame_png(self) -> tuple[int, bytes] | None:
+        with self.live_lock:
+            if self.live_frame is None:
+                return None
+            sequence = self.live_frame_sequence
+            frame = self.live_frame
+            png_cache_key = pfrm_png_cache_key(frame)
+            cached_png = self.live_png_cache.get(png_cache_key)
+            if cached_png is not None:
+                self.live_png_cache.pop(png_cache_key)
+                self.live_png_cache[png_cache_key] = cached_png
+                self.live_png = cached_png
+                self.live_png_frame = png_cache_key
+                self.live_png_sequence = sequence
+                return sequence, cached_png
+        png = pfrm_to_png(frame)
+        with self.live_lock:
+            self.live_png_cache[png_cache_key] = png
+            while len(self.live_png_cache) > LIVE_PNG_CACHE_SIZE:
+                self.live_png_cache.pop(next(iter(self.live_png_cache)))
+            if self.live_frame is not None and pfrm_png_cache_key(self.live_frame) == png_cache_key:
+                self.live_png = png
+                self.live_png_frame = png_cache_key
+                sequence = self.live_frame_sequence
+                self.live_png_sequence = sequence
+            return sequence, png
+
+    def wait_for_frame(self, after_sequence: int, timeout: float) -> int:
+        deadline = time.monotonic() + timeout
+        with self.live_condition:
+            while self.live_frame_sequence <= after_sequence:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.live_condition.wait(remaining)
+            return self.live_frame_sequence
+
+    def atomic_write_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> os.stat_result:
         tmp = path.with_name(
             f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
         )
         try:
-            tmp.write_text(text, encoding=encoding)
-            os.replace(tmp, path)
+            with tmp.open("w", encoding=encoding) as stream:
+                stream.write(text)
+                stream.flush()
+                os.replace(tmp, path)
+                # Stat the file we wrote, even if another writer replaces the path.
+                return os.fstat(stream.fileno())
         finally:
             try:
                 tmp.unlink()
@@ -553,16 +1425,8 @@ class DebugState:
         return self.asset_dir / f"{self.checkpoint_slot if slot is None else int(slot)}.rpg"
 
     @property
-    def state_path(self) -> Path:
-        return self.runtime_dir / "state.json"
-
-    @property
     def screen_path(self) -> Path:
         return self.runtime_dir / "screen.bmp"
-
-    @property
-    def frame_path(self) -> Path:
-        return self.runtime_dir / "frame.rgba"
 
     @property
     def action_path(self) -> Path:
@@ -602,6 +1466,39 @@ class DebugState:
     def companion_checkpoint_path(self, checkpoint_dir: Path, relative_path: Path) -> Path:
         return checkpoint_dir / "companion" / relative_path
 
+    @property
+    def companion_owner_path(self) -> Path:
+        return self.runtime_dir / "companion_owner.json"
+
+    def write_companion_owner(self, reason: str) -> None:
+        snapshot = self.agent_runtime.snapshot()
+        owner = {
+            "session_id": snapshot.get("session_id"),
+            "checkpoint_id": snapshot.get("checkpoint_id"),
+            "generation": snapshot.get("generation"),
+            "reason": str(reason)[:80],
+            "updated_at": utc_timestamp(),
+        }
+        self.atomic_write_text(
+            self.companion_owner_path,
+            json.dumps(owner, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def read_companion_owner(self) -> dict | None:
+        try:
+            value = json.loads(self.companion_owner_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def companion_owner_matches(self) -> bool:
+        owner = self.read_companion_owner()
+        if owner is None:
+            # No sidecar yet: unguarded for backward compatibility.
+            return True
+        return str(owner.get("session_id") or "") == str(self.agent_runtime.snapshot().get("session_id") or "")
+
     def checkpoint_id(self, value: str | None = None, generate: bool = True) -> str:
         if value:
             checkpoint_id = CHECKPOINT_ID_RE.sub("-", value.strip()).strip(".-")
@@ -626,6 +1523,7 @@ class DebugState:
         for relative_path in CHECKPOINT_COMPANION_FILES:
             key = f"companion/{relative_path.as_posix()}"
             files[key] = self.file_info(self.companion_checkpoint_path(checkpoint_dir, relative_path))
+        files["agent/session.json"] = self.file_info(checkpoint_dir / "agent" / "session.json")
         return files
 
     def checkpoint_context(self, state: dict) -> dict:
@@ -673,31 +1571,36 @@ class DebugState:
         return {"ok": True, "checkpoints": checkpoints}
 
     def preflight_checkpoint_action(self, state: dict, *, allow_startup_waiting: bool = False) -> None:
-        state_info = self.file_info(self.state_path)
+        state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             raise RuntimeError("state_stale")
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
             raise RuntimeError(str(state.get("status")))
         if state.get("status") == "startup_waiting":
             if allow_startup_waiting:
-                if self.action_path.exists():
+                if self.action_pending(state):
                     raise RuntimeError("action_pending")
                 return
             raise RuntimeError("startup_waiting")
+        if state.get("in_main_game") is False:
+            raise RuntimeError("not_in_main_game")
+        control = self.control_state(state, state_info)
+        if control["owner"] == "game" and control["phase"] not in {"battle", "entering_scene", "action_pending"}:
+            raise RuntimeError("game_controlled")
         if state.get("in_battle"):
             raise RuntimeError("in_battle")
         if (state.get("dialog") or {}).get("active"):
             raise RuntimeError("in_dialog")
+        if control["phase"] == "shop":
+            raise RuntimeError("in_shop")
         if state.get("entering_scene"):
             raise RuntimeError("entering_scene")
-        if state.get("in_main_game") is False:
-            raise RuntimeError("not_in_main_game")
-        if self.action_path.exists():
+        if self.action_pending(state):
             raise RuntimeError("action_pending")
 
     def preflight_start_new_game(self, state: dict) -> None:
         """Validate a reset without requiring the game to be at a safe save point."""
-        state_info = self.file_info(self.state_path)
+        state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             raise RuntimeError("state_stale")
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
@@ -706,16 +1609,32 @@ class DebugState:
             raise RuntimeError("in_battle")
         if state.get("entering_scene"):
             raise RuntimeError("entering_scene")
-        if self.action_path.exists():
+        if self.action_pending(state):
             raise RuntimeError("action_pending")
 
     def refresh_companion_caches(self) -> None:
+        self.motion_history.clear()
+        if hasattr(self, "object_vision"):
+            self.object_vision.clear()
+        self.cancel_runtime_observations("checkpoint_restored")
         self.event_log = self.read_events()
         self.dialog_history = self.read_dialog_history()
         self.dialog_source_keys = self.dialog_history_source_keys(self.dialog_history)
         self.last_observed_state = None
         self.last_stable_room_state = None
         self.pending_transition_observation = None
+        self.pending_interaction_observation = None
+        self.pending_room_entry_intent = None
+
+    def cancel_runtime_observations(self, reason: str) -> None:
+        self.spatial_execution = None
+        self.motion_history.clear()
+        self.observations.clear_all(reason)
+        self.navigation_transition_requests.clear()
+        self.dialog_advance_observation_id = None
+        self.pending_transition_observation = None
+        self.pending_interaction_observation = None
+        self.pending_room_entry_intent = None
 
     def int_frame(self, value) -> int | None:
         try:
@@ -845,14 +1764,19 @@ class DebugState:
         if command not in {"save_slot", "load_slot", "start_slot"}:
             raise ValueError("unsupported slot command")
         with self.action_lock:
-            if self.action_path.exists():
+            if self.action_pending():
                 raise RuntimeError("action_pending")
             try:
                 self.action_result_path.unlink()
             except FileNotFoundError:
                 pass
-            self.atomic_write_text(self.action_path, f"{command} {int(slot)}\n", encoding="ascii")
             entry = {"time": time.time(), "command": command, "slot": int(slot)}
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(self.action_path, f"{command} {int(slot)}\n", encoding="ascii")
+            except Exception:
+                self.pending_written_action = None
+                raise
             self.action_log.append(entry)
             self.append_navigation_diagnostic("action_written", {"action": entry})
             return entry
@@ -971,7 +1895,7 @@ class DebugState:
         return restored
 
     def save_checkpoint(self, checkpoint_id: str | None = None, label: str | None = None) -> dict:
-        state = read_json(self.state_path)
+        state = self.read_live_state()
         self.preflight_checkpoint_action(state)
         checkpoint_id = self.checkpoint_id(checkpoint_id)
         checkpoint_dir = self.checkpoint_dir(checkpoint_id)
@@ -984,6 +1908,7 @@ class DebugState:
             command_result = self.run_slot_command("save_slot", slot)
             self.copy_game_save_to_checkpoint(checkpoint_dir, slot)
             companion = self.copy_companion_to_checkpoint(checkpoint_dir)
+            agent_bundle = self.agent_runtime.export_checkpoint(checkpoint_dir)
             manifest = {
                 "version": CHECKPOINT_MANIFEST_VERSION,
                 "id": checkpoint_id,
@@ -994,17 +1919,19 @@ class DebugState:
                 "state": self.checkpoint_context(state),
                 "native_result": command_result["result"],
                 "companion": companion,
+                "agent_bundle": agent_bundle,
             }
             tmp = checkpoint_dir / "manifest.json.tmp"
             tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             os.replace(tmp, checkpoint_dir / "manifest.json")
+            self.write_companion_owner("save_checkpoint")
             return {"ok": True, "checkpoint": self.checkpoint_manifest(checkpoint_dir)}
         except Exception:
             shutil.rmtree(checkpoint_dir, ignore_errors=True)
             raise
 
     def load_checkpoint(self, checkpoint_id: str) -> dict:
-        state = read_json(self.state_path)
+        state = self.read_live_state()
         self.preflight_checkpoint_action(state, allow_startup_waiting=True)
         checkpoint_dir = self.checkpoint_dir(checkpoint_id)
         manifest = self.checkpoint_manifest(checkpoint_dir)
@@ -1022,16 +1949,24 @@ class DebugState:
             {"checkpoint_id": checkpoint_id, "restored": restored},
             state=state,
         )
-        return {
+        result = {
             "ok": True,
             "checkpoint": self.checkpoint_manifest(checkpoint_dir),
             "restored": restored,
             "native_result": command_result["result"],
         }
+        self.agent_runtime.restore_checkpoint(
+            checkpoint_dir,
+            checkpoint_id,
+            state.get("game_instance_id"),
+        )
+        self.write_companion_owner("load_checkpoint")
+        return result
 
     def start_new_game(self) -> dict:
-        state = read_json(self.state_path)
+        state = self.read_live_state()
         self.preflight_start_new_game(state)
+        old_session_id = str(self.agent_runtime.snapshot().get("session_id") or "")
         command_result = self.run_slot_command("start_slot", 0)
         self.clear_runtime_history(reason="start_new_game", state=state)
         self.logical_frame_offset = 0
@@ -1039,10 +1974,52 @@ class DebugState:
         self.last_logical_frame = None
         self.last_snapshot_frame = None
         self.pending_checkpoint_frame_reset = None
-        return {
+        result = {
             "ok": True,
             "native_result": command_result["result"],
         }
+        self.agent_runtime.reset("start_new_game", game_instance_id=state.get("game_instance_id"))
+        if old_session_id:
+            try:
+                self.agent_runtime.prune_sessions({old_session_id})
+            except Exception:
+                pass
+        self.write_companion_owner("new_game")
+        return result
+
+    def reset_agent_session(self) -> dict:
+        runtime = self.agent_runtime
+        if runtime.is_running():
+            raise RuntimeError("agent_session_running")
+        old_session_id = str(runtime.snapshot().get("session_id") or "")
+        archived_checkpoint_id = None
+        try:
+            auto_id = "auto-reset-" + time.strftime("%Y%m%d-%H%M%S", time.localtime())
+            archived = self.save_checkpoint(auto_id, "auto archive before reset")
+            archived_checkpoint_id = (archived.get("checkpoint") or {}).get("id")
+        except Exception:
+            archived_checkpoint_id = None
+        self.clear_runtime_history(reason="user_reset")
+        session = runtime.reset("user_reset")
+        if archived_checkpoint_id is not None and old_session_id:
+            try:
+                runtime.prune_sessions({old_session_id})
+            except Exception:
+                pass
+        self.write_companion_owner("reset")
+        return {"ok": True, "session": session, "archived_checkpoint_id": archived_checkpoint_id}
+
+    def prune_orphan_sessions(self, session_ids: set[str] | None = None) -> dict:
+        runtime = self.agent_runtime
+        if session_ids is None:
+            discovered = runtime.discover_session_ids()
+            live = str(runtime.snapshot().get("session_id") or "")
+            orphaned = discovered - {live}
+        else:
+            orphaned = {str(session_id) for session_id in session_ids if str(session_id)}
+        result = runtime.prune_sessions(orphaned)
+        result["pruned_total"] = len(result.get("pruned_session_ids") or [])
+        return result
 
     def delete_checkpoint(self, checkpoint_id: str) -> dict:
         checkpoint_dir = self.checkpoint_dir(checkpoint_id)
@@ -1139,6 +2116,7 @@ class DebugState:
         )
         entry = {
             "time": time.time(),
+            "session_id": getattr(getattr(self, "agent_runtime", None), "state", {}).get("session_id"),
             "episode": episode,
             "turn": turn,
             "frame": state.get("frame"),
@@ -1166,6 +2144,7 @@ class DebugState:
     def append_agent_llm_log(self, state: dict, entry: dict) -> dict:
         payload = {
             "time": time.time(),
+            "session_id": getattr(getattr(self, "agent_runtime", None), "state", {}).get("session_id"),
             "state_context": self.state_context(state),
             **entry,
         }
@@ -1199,6 +2178,7 @@ class DebugState:
         )
         entry = {
             "time": time.time(),
+            "session_id": getattr(getattr(self, "agent_runtime", None), "state", {}).get("session_id"),
             "episode": episode,
             "turn": turn,
             "frame": state.get("frame"),
@@ -1232,13 +2212,13 @@ class DebugState:
 
     def clear_runtime_history(self, reason: str = "reset", state: dict | None = None) -> None:
         with self.state_lock:
+            self.cancel_runtime_observations(reason)
             self.action_log = []
             self.event_log = []
             self.dialog_history = []
             self.dialog_source_keys = set()
             self.last_observed_state = None
             self.last_stable_room_state = None
-            self.pending_transition_observation = None
             for path in (
                 self.action_result_path,
                 self.agent_log_path,
@@ -1247,6 +2227,7 @@ class DebugState:
                 self.dialogs_path,
                 self.exploration_path,
                 self.navigation_log_path,
+                self.companion_owner_path,
             ):
                 try:
                     path.unlink()
@@ -1274,8 +2255,11 @@ class DebugState:
                 continue
             if event.get("type") == "object_changed":
                 changes = event.get("changes") if isinstance(event.get("changes"), dict) else {}
-                if changes and not any(key != "auto_script" for key in changes):
-                    continue
+                if changes:
+                    changes = semantic_object_changes(changes)
+                    if not changes:
+                        continue
+                    event = {**event, "changes": changes}
             cleaned.append(event)
         return cleaned[-200:]
 
@@ -1301,6 +2285,10 @@ class DebugState:
         )
 
     def append_event(self, state: dict, event_type: str, payload: dict) -> dict:
+        if event_type in {"interaction_effect", "interaction_no_effect"} and not isinstance(
+            payload.get("interaction_context"), dict
+        ):
+            payload = {**payload, "interaction_context": self.interaction_context_snapshot()}
         identity = self.room_identity(state)
         event = {
             "time": time.time(),
@@ -1325,6 +2313,8 @@ class DebugState:
         self.write_events()
         if event_type in {"interaction_effect", "interaction_no_effect"} or self.object_change_cleared_blocker(event):
             self.record_persistent_object_event(event, state=state)
+        if event_type in TASK_INBOX_STRUCTURAL_EVENT_TYPES:
+            self.record_observable_context_event(event)
         return event
 
     def append_navigation_diagnostic(self, event_type: str, payload: dict | None = None, state: dict | None = None) -> None:
@@ -1351,7 +2341,7 @@ class DebugState:
                     "dialog_latest_text": (dialog.get("latest_event") or {}).get("text"),
                     "in_battle": bool(state.get("in_battle")),
                     "in_main_game": state.get("in_main_game"),
-                    "action_pending": self.action_path.exists(),
+                    "action_pending": self.action_pending(state),
                 }
             )
         self.navigation_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1534,6 +2524,8 @@ class DebugState:
             "event_object_id": event.get("event_object_id"),
             "message_id": event.get("message_id"),
             "message_ids": self.dialog_message_ids(event),
+            "trigger_generation": event.get("trigger_generation"),
+            "game_instance_id": state.get("game_instance_id"),
             "dialog_position": event.get("dialog_position") or dialog.get("position"),
             "speaker_hint": self.dialog_speaker_hint(event),
             "text": str(event.get("text") or ""),
@@ -1567,10 +2559,18 @@ class DebugState:
         for key in ("speaker_hint", "event_object_id", "scene_id", "map_id", "room_id", "room_key", "region_key"):
             if previous.get(key) != current.get(key):
                 return False
+        for key in ("trigger_generation", "game_instance_id"):
+            if previous.get(key) != current.get(key):
+                return False
+        # Repeated messages start another utterance, even on older runtimes
+        # without trigger generations. Sequence adjacency alone is insufficient.
+        if set(previous.get("message_ids") or []) & set(current.get("message_ids") or []):
+            return False
         return self.dialog_events_are_contiguous(previous, current)
 
     def merge_dialog_turn(self, previous: dict, current: dict) -> None:
         previous["text"] = f"{previous.get('text') or ''}{current.get('text') or ''}"
+        previous["updated_at"] = current.get("time")
         previous["end_sequence"] = current.get("end_sequence")
         previous["end_frame"] = current.get("end_frame", current.get("frame"))
         previous["end_logical_frame"] = current.get("end_logical_frame", current.get("logical_frame", current.get("end_frame", current.get("frame"))))
@@ -1602,6 +2602,7 @@ class DebugState:
             return
 
         changed = False
+        inbox_entries: list[dict] = []
         processed_source_keys: set[str] = set()
         for event in events:
             if not isinstance(event, dict) or not event.get("text"):
@@ -1619,8 +2620,10 @@ class DebugState:
                 continue
             if self.dialog_history and self.can_merge_dialog_turn(self.dialog_history[-1], entry):
                 self.merge_dialog_turn(self.dialog_history[-1], entry)
+                inbox_entries.append(self.dialog_history[-1])
             else:
                 self.dialog_history.append(entry)
+                inbox_entries.append(entry)
             self.dialog_source_keys.add(source_key)
             processed_source_keys.add(source_key)
             changed = True
@@ -1630,6 +2633,7 @@ class DebugState:
             self.dialog_source_keys = self.dialog_history_source_keys(self.dialog_history)
             self.dialog_source_keys.update(processed_source_keys)
             self.write_dialog_history()
+            self.record_task_inbox_entries(inbox_entries)
 
     def dialog_advance_source_keys(self, entry: dict | None) -> list[str]:
         if not isinstance(entry, dict):
@@ -1880,6 +2884,241 @@ class DebugState:
             item.pop("_last_index", None)
         return {"speakers": ordered[:limit], "total": len(ordered), "returned": min(len(ordered), limit)}
 
+    @staticmethod
+    def item_approach_requirements(state: dict) -> list[dict]:
+        requirements = []
+        for item in state.get("inventory") or []:
+            if not isinstance(item, dict) or item.get("usable") is not True:
+                continue
+            try:
+                item_id = int(item.get("item_id") or 0)
+                available = int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0)
+            except (TypeError, ValueError):
+                continue
+            effect = item.get("use_effect") if isinstance(item.get("use_effect"), dict) else {}
+            if item_id <= 0 or available <= 0:
+                continue
+            for requirement in effect.get("requirements") or []:
+                if not isinstance(requirement, dict) or requirement.get("kind") != "face_event_object":
+                    continue
+                try:
+                    object_id = int(requirement.get("event_object_id") or 0)
+                    distance_level = int(requirement.get("distance_level") or 0)
+                    script_entry = int(requirement.get("script_entry") or 0)
+                    failure_script_entry = int(requirement.get("failure_script_entry") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if object_id <= 0 or distance_level < 0:
+                    continue
+                requirements.append({
+                    "kind": "face_event_object",
+                    "item_id": item_id,
+                    "item_name": str(item.get("name") or ""),
+                    "event_object_id": object_id,
+                    "distance_level": distance_level,
+                    "distance_limit": distance_level * 32 + 16,
+                    "script_entry": script_entry,
+                    "failure_script_entry": failure_script_entry,
+                    "conditional": requirement.get("conditional") is True,
+                    "requirements_complete": effect.get("requirements_complete") is True,
+                })
+        return sorted(
+            requirements,
+            key=lambda entry: (
+                entry["event_object_id"],
+                entry["item_id"],
+                entry["script_entry"],
+            ),
+        )
+
+    def approach_requirements_by_target(
+        self,
+        state: dict,
+        item_id: int | None = None,
+    ) -> dict[int, list[dict]]:
+        result: dict[int, list[dict]] = {}
+        for requirement in self.item_approach_requirements(state):
+            if item_id is not None and requirement["item_id"] != item_id:
+                continue
+            result.setdefault(requirement["event_object_id"], []).append(requirement)
+        return result
+
+    def item_approach_affordances(
+        self,
+        state: dict,
+        target_id: int,
+        requirements: list[dict] | None = None,
+        *,
+        grid: dict | None = None,
+        reachable_order: list[tuple[int, int]] | None = None,
+        reachable_distance: dict[tuple[int, int], int] | None = None,
+        fallback_order: list[tuple[int, int]] | None = None,
+    ) -> list[dict]:
+        candidates = requirements
+        if candidates is None:
+            candidates = self.approach_requirements_by_target(state).get(target_id, [])
+        affordances = []
+        target = self.target_object(state, target_id)
+        for requirement in candidates:
+            if (
+                grid is not None
+                and reachable_order is not None
+                and reachable_distance is not None
+                and target is not None
+            ):
+                goals, directions, _ = self.approach_goal_nodes(
+                    state,
+                    grid,
+                    target,
+                    [requirement],
+                )
+                goal = next((node for node in reachable_order if node in goals), None)
+                fallback_goal = (
+                    next((node for node in fallback_order if node in goals), None)
+                    if goal is None and fallback_order is not None
+                    else None
+                )
+                selected_goal = goal or fallback_goal
+                status = "reachable" if goal is not None else "blocked_by_transition" if fallback_goal is not None else "unreachable_static"
+                affordances.append({
+                    **dict(requirement),
+                    "kind": "item_approach",
+                    "status": status,
+                    "steps": int(reachable_distance[goal]) if goal is not None else None,
+                    "required_direction": (
+                        DIR_TO_BUTTON.get(
+                            directions.get(selected_goal, int(state.get("party_direction") or 0)),
+                            "down",
+                        )
+                        if selected_goal is not None
+                        else None
+                    ),
+                })
+            else:
+                route = self.route_to_object(
+                    state,
+                    target_id,
+                    avoid_transitions=True,
+                    approach_item_id=int(requirement.get("item_id") or 0),
+                    approach_requirement=requirement,
+                )
+                if route.get("status") != "reachable":
+                    continue
+                affordance = route.get("affordance")
+                if isinstance(affordance, dict):
+                    affordances.append(affordance)
+        return sorted(
+            affordances,
+            key=lambda entry: (
+                0 if entry.get("status") == "reachable" else 1,
+                int(entry.get("steps")) if entry.get("steps") is not None else 1 << 30,
+                int(entry.get("item_id") or 0),
+                int(entry.get("script_entry") or 0),
+            ),
+        )
+
+    def matched_item_event_object(self, state: dict, item_id: int) -> dict | None:
+        try:
+            normalized_item_id = int(item_id)
+        except (TypeError, ValueError):
+            return None
+        item = next((i for i in state.get("inventory") or [] if i.get("item_id") == normalized_item_id), {})
+        for requirement in (item.get("use_effect") or {}).get("requirements") or []:
+            if requirement.get("kind") == "place_event_object":
+                return {"event_object_id": requirement.get("event_object_id"), "requirement": dict(requirement)}
+        pos = state.get("party_position") or {}
+        position = (int(pos.get("x") or 0), int(pos.get("y") or 0))
+        direction = int(state.get("party_direction") or 0)
+        objects = {
+            int(obj.get("id") or 0): obj
+            for obj in state.get("objects") or []
+            if isinstance(obj, dict) and int(obj.get("state") or 0) > 0
+        }
+        matches = []
+        for requirement in self.item_approach_requirements(state):
+            if int(requirement.get("item_id") or 0) != normalized_item_id:
+                continue
+            object_id = int(requirement.get("event_object_id") or 0)
+            target = objects.get(object_id)
+            if target is None or not facing_event_object_hits(
+                position,
+                direction,
+                target,
+                int(requirement.get("distance_limit") or 0),
+            ):
+                continue
+            matches.append((int(requirement.get("script_entry") or 0), object_id, requirement))
+        if not matches:
+            return None
+        _, object_id, requirement = min(matches, key=lambda entry: (entry[0], entry[1]))
+        return {"event_object_id": object_id, "requirement": dict(requirement)}
+
+    @staticmethod
+    def item_object_effect_observation(
+        before: dict,
+        after: dict,
+        matched: dict | None,
+    ) -> dict:
+        if not isinstance(matched, dict):
+            return {
+                "matched_event_object_id": None,
+                "effect_observed": None,
+                "object_delta": None,
+            }
+        object_id = int(matched.get("event_object_id") or 0)
+
+        def object_snapshot(state: dict) -> dict | None:
+            obj = next(
+                (
+                    entry for entry in state.get("objects") or []
+                    if isinstance(entry, dict) and int(entry.get("id") or 0) == object_id
+                ),
+                None,
+            )
+            if obj is None:
+                return None
+            return {key: obj.get(key) for key in (
+                "state", "trigger_mode", "trigger_script", "auto_script", "x", "y",
+            )}
+
+        before_object = object_snapshot(before)
+        after_object = object_snapshot(after)
+        changed = {}
+        if before_object is None or after_object is None:
+            if before_object != after_object:
+                changed["existence"] = {
+                    "before": before_object is not None,
+                    "after": after_object is not None,
+                }
+        else:
+            for key in ("state", "trigger_mode", "trigger_script", "auto_script", "x", "y"):
+                if before_object.get(key) != after_object.get(key):
+                    changed[key] = {
+                        "before": before_object.get(key),
+                        "after": after_object.get(key),
+                    }
+
+        before_trigger = before.get("trigger_observation") if isinstance(before.get("trigger_observation"), dict) else None
+        after_trigger = after.get("trigger_observation") if isinstance(after.get("trigger_observation"), dict) else None
+        trigger_changed = (
+            isinstance(after_trigger, dict)
+            and int(after_trigger.get("event_object_id") or 0) == object_id
+            and after_trigger != before_trigger
+        )
+        if trigger_changed:
+            changed["trigger_observation"] = {
+                "before": before_trigger,
+                "after": after_trigger,
+            }
+
+        same_room = spatial_room_key(before) == spatial_room_key(after)
+        effect_observed = True if changed else False if same_room and after_object is not None else None
+        return {
+            "matched_event_object_id": object_id,
+            "effect_observed": effect_observed,
+            "object_delta": changed or {},
+        }
+
     def navigation_environment(self, state: dict) -> dict:
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
@@ -1922,6 +3161,7 @@ class DebugState:
                 "active": bool(dialog.get("active")),
             },
             "objects": objects,
+            "approach_requirements": self.item_approach_requirements(state),
         }
 
     def navigation_environment_payload(self, state: dict) -> dict:
@@ -1972,15 +3212,34 @@ class DebugState:
             }
         return observed
 
+    def observed_equipment(self, state: dict) -> dict[int, list[int]]:
+        observed: dict[int, list[int]] = {}
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            try:
+                role_id = int(role.get("role_id"))
+            except (TypeError, ValueError):
+                continue
+            observed[role_id] = [
+                int(item.get("item_id") or 0)
+                for item in role.get("equipment") or []
+                if isinstance(item, dict)
+            ]
+        return observed
+
     def record_state_events(self, state: dict) -> None:
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
             return
 
+        identity = self.room_identity(state)
         current = {
+            "logical_room_id": identity.get("id") if identity else None,
             "cash": int(state.get("cash") or 0),
             "inventory": self.observed_inventory(state),
             "objects": self.observed_objects(state),
             "party_sprites": self.observed_party_sprites(state),
+            "equipment": self.observed_equipment(state),
         }
         previous = self.last_observed_state
         self.last_observed_state = current
@@ -2008,6 +3267,21 @@ class DebugState:
                     },
                 )
 
+        equipment_roles = set(previous.get("equipment", {})) | set(current["equipment"])
+        for role_id in sorted(equipment_roles):
+            before_equipment = previous.get("equipment", {}).get(role_id, [])
+            after_equipment = current["equipment"].get(role_id, [])
+            if before_equipment != after_equipment:
+                self.append_event(
+                    state,
+                    "equipment_changed",
+                    {
+                        "role_id": role_id,
+                        "from_item_ids": before_equipment,
+                        "to_item_ids": after_equipment,
+                    },
+                )
+
         item_ids = set(previous["inventory"]) | set(current["inventory"])
         for item_id in sorted(item_ids):
             before = previous["inventory"].get(item_id, {}).get("amount", 0)
@@ -2024,13 +3298,26 @@ class DebugState:
         for obj_id in sorted(object_ids):
             before = previous["objects"][obj_id]
             after = current["objects"][obj_id]
-            changes = {
+            changes = semantic_object_changes({
                 key: {"from": before.get(key), "to": after.get(key)}
                 for key in OBJECT_OBSERVATION_FIELDS
-                if key != "auto_script" and before.get(key) != after.get(key)
-            }
+                if before.get(key) != after.get(key)
+            })
             if changes:
                 self.append_event(state, "object_changed", {"object_id": obj_id, "changes": changes})
+        if previous.get("logical_room_id") == current.get("logical_room_id"):
+            for obj_id in sorted(set(previous["objects"]) - set(current["objects"])):
+                self.append_event(
+                    state,
+                    "object_changed",
+                    {"object_id": obj_id, "changes": {"presence": {"from": True, "to": False}}},
+                )
+            for obj_id in sorted(set(current["objects"]) - set(previous["objects"])):
+                self.append_event(
+                    state,
+                    "object_changed",
+                    {"object_id": obj_id, "changes": {"presence": {"from": False, "to": True}}},
+                )
 
     def inventory_delta(self, before: dict[int, dict], after: dict[int, dict]) -> list[dict]:
         changes = []
@@ -2073,9 +3360,14 @@ class DebugState:
         via_target_id: int | None = None,
         action: dict | None = None,
         status: str = "interacting",
-    ) -> None:
+    ) -> str:
+        if isinstance(self.pending_interaction_observation, dict):
+            self.observations.cancel(
+                self.pending_interaction_observation.get("observation_id"),
+                "superseded",
+            )
         identity = self.room_identity(state)
-        self.pending_interaction_observation = {
+        payload = {
             "object_id": int(object_id),
             "via_target_id": int(via_target_id or object_id),
             "status": status,
@@ -2091,10 +3383,23 @@ class DebugState:
             "nav_room_id": identity.get("nav_room_id") if identity else None,
             "legacy_room_id": identity.get("legacy_room_id") if identity else None,
             "legacy_nav_room_id": identity.get("legacy_nav_room_id") if identity else None,
+            "game_instance_id": str(state.get("game_instance_id") or ""),
             "inventory": self.observed_inventory(state),
             "object": self.object_snapshot_for_interaction(state, int(object_id)),
             "action": action,
+            "armed": action is not None,
+            "trigger_generation_before": int((self.native_trigger_generation(state) or {}).get("generation") or 0),
+            "source_position": dict(state.get("party_position") or {}),
         }
+        observation_id = self.observations.register(
+            "interaction",
+            owner="navigation",
+            timeout=60.0,
+            payload=payload,
+        )
+        payload["observation_id"] = observation_id
+        self.pending_interaction_observation = payload
+        return observation_id
 
     def observe_pending_interaction_outcome(self, state: dict) -> dict | None:
         pending = self.pending_interaction_observation
@@ -2103,14 +3408,42 @@ class DebugState:
         try:
             object_id = int(pending.get("object_id") or 0)
         except (TypeError, ValueError):
+            self.observations.cancel(pending.get("observation_id"), "invalid_interaction_observation")
             self.pending_interaction_observation = None
             return None
         if object_id <= 0:
+            self.observations.cancel(pending.get("observation_id"), "invalid_interaction_observation")
             self.pending_interaction_observation = None
             return None
-
-        if self.action_path.exists():
+        if not pending.get("armed"):
             return None
+
+        if self.action_pending(state):
+            return None
+        native = self.native_trigger_generation(state) or {}
+        source = native.get("source") or {}
+        actual_id = int(native.get("event_object_id") or 0)
+        if (
+            int(native.get("generation") or 0) == int(pending.get("trigger_generation_before") or 0) + 1
+            and actual_id > 0 and actual_id != object_id
+            and source.get("scene_id") == pending.get("scene_id")
+            and source.get("map_id") == pending.get("map_id")
+            and {key: source.get(key) for key in ("x", "y")} == pending.get("source_position")
+            and str(state.get("game_instance_id") or "") == pending.get("game_instance_id", "")
+        ):
+            payload = {
+                "requested_object_id": object_id,
+                "actual_object_id": actual_id,
+                "via_target_id": pending.get("via_target_id"),
+                "trigger_generation": native.get("generation"),
+                "reason": "search_target_mismatch",
+            }
+            self.append_event(state, "interaction_target_mismatch", payload)
+            self.observations.complete(pending.get("observation_id"), {
+                "type": "interaction_target_mismatch", "event": payload,
+            })
+            self.pending_interaction_observation = None
+            return payload
         dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
         if dialog.get("active"):
             return None
@@ -2132,6 +3465,11 @@ class DebugState:
             or state.get("map_id") != pending.get("map_id")
             or (self.room_identity(state) or {}).get("id") != pending.get("room_id")
         )
+        transition = self.pending_transition_observation
+        linked_transition = (
+            isinstance(transition, dict)
+            and transition.get("linked_interaction_observation_id") == pending.get("observation_id")
+        )
 
         base_payload = {
             "object_id": object_id,
@@ -2146,6 +3484,8 @@ class DebugState:
             "finished_object": finished_object,
             "action": pending.get("action"),
         }
+        if linked_transition and (room_changed or state.get("entering_scene")):
+            return None
         if inventory_changes or object_changes or room_changed:
             payload = {
                 **base_payload,
@@ -2154,12 +3494,23 @@ class DebugState:
                 "room_changed": room_changed,
             }
             self.append_event(state, "interaction_effect", payload)
+            self.observations.complete(
+                pending.get("observation_id"),
+                {"type": "interaction_effect", "event": payload},
+            )
             self.pending_interaction_observation = None
             return payload
 
+        if linked_transition:
+            # A matching native event-object script is authoritative while it is
+            # running.  In particular, a delayed search teleport must not lose
+            # its interaction observation to the short no-effect window.
+            return None
+
         elapsed_frames = (current_frame - start_frame) if current_frame is not None and start_frame is not None else None
         elapsed_time = time.time() - float(pending.get("sent_at") or time.time())
-        if (elapsed_frames is not None and elapsed_frames >= 8) or elapsed_time >= 0.7:
+        enough_frames = elapsed_frames is None or elapsed_frames >= 8
+        if enough_frames and elapsed_time >= INTERACTION_NO_EFFECT_MIN_SECONDS:
             payload = {
                 **base_payload,
                 "elapsed_frames": elapsed_frames,
@@ -2167,6 +3518,10 @@ class DebugState:
                 "reason": "no_state_change",
             }
             self.append_event(state, "interaction_no_effect", payload)
+            self.observations.complete(
+                pending.get("observation_id"),
+                {"type": "interaction_no_effect", "event": payload},
+            )
             self.pending_interaction_observation = None
             return payload
         return None
@@ -2192,7 +3547,12 @@ class DebugState:
                 )
             }
             current_payload["kind"] = trigger_kind(int(current.get("trigger_mode") or 0))
-            current_payload["transition_candidate"] = transition_candidate(current)
+            destination = self.transition_destination_for_state(state, object_id)
+            current_payload["transition_candidate"] = (
+                transition_candidate(current) or bool(destination.get("known_destination"))
+            )
+            if current_payload["transition_candidate"]:
+                current_payload.update(destination)
 
         persistent = self.persistent_object_entry(state, object_id)
         history = []
@@ -2394,46 +3754,68 @@ class DebugState:
         return component
 
     def logical_room_component_for_state(self, state: dict, grid: dict) -> tuple[set[tuple[int, int]], set[tuple[int, int]], tuple[int, int] | None]:
-        passable = {
-            (x, y)
-            for y in range(grid["height"])
-            for x in range(grid["width"])
-            if nav_bit(grid, (x, y))
-        }
+        passable = set(self.navigation_graph(grid))
         portal_cut = self.logical_room_cut_nodes(state, grid) & passable
-        stable_nodes = passable - portal_cut
+        stable_nodes, by_node = self.navigation_components(grid, frozenset(portal_cut))
         pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
         current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         seed, _ = self.logical_room_seed(grid, current, stable_nodes)
-        component = self.logical_room_component(grid, seed, stable_nodes) if seed is not None else set()
+        component = set(by_node.get(seed, ()))
         if not component and current in passable:
             component = {current}
         return component, portal_cut, current
 
+    def navigation_components(self, grid: dict, blocked: frozenset = frozenset()) -> tuple:
+        key = (self.navigation_grid_key(grid), blocked)
+        with self.navigation_graph_lock:
+            cached = self.navigation_component_cache.get(key)
+            if cached is not None:
+                self.navigation_component_cache.move_to_end(key)
+        if cached is None:
+            graph = self.navigation_graph(grid)
+            passable = frozenset(graph).difference(blocked)
+            remaining = set(passable)
+            by_node = {}
+            while remaining:
+                seed = next(iter(remaining))
+                component = frozenset(self.logical_room_component(grid, seed, remaining))
+                remaining.difference_update(component)
+                by_node.update(dict.fromkeys(component, component))
+            cached = (passable, by_node)
+            with self.navigation_graph_lock:
+                self.navigation_component_cache[key] = cached
+                while len(self.navigation_component_cache) > NAVIGATION_GRAPH_CACHE_SIZE:
+                    self.navigation_component_cache.popitem(last=False)
+        return cached
+
     def static_room_component_for_state(
-        self,
-        state: dict,
-        grid: dict,
+        self, state: dict, grid: dict,
     ) -> tuple[set[tuple[int, int]], tuple[int, int] | None]:
         """Return the native static walkable component without event-object cuts."""
-        passable = {
-            (x, y)
-            for y in range(grid["height"])
-            for x in range(grid["width"])
-            if nav_bit(grid, (x, y))
-        }
+        passable, by_node = self.navigation_components(grid)
         pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
         current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         seed, _ = self.logical_room_seed(grid, current, passable)
-        component = self.logical_room_component(grid, seed, passable) if seed is not None else set()
+        component = set(by_node.get(seed, ()))
         if not component and current in passable:
             component = {current}
         return component, current
 
     def logical_room_hash(self, scene_id, map_id, grid: dict, nodes: set[tuple[int, int]]) -> str:
+        key = (scene_id, map_id, self.navigation_grid_key(grid), frozenset(nodes))
+        with self.navigation_graph_lock:
+            cached = self.navigation_room_hash_cache.get(key)
+            if cached is not None:
+                self.navigation_room_hash_cache.move_to_end(key)
+                return cached
         absolute_nodes = [list(world_pos(grid, node)) for node in sorted(nodes, key=lambda item: (item[1], item[0]))]
         payload = [scene_id, map_id, absolute_nodes]
-        return hashlib.sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+        result = hashlib.sha256(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+        with self.navigation_graph_lock:
+            self.navigation_room_hash_cache[key] = result
+            while len(self.navigation_room_hash_cache) > NAVIGATION_GRAPH_CACHE_SIZE:
+                self.navigation_room_hash_cache.popitem(last=False)
+        return result
 
     def room_state_stable(self, state: dict) -> bool:
         return (
@@ -2545,40 +3927,1073 @@ class DebugState:
         return {
             "version": EXPLORATION_VERSION,
             "rooms": {},
+            "room_memos": {},
             "transitions": {},
             "object_interactions": {},
+            "object_visual_annotations": {},
+            "battle_reappearances": {},
+            "combat_knowledge": {
+                "version": COMBAT_KNOWLEDGE_VERSION,
+                "actions": {},
+                "enemies": {},
+                "active_battles": {},
+                "hp_tracking_version": COMBAT_HP_TRACKING_VERSION,
+                "encounters": {},
+                "seen": [],
+            },
+            "interaction_observable_context": {
+                "revision": 0,
+                "event_keys": [],
+                "evidence": [],
+            },
             "tasks": {},
+            "tasks_revision": 0,
+            "task_inbox": {},
+            "task_inbox_version": TASK_INBOX_SCHEMA_VERSION,
+            "task_inbox_initialized": True,
         }
 
     def read_exploration(self) -> dict:
+        started = time.monotonic()
+        try:
+            return self._read_exploration_cached()
+        finally:
+            metrics = getattr(self.navigation_timings, "current", None)
+            if metrics is not None:
+                metrics["history_reads"] = metrics.get("history_reads", 0) + 1
+                metrics["history_read_ms"] = metrics.get("history_read_ms", 0) + (time.monotonic() - started) * 1000
+
+    @staticmethod
+    def exploration_file_signature(stat: os.stat_result) -> tuple:
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _read_exploration_cached(self) -> dict:
+        def signature():
+            return self.exploration_file_signature(self.exploration_path.stat())
+
+        try:
+            before = signature()
+        except FileNotFoundError:
+            return self.empty_exploration()
+        cached = self.exploration_read_cache
+        if cached is not None and cached[0] == before:
+            return json.loads(cached[1])
+        data = self._read_exploration()
+        try:
+            if signature() == before:
+                self.exploration_read_cache = (
+                    before, json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                )
+        except FileNotFoundError:
+            pass
+        return data
+
+    def _read_exploration(self) -> dict:
         try:
             data = json.loads(self.exploration_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             return self.empty_exploration()
+        return self.normalize_exploration(data)
+
+    def normalize_exploration(self, data: dict) -> dict:
         if not isinstance(data, dict) or data.get("version") != EXPLORATION_VERSION:
             return self.empty_exploration()
         rooms = data.get("rooms")
         if not isinstance(rooms, dict):
             data["rooms"] = {}
+        else:
+            # Room coverage `complete` predates stable logical room identity and
+            # duplicates the visited/frontier geometry.  Ignore legacy values;
+            # the next ordinary write will naturally omit them.
+            for room in rooms.values():
+                if isinstance(room, dict):
+                    room.pop("complete", None)
+        room_memos = data.get("room_memos")
+        if not isinstance(room_memos, dict):
+            data["room_memos"] = {}
+        else:
+            data["room_memos"] = {
+                room_id: memo
+                for room_id, memo in room_memos.items()
+                if (
+                    is_logical_room_id(room_id)
+                    and isinstance(memo, dict)
+                    and memo.get("room_id") == room_id
+                    and memo.get("source") == "agent_annotation"
+                    and isinstance(memo.get("text"), str)
+                    and 0 < len(memo["text"]) <= MAX_ROOM_MEMO_TEXT
+                    and isinstance(memo.get("created_at"), (int, float))
+                    and not isinstance(memo.get("created_at"), bool)
+                    and isinstance(memo.get("updated_at"), (int, float))
+                    and not isinstance(memo.get("updated_at"), bool)
+                    and isinstance(memo.get("created_agent_turn"), int)
+                    and not isinstance(memo.get("created_agent_turn"), bool)
+                    and isinstance(memo.get("updated_agent_turn"), int)
+                    and not isinstance(memo.get("updated_agent_turn"), bool)
+                )
+            }
         transitions = data.get("transitions")
         if not isinstance(transitions, dict):
             data["transitions"] = {}
+        else:
+            self.derive_transition_endpoints(data)
         object_interactions = data.get("object_interactions")
+        if not isinstance(data.get("object_visual_annotations"), dict):
+            data["object_visual_annotations"] = {}
         if not isinstance(object_interactions, dict):
             data["object_interactions"] = {}
+        battle_reappearances = data.get("battle_reappearances")
+        if not isinstance(battle_reappearances, dict):
+            data["battle_reappearances"] = {}
+        knowledge = data.get("combat_knowledge")
+        if not isinstance(knowledge, dict):
+            data["combat_knowledge"] = self.empty_exploration()["combat_knowledge"]
+        else:
+            # v1 stored useful per-action samples and legacy lineup encounters.
+            # Keep both intact, but v2 no longer reads or writes encounters.
+            if knowledge.get("version") == 1:
+                knowledge["version"] = COMBAT_KNOWLEDGE_VERSION
+                knowledge.setdefault("enemies", {})
+                knowledge.setdefault("active_battles", {})
+            elif knowledge.get("version") != COMBAT_KNOWLEDGE_VERSION:
+                data["combat_knowledge"] = self.empty_exploration()["combat_knowledge"]
+                knowledge = data["combat_knowledge"]
+            for key in ("actions", "enemies", "active_battles", "encounters"):
+                if not isinstance(knowledge.get(key), dict):
+                    knowledge[key] = {}
+            if knowledge.get("hp_tracking_version") != COMBAT_HP_TRACKING_VERSION:
+                for enemy in knowledge["enemies"].values():
+                    if isinstance(enemy, dict):
+                        enemy["hp_samples"] = []
+                knowledge["active_battles"] = {}
+                knowledge["hp_tracking_version"] = COMBAT_HP_TRACKING_VERSION
+            if not isinstance(knowledge.get("seen"), list):
+                knowledge["seen"] = []
+        observable_context = data.get("interaction_observable_context")
+        if not isinstance(observable_context, dict):
+            data["interaction_observable_context"] = None
         # Tasks are companion memory inferred by the agent, rather than game facts.
         # Keep current exploration files usable when the additive task ledger is absent.
         tasks = data.get("tasks")
         if not isinstance(tasks, dict):
             data["tasks"] = {}
+        try:
+            data["tasks_revision"] = max(0, int(data.get("tasks_revision") or 0))
+        except (TypeError, ValueError):
+            data["tasks_revision"] = 0
+        task_inbox = data.get("task_inbox")
+        if not isinstance(task_inbox, dict):
+            data["task_inbox"] = {}
+        self._migrate_task_inbox(data)
+        if not isinstance(data.get("task_inbox_initialized"), bool):
+            data["task_inbox_initialized"] = False
         return data
 
     def write_exploration(self, data: dict) -> None:
-        self.atomic_write_text(
-            self.exploration_path,
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        canonical = self.normalize_exploration(data)
+        text = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+        stat = self.atomic_write_text(self.exploration_path, text, encoding="utf-8")
+        if stat is not None:
+            self.exploration_read_cache = (self.exploration_file_signature(stat), text)
+
+    @staticmethod
+    def _combat_trim_keys(values: dict, capacity: int) -> None:
+        while len(values) > capacity:
+            oldest = min(
+                values,
+                key=lambda key: (
+                    float(values[key].get("updated_at") or 0)
+                    if isinstance(values[key], dict) else 0,
+                    key,
+                ),
+            )
+            values.pop(oldest, None)
+
+    @staticmethod
+    def _visible_outcome_sample(outcome: dict, enemy_object_id: int) -> dict:
+        actor = outcome.get("actor") if isinstance(outcome.get("actor"), dict) else {}
+        action = outcome.get("action") if isinstance(outcome.get("action"), dict) else {}
+        return {
+            "sequence": int(outcome.get("sequence") or 0),
+            "actor": {
+                key: actor.get(key)
+                for key in ("index", "role_id", "object_id", "name") if key in actor
+            },
+            "action_type": str(action.get("action_type") or ""),
+            "object_id": int(action.get("object_id") or 0),
+            "name": str(action.get("name") or ""),
+            **({"mp_cost": int(action.get("mp_cost") or 0)} if "mp_cost" in action else {}),
+            "enemy_object_id": enemy_object_id,
+            "enemy_changes": [
+                {
+                    key: change.get(key)
+                    for key in ("slot_index", "object_id", "name", "amount", "kind", "defeated")
+                    if key in change
+                }
+                for change in outcome.get("enemy_changes") or []
+                if isinstance(change, dict) and int(change.get("object_id") or 0) == enemy_object_id
+            ],
+            "player_changes": [
+                {
+                    key: change.get(key)
+                    for key in (
+                        "index", "hp", "mp", "knocked_out", "status_before",
+                        "status_after", "poisons_before", "poisons_after",
+                    ) if key in change
+                }
+                for change in outcome.get("player_changes") or []
+                if isinstance(change, dict)
+            ],
+            "numbers": [
+                {
+                    key: number.get(key)
+                    for key in (
+                        "side", "target_index", "stat", "amount", "kind",
+                        "object_id", "role_id", "name",
+                    ) if key in number
+                }
+                for number in outcome.get("numbers") or []
+                if isinstance(number, dict)
+            ],
+            "no_numeric_change_observed": bool(outcome.get("no_numeric_change_observed")),
+        }
+
+    @staticmethod
+    def _single_enemy_win_hp_fallback(source: dict) -> dict | None:
+        """Infer one defeated life only from an unambiguous completed win log."""
+        if source.get("result") != "won":
+            return None
+        enemies = [
+            enemy for enemy in source.get("enemies") or []
+            if isinstance(enemy, dict) and int(enemy.get("object_id") or 0) > 0
+        ]
+        if len(enemies) != 1:
+            return None
+        enemy_id = int(enemies[0].get("object_id") or 0)
+        outcomes = sorted(
+            (outcome for outcome in source.get("visible_outcomes") or [] if isinstance(outcome, dict)),
+            key=lambda outcome: int(outcome.get("sequence") or 0),
         )
+        sequences = [int(outcome.get("sequence") or 0) for outcome in outcomes]
+        if not sequences or sequences != list(range(1, sequences[-1] + 1)):
+            return None
+        changes = [
+            (int(outcome.get("sequence") or 0), change)
+            for outcome in outcomes
+            for change in outcome.get("enemy_changes") or []
+            if isinstance(change, dict)
+        ]
+        if not changes or any(change.get("defeated") is True for _, change in changes):
+            return None
+        identities = {
+            (int(change.get("slot_index") or 0), int(change.get("object_id") or 0))
+            for _, change in changes
+        }
+        if len(identities) != 1 or next(iter(identities))[1] != enemy_id:
+            return None
+        final_sequence, final_change = changes[-1]
+        if (
+            final_sequence != sequences[-1]
+            or final_change.get("kind") != "damage"
+            or int(final_change.get("amount") or 0) <= 0
+        ):
+            return None
+        net_damage = 0
+        lower = 0
+        for sequence, change in changes:
+            amount = max(0, int(change.get("amount") or 0))
+            if sequence == final_sequence and change is final_change:
+                lower = net_damage
+            if change.get("kind") == "damage":
+                net_damage += amount
+            elif change.get("kind") == "recovery":
+                net_damage = max(0, net_damage - amount)
+            else:
+                return None
+        if net_damage <= lower:
+            return None
+        return {
+            "object_id": enemy_id,
+            "name": str(enemies[0].get("name") or final_change.get("name") or ""),
+            "lower_exclusive": lower,
+            "upper_inclusive": net_damage,
+            "defeat_confirmation": "completed_single_enemy_win",
+            "tracking_version": COMBAT_HP_TRACKING_VERSION,
+        }
+
+    def observe_combat_knowledge(self, state: dict) -> None:
+        if not self.companion_owner_matches():
+            return
+        instance_id = str(state.get("game_instance_id") or "")
+        if not instance_id:
+            return
+        sources = []
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        last = state.get("last_battle") if isinstance(state.get("last_battle"), dict) else None
+        if battle is not None:
+            sources.append((battle, False))
+        if last is not None:
+            sources.append((last, True))
+        if not sources:
+            return
+        with self.exploration_lock:
+            data = self.read_exploration()
+            knowledge = data["combat_knowledge"]
+            seen_list = [str(value) for value in knowledge.get("seen") or []]
+            seen = set(seen_list)
+            changed = False
+            for source, completed in sources:
+                generation = int(source.get("generation") or 0)
+                if generation <= 0:
+                    continue
+                battle_key = f"{instance_id}:{generation}"
+                outcomes = sorted(
+                    (outcome for outcome in source.get("visible_outcomes") or [] if isinstance(outcome, dict)),
+                    key=lambda outcome: int(outcome.get("sequence") or 0),
+                )
+                active = knowledge["active_battles"].get(battle_key)
+                if not isinstance(active, dict):
+                    first_sequence = int(outcomes[0].get("sequence") or 0) if outcomes else 0
+                    active = {
+                        "game_instance_id": instance_id,
+                        "battle_generation": generation,
+                        "last_sequence": 0,
+                        "complete_from_start": first_sequence in (0, 1),
+                        "lives": {},
+                        "pending_hp_samples": [],
+                        "updated_at": time.time(),
+                    }
+                    knowledge["active_battles"][battle_key] = active
+                    changed = True
+                lives = active.setdefault("lives", {})
+                last_sequence = int(active.get("last_sequence") or 0)
+                pending_change_keys = {
+                    f"{int(change.get('slot_index') or 0)}:{int(change.get('object_id') or 0)}"
+                    for outcome in outcomes
+                    if int(outcome.get("sequence") or 0) > last_sequence
+                    for change in outcome.get("enemy_changes") or []
+                    if isinstance(change, dict) and int(change.get("object_id") or 0) > 0
+                }
+                present_keys = set()
+                if not completed:
+                    for enemy in source.get("enemies") or []:
+                        if not isinstance(enemy, dict) or enemy.get("present", True) is False:
+                            continue
+                        slot = int(enemy.get("slot_index") or 0)
+                        enemy_id = int(enemy.get("object_id") or 0)
+                        if enemy_id <= 0:
+                            continue
+                        life_key = f"{slot}:{enemy_id}"
+                        present_keys.add(life_key)
+                        life = lives.get(life_key)
+                        if isinstance(life, dict) and life.pop("temporarily_absent", False):
+                            life["net_damage"] = 0
+                            changed = True
+                        else:
+                            lives.setdefault(life_key, {
+                                "slot_index": slot,
+                                "object_id": enemy_id,
+                                "name": str(enemy.get("name") or ""),
+                                "net_damage": 0,
+                            })
+                for life_key in list(lives):
+                    slot_text = life_key.split(":", 1)[0]
+                    replaced = any(
+                        key.split(":", 1)[0] == slot_text and key != life_key
+                        for key in present_keys
+                    )
+                    if replaced or (completed and life_key not in pending_change_keys):
+                        lives.pop(life_key, None)
+                        changed = True
+                    elif life_key not in present_keys and life_key not in pending_change_keys:
+                        lives[life_key]["temporarily_absent"] = True
+                        changed = True
+                for outcome in outcomes:
+                    if not isinstance(outcome, dict):
+                        continue
+                    sequence = int(outcome.get("sequence") or 0)
+                    token = f"{instance_id}:{generation}:{sequence}"
+                    if sequence <= 0:
+                        continue
+                    if sequence > last_sequence:
+                        if sequence != last_sequence + 1:
+                            active["complete_from_start"] = False
+                            active["pending_hp_samples"] = []
+                            for life in lives.values():
+                                if isinstance(life, dict):
+                                    life["net_damage"] = 0
+                        for change in outcome.get("enemy_changes") or []:
+                            if not isinstance(change, dict):
+                                continue
+                            slot = int(change.get("slot_index") or 0)
+                            enemy_id = int(change.get("object_id") or 0)
+                            if enemy_id <= 0:
+                                continue
+                            life_key = f"{slot}:{enemy_id}"
+                            life = lives.setdefault(life_key, {
+                                "slot_index": slot,
+                                "object_id": enemy_id,
+                                "name": str(change.get("name") or ""),
+                                "net_damage": 0,
+                            })
+                            before_final = max(0, int(life.get("net_damage") or 0))
+                            amount = max(0, int(change.get("amount") or 0))
+                            if change.get("kind") == "damage":
+                                life["net_damage"] = before_final + amount
+                            elif change.get("kind") == "recovery":
+                                life["net_damage"] = max(0, before_final - amount)
+                            if change.get("defeated") is True:
+                                after_final = max(0, int(life.get("net_damage") or 0))
+                                if active.get("complete_from_start") and after_final > before_final:
+                                    active["pending_hp_samples"].append({
+                                        "object_id": enemy_id,
+                                        "name": str(change.get("name") or life.get("name") or ""),
+                                        "lower_exclusive": before_final,
+                                        "upper_inclusive": after_final,
+                                        "tracking_version": COMBAT_HP_TRACKING_VERSION,
+                                    })
+                                lives.pop(life_key, None)
+                        active["last_sequence"] = sequence
+                        active["updated_at"] = time.time()
+                        last_sequence = sequence
+                        changed = True
+                    if token in seen:
+                        continue
+                    actor = outcome.get("actor") if isinstance(outcome.get("actor"), dict) else {}
+                    action = outcome.get("action") if isinstance(outcome.get("action"), dict) else {}
+                    if actor.get("side") == "player":
+                        affected_ids = {
+                            int(change.get("object_id") or 0)
+                            for change in outcome.get("enemy_changes") or []
+                            if isinstance(change, dict) and int(change.get("object_id") or 0) > 0
+                        }
+                        target = outcome.get("target") if isinstance(outcome.get("target"), dict) else {}
+                        if int(target.get("object_id") or 0) > 0:
+                            affected_ids.add(int(target["object_id"]))
+                        if not affected_ids:
+                            affected_ids = {0}
+                        for enemy_id in affected_ids:
+                            key = ":".join(str(value) for value in (
+                                int(actor.get("role_id") or 0),
+                                str(action.get("action_type") or ""),
+                                int(action.get("object_id") or 0),
+                                enemy_id,
+                            ))
+                            entry = knowledge["actions"].setdefault(key, {
+                                "actor_role_id": int(actor.get("role_id") or 0),
+                                "actor_name": str(actor.get("name") or ""),
+                                "action_type": str(action.get("action_type") or ""),
+                                "object_id": int(action.get("object_id") or 0),
+                                "name": str(action.get("name") or ""),
+                                "enemy_object_id": enemy_id,
+                                "samples": [],
+                            })
+                            sample = self._visible_outcome_sample(outcome, enemy_id)
+                            sample.update(game_instance_id=instance_id, battle_generation=generation)
+                            entry["samples"] = (entry.get("samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):] + [sample]
+                            entry["updated_at"] = time.time()
+                    elif actor.get("side") == "enemy":
+                        enemy_id = int(actor.get("object_id") or 0)
+                        if enemy_id > 0:
+                            enemy = knowledge["enemies"].setdefault(str(enemy_id), {
+                                "object_id": enemy_id,
+                                "name": str(actor.get("name") or ""),
+                                "hp_samples": [],
+                                "enemy_effect_samples": [],
+                            })
+                            sample = self._visible_outcome_sample(outcome, 0)
+                            sample["object_id"] = 0
+                            sample["name"] = ""
+                            sample.pop("mp_cost", None)
+                            sample["enemy_changes"] = []
+                            sample["numbers"] = []
+                            sample.update(game_instance_id=instance_id, battle_generation=generation)
+                            enemy["enemy_effect_samples"] = (
+                                (enemy.get("enemy_effect_samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):]
+                                + [sample]
+                            )
+                            enemy["updated_at"] = time.time()
+                    seen.add(token)
+                    seen_list.append(token)
+                    changed = True
+                result_token = f"{instance_id}:{generation}:result"
+                if completed and result_token not in seen:
+                    for hp_sample in active.get("pending_hp_samples") or []:
+                        enemy_id = int(hp_sample.get("object_id") or 0)
+                        if enemy_id <= 0:
+                            continue
+                        enemy = knowledge["enemies"].setdefault(str(enemy_id), {
+                            "object_id": enemy_id,
+                            "name": str(hp_sample.get("name") or ""),
+                            "hp_samples": [],
+                            "enemy_effect_samples": [],
+                        })
+                        sample = dict(hp_sample)
+                        sample.update(game_instance_id=instance_id, battle_generation=generation)
+                        enemy["hp_samples"] = (
+                            (enemy.get("hp_samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):] + [sample]
+                        )
+                        enemy["updated_at"] = time.time()
+                    seen.add(result_token)
+                    seen_list.append(result_token)
+                    knowledge["active_battles"].pop(battle_key, None)
+                    changed = True
+                elif completed and battle_key in knowledge["active_battles"]:
+                    knowledge["active_battles"].pop(battle_key, None)
+                    changed = True
+                fallback_token = f"{instance_id}:{generation}:hp-fallback-single-win"
+                if completed and fallback_token not in seen:
+                    hp_sample = self._single_enemy_win_hp_fallback(source)
+                    if hp_sample is not None:
+                        enemy_id = int(hp_sample["object_id"])
+                        enemy = knowledge["enemies"].setdefault(str(enemy_id), {
+                            "object_id": enemy_id,
+                            "name": str(hp_sample.get("name") or ""),
+                            "hp_samples": [],
+                            "enemy_effect_samples": [],
+                        })
+                        sample = dict(hp_sample)
+                        sample.update(game_instance_id=instance_id, battle_generation=generation)
+                        enemy["hp_samples"] = (
+                            (enemy.get("hp_samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):]
+                            + [sample]
+                        )
+                        enemy["updated_at"] = time.time()
+                        seen.add(fallback_token)
+                        seen_list.append(fallback_token)
+                        changed = True
+            if changed:
+                knowledge["seen"] = seen_list[-COMBAT_SEEN_CAPACITY:]
+                self._combat_trim_keys(knowledge["actions"], COMBAT_ACTION_KEY_CAPACITY)
+                self._combat_trim_keys(knowledge["enemies"], COMBAT_ENEMY_KEY_CAPACITY)
+                self._combat_trim_keys(knowledge["active_battles"], COMBAT_ACTIVE_BATTLE_CAPACITY)
+                self.write_exploration(data)
+
+    def observe_visible_item_use(
+        self,
+        before: dict,
+        after: dict,
+        item_id: int,
+        role_id: int,
+    ) -> None:
+        if not self.companion_owner_matches():
+            return
+        instance_id = str(after.get("game_instance_id") or before.get("game_instance_id") or "")
+        sequence = int(after.get("logical_frame", after.get("frame")) or 0)
+        if not instance_id or sequence <= 0:
+            return
+        before_party = {
+            int(player.get("role_id") if player.get("role_id") is not None else -1): player
+            for player in before.get("party") or [] if isinstance(player, dict)
+        }
+        after_party = {
+            int(player.get("role_id") if player.get("role_id") is not None else -1): player
+            for player in after.get("party") or [] if isinstance(player, dict)
+        }
+        actor_before = before_party.get(int(role_id)) or {}
+        actor_after = after_party.get(int(role_id)) or {}
+        item = next((
+            entry for entry in before.get("inventory") or []
+            if isinstance(entry, dict) and int(entry.get("item_id") or 0) == int(item_id)
+        ), {})
+        def visible_effects(player: dict) -> tuple[list[dict], list[dict]]:
+            statuses = [
+                {key: effect.get(key) for key in ("status_id", "key", "remaining_rounds", "persistent") if key in effect}
+                for effect in player.get("status_effects") or [] if isinstance(effect, dict)
+            ]
+            poisons = [
+                {"name": poison.get("name")}
+                for poison in player.get("poisons") or []
+                if isinstance(poison, dict) and poison.get("name")
+            ]
+            return statuses, poisons
+        status_before, poison_before = visible_effects(actor_before)
+        status_after, poison_after = visible_effects(actor_after)
+        hp_before, hp_after = int(actor_before.get("hp") or 0), int(actor_after.get("hp") or 0)
+        mp_before, mp_after = int(actor_before.get("mp") or 0), int(actor_after.get("mp") or 0)
+        sample = {
+            "sequence": sequence,
+            "actor": {"role_id": int(role_id), "name": str(actor_after.get("name") or actor_before.get("name") or "")},
+            "action_type": "use_item",
+            "object_id": int(item_id),
+            "name": str(item.get("name") or ""),
+            "enemy_object_id": 0,
+            "enemy_changes": [],
+            "player_changes": [{
+                "role_id": int(role_id),
+                "hp": {"before": hp_before, "after": hp_after, "max": int(actor_after.get("max_hp") or actor_before.get("max_hp") or 0)},
+                "mp": {"before": mp_before, "after": mp_after, "max": int(actor_after.get("max_mp") or actor_before.get("max_mp") or 0)},
+                "status_before": status_before,
+                "status_after": status_after,
+                "poisons_before": poison_before,
+                "poisons_after": poison_after,
+            }],
+            "no_numeric_change_observed": hp_before == hp_after and mp_before == mp_after,
+            "game_instance_id": instance_id,
+            "battle_generation": 0,
+        }
+        token = f"{instance_id}:item:{sequence}:{int(item_id)}:{int(role_id)}"
+        key = f"{int(role_id)}:use_item:{int(item_id)}:0"
+        with self.exploration_lock:
+            data = self.read_exploration()
+            knowledge = data["combat_knowledge"]
+            seen = [str(value) for value in knowledge.get("seen") or []]
+            if token in set(seen):
+                return
+            entry = knowledge["actions"].setdefault(key, {
+                "actor_role_id": int(role_id),
+                "actor_name": sample["actor"]["name"],
+                "action_type": "use_item",
+                "object_id": int(item_id),
+                "name": sample["name"],
+                "enemy_object_id": 0,
+                "samples": [],
+            })
+            entry["samples"] = (entry.get("samples") or [])[-(COMBAT_SAMPLE_CAPACITY - 1):] + [sample]
+            entry["updated_at"] = time.time()
+            knowledge["seen"] = (seen + [token])[-COMBAT_SEEN_CAPACITY:]
+            self._combat_trim_keys(knowledge["actions"], COMBAT_ACTION_KEY_CAPACITY)
+            self.write_exploration(data)
+
+    def combat_experience(self, battle: dict | None, *, item_id: int | None = None) -> dict:
+        if not self.companion_owner_matches():
+            return {"available": False, "isolation_error": "companion_owner_mismatch"}
+        with self.exploration_lock:
+            knowledge = self.read_exploration().get("combat_knowledge") or {}
+        current_enemies = {}
+        for enemy in (battle or {}).get("enemies") or []:
+            if not isinstance(enemy, dict) or enemy.get("present", True) is False:
+                continue
+            enemy_id = int(enemy.get("object_id") or 0)
+            if enemy_id <= 0:
+                continue
+            current = current_enemies.setdefault(enemy_id, {
+                "object_id": enemy_id, "name": str(enemy.get("name") or ""), "current_count": 0,
+            })
+            current["current_count"] += 1
+        grouped_actions = {enemy_id: [] for enemy_id in current_enemies}
+        support_actions = []
+        for entry in (knowledge.get("actions") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            enemy_id = int(entry.get("enemy_object_id") or 0)
+            if item_id is not None:
+                if int(entry.get("object_id") or 0) != int(item_id):
+                    continue
+            if enemy_id not in current_enemies and enemy_id != 0:
+                continue
+            (support_actions if enemy_id == 0 else grouped_actions[enemy_id]).append(entry)
+        support_actions.sort(key=lambda entry: float(entry.get("updated_at") or 0), reverse=True)
+        enemy_memories = []
+        for enemy_id, current in current_enemies.items():
+            stored = (knowledge.get("enemies") or {}).get(str(enemy_id))
+            stored = stored if isinstance(stored, dict) else {}
+            hp_samples = [sample for sample in stored.get("hp_samples") or [] if isinstance(sample, dict)]
+            if not hp_samples:
+                hp_estimate = {"status": "unknown"}
+            else:
+                lower = max(int(sample.get("lower_exclusive") or 0) for sample in hp_samples)
+                upper = min(int(sample.get("upper_inclusive") or 0) for sample in hp_samples)
+                hp_estimate = (
+                    {"status": "estimated", "lower_exclusive": lower, "upper_inclusive": upper,
+                     "sample_count": len(hp_samples)}
+                    if lower < upper else
+                    {"status": "inconsistent", "sample_count": len(hp_samples), "samples": [
+                        {
+                            "lower_exclusive": int(sample.get("lower_exclusive") or 0),
+                            "upper_inclusive": int(sample.get("upper_inclusive") or 0),
+                        }
+                        for sample in hp_samples
+                    ]}
+                )
+            actions = grouped_actions[enemy_id]
+            actions.sort(key=lambda entry: float(entry.get("updated_at") or 0), reverse=True)
+            enemy_memories.append({
+                **current,
+                "hp_estimate": hp_estimate,
+                "player_actions": actions,
+                "enemy_effects": [
+                    {
+                        "sequence": int(sample.get("sequence") or 0),
+                        "battle_generation": int(sample.get("battle_generation") or 0),
+                        "actor": {
+                            key: (sample.get("actor") or {}).get(key)
+                            for key in ("index", "object_id", "name")
+                            if key in (sample.get("actor") or {})
+                        },
+                        "player_changes": copy.deepcopy(sample.get("player_changes") or []),
+                        "no_numeric_change_observed": bool(
+                            sample.get("no_numeric_change_observed")
+                        ),
+                    }
+                    for sample in stored.get("enemy_effect_samples") or []
+                    if isinstance(sample, dict)
+                ],
+            })
+        return {
+            "available": True,
+            "enemy_memories": enemy_memories,
+            "support_actions": support_actions,
+            **({"matching_actions": support_actions + [
+                action
+                for memory in enemy_memories
+                for action in memory.get("player_actions") or []
+            ]} if item_id is not None else {}),
+        }
+
+    @staticmethod
+    def battle_trigger_is_absent(obj: dict) -> bool:
+        try:
+            vanish_time = int(obj.get("vanish_time") or 0)
+            object_state = int(obj.get("state") or 0)
+        except (TypeError, ValueError):
+            return False
+        return obj.get("interactable") is False or object_state <= 0 or vanish_time != 0
+
+    def record_battle_reappearance_candidate(self, summary: dict, state: dict) -> dict | None:
+        """Remember a won battle only after its trigger is observably absent."""
+        if not isinstance(summary, dict) or summary.get("result") != "won":
+            return None
+        context = summary.get("trigger_context")
+        if not isinstance(context, dict):
+            return None
+        room_id = context.get("logical_room_id")
+        try:
+            object_id = int(context.get("event_object_id") or 0)
+            trigger_script = int(context.get("trigger_script") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not is_logical_room_id(room_id) or object_id <= 0 or trigger_script <= 0:
+            return None
+        identity = self.room_identity(state)
+        if not isinstance(identity, dict) or identity.get("id") != room_id:
+            return None
+        obj = next(
+            (entry for entry in state.get("objects") or []
+             if isinstance(entry, dict) and int(entry.get("id") or 0) == object_id),
+            None,
+        )
+        if obj is None or int(obj.get("trigger_script") or 0) != trigger_script:
+            return None
+        if not self.battle_trigger_is_absent(obj):
+            return None
+        now = time.time()
+        with self.exploration_lock:
+            data = self.read_exploration()
+            history = data.setdefault("battle_reappearances", {})
+            room = history.get(room_id)
+            if not isinstance(room, dict):
+                room = {}
+                history[room_id] = room
+            scripts = room.get(str(object_id))
+            if not isinstance(scripts, dict):
+                scripts = {}
+                room[str(object_id)] = scripts
+            previous = scripts.get(str(trigger_script))
+            try:
+                count = int(previous.get("battle_count") or 0) if isinstance(previous, dict) else 0
+                reappearance_count = int(previous.get("reappearance_count") or 0) if isinstance(previous, dict) else 0
+            except (TypeError, ValueError):
+                count = 0
+                reappearance_count = 0
+            entry = {
+                "object_id": object_id,
+                "trigger_script": trigger_script,
+                "battle_count": count + 1,
+                "reappearance_count": reappearance_count,
+                "status": "awaiting_reappearance",
+                "last_battle_at": now,
+            }
+            if isinstance(previous, dict) and previous.get("last_reappeared_at") is not None:
+                entry["last_reappeared_at"] = previous["last_reappeared_at"]
+            scripts[str(trigger_script)] = entry
+            self.write_exploration(data)
+        return dict(entry)
+
+    def observe_battle_reappearances(self, state: dict) -> list[dict]:
+        """Confirm pending records from a stable, matching, interactable object."""
+        with self.exploration_lock:
+            data = self.read_exploration()
+            confirmed = self.confirm_battle_reappearances(state, data)
+            if confirmed:
+                self.write_exploration(data)
+            return confirmed
+
+    def confirm_battle_reappearances(self, state: dict, data: dict) -> list[dict]:
+        if not self.room_state_stable(state):
+            return []
+        identity = self.room_identity(state)
+        if identity is None:
+            return []
+        objects = {str(entry.get("id")): entry for entry in state.get("objects") or [] if isinstance(entry, dict)}
+        confirmed = []
+        history = data.get("battle_reappearances")
+        room = history.get(identity["id"]) if isinstance(history, dict) else None
+        if not isinstance(room, dict):
+            return []
+        now = time.time()
+        for object_id, scripts in room.items():
+            obj = objects.get(object_id)
+            if obj is None or not isinstance(scripts, dict) or obj.get("interactable") is not True:
+                continue
+            script = str(obj.get("trigger_script") or 0)
+            entry = scripts.get(script)
+            if not isinstance(entry, dict) or entry.get("status") != "awaiting_reappearance":
+                continue
+            entry["status"] = "confirmed"
+            entry["reappearance_count"] = int(entry.get("reappearance_count") or 0) + 1
+            entry["last_reappeared_at"] = now
+            confirmed.append(dict(entry))
+        return confirmed
+
+    def battle_reappearance_for_target(self, state: dict, target_id: int, data: dict | None = None) -> dict | None:
+        identity = self.room_identity(state)
+        obj = next((entry for entry in state.get("objects") or [] if isinstance(entry, dict) and int(entry.get("id") or 0) == target_id), None)
+        if identity is None or obj is None:
+            return None
+        if data is None:
+            data = self.read_exploration()
+        history = data.get("battle_reappearances")
+        room = history.get(identity["id"]) if isinstance(history, dict) else None
+        scripts = room.get(str(target_id)) if isinstance(room, dict) else None
+        entry = scripts.get(str(obj.get("trigger_script") or 0)) if isinstance(scripts, dict) else None
+        if not isinstance(entry, dict) or entry.get("status") != "confirmed":
+            return None
+        return {
+            key: entry.get(key)
+            for key in ("battle_count", "reappearance_count", "last_battle_at", "last_reappeared_at")
+            if entry.get(key) is not None
+        }
+
+    def room_memo(self, room_id: str | None, data: dict | None = None) -> dict | None:
+        if not is_logical_room_id(room_id):
+            return None
+        if data is None:
+            with self.exploration_lock:
+                data = self.read_exploration()
+        room_memos = data.get("room_memos") if isinstance(data, dict) else None
+        memo = room_memos.get(room_id) if isinstance(room_memos, dict) else None
+        return dict(memo) if isinstance(memo, dict) else None
+
+    def upsert_room_memo(self, arguments: dict, state: dict) -> dict:
+        operation = arguments.get("operation", "set")
+        if operation not in {"set", "clear"}:
+            return {"ok": False, "error": "operation must be set or clear"}
+
+        if "room_id" in arguments:
+            room_id = arguments.get("room_id")
+            if not is_logical_room_id(room_id):
+                return {"ok": False, "error": "room_id must be a stable logical_room_id"}
+        else:
+            identity = self.room_identity(state)
+            room_id = identity.get("id") if isinstance(identity, dict) else None
+            if not is_logical_room_id(room_id):
+                return {"ok": False, "error": "current stable logical_room_id is unavailable"}
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room_memos = data.setdefault("room_memos", {})
+            existing = room_memos.get(room_id)
+            if operation == "clear":
+                if not isinstance(existing, dict):
+                    return {"ok": True, "operation": "unchanged", "room_id": room_id, "memo": None}
+                room_memos.pop(room_id, None)
+                self.write_exploration(data)
+                return {"ok": True, "operation": "cleared", "room_id": room_id, "memo": None}
+
+            text = arguments.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return {"ok": False, "error": "text must be a non-empty string for operation=set"}
+            text = text.strip()
+            if len(text) > MAX_ROOM_MEMO_TEXT:
+                return {
+                    "ok": False,
+                    "error": f"text must be at most {MAX_ROOM_MEMO_TEXT} characters",
+                    "max_length": MAX_ROOM_MEMO_TEXT,
+                }
+            if isinstance(existing, dict) and existing.get("text") == text:
+                return {
+                    "ok": True,
+                    "operation": "unchanged",
+                    "room_id": room_id,
+                    "memo": dict(existing),
+                }
+
+            now = time.time()
+            turn = self.current_agent_turn()
+            created = not isinstance(existing, dict)
+            memo = {
+                "room_id": room_id,
+                "text": text,
+                "source": "agent_annotation",
+                "created_at": now if created else existing.get("created_at"),
+                "updated_at": now,
+                "created_agent_turn": turn if created else existing.get("created_agent_turn"),
+                "updated_agent_turn": turn,
+            }
+            room_memos[room_id] = memo
+            self.write_exploration(data)
+            return {
+                "ok": True,
+                "operation": "created" if created else "updated",
+                "room_id": room_id,
+                "memo": dict(memo),
+            }
+
+    @staticmethod
+    def stable_digest(value) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def dialog_semantic_signature(self, entry: dict) -> str | None:
+        text = " ".join(str(entry.get("text") or "").split())
+        if not text:
+            return None
+        payload = {
+            "speaker": entry.get("speaker_hint"),
+            "event_object_id": entry.get("event_object_id"),
+            "room_id": entry.get("logical_room_id") or entry.get("room_id") or entry.get("room_key"),
+            "text": text,
+        }
+        return self.stable_digest(payload)
+
+    def narrative_context_digest(self) -> str:
+        signatures = {
+            signature
+            for entry in self.dialog_history
+            if isinstance(entry, dict)
+            if (signature := self.dialog_semantic_signature(entry)) is not None
+        }
+        return self.stable_digest(sorted(signatures))
+
+    def active_task_structure(self, data: dict) -> list[dict]:
+        tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+        payload = []
+        for task in tasks.values():
+            if not isinstance(task, dict) or task.get("status") != "active":
+                continue
+            payload.append({
+                key: task.get(key)
+                for key in (
+                    "id", "description", "priority", "object_id",
+                    "transition_key", "room_id", "route_context_revision",
+                )
+            })
+        payload.sort(key=lambda task: str(task.get("id") or ""))
+        return payload
+
+    def active_task_context_digest(self, data: dict) -> str:
+        return self.stable_digest(self.active_task_structure(data))
+
+    def transition_task_context_snapshot(self, data: dict | None = None) -> dict:
+        if data is None:
+            with self.exploration_lock:
+                data = self.read_exploration()
+        tasks = self.active_task_structure(data)
+        return {
+            "digest": self.stable_digest(tasks),
+            "active_task_ids": [str(task.get("id")) for task in tasks],
+            "captured_at": time.time(),
+        }
+
+    def observable_context_event_payload(self, event: dict) -> dict | None:
+        event_type = str(event.get("type") or "")
+        if event_type not in TASK_INBOX_STRUCTURAL_EVENT_TYPES:
+            return None
+        payload = {
+            "type": event_type,
+            "time": self.task_evidence_time(event),
+        }
+        if event_type == "object_changed":
+            changes = event.get("changes") if isinstance(event.get("changes"), dict) else {}
+            visible_changes = {
+                key: value for key, value in changes.items()
+                if key in OBSERVABLE_CONTEXT_OBJECT_FIELDS
+            }
+            if not visible_changes:
+                return None
+            payload.update({
+                "object_id": event.get("object_id"),
+                "room_id": event.get("logical_room_id") or event.get("room_id") or event.get("room_key"),
+                "fields": sorted(visible_changes),
+            })
+        elif event_type == "inventory_changed":
+            payload["item_id"] = event.get("item_id")
+        elif event_type in {"party_sprite_changed", "equipment_changed"}:
+            payload["role_id"] = event.get("role_id")
+        return payload
+
+    def _record_observable_context_event_locked(self, data: dict, event: dict) -> bool:
+        payload = self.observable_context_event_payload(event)
+        if payload is None:
+            return False
+        context = data.get("interaction_observable_context")
+        if not isinstance(context, dict):
+            context = {"revision": 0, "event_keys": [], "evidence": []}
+            data["interaction_observable_context"] = context
+        event_key = self.object_event_key(event)
+        event_keys = context.get("event_keys") if isinstance(context.get("event_keys"), list) else []
+        if event_key in event_keys:
+            return False
+        revision = max(0, int(context.get("revision") or 0)) + 1
+        evidence = context.get("evidence") if isinstance(context.get("evidence"), list) else []
+        evidence.append({**payload, "revision": revision})
+        context["revision"] = revision
+        context["updated_at"] = payload.get("time") or time.time()
+        context["event_keys"] = (event_keys + [event_key])[-200:]
+        context["evidence"] = evidence[-MAX_INTERACTION_CONTEXT_EVIDENCE:]
+        return True
+
+    def _ensure_observable_context_locked(self, data: dict) -> bool:
+        if isinstance(data.get("interaction_observable_context"), dict):
+            return False
+        data["interaction_observable_context"] = {
+            "revision": 0,
+            "event_keys": [],
+            "evidence": [],
+        }
+        for event in self.event_log:
+            if isinstance(event, dict):
+                self._record_observable_context_event_locked(data, event)
+        return True
+
+    def record_observable_context_event(self, event: dict) -> None:
+        if self.observable_context_event_payload(event) is None:
+            return
+        with self.exploration_lock:
+            data = self.read_exploration()
+            initialized = self._ensure_observable_context_locked(data)
+            changed = self._record_observable_context_event_locked(data, event)
+            if initialized or changed:
+                self.write_exploration(data)
+
+    def interaction_context_snapshot(self) -> dict:
+        with self.exploration_lock:
+            data = self.read_exploration()
+            initialized = self._ensure_observable_context_locked(data)
+            if initialized:
+                self.write_exploration(data)
+            return self.interaction_context_from_data(data)
+
+    def interaction_context_from_data(self, data: dict) -> dict:
+        observable = data.get("interaction_observable_context") or {}
+        context = {
+            "observable_revision": max(0, int(observable.get("revision") or 0)),
+            "narrative_digest": self.narrative_context_digest(),
+            "task_digest": self.active_task_context_digest(data),
+            "captured_at": time.time(),
+        }
+        context["key"] = self.stable_digest({
+            key: context[key] for key in ("observable_revision", "narrative_digest", "task_digest")
+        })
+        return context
+
+    @staticmethod
+    def task_ledger_revision(data: dict) -> int:
+        try:
+            return max(0, int(data.get("tasks_revision") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def task_view(self, task: dict, *, include_history: bool = True) -> dict:
         """Return a compact, JSON-safe task record without treating it as engine state."""
@@ -2588,15 +5003,57 @@ class DebugState:
                 "id", "description", "priority", "status", "object_id",
                 "transition_key", "room_id", "rationale", "created_at",
                 "updated_at", "created_agent_turn", "updated_agent_turn",
+                "completed_at", "completed_frame", "completed_raw_frame",
+                "completed_agent_turn",
+                "status_changed_at", "status_changed_agent_turn",
+                "dormant_at", "dormant_agent_turn", "abandoned_at", "abandoned_agent_turn",
+                "last_reviewed_at", "last_reviewed_agent_turn",
+                "provenance", "review_watch", "status_reason", "status_evidence",
+                "origin_evidence", "recent_evidence",
             )
         }
+        result["last_reviewed_at"] = task.get("last_reviewed_at", task.get("updated_at"))
+        result["last_reviewed_agent_turn"] = task.get(
+            "last_reviewed_agent_turn", task.get("updated_agent_turn")
+        )
         if include_history:
             result["history"] = list(task.get("history") or [])[-MAX_TASK_HISTORY:]
         return result
 
-    def task_ledger(self, *, include_closed: bool = False, limit: int = 20) -> list[dict]:
+    def task_summary_view(self, task: dict) -> dict:
+        description = " ".join(str(task.get("description") or "").split())
+        rationale = " ".join(str(task.get("rationale") or "").split())
+        if len(description) > MAX_ACTIVE_TASK_DESCRIPTION:
+            description = description[:MAX_ACTIVE_TASK_DESCRIPTION - 1] + "…"
+        if len(rationale) > MAX_ACTIVE_TASK_DESCRIPTION:
+            rationale = rationale[:MAX_ACTIVE_TASK_DESCRIPTION - 1] + "…"
+        return {
+            **{
+                key: task.get(key)
+                for key in (
+                    "id", "status", "object_id",
+                    "transition_key", "room_id",
+                    "review_watch", "status_reason", "status_evidence",
+                    "completed_at", "completed_frame", "completed_raw_frame",
+                    "completed_agent_turn",
+                )
+                if task.get(key) is not None
+            },
+            "description": description,
+            "rationale": rationale,
+        }
+
+    def task_ledger_page(
+        self,
+        *,
+        include_closed: bool,
+        detail: str,
+        offset: int,
+        limit: int,
+    ) -> dict:
         with self.exploration_lock:
             data = self.read_exploration()
+            revision = self.task_ledger_revision(data)
             tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
             records = [task for task in tasks.values() if isinstance(task, dict)]
         if not include_closed:
@@ -2611,35 +5068,982 @@ class DebugState:
             except (TypeError, ValueError):
                 updated_at = 0
             return (-priority, -updated_at, str(task.get("id") or ""))
+        def completed_sort_key(task: dict) -> tuple[float, str]:
+            try:
+                completed_at = float(task.get("completed_at") or task.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                completed_at = 0
+            return (-completed_at, str(task.get("id") or ""))
         records.sort(key=sort_key)
-        return [self.task_view(task) for task in records[:limit]]
+        completed = iter(sorted(
+            (task for task in records if task.get("status") == "completed"),
+            key=completed_sort_key,
+        ))
+        records = [next(completed) if task.get("status") == "completed" else task for task in records]
+        selected = records[offset:offset + limit]
+        complete = offset + len(selected) >= len(records)
+        view = self.task_summary_view if detail == "summary" else self.task_view
+        counts = {
+            status: sum(1 for task in records if task.get("status") == status)
+            for status in ("active", "dormant", "completed", "abandoned")
+        }
+        return {
+            "revision": revision,
+            "tasks": [view(task) for task in selected],
+            "returned": len(selected),
+            "total": len(records),
+            "offset": offset,
+            "next_offset": None if complete else offset + len(selected),
+            "complete": complete,
+            "counts": counts,
+        }
 
-    def upsert_agent_task(self, arguments: dict) -> dict:
+    def task_ledger(self, *, include_closed: bool = False, limit: int | None = 20) -> list[dict]:
+        page = self.task_ledger_page(
+            include_closed=include_closed,
+            detail="full",
+            offset=0,
+            limit=1_000_000 if limit is None else max(0, int(limit)),
+        )
+        return page["tasks"]
+
+    def agent_tasks_view(self) -> dict:
+        grouped = {status: [] for status in ("active", "dormant", "completed", "abandoned")}
+        for task in self.task_ledger(include_closed=True, limit=None):
+            status = task.get("status")
+            if status not in grouped:
+                continue
+            grouped[status].append({
+                key: task.get(key)
+                for key in (
+                    "id", "description", "priority", "status",
+                    "completed_at", "completed_frame", "completed_raw_frame",
+                    "completed_agent_turn",
+                )
+                if key in {"id", "description", "priority", "status"} or task.get(key) is not None
+            })
+        tasks = [
+            task
+            for status in ("active", "dormant", "completed", "abandoned")
+            for task in grouped[status]
+        ]
+        counts = {status: len(records) for status, records in grouped.items()}
+        counts["total"] = len(tasks)
+        return {"ok": True, "counts": counts, "tasks": tasks}
+
+    def task_review_snapshot(self, state: dict | None = None) -> dict:
+        """Capture net game state used to decide whether a task needs review."""
+        state = state if isinstance(state, dict) else self.read_live_state()
+        inventory = self.observed_inventory(state)
+        sprites = self.observed_party_sprites(state)
+        return {
+            "cash": int(state.get("cash") or 0),
+            "inventory": {
+                str(item_id): int(item.get("amount") or 0)
+                for item_id, item in inventory.items()
+            },
+            "party_sprites": {
+                str(role_id): int(role.get("scene_sprite_id") or 0)
+                for role_id, role in sprites.items()
+            },
+        }
+
+    @staticmethod
+    def task_evidence_time(entry: dict) -> float | None:
+        for key in ("updated_at", "time", "observed_at"):
+            try:
+                return float(entry.get(key))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def task_review_watch(value: object) -> dict:
+        """Normalize explicit resource subscriptions; absent fields subscribe to nothing."""
+        value = value if isinstance(value, dict) else {}
+        def ids(name: str) -> list[int]:
+            raw = value.get(name)
+            if not isinstance(raw, list):
+                return []
+            normalized = []
+            for item in raw:
+                try:
+                    number = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if number >= 0 and number not in normalized:
+                    normalized.append(number)
+            return normalized
+        return {
+            "cash": value.get("cash") is True,
+            "inventory_item_ids": ids("inventory_item_ids"),
+            "party_role_ids": ids("party_role_ids"),
+        }
+
+    def task_evidence_catalog(self, data: dict | None = None) -> dict[str, dict]:
+        """Build compact references from persisted/current narrative evidence only."""
+        data = data if isinstance(data, dict) else self.read_exploration()
+        catalog: dict[str, dict] = {}
+        def add(ref: str, kind: str, entry: dict, summary: str = "") -> None:
+            ref = str(ref or "").strip()
+            if not ref or ref in catalog:
+                return
+            compact = {"ref": ref, "kind": kind}
+            observed_at = self.task_evidence_time(entry)
+            if observed_at is not None:
+                compact["observed_at"] = observed_at
+            if summary:
+                compact["summary"] = " ".join(summary.split())[:240]
+            catalog[ref] = compact
+
+        inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+        for inbox_id, record in inbox.items():
+            if not isinstance(record, dict):
+                continue
+            text = " ".join(str(item.get("text") or "") for item in record.get("dialogs") or [] if isinstance(item, dict))
+            add(str(inbox_id), "task_inbox", record, text)
+            add(f"task-inbox:{inbox_id}", "task_inbox", record, text)
+        for entry in self.dialog_history:
+            if not isinstance(entry, dict):
+                continue
+            for raw in (entry.get("source_key"), entry.get("message_id")):
+                if raw is not None and str(raw).strip():
+                    add(str(raw), "dialog", entry, str(entry.get("text") or ""))
+                    add(f"dialog:{raw}", "dialog", entry, str(entry.get("text") or ""))
+        for index, entry in enumerate(self.event_log):
+            if not isinstance(entry, dict):
+                continue
+            refs = [entry.get(key) for key in ("id", "source_key", "event_key")]
+            refs.append(f"event:{index}")
+            for raw in refs:
+                if raw is not None and str(raw).strip():
+                    add(str(raw), "event", entry, str(entry.get("type") or "event"))
+        transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
+        for by_room in transitions.values():
+            if not isinstance(by_room, dict):
+                continue
+            for stored_key, record in by_room.items():
+                if isinstance(record, dict):
+                    key = str(record.get("transition_key") or stored_key)
+                    add(key, "transition", record, key)
+                    add(f"transition:{key}", "transition", record, key)
+        return catalog
+
+    def resolve_task_evidence(self, refs: object, data: dict) -> tuple[list[dict] | None, str | None]:
+        if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+            return None, "status_evidence must be a non-empty list of evidence references"
+        catalog = self.task_evidence_catalog(data)
+        missing = [ref.strip() for ref in refs if ref.strip() not in catalog]
+        if missing:
+            return None, f"status_evidence references were not found: {', '.join(missing)}"
+        return [catalog[ref.strip()] for ref in dict.fromkeys(refs)], None
+
+    def task_review_for(self, task: dict, state: dict | None = None) -> dict | None:
+        if task.get("status") != "active":
+            return None
+        try:
+            reviewed_at = float(task.get("last_reviewed_at") or task.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            reviewed_at = 0.0
+        reasons: list[dict] = []
+        latest = reviewed_at
+
+        try:
+            object_id = int(task.get("object_id") or 0)
+        except (TypeError, ValueError):
+            object_id = 0
+        if object_id > 0:
+            for entry in self.dialog_history:
+                observed_at = self.task_evidence_time(entry)
+                if observed_at is None or observed_at <= reviewed_at:
+                    continue
+                try:
+                    matches = int(entry.get("event_object_id") or 0) == object_id
+                except (TypeError, ValueError):
+                    matches = False
+                if matches:
+                    reasons.append({"kind": "dialog", "object_id": object_id})
+                    latest = max(latest, observed_at)
+                    break
+            for entry in self.event_log:
+                if entry.get("type") not in {"object_changed", "interaction_effect", "interaction_no_effect"}:
+                    continue
+                observed_at = self.task_evidence_time(entry)
+                if observed_at is None or observed_at <= reviewed_at:
+                    continue
+                try:
+                    entry_id = int(entry.get("object_id") or entry.get("target_id") or 0)
+                except (TypeError, ValueError):
+                    entry_id = 0
+                if entry_id == object_id:
+                    reasons.append({"kind": str(entry.get("type")), "object_id": object_id})
+                    latest = max(latest, observed_at)
+                    break
+
+        transition_key = task.get("transition_key")
+        room_id = task.get("room_id")
+        if transition_key or room_id:
+            data = self.read_exploration()
+            transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
+            for by_room in transitions.values():
+                if not isinstance(by_room, dict):
+                    continue
+                for record in by_room.values():
+                    if not isinstance(record, dict):
+                        continue
+                    observed_at = self.task_evidence_time(record)
+                    if observed_at is None or observed_at <= reviewed_at:
+                        continue
+                    key_match = bool(transition_key) and record.get("transition_key") == transition_key
+                    room_match = bool(room_id) and str(room_id) in {
+                        str(record.get("from_room_id")), str(record.get("from_logical_room_id")),
+                        str(record.get("to_room_id")), str(record.get("to_logical_room_id")),
+                    }
+                    if key_match or room_match:
+                        reasons.append({
+                            "kind": "transition",
+                            "transition_key": record.get("transition_key"),
+                            "room_id": room_id if room_match else None,
+                        })
+                        latest = max(latest, observed_at)
+                        break
+
+        current = self.task_review_snapshot(state)
+        baseline = task.get("_review_snapshot") if isinstance(task.get("_review_snapshot"), dict) else {}
+        watch = self.task_review_watch(task.get("review_watch"))
+        watches_resources = bool(
+            watch["cash"] or watch["inventory_item_ids"] or watch["party_role_ids"]
+        )
+        if not baseline and watches_resources:
+            # Reconstruct the review-time net state for tasks created before
+            # snapshots were introduced. This is intentionally numeric only.
+            baseline = json.loads(json.dumps(current))
+            reconstructed_sprite_roles: set[str] = set()
+            for entry in self.event_log:
+                observed_at = self.task_evidence_time(entry)
+                if observed_at is None or observed_at <= reviewed_at:
+                    continue
+                event_type = entry.get("type")
+                if event_type == "cash_changed":
+                    try:
+                        baseline["cash"] -= int(entry.get("delta") or 0)
+                        latest = max(latest, observed_at)
+                    except (TypeError, ValueError):
+                        pass
+                elif event_type == "inventory_changed":
+                    try:
+                        item_id = str(int(entry.get("item_id") or 0))
+                        baseline["inventory"][item_id] = int(baseline["inventory"].get(item_id) or 0) - int(entry.get("delta") or 0)
+                        latest = max(latest, observed_at)
+                    except (TypeError, ValueError):
+                        pass
+                elif event_type == "party_sprite_changed":
+                    try:
+                        role_id = str(int(entry.get("role_id")))
+                        if role_id not in reconstructed_sprite_roles:
+                            baseline["party_sprites"][role_id] = int(entry.get("from_scene_sprite_id"))
+                            reconstructed_sprite_roles.add(role_id)
+                        latest = max(latest, observed_at)
+                    except (TypeError, ValueError):
+                        pass
+        if baseline:
+            if watch["cash"] and int(current.get("cash") or 0) != int(baseline.get("cash") or 0):
+                reasons.append({
+                    "kind": "cash_net_changed",
+                    "from": int(baseline.get("cash") or 0),
+                    "to": int(current.get("cash") or 0),
+                })
+            before_inventory = baseline.get("inventory") if isinstance(baseline.get("inventory"), dict) else {}
+            after_inventory = current.get("inventory") if isinstance(current.get("inventory"), dict) else {}
+            watched_items = {str(item_id) for item_id in watch["inventory_item_ids"]}
+            changed_items = sorted(
+                key for key in watched_items
+                if int(before_inventory.get(key) or 0) != int(after_inventory.get(key) or 0)
+            )
+            if changed_items:
+                reasons.append({"kind": "inventory_net_changed", "item_ids": changed_items[:12]})
+            before_sprites = baseline.get("party_sprites") if isinstance(baseline.get("party_sprites"), dict) else {}
+            after_sprites = current.get("party_sprites") if isinstance(current.get("party_sprites"), dict) else {}
+            watched_roles = {str(role_id) for role_id in watch["party_role_ids"]}
+            changed_roles = sorted(
+                key for key in watched_roles & set(before_sprites) & set(after_sprites)
+                if int(before_sprites.get(key) or 0) != int(after_sprites.get(key) or 0)
+            )
+            if changed_roles:
+                reasons.append({
+                    "kind": "party_sprite_net_changed",
+                    "roles": [
+                        {"role_id": role_id, "from": before_sprites.get(role_id), "to": after_sprites.get(role_id)}
+                        for role_id in changed_roles[:8]
+                    ],
+                })
+            if reasons and latest <= reviewed_at:
+                latest = max(reviewed_at, float(self.live_info("state").get("mtime") or reviewed_at))
+
+        if not reasons:
+            return None
+        return {"id": task.get("id"), "reasons": reasons, "latest_evidence_at": latest}
+
+    def task_review_context(self, state: dict | None = None) -> dict:
+        with self.exploration_lock:
+            data = self.read_exploration()
+            tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+            active = [task for task in tasks.values() if isinstance(task, dict) and task.get("status") == "active"]
+        reviews = [review for task in active if (review := self.task_review_for(task, state)) is not None]
+        reviews.sort(key=lambda item: str(item.get("id") or ""))
+        return {"required": bool(reviews), "tasks": reviews}
+
+    @staticmethod
+    def task_inbox_entry_time(entry: dict) -> float:
+        for key in ("updated_at", "time"):
+            value = entry.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    def task_inbox_dialog_payload(self, entry: dict) -> dict:
+        text = str(entry.get("text") or "")
+        if len(text) > TASK_INBOX_DIALOG_TEXT_LIMIT:
+            text = text[:TASK_INBOX_DIALOG_TEXT_LIMIT - 1] + "…"
+        payload = {
+            key: entry.get(key)
+            for key in (
+                "source_key", "speaker_hint", "event_object_id", "message_id",
+                "scene_id", "map_id", "room_id", "logical_room_id", "room_key",
+            )
+            if entry.get(key) is not None
+        } | {"text": text}
+        if payload.get("event_object_id") is not None:
+            payload["source_event_object_id"] = payload["event_object_id"]
+        return payload
+
+    def task_inbox_batch_identity(self, entry: dict) -> tuple[str, str]:
+        source_key = str(entry.get("source_key") or "").strip()
+        if source_key:
+            identity = f"dialog:{source_key}"
+        else:
+            try:
+                turn = max(0, int(entry.get("agent_turn") or 0))
+            except (TypeError, ValueError):
+                turn = 0
+            room_id = str(entry.get("logical_room_id") or entry.get("room_id") or entry.get("room_key") or "")
+            speaker = str(entry.get("speaker_hint") or "")
+            object_id = str(entry.get("event_object_id") or "")
+            text = str(entry.get("text") or "")
+            identity = f"fallback:{turn}:{room_id}:{object_id}:{speaker}:{text}"
+        batch_id = "inbox-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        return batch_id, identity
+
+    def _migrate_task_inbox(self, data: dict) -> bool:
+        try:
+            version = int(data.get("task_inbox_version") or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version >= TASK_INBOX_SCHEMA_VERSION:
+            return False
+        inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+        migrated: dict[str, dict] = {}
+        for legacy_id, legacy in inbox.items():
+            if not isinstance(legacy, dict) or legacy.get("status") != "pending":
+                if isinstance(legacy, dict):
+                    migrated[str(legacy_id)] = legacy
+                continue
+            dialogs = [item for item in legacy.get("dialogs") or [] if isinstance(item, dict)]
+            if not dialogs:
+                migrated[str(legacy_id)] = legacy
+                continue
+            for dialog in dialogs:
+                entry = {
+                    **dialog,
+                    "agent_turn": legacy.get("created_agent_turn"),
+                    "time": legacy.get("created_at"),
+                    "updated_at": legacy.get("updated_at"),
+                }
+                batch_id, identity = self.task_inbox_batch_identity(entry)
+                payload = self.task_inbox_dialog_payload(entry)
+                record = {
+                    "id": batch_id,
+                    "identity": identity,
+                    "status": "pending",
+                    "created_at": legacy.get("created_at"),
+                    "updated_at": legacy.get("updated_at"),
+                    "created_agent_turn": legacy.get("created_agent_turn"),
+                    "room_id": dialog.get("logical_room_id") or dialog.get("room_id") or legacy.get("room_id"),
+                    "event_object_id": dialog.get("event_object_id", legacy.get("event_object_id")),
+                    "source_event_object_id": dialog.get("event_object_id", legacy.get("event_object_id")),
+                    "dialogs": [payload],
+                    "migrated_from_batch_id": str(legacy_id),
+                }
+                migrated[batch_id] = record
+        data["task_inbox"] = migrated
+        data["task_inbox_version"] = TASK_INBOX_SCHEMA_VERSION
+        return True
+
+    def _prune_task_inbox_locked(self, data: dict) -> None:
+        inbox = data.setdefault("task_inbox", {})
+        resolved = sorted(
+            (
+                record for record in inbox.values()
+                if isinstance(record, dict) and record.get("status") != "pending"
+            ),
+            key=lambda record: (float(record.get("resolved_at") or 0), str(record.get("id") or "")),
+            reverse=True,
+        )
+        keep_resolved = {str(record.get("id")) for record in resolved[:MAX_TASK_INBOX_HISTORY]}
+        data["task_inbox"] = {
+            key: record
+            for key, record in inbox.items()
+            if isinstance(record, dict) and (record.get("status") == "pending" or key in keep_resolved)
+        }
+
+    def _record_task_inbox_entries_locked(self, data: dict, entries: list[dict]) -> bool:
+        inbox = data.setdefault("task_inbox", {})
+        changed = False
+        for entry in entries:
+            if not isinstance(entry, dict) or not str(entry.get("text") or "").strip():
+                continue
+            payload = self.task_inbox_dialog_payload(entry)
+            source_key = str(payload.get("source_key") or "")
+            batch_id, identity = self.task_inbox_batch_identity(entry)
+            record = inbox.get(batch_id)
+            if isinstance(record, dict) and record.get("status") != "pending":
+                continue
+            if not isinstance(record, dict):
+                observed_at = self.task_inbox_entry_time(entry) or time.time()
+                try:
+                    created_turn = max(0, int(entry.get("agent_turn") or 0))
+                except (TypeError, ValueError):
+                    created_turn = 0
+                record = {
+                    "id": batch_id,
+                    "identity": identity,
+                    "status": "pending",
+                    "created_at": observed_at,
+                    "updated_at": observed_at,
+                    "created_agent_turn": created_turn,
+                    "room_id": entry.get("logical_room_id") or entry.get("room_id"),
+                    "event_object_id": entry.get("event_object_id"),
+                    "source_event_object_id": entry.get("event_object_id"),
+                    "dialogs": [],
+                }
+                inbox[batch_id] = record
+                changed = True
+            if record.get("status") != "pending":
+                continue
+            dialogs = record.setdefault("dialogs", [])
+            existing_index = next(
+                (index for index, item in enumerate(dialogs) if str(item.get("source_key") or "") == source_key),
+                None,
+            )
+            if existing_index is None:
+                dialogs.append(payload)
+                changed = True
+            elif dialogs[existing_index] != payload:
+                dialogs[existing_index] = payload
+                changed = True
+            observed_at = self.task_inbox_entry_time(entry) or float(record.get("updated_at") or 0)
+            if observed_at > float(record.get("updated_at") or 0):
+                record["updated_at"] = observed_at
+                changed = True
+        if changed:
+            self._prune_task_inbox_locked(data)
+        return changed
+
+    def record_task_inbox_entries(self, entries: list[dict]) -> None:
+        if not entries:
+            return
+        with self.exploration_lock:
+            data = self.read_exploration()
+            data["task_inbox_initialized"] = True
+            if self._record_task_inbox_entries_locked(data, entries):
+                self.write_exploration(data)
+
+    def _ensure_task_inbox_initialized_locked(self, data: dict) -> bool:
+        if data.get("task_inbox_initialized") is True:
+            return False
+        latest = self.dialog_history[-1] if self.dialog_history else None
+        entries: list[dict] = []
+        if isinstance(latest, dict):
+            latest_turn = latest.get("agent_turn")
+            latest_object = latest.get("event_object_id")
+            latest_room = latest.get("logical_room_id") or latest.get("room_id") or latest.get("room_key")
+            for entry in reversed(self.dialog_history):
+                if entry.get("agent_turn") != latest_turn:
+                    break
+                if entry.get("event_object_id") != latest_object:
+                    break
+                if (entry.get("logical_room_id") or entry.get("room_id") or entry.get("room_key")) != latest_room:
+                    break
+                entries.append(entry)
+            entries.reverse()
+        data["task_inbox_initialized"] = True
+        self._record_task_inbox_entries_locked(data, entries)
+        return True
+
+    def task_inbox_pending(self) -> list[dict]:
+        with self.exploration_lock:
+            data = self.read_exploration()
+            initialized = self._ensure_task_inbox_initialized_locked(data)
+            if initialized:
+                self.write_exploration(data)
+            inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+            pending = [
+                copy.deepcopy(record)
+                for record in inbox.values()
+                if isinstance(record, dict) and record.get("status") == "pending"
+            ]
+        pending.sort(key=lambda record: (float(record.get("created_at") or 0), str(record.get("id") or "")))
+        return pending
+
+    def task_inbox_structural_changes(self, record: dict) -> list[str]:
+        try:
+            created_at = float(record.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        kinds = {
+            str(event.get("type"))
+            for event in self.event_log
+            if isinstance(event, dict)
+            and event.get("type") in TASK_INBOX_STRUCTURAL_EVENT_TYPES
+            and self.task_evidence_time(event) is not None
+            and float(self.task_evidence_time(event) or 0) >= created_at
+        }
+        return sorted(kinds)
+
+    def task_inbox_gate_context(self, state: dict | None = None, *, action: str | None = None, target_id=None) -> dict:
+        state = state if isinstance(state, dict) else self.read_live_state()
+        pending = self.task_inbox_pending()
+        reasons: list[dict] = []
+        if pending:
+            reasons.append({
+                "kind": "pending_dialog_evidence",
+                "batch_ids": [str(record.get("id")) for record in pending if record.get("id")],
+            })
+        current_turn = self.current_agent_turn()
+        aged_ids = [
+            str(record.get("id"))
+            for record in pending
+            if current_turn - int(record.get("created_agent_turn") or 0) >= TASK_INBOX_MAX_PENDING_TURNS
+        ]
+        if aged_ids:
+            reasons.append({"kind": "aged", "batch_ids": aged_ids, "turns": TASK_INBOX_MAX_PENDING_TURNS})
+        if len(pending) >= TASK_INBOX_MAX_PENDING_BATCHES:
+            reasons.append({"kind": "backlog", "pending_total": len(pending)})
+        structural = [
+            {"batch_id": str(record.get("id")), "event_types": changes}
+            for record in pending
+            if (changes := self.task_inbox_structural_changes(record))
+        ]
+        if structural:
+            reasons.append({"kind": "structural_change", "batches": structural})
+        if action == "navigate" and target_id is not None:
+            try:
+                requested_id = int(target_id)
+            except (TypeError, ValueError):
+                requested_id = 0
+            target = next(
+                (item for item in state.get("objects") or [] if int(item.get("id") or 0) == requested_id),
+                None,
+            )
+            if isinstance(target, dict) and transition_candidate(target):
+                reasons.append({"kind": "leaving_room", "target_id": requested_id})
+        if action == "use_item":
+            reasons.append({"kind": "use_item_boundary"})
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        hard_reason_kinds = {"leaving_room", "use_item_boundary"}
+        required = bool(
+            pending
+            and not dialog.get("active")
+            and any(reason.get("kind") in hard_reason_kinds for reason in reasons)
+        )
+        return {
+            "pending_total": len(pending),
+            "active_tasks": self.active_task_summary(limit=1_000_000) if pending else [],
+            "active_tasks_total": len(self.task_ledger(limit=None)) if pending else 0,
+            "batches": [
+                {
+                    key: record.get(key)
+                    for key in (
+                        "id", "created_agent_turn", "room_id", "event_object_id",
+                        "source_event_object_id", "dialogs",
+                    )
+                }
+                for record in pending[:MAX_TASK_INBOX_CONTEXT]
+            ],
+            "review_required": required,
+            "reasons": reasons,
+        }
+
+    def review_agent_task_inbox(self, arguments: dict, state: dict, tool_cycle: dict | None) -> dict:
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        if dialog.get("active"):
+            return {"ok": False, "error": "finish the active dialog before reviewing task inbox evidence"}
+        resolutions = arguments.get("resolutions")
+        legacy = resolutions is None
+        if legacy:
+            batch_ids = arguments.get("batch_ids")
+            if not isinstance(batch_ids, list) or not batch_ids:
+                return {"ok": False, "error": "resolutions must be a non-empty list"}
+            disposition = arguments.get("disposition")
+            if disposition == "no_task":
+                disposition = "no_follow_up"
+            outcome = "task_updated" if disposition == "tasks_updated" else disposition
+            resolutions = [
+                {
+                    "inbox_id": batch_id,
+                    "outcome": outcome,
+                    "task_ids": arguments.get("task_ids", []),
+                    "reason_code": arguments.get("reason_code", "chatter"),
+                    "rationale": arguments.get("rationale"),
+                }
+                for batch_id in batch_ids
+            ]
+        if not isinstance(resolutions, list) or not resolutions:
+            return {"ok": False, "error": "resolutions must be a non-empty list"}
+
+        normalized: list[dict] = []
+        seen_ids: set[str] = set()
+        for resolution in resolutions:
+            if not isinstance(resolution, dict):
+                return {"ok": False, "error": "each resolution must be an object"}
+            inbox_id = str(resolution.get("inbox_id") or "").strip()
+            if not inbox_id or inbox_id in seen_ids:
+                return {"ok": False, "error": "each resolution requires a unique inbox_id"}
+            seen_ids.add(inbox_id)
+            outcome = resolution.get("outcome")
+            if outcome not in {"new_task", "task_updated", "no_follow_up"}:
+                return {"ok": False, "error": "outcome must be new_task, task_updated, or no_follow_up"}
+            rationale = resolution.get("rationale")
+            if not isinstance(rationale, str) or not rationale.strip():
+                return {"ok": False, "error": "each resolution requires a non-empty rationale"}
+            task_ids = resolution.get("task_ids", [])
+            if not isinstance(task_ids, list) or any(not isinstance(item, str) or not item.strip() for item in task_ids):
+                return {"ok": False, "error": "task_ids must be a list of strings"}
+            task_ids = list(dict.fromkeys(item.strip() for item in task_ids))
+            reason_code = resolution.get("reason_code")
+            if outcome == "no_follow_up":
+                if task_ids:
+                    return {"ok": False, "error": "no_follow_up must not include task_ids"}
+                if reason_code not in TASK_INBOX_NO_FOLLOW_UP_REASONS:
+                    return {
+                        "ok": False,
+                        "error": "no_follow_up requires reason_code chatter, duplicate_evidence, or already_completed",
+                    }
+            elif not task_ids:
+                return {"ok": False, "error": f"{outcome} requires task_ids"}
+            elif outcome == "new_task" and len(task_ids) != 1:
+                return {"ok": False, "error": "new_task requires exactly one task id"}
+            normalized.append({
+                "inbox_id": inbox_id,
+                "outcome": outcome,
+                "task_ids": task_ids,
+                "reason_code": reason_code if outcome == "no_follow_up" else None,
+                "rationale": rationale.strip(),
+            })
+
+        task_outcomes = [item for item in normalized if item["outcome"] != "no_follow_up"]
+        if task_outcomes and (not isinstance(tool_cycle, dict) or not tool_cycle.get("tasks_queried")):
+            return {"ok": False, "error": "call get_tasks before resolving inbox evidence with tasks"}
+        upserted = set(tool_cycle.get("upserted_task_ids") or []) if isinstance(tool_cycle, dict) else set()
+        missing_upserts = sorted({task_id for item in task_outcomes for task_id in item["task_ids"]} - upserted)
+        if missing_upserts:
+            return {
+                "ok": False,
+                "error": "every referenced task must be upserted in this tool cycle",
+                "missing_task_ids": missing_upserts,
+            }
+        now = time.time()
+        with self.exploration_lock:
+            data = self.read_exploration()
+            inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+            missing_batches = sorted(
+                item["inbox_id"] for item in normalized
+                if not isinstance(inbox.get(item["inbox_id"]), dict)
+                or inbox[item["inbox_id"]].get("status") != "pending"
+            )
+            if missing_batches:
+                return {"ok": False, "error": "unknown or already resolved task inbox batch", "missing_batch_ids": missing_batches}
+            tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+            for item in task_outcomes:
+                record = inbox[item["inbox_id"]]
+                for task_id in item["task_ids"]:
+                    task = tasks.get(task_id)
+                    provenance = task.get("provenance") if isinstance(task, dict) else None
+                    linked_ids = provenance.get("task_inbox_batch_ids") if isinstance(provenance, dict) else None
+                    if not isinstance(linked_ids, list) or item["inbox_id"] not in linked_ids:
+                        return {
+                            "ok": False,
+                            "error": "every referenced task must durably link the resolved inbox evidence",
+                            "missing_inbox_links": [{"inbox_id": item["inbox_id"], "task_id": task_id}],
+                        }
+                    if item["outcome"] == "new_task":
+                        created_turn = int(task.get("created_agent_turn") or 0)
+                        evidence_turn = int(record.get("created_agent_turn") or 0)
+                        if task.get("status") != "active" or created_turn < evidence_turn:
+                            return {
+                                "ok": False,
+                                "error": "new_task requires an active task created from this evidence",
+                                "task_id": task_id,
+                            }
+            for item in normalized:
+                record = inbox[item["inbox_id"]]
+                record["status"] = "dismissed" if item["outcome"] == "no_follow_up" else "promoted"
+                record["resolved_at"] = now
+                record["resolved_agent_turn"] = self.current_agent_turn()
+                record["resolution"] = {
+                    "outcome": item["outcome"],
+                    "rationale": item["rationale"],
+                    "task_ids": item["task_ids"],
+                }
+                if item["reason_code"] is not None:
+                    record["resolution"]["reason_code"] = item["reason_code"]
+            self._prune_task_inbox_locked(data)
+            self.write_exploration(data)
+        if isinstance(tool_cycle, dict):
+            resolved = tool_cycle.setdefault("resolved_inbox_batch_ids", [])
+            resolved.extend(item["inbox_id"] for item in normalized if item["inbox_id"] not in resolved)
+        remaining = self.task_inbox_pending()
+        result = {
+            "ok": True,
+            "resolutions": normalized,
+            "resolved_batch_ids": [item["inbox_id"] for item in normalized],
+            "pending_total": len(remaining),
+            "pending_batches": [
+                {
+                    key: record.get(key)
+                    for key in (
+                        "id", "created_agent_turn", "room_id", "event_object_id",
+                        "source_event_object_id", "dialogs",
+                    )
+                }
+                for record in remaining[:MAX_TASK_INBOX_REVIEW_BATCHES]
+            ],
+        }
+        if legacy:
+            result["disposition"] = arguments.get("disposition")
+            result["task_ids"] = list(dict.fromkeys(
+                task_id for item in normalized for task_id in item["task_ids"]
+            ))
+        return result
+
+    def new_agent_tool_cycle(self, state: dict | None = None) -> dict:
+        review = self.task_review_context(state)
+        return {
+            "tasks_queried": False,
+            "task_query_audit": None,
+            "task_review_nonce": os.urandom(16).hex(),
+            "required_task_ids": [str(item.get("id")) for item in review.get("tasks") or []],
+            "reviewed_task_ids": [],
+            "reconciled_task_ids": [],
+            "upserted_task_ids": [],
+            "resolved_inbox_batch_ids": [],
+            "room_memory_queried_ids": [],
+            "equipment_review_item_id": None,
+            "vision_request_used": False,
+        }
+
+    def task_room_memory_review_error(
+        self,
+        arguments: dict,
+        tool_cycle: dict | None,
+    ) -> dict | None:
+        if "room_id" not in arguments or arguments.get("room_id") is None:
+            return None
+        room_id = arguments.get("room_id")
+        if not isinstance(room_id, str) or not room_id.strip():
+            return None
+        room_id = room_id.strip()
+        task_id = str(arguments.get("id") or "").strip()
+        with self.exploration_lock:
+            data = self.read_exploration()
+            tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+            existing = tasks.get(task_id) if task_id else None
+            existing_room_id = existing.get("room_id") if isinstance(existing, dict) else None
+        if existing_room_id == room_id:
+            return None
+        queried = set(tool_cycle.get("room_memory_queried_ids") or []) if isinstance(tool_cycle, dict) else set()
+        if room_id in queried:
+            return None
+        return {
+            "ok": False,
+            "error": {
+                "code": "room_memory_review_required",
+                "message": (
+                    "Adding or changing a non-empty task room_id requires get_room_memory "
+                    "for that room in the same tool cycle. The task was not changed."
+                ),
+                "room_id": room_id,
+            },
+        }
+
+    def task_creation_review_error(
+        self,
+        tool_cycle: dict | None,
+        review_token: object,
+        *,
+        current_revision: int | None = None,
+    ) -> dict | None:
+        audit = tool_cycle.get("task_query_audit") if isinstance(tool_cycle, dict) else None
+        if not isinstance(audit, dict) or audit.get("complete") is not True:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task_creation_review_required",
+                    "message": (
+                        "Creating a task requires a complete summary audit of active, dormant, "
+                        "completed, and abandoned tasks from a previous model batch. Call get_tasks with "
+                        "include_closed=true and detail=summary, following every page."
+                    ),
+                },
+            }
+        supplied = str(review_token or "")
+        if supplied != str(audit.get("review_token") or ""):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task_creation_review_required",
+                    "message": "Use the review_token returned by the completed get_tasks audit in a later model batch.",
+                },
+            }
+        if current_revision is None:
+            with self.exploration_lock:
+                revision = self.task_ledger_revision(self.read_exploration())
+        else:
+            revision = current_revision
+        if revision != audit.get("revision"):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "task_creation_review_required",
+                    "message": "The task ledger changed after it was reviewed; repeat the complete closed-inclusive audit.",
+                    "reviewed_revision": audit.get("revision"),
+                    "current_revision": revision,
+                },
+            }
+        return None
+
+    def upsert_agent_task(
+        self,
+        arguments: dict,
+        tool_cycle: dict | None = None,
+        state: dict | None = None,
+    ) -> dict:
         task_id = str(arguments.get("id") or "").strip()
         status = arguments.get("status")
-        if status is not None and status not in {"active", "completed", "abandoned"}:
-            return {"ok": False, "error": "status must be active, completed, or abandoned"}
+        if status is not None and status not in {"active", "dormant", "completed", "abandoned"}:
+            return {"ok": False, "error": "status must be active, dormant, completed, or abandoned"}
+        if "review_watch" in arguments:
+            raw_watch = arguments.get("review_watch")
+            if not isinstance(raw_watch, dict) or set(raw_watch) - {"cash", "inventory_item_ids", "party_role_ids"}:
+                return {"ok": False, "error": "review_watch must contain only cash, inventory_item_ids, and party_role_ids"}
+            if "cash" in raw_watch and not isinstance(raw_watch.get("cash"), bool):
+                return {"ok": False, "error": "review_watch.cash must be a boolean"}
+            for key in ("inventory_item_ids", "party_role_ids"):
+                values = raw_watch.get(key, [])
+                if not isinstance(values, list) or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in values):
+                    return {"ok": False, "error": f"review_watch.{key} must be a list of non-negative integers"}
+        source_inbox_ids = arguments.get("source_inbox_ids", [])
+        if (
+            not isinstance(source_inbox_ids, list)
+            or any(not isinstance(item, str) or not item.strip() for item in source_inbox_ids)
+        ):
+            return {"ok": False, "error": "source_inbox_ids must be a list of strings"}
+        source_inbox_ids = list(dict.fromkeys(item.strip() for item in source_inbox_ids))
         now = time.time()
         turn = self.current_agent_turn()
         with self.exploration_lock:
             data = self.read_exploration()
             tasks = data.setdefault("tasks", {})
+            inbox = data.get("task_inbox") if isinstance(data.get("task_inbox"), dict) else {}
+            missing_inbox_ids = sorted(
+                inbox_id for inbox_id in source_inbox_ids
+                if not isinstance(inbox.get(inbox_id), dict) or inbox[inbox_id].get("status") != "pending"
+            )
+            if missing_inbox_ids:
+                return {
+                    "ok": False,
+                    "error": "source_inbox_ids must reference pending task inbox evidence",
+                    "missing_inbox_ids": missing_inbox_ids,
+                }
             existing = tasks.get(task_id) if task_id else None
-            if task_id and not isinstance(existing, dict):
-                return {"ok": False, "error": "task id was not found"}
+            if not isinstance(existing, dict):
+                existing = None
             if existing is None:
+                if self.agent_runtime.task_reconciliation_pending():
+                    return {
+                        "ok": False,
+                        "error": {
+                            "code": "task_reconciliation_required",
+                            "message": "Finish the pending full-ledger reconciliation before creating a task.",
+                        },
+                    }
+                review_error = self.task_creation_review_error(
+                    tool_cycle,
+                    arguments.get("review_token"),
+                    current_revision=self.task_ledger_revision(data),
+                )
+                if review_error is not None:
+                    return review_error
                 description = arguments.get("description")
                 rationale = arguments.get("rationale")
-                if not isinstance(description, str) or not description.strip():
-                    return {"ok": False, "error": "creating a task requires a non-empty description"}
-                if not isinstance(rationale, str) or not rationale.strip():
-                    return {"ok": False, "error": "creating a task requires a non-empty rationale"}
-                task_id = "task-" + hashlib.sha256(f"{now}:{turn}:{description}".encode("utf-8")).hexdigest()[:16]
+                if (
+                    not isinstance(description, str)
+                    or not description.strip()
+                    or not isinstance(rationale, str)
+                    or not rationale.strip()
+                ):
+                    if task_id:
+                        return {
+                            "ok": False,
+                            "error": (
+                                "unknown task id; creating it requires non-empty description and rationale; "
+                                "call get_tasks to verify existing ids"
+                            ),
+                        }
+                    return {
+                        "ok": False,
+                        "error": "creating a task requires non-empty description and rationale",
+                    }
+                if not task_id:
+                    task_id = "task-" + hashlib.sha256(
+                        f"{now}:{turn}:{description}".encode("utf-8")
+                    ).hexdigest()[:16]
                 existing = {
                     "id": task_id, "description": description.strip(), "rationale": rationale.strip(),
                     "priority": 0, "status": status or "active", "created_at": now,
                     "created_agent_turn": turn, "history": [],
                 }
+                operation = "created"
+                previous_status = None
+            else:
+                operation = "updated"
+                previous_status = existing.get("status")
+                if self.agent_runtime.task_reconciliation_pending():
+                    review_error = self.task_creation_review_error(
+                        tool_cycle,
+                        arguments.get("review_token"),
+                        current_revision=self.task_ledger_revision(data),
+                    )
+                    if review_error is not None:
+                        review_error["error"]["code"] = "task_reconciliation_required"
+                        return review_error
+            requested_status = status if status is not None else existing.get("status")
+            status_changed = previous_status is not None and requested_status != previous_status
+            if previous_status is None and requested_status != "active":
+                status_changed = True
+            resolved_status_evidence: list[dict] = []
+            if status_changed:
+                status_reason = arguments.get("status_reason")
+                if not isinstance(status_reason, str) or not status_reason.strip():
+                    return {"ok": False, "error": "a status change requires non-empty status_reason"}
+                resolved, evidence_error = self.resolve_task_evidence(arguments.get("status_evidence"), data)
+                if evidence_error is not None:
+                    return {"ok": False, "error": evidence_error}
+                resolved_status_evidence = resolved or []
             changed = {}
             for key in ("description", "rationale", "status", "transition_key", "room_id"):
                 if key not in arguments:
@@ -2656,6 +6060,50 @@ class DebugState:
                 if existing.get(key) != value:
                     changed[key] = {"from": existing.get(key), "to": value}
                     existing[key] = value
+            if source_inbox_ids:
+                provenance = existing.setdefault("provenance", {})
+                linked_ids = provenance.setdefault("task_inbox_batch_ids", [])
+                added_ids = [inbox_id for inbox_id in source_inbox_ids if inbox_id not in linked_ids]
+                if added_ids:
+                    linked_ids.extend(added_ids)
+                    changed["source_inbox_ids"] = {"added": added_ids}
+            if "review_watch" in arguments:
+                value = self.task_review_watch(arguments.get("review_watch"))
+                if existing.get("review_watch") != value:
+                    changed["review_watch"] = {"from": existing.get("review_watch"), "to": value}
+                    existing["review_watch"] = value
+            else:
+                existing.setdefault("review_watch", self.task_review_watch(None))
+            if status_changed:
+                existing["status_reason"] = arguments["status_reason"].strip()
+                existing["status_evidence"] = resolved_status_evidence
+                changed["status_reason"] = {"to": existing["status_reason"]}
+                changed["status_evidence"] = {"to": resolved_status_evidence}
+            if existing.get("status") == "completed" and previous_status != "completed":
+                state = state if isinstance(state, dict) else self.read_live_state()
+                existing["completed_at"] = now
+                existing["completed_frame"] = self.int_frame(
+                    state.get("logical_frame", state.get("frame"))
+                )
+                existing["completed_raw_frame"] = self.int_frame(state.get("raw_frame"))
+                existing["completed_agent_turn"] = turn
+            elif previous_status == "completed" and existing.get("status") != "completed":
+                for key in (
+                    "completed_at", "completed_frame", "completed_raw_frame",
+                    "completed_agent_turn",
+                ):
+                    existing.pop(key, None)
+            if status_changed:
+                existing["status_changed_at"] = now
+                existing["status_changed_agent_turn"] = turn
+                for lifecycle_status in ("dormant", "abandoned"):
+                    prefix = lifecycle_status
+                    if existing.get("status") == lifecycle_status:
+                        existing[f"{prefix}_at"] = now
+                        existing[f"{prefix}_agent_turn"] = turn
+                    elif previous_status == lifecycle_status:
+                        existing.pop(f"{prefix}_at", None)
+                        existing.pop(f"{prefix}_agent_turn", None)
             for key in ("priority", "object_id"):
                 if key not in arguments:
                     continue
@@ -2672,6 +6120,49 @@ class DebugState:
                     existing[key] = value
             if not existing.get("history"):
                 changed = {"created": True, **changed}
+            structural_changes = {
+                "created", "description", "priority", "status",
+                "object_id", "transition_key", "room_id", "review_watch",
+            }
+            if structural_changes.intersection(changed):
+                existing["route_context_revision"] = max(
+                    0, int(existing.get("route_context_revision") or 0)
+                ) + 1
+            existing["last_reviewed_at"] = now
+            existing["last_reviewed_agent_turn"] = turn
+            existing["_review_snapshot"] = self.task_review_snapshot()
+            linked_evidence = []
+            catalog = self.task_evidence_catalog(data)
+            for inbox_id in source_inbox_ids:
+                if inbox_id in catalog:
+                    linked_evidence.append(catalog[inbox_id])
+            linked_evidence.extend(resolved_status_evidence)
+            if operation == "updated":
+                review = self.task_review_for(existing, state)
+                for reason in (review or {}).get("reasons") or []:
+                    compact = {
+                        key: copy.deepcopy(reason.get(key))
+                        for key in ("kind", "object_id", "transition_key", "room_id", "from", "to", "item_ids", "roles")
+                        if reason.get(key) is not None
+                    }
+                    compact["ref"] = "review:" + hashlib.sha256(
+                        json.dumps(compact, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    ).hexdigest()[:16]
+                    if review.get("latest_evidence_at") is not None:
+                        compact["observed_at"] = review["latest_evidence_at"]
+                    linked_evidence.append(compact)
+            if operation == "created":
+                existing["origin_evidence"] = list(linked_evidence)[:MAX_TASK_EVIDENCE]
+            existing.setdefault("origin_evidence", [])
+            recent = list(existing.get("recent_evidence") or [])
+            for evidence in linked_evidence:
+                recent = [item for item in recent if item.get("ref") != evidence.get("ref")]
+                recent.append(evidence)
+            existing["recent_evidence"] = recent[-MAX_TASK_EVIDENCE:]
+            if not changed:
+                tasks[task_id] = existing
+                self.write_exploration(data)
+                return {"ok": True, "operation": operation, "task": self.task_view(existing)}
             existing["updated_at"] = now
             existing["updated_agent_turn"] = turn
             existing.setdefault("history", []).append({
@@ -2680,14 +6171,70 @@ class DebugState:
             })
             existing["history"] = existing["history"][-MAX_TASK_HISTORY:]
             tasks[task_id] = existing
+            data["tasks_revision"] = self.task_ledger_revision(data) + 1
             self.write_exploration(data)
-            return {"ok": True, "task": self.task_view(existing)}
+            return {"ok": True, "operation": operation, "task": self.task_view(existing)}
 
-    def active_task_summary(self, limit: int = 20) -> list[dict]:
+    def active_task_summary(self, limit: int = MAX_ACTIVE_TASK_CONTEXT) -> list[dict]:
+        limit = max(0, int(limit))
+        def compact_description(value) -> str:
+            description = str(value or "")
+            if len(description) <= MAX_ACTIVE_TASK_DESCRIPTION:
+                return description
+            return description[:MAX_ACTIVE_TASK_DESCRIPTION - 1] + "…"
         return [
-            {key: task.get(key) for key in ("id", "description", "priority", "object_id", "transition_key", "room_id", "rationale", "updated_agent_turn")}
+            {
+                **{key: task.get(key) for key in ("id", "priority", "object_id", "transition_key", "room_id")},
+                "description": compact_description(task.get("description")),
+            }
             for task in self.task_ledger(limit=limit)
         ]
+
+    def active_task_context(self, state: dict | None = None) -> dict:
+        return {
+            "active_tasks": self.active_task_summary(),
+            "active_tasks_total": len(self.task_ledger(limit=None)),
+            "task_review": self.task_review_context(state),
+            "task_inbox": self.task_inbox_gate_context(state),
+        }
+
+    def task_reconciliation_context(self, tool_cycle: dict | None = None) -> dict:
+        pending = self.agent_runtime.task_reconciliation_pending()
+        result = {
+            "pending": pending,
+            "reason": self.agent_runtime.task_reconciliation_reason() if pending else None,
+        }
+        if pending:
+            result["requirements"] = (
+                "Read every get_tasks page with include_closed=true and detail=summary, then in a later model "
+                "batch upsert every active task with the returned review_token. Preserve completed tasks; mark "
+                "semantic duplicates abandoned with their relationship. The audit clears as soon as every active "
+                "task has been reconciled."
+            )
+        if isinstance(tool_cycle, dict):
+            audit = tool_cycle.get("task_query_audit")
+            with self.exploration_lock:
+                revision = self.task_ledger_revision(self.read_exploration())
+            active_ids = {
+                str(task.get("id")) for task in self.task_ledger(limit=None) if task.get("id")
+            }
+            reconciled = set(tool_cycle.get("reconciled_task_ids") or [])
+            result["audit_complete"] = (
+                isinstance(audit, dict)
+                and audit.get("complete") is True
+                and audit.get("revision") == revision
+            )
+            result["missing_active_task_ids"] = sorted(active_ids - reconciled)
+        return result
+
+    def maybe_clear_task_reconciliation(self, tool_cycle: dict | None) -> bool:
+        if not self.agent_runtime.task_reconciliation_pending():
+            return False
+        reconciliation = self.task_reconciliation_context(tool_cycle)
+        if not reconciliation.get("audit_complete") or reconciliation.get("missing_active_task_ids"):
+            return False
+        self.agent_runtime.clear_task_reconciliation()
+        return True
 
     def object_event_key(self, event: dict) -> str:
         payload = {
@@ -2836,6 +6383,136 @@ class DebugState:
                 return False
         return compared
 
+    def task_structure_changed_after(self, data: dict, observed_at: float) -> bool:
+        tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+        structural_fields = {"created", "description", "status", "object_id", "transition_key", "room_id"}
+        for task in tasks.values():
+            if not isinstance(task, dict):
+                continue
+            try:
+                if float(task.get("created_at") or 0) > observed_at:
+                    return True
+            except (TypeError, ValueError):
+                pass
+            for change in task.get("history") or []:
+                if not isinstance(change, dict):
+                    continue
+                try:
+                    changed_at = float(change.get("time") or 0)
+                except (TypeError, ValueError):
+                    continue
+                fields = change.get("changes") if isinstance(change.get("changes"), dict) else {}
+                if changed_at > observed_at and structural_fields.intersection(fields):
+                    return True
+        return False
+
+    def legacy_interaction_context_changes(self, data: dict, event: dict) -> list[str]:
+        try:
+            observed_at = float(event.get("time") or event.get("started_at") or 0)
+        except (TypeError, ValueError):
+            observed_at = 0.0
+        if observed_at <= 0:
+            return []
+        changes: list[str] = []
+        observable = data.get("interaction_observable_context")
+        evidence = observable.get("evidence") if isinstance(observable, dict) else []
+        if any(
+            isinstance(item, dict) and float(item.get("time") or 0) > observed_at
+            for item in evidence or []
+        ):
+            changes.append("observable_state_changed")
+        if any(
+            isinstance(entry, dict)
+            and self.dialog_semantic_signature(entry) is not None
+            and self.task_inbox_entry_time(entry) > observed_at
+            for entry in self.dialog_history
+        ):
+            changes.append("new_dialog_evidence")
+        if self.task_structure_changed_after(data, observed_at):
+            changes.append("task_structure_changed")
+        return changes
+
+    def context_changes_since_interaction(
+        self,
+        data: dict,
+        recorded: dict | None,
+        current: dict,
+    ) -> tuple[str, list[str]]:
+        if not isinstance(recorded, dict) or not recorded.get("key"):
+            return "legacy", []
+        if recorded.get("key") == current.get("key"):
+            return "same", []
+        changes: list[str] = []
+        try:
+            old_revision = int(recorded.get("observable_revision") or 0)
+        except (TypeError, ValueError):
+            old_revision = 0
+        if old_revision != int(current.get("observable_revision") or 0):
+            changes.append("observable_state_changed")
+        if recorded.get("narrative_digest") != current.get("narrative_digest"):
+            changes.append("new_dialog_evidence")
+        if recorded.get("task_digest") != current.get("task_digest"):
+            changes.append("task_structure_changed")
+        return "stale", changes
+
+    def interaction_failure_evidence(
+        self,
+        state: dict,
+        entry: dict,
+        data: dict,
+        current_context: dict,
+    ) -> dict:
+        current_object = self.object_snapshot_for_interaction(state, int(entry.get("object_id") or 0))
+        attempts = []
+        for detail in entry.get("history") or []:
+            if not isinstance(detail, dict) or detail.get("type") != "interaction_no_effect":
+                continue
+            recorded_object = detail.get("finished_object") or detail.get("started_object")
+            if not self.object_snapshot_compatible(current_object, recorded_object):
+                continue
+            relation, changes = self.context_changes_since_interaction(
+                data,
+                detail.get("interaction_context"),
+                current_context,
+            )
+            legacy = relation == "legacy"
+            if relation == "legacy":
+                changes = self.legacy_interaction_context_changes(data, detail)
+                relation = "stale" if changes else "unknown"
+            attempts.append({
+                "time": detail.get("time"),
+                "relation": relation,
+                "legacy": legacy,
+                "context_changes": changes,
+                "reason": detail.get("reason"),
+            })
+        same_count = sum(1 for attempt in attempts if attempt["relation"] == "same")
+        stale_count = sum(1 for attempt in attempts if attempt["relation"] == "stale")
+        unknown_count = sum(1 for attempt in attempts if attempt["relation"] == "unknown")
+        context_keys = {
+            str(detail.get("interaction_context", {}).get("key"))
+            for detail in entry.get("history") or []
+            if isinstance(detail, dict)
+            and detail.get("type") == "interaction_no_effect"
+            and isinstance(detail.get("interaction_context"), dict)
+            and detail.get("interaction_context", {}).get("key")
+        }
+        if any(attempt["legacy"] and attempt["relation"] == "stale" for attempt in attempts):
+            context_keys.add("legacy-stale")
+        if any(attempt["legacy"] and attempt["relation"] == "unknown" for attempt in attempts):
+            context_keys.add("legacy-unknown")
+        latest = attempts[-1] if attempts else None
+        return {
+            "no_effect_count": int(entry.get("no_effect_count") or len(attempts)),
+            "compatible_no_effect_count": len(attempts),
+            "same_context_no_effect_count": same_count,
+            "stale_context_no_effect_count": stale_count,
+            "unknown_context_no_effect_count": unknown_count,
+            "failed_context_count": len(context_keys),
+            "context_changes_since_latest": list((latest or {}).get("context_changes") or []),
+            "recent_context_outcomes": attempts[-6:],
+        }
+
     def recover_object_interactions_from_agent_llm_log(self) -> int:
         try:
             stat = self.agent_llm_log_path.stat()
@@ -2879,7 +6556,7 @@ class DebugState:
                     continue
                 history_current = (
                     result.get("current")
-                    if message.get("name") == "get_object_history" and isinstance(result.get("current"), dict)
+                    if message.get("name") == "inspect_target" and isinstance(result.get("current"), dict)
                     else None
                 )
 
@@ -2956,7 +6633,6 @@ class DebugState:
                 "nav_room_id": None,
                 "legacy_room_id": None,
                 "legacy_nav_room_id": None,
-                "complete": False,
                 "explored": 0,
                 "explorable": 0,
                 "frontier": 0,
@@ -2977,7 +6653,6 @@ class DebugState:
                 "nav_room_id": None,
                 "legacy_room_id": None,
                 "legacy_nav_room_id": None,
-                "complete": False,
                 "explored": 0,
                 "explorable": 0,
                 "frontier": 0,
@@ -2995,21 +6670,11 @@ class DebugState:
             "nav_room_id": room.get("nav_room_id"),
             "legacy_room_id": room.get("legacy_room_id"),
             "legacy_nav_room_id": room.get("legacy_nav_room_id"),
-            "complete": bool(room.get("complete")),
             "explored": len(room.get("visited") or []),
             "explorable": int(room.get("explorable") or 0),
             "frontier": len(room.get("frontier") or []),
             "updated_at": room.get("updated_at"),
         }
-
-    def destination_priority(self, summary: dict) -> str:
-        if not summary.get("known"):
-            return "unknown"
-        if summary.get("complete"):
-            return "complete"
-        if int(summary.get("explored") or 0) <= 0:
-            return "unexplored"
-        return "partial"
 
     def transition_object_payload(self, obj: dict | None, object_id: int) -> dict:
         obj = obj if isinstance(obj, dict) else {}
@@ -3039,6 +6704,113 @@ class DebugState:
     def transition_key_from_fields(self, fields: dict) -> str:
         values = [fields.get(key) for key in TRANSITION_KEY_FIELDS]
         return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def transition_endpoint_position(record: dict) -> dict | None:
+        fields = record.get("transition_key_fields") if isinstance(record.get("transition_key_fields"), dict) else {}
+        obj = record.get("object") if isinstance(record.get("object"), dict) else {}
+        try:
+            return {
+                "x": int(fields.get("x") if fields.get("x") is not None else obj.get("x")),
+                "y": int(fields.get("y") if fields.get("y") is not None else obj.get("y")),
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def transition_source_endpoint(self, record: dict, stored_key: object) -> dict:
+        fields = record.get("transition_key_fields") if isinstance(record.get("transition_key_fields"), dict) else {}
+        obj = record.get("object") if isinstance(record.get("object"), dict) else {}
+        return {
+            "transition_key": record.get("transition_key") or str(stored_key),
+            "object_id": self.int_or_none(record.get("object_id")),
+            "position": self.transition_endpoint_position(record),
+            "trigger_script": self.int_or_none(
+                fields.get("trigger_script")
+                if fields.get("trigger_script") is not None
+                else obj.get("trigger_script")
+            ),
+        }
+
+    def derive_transition_endpoints(self, data: dict) -> None:
+        legacy_fields = {
+            "from_subregion_id", "to_subregion_id",
+            "from_location_id", "to_location_id",
+            "subregion_basis", "subregion_match_distance",
+        }
+
+        def clear_legacy(value) -> None:
+            if isinstance(value, dict):
+                for key in legacy_fields:
+                    value.pop(key, None)
+                for item in value.values():
+                    clear_legacy(item)
+            elif isinstance(value, list):
+                for item in value:
+                    clear_legacy(item)
+
+        transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
+        for by_room in transitions.values():
+            if not isinstance(by_room, dict):
+                continue
+            sources = []
+            for stored_key, record in by_room.items():
+                if not isinstance(record, dict):
+                    continue
+                clear_legacy(record)
+                record.pop("source_endpoint", None)
+                record.pop("destination_endpoint", None)
+                endpoint = self.transition_source_endpoint(record, stored_key)
+                if record.get("intra_room_transition"):
+                    record["source_endpoint"] = endpoint
+                if record.get("confirmation") in {"native_trigger", "human_confirmed"}:
+                    sources.append((str(endpoint.get("transition_key")), endpoint))
+
+            for stored_key, record in by_room.items():
+                if not isinstance(record, dict) or not record.get("intra_room_transition"):
+                    continue
+                native = record.get("native_destination") if isinstance(record.get("native_destination"), dict) else {}
+                try:
+                    landing = {"x": int(native.get("x")), "y": int(native.get("y"))}
+                except (TypeError, ValueError):
+                    landing = None
+                destination = {"kind": "native_landing", "position": landing}
+                current_key = str(record.get("transition_key") or stored_key)
+                ranked = []
+                if (
+                    landing is not None
+                    and record.get("confirmation") in {"native_trigger", "human_confirmed"}
+                ):
+                    for candidate_key, endpoint in sources:
+                        position = endpoint.get("position") if isinstance(endpoint.get("position"), dict) else None
+                        if candidate_key == current_key or position is None:
+                            continue
+                        distance = pal_distance(
+                            (landing["x"], landing["y"]),
+                            (position["x"], position["y"]),
+                        )
+                        if distance <= TRANSITION_ENDPOINT_MATCH_DISTANCE:
+                            ranked.append((distance, candidate_key, endpoint))
+                if ranked:
+                    minimum = min(item[0] for item in ranked)
+                    nearest = [item for item in ranked if item[0] == minimum]
+                    selected = nearest[0] if len(nearest) == 1 else None
+                    if selected is None:
+                        source_object_id = self.int_or_none(record.get("object_id"))
+                        same_object = [
+                            item for item in nearest
+                            if item[2].get("object_id") == source_object_id
+                        ]
+                        if len(same_object) == 1:
+                            selected = same_object[0]
+                    if selected is not None:
+                        endpoint = selected[2]
+                        destination = {
+                            "kind": "confirmed_transition_source",
+                            "transition_key": endpoint.get("transition_key"),
+                            "object_id": endpoint.get("object_id"),
+                            "position": endpoint.get("position"),
+                        }
+                record["destination_endpoint"] = destination
 
     def transition_observed_state(self, state: dict | None, identity: dict | None = None) -> dict | None:
         if not isinstance(state, dict):
@@ -3163,6 +6935,63 @@ class DebugState:
             recent.append(room_id)
         return recent
 
+    def transition_traversal_context(self, record: dict | None, data: dict) -> dict:
+        snapshot = self.transition_task_context_snapshot(data)
+        active_task_ids = snapshot["active_task_ids"]
+        record = record if isinstance(record, dict) else {}
+        contexts = record.get("traversal_contexts") if isinstance(record.get("traversal_contexts"), list) else []
+        current = next((
+            item for item in contexts
+            if isinstance(item, dict) and item.get("digest") == snapshot["digest"]
+        ), None)
+        if active_task_ids:
+            status = "traversed_current_context" if current else "untraversed_current_context"
+        elif record and record.get("traversal_context_version") is None:
+            status = "legacy_observed"
+        else:
+            status = "no_active_tasks"
+        try:
+            total_count = int(record.get("traversal_count"))
+        except (TypeError, ValueError):
+            total_count = 1 if record.get("observed") else 0
+        return {
+            "status": status,
+            "context_digest": snapshot["digest"],
+            "active_task_ids": active_task_ids,
+            "current_context_count": int(current.get("count") or 0) if current else 0,
+            "current_context_last_traversed_at": current.get("last_traversed_at") if current else None,
+            "total_count": max(0, total_count),
+            "last_traversed_at": record.get("last_traversed_at") or record.get("observed_at"),
+        }
+
+    @staticmethod
+    def record_transition_traversal(record: dict, snapshot: dict, traversed_at: float) -> None:
+        try:
+            previous_count = (
+                int(record.get("traversal_count"))
+                if record.get("traversal_count") is not None
+                else (1 if record.get("observed") else 0)
+            )
+            record["traversal_count"] = max(0, previous_count) + 1
+        except (TypeError, ValueError):
+            record["traversal_count"] = 1
+        record["last_traversed_at"] = traversed_at
+        record["traversal_context_version"] = 1
+        active_task_ids = snapshot.get("active_task_ids") if isinstance(snapshot.get("active_task_ids"), list) else []
+        if not active_task_ids:
+            return
+        contexts = record.get("traversal_contexts") if isinstance(record.get("traversal_contexts"), list) else []
+        digest = str(snapshot.get("digest") or "")
+        current = next((item for item in contexts if isinstance(item, dict) and item.get("digest") == digest), None)
+        if current is None:
+            current = {"digest": digest, "active_task_ids": list(active_task_ids), "count": 0}
+            contexts.append(current)
+        current["active_task_ids"] = list(active_task_ids)
+        current["count"] = max(0, int(current.get("count") or 0)) + 1
+        current["last_traversed_at"] = traversed_at
+        contexts.sort(key=lambda item: float(item.get("last_traversed_at") or 0))
+        record["traversal_contexts"] = contexts[-MAX_TRANSITION_TASK_CONTEXTS:]
+
     def transition_destination_payload(
         self,
         data: dict,
@@ -3180,14 +7009,15 @@ class DebugState:
             "known_destination_observed_at": None,
             "known_destination_transition_key": None,
             "destination_exploration": self.room_exploration_summary_from_data(data, None),
-            "destination_priority": "unknown",
             "returns_to_recent_room": False,
+            "traversal_context": self.transition_traversal_context(None, data),
         }
         if not from_logical_room_id:
             return payload
         record = self.transition_record_for_object(data, from_logical_room_id, object_id, state, transition_key)
         if not isinstance(record, dict) or not record.get("to_room_id"):
             return payload
+        payload["traversal_context"] = self.transition_traversal_context(record, data)
         if record.get("confirmation") not in {"native_trigger", "human_confirmed"}:
             payload["unconfirmed_destination"] = True
             return payload
@@ -3210,18 +7040,16 @@ class DebugState:
                 "known_destination_observed_at": record.get("observed_at"),
                 "known_destination_transition_key": record.get("transition_key"),
                 "destination_exploration": destination,
-                "destination_priority": self.destination_priority(destination),
                 "returns_to_recent_room": returns_to_recent_room,
+                "traversal_context": self.transition_traversal_context(record, data),
                 "transition_key": record.get("transition_key"),
                 "transition_key_fields": record.get("transition_key_fields"),
                 "from_semantic_room": record.get("from_semantic_room"),
                 "to_semantic_room": record.get("to_semantic_room"),
                 "confidence": record.get("confidence"),
                 "intra_room_transition": bool(record.get("intra_room_transition")),
-                "from_location_id": record.get("from_location_id") or record.get("from_room_id"),
-                "to_location_id": record.get("to_location_id") or record.get("to_room_id"),
-                "from_subregion_id": record.get("from_subregion_id"),
-                "to_subregion_id": record.get("to_subregion_id"),
+                "source_endpoint": record.get("source_endpoint"),
+                "destination_endpoint": record.get("destination_endpoint"),
                 "native_destination": record.get("native_destination"),
             }
         )
@@ -3258,7 +7086,7 @@ class DebugState:
                 data = self.read_exploration()
         if recent_room_ids is None:
             recent_room_ids = self.recent_room_ids(state)
-        return self.transition_destination_payload(
+        payload = self.transition_destination_payload(
             data,
             identity["id"] if identity else None,
             object_id,
@@ -3267,6 +7095,111 @@ class DebugState:
             transition_key,
             recent_semantic_room_keys,
         )
+        if not payload.get("known_destination") and isinstance(obj, dict) and identity is not None:
+            fields = self.transition_key_fields(identity, obj, object_id)
+            by_room = (data.get("transitions") or {}).get(identity["id"], {})
+            site_records = []
+            for record in by_room.values() if isinstance(by_room, dict) else []:
+                versions = [record]
+                versions.extend(
+                    item for item in record.get("observations") or []
+                    if isinstance(item, dict)
+                )
+                for version in versions:
+                    record_fields = version.get("transition_key_fields")
+                    if not isinstance(record_fields, dict):
+                        continue
+                    if version.get("confirmation") not in {"native_trigger", "human_confirmed"}:
+                        continue
+                    if int(version.get("object_id") or 0) != int(object_id):
+                        continue
+                    if all(
+                        record_fields.get(key) == fields.get(key)
+                        for key in ("scene_id", "map_id", "x", "y", "trigger_mode")
+                    ):
+                        site_records.append(version)
+            destinations = {
+                str(record.get("to_room_id"))
+                for record in site_records
+                if record.get("to_room_id")
+            }
+            if len(destinations) == 1:
+                record = site_records[0]
+                fallback = self.transition_destination_payload(
+                    data,
+                    identity["id"],
+                    object_id,
+                    recent_room_ids,
+                    None,
+                    str(record.get("transition_key")),
+                    recent_semantic_room_keys,
+                )
+                if fallback.get("known_destination"):
+                    fallback["known_destination_basis"] = "confirmed_site_history"
+                    fallback["transition_key"] = transition_key
+                    fallback["transition_key_fields"] = fields
+                    return fallback
+        return payload
+
+    def infer_destination_entry_candidate(
+        self,
+        destination_state: dict,
+        source_identity: dict,
+        source_record: dict,
+    ) -> dict | None:
+        navigation = self.navigation(destination_state)
+        executable = {"reachable", "transition", "blocked_by_interactable"}
+        nearby = []
+        for target in navigation.get("targets") or []:
+            try:
+                steps = int(target.get("steps"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                target.get("transition_candidate") is True
+                and target.get("status") in executable
+                and steps <= IMMEDIATE_ENTRY_RETURN_MAX_STEPS
+            ):
+                nearby.append(target)
+        if len(nearby) != 1:
+            return None
+        target = nearby[0]
+        return {
+            "entry_relation": "inferred_entry_return",
+            "object_id": int(target.get("id") or 0),
+            "transition_key": target.get("transition_key"),
+            "transition_key_fields": target.get("transition_key_fields"),
+            "candidate_return_room_id": source_identity.get("id"),
+            "source_transition_key": source_record.get("transition_key"),
+            "evidence": {
+                "kind": "native_landing_proximity",
+                "steps": int(target.get("steps") or 0),
+                "max_steps": IMMEDIATE_ENTRY_RETURN_MAX_STEPS,
+                "native_destination": source_record.get("native_destination"),
+            },
+        }
+
+    def destination_entry_candidate_for_target(
+        self,
+        data: dict,
+        room_id: str,
+        object_id: int,
+        transition_key: str | None,
+    ) -> dict | None:
+        matches = []
+        for by_room in (data.get("transitions") or {}).values():
+            if not isinstance(by_room, dict):
+                continue
+            for record in by_room.values():
+                candidate = record.get("destination_entry_candidate") if isinstance(record, dict) else None
+                if not isinstance(candidate, dict) or record.get("to_room_id") != room_id:
+                    continue
+                if int(candidate.get("object_id") or 0) != int(object_id):
+                    continue
+                if transition_key and candidate.get("transition_key") != transition_key:
+                    continue
+                matches.append(candidate)
+        return copy.deepcopy(matches[0]) if len(matches) == 1 else None
 
     def record_transition_destination(
         self,
@@ -3283,6 +7216,7 @@ class DebugState:
         confirmation: str = "human_confirmed",
         intra_room_transition: bool = False,
         native_destination: dict | None = None,
+        traversal_context_snapshot: dict | None = None,
     ) -> dict:
         observed_at = time.time()
         transition_key_fields = transition_key_fields or self.transition_key_fields(from_identity, from_object, object_id)
@@ -3324,30 +7258,20 @@ class DebugState:
                 "intra_room_transition": bool(intra_room_transition),
                 "native_destination": native_destination,
             }
-            if intra_room_transition:
-                from_subregion_id = f".{int(object_id)}"
-                nearest = self.nearest_transition_candidate(to_state or {}, native_destination)
-                to_subregion_id = f".{nearest[0]}" if nearest else None
-                record.update({
-                    "from_subregion_id": from_subregion_id,
-                    "to_subregion_id": to_subregion_id,
-                    "from_location_id": f"{from_identity['id']}{from_subregion_id}",
-                    "to_location_id": f"{to_identity['id']}{to_subregion_id}" if to_subregion_id else to_identity["id"],
-                    "subregion_basis": "native_trigger_destination_nearest_active_transition" if nearest else None,
-                    "subregion_match_distance": nearest[1] if nearest else None,
-                })
-            else:
-                record.update({
-                    "from_subregion_id": None,
-                    "to_subregion_id": None,
-                    "from_location_id": from_identity["id"],
-                    "to_location_id": to_identity["id"],
-                })
+            snapshot = (
+                traversal_context_snapshot
+                if isinstance(traversal_context_snapshot, dict)
+                else self.transition_task_context_snapshot(data)
+            )
+            if not existing:
+                record["traversal_count"] = 0
+            self.record_transition_traversal(record, snapshot, observed_at)
             if existing.get("to_room_id") and existing.get("to_room_id") != to_identity["id"]:
                 previous = {key: value for key, value in existing.items() if key != "observations"}
                 observations = existing.get("observations") if isinstance(existing.get("observations"), list) else []
                 record["observations"] = [*observations, previous]
             by_room[transition_key] = record
+            self.derive_transition_endpoints(data)
             self.write_exploration(data)
         return record
 
@@ -3410,31 +7334,414 @@ class DebugState:
             return None
         return observation if generation > 0 and object_id > 0 else None
 
+    @contextmanager
+    def spatial_execution_scope(self, action: str, target_id=None, cancel_event=None):
+        state = self.read_live_state()
+        execution = {
+            "id": time.monotonic_ns(), "action": action, "target_id": target_id,
+            "room_id": (self.room_identity(state) or {}).get("id"),
+            "game_instance_id": str(state.get("game_instance_id") or ""),
+            "baseline_generation": (self.native_trigger_generation(state) or {}).get("generation", 0),
+            "cancel_event": cancel_event, "receipt": None,
+        }
+        with self.state_lock:
+            self.spatial_execution = execution
+        try:
+            yield execution
+        finally:
+            with self.state_lock:
+                if self.spatial_execution is execution:
+                    self.spatial_execution = None
+                # A later execution must never inherit an unconsumed success.
+                with self.exploration_lock:
+                    data = self.read_exploration()
+                    route = ((data.get("rooms") or {}).get(execution["room_id"]) or {}).get("last_route")
+                    if isinstance(route, dict) and route.get("execution_id") == execution["id"]:
+                        route["pending"] = False
+                        route["completion_reported_at"] = time.time()
+                        self.write_exploration(data)
+
+    def capture_spatial_completion(self, pending, state):
+        execution = self.spatial_execution
+        native = self.native_trigger_generation(state or {}) or {}
+        if (not execution or pending.get("execution_id") != execution["id"]
+                or pending.get("owner") != "navigation"
+                or (execution["cancel_event"] is not None and execution["cancel_event"].is_set())
+                or str((state or {}).get("game_instance_id") or "") != execution["game_instance_id"]
+                or (pending.get("from_room") or {}).get("id") != execution["room_id"]
+                or native.get("completed") is not True
+                or native.get("event_object_id") != pending.get("object_id")
+                or native.get("generation") != pending.get("trigger_generation")
+                or native.get("generation", 0) <= execution["baseline_generation"]
+                or (execution["target_id"] is not None and execution["target_id"] != pending.get("object_id"))):
+            return
+        if execution.get("receipt") is None and not execution.get("consumed"):
+            execution["receipt"] = {"trigger_evidence": {
+                "source": "native_trigger_completion", "object_id": pending["object_id"],
+                "execution_id": execution["id"], "action": execution["action"],
+                "game_instance_id": execution["game_instance_id"], "room_id": execution["room_id"],
+                "trigger_generation": native["generation"], "completed_at": time.time(),
+                "motion_sequence": self.motion_history.serial,
+                "object_changes": self.object_snapshot_delta(pending.get("execution_started_object"),
+                    self.object_snapshot_for_interaction(state, pending["object_id"])),
+            }}
+
+    def consume_spatial_completion(self, state, target_id=None):
+        with self.state_lock:
+            execution = self.spatial_execution
+            if (not execution or not execution.get("receipt")
+                    or (execution["cancel_event"] is not None and execution["cancel_event"].is_set())
+                    or str(state.get("game_instance_id") or "") != execution["game_instance_id"]
+                    or (self.room_identity(state) or {}).get("id") != execution["room_id"]):
+                return None
+            receipt = execution["receipt"]
+            evidence = receipt["trigger_evidence"]
+            if target_id is not None and evidence["object_id"] != target_id:
+                return None
+            execution["receipt"] = None
+            execution["consumed"] = True
+            with self.exploration_lock:
+                data = self.read_exploration()
+                objects = data.setdefault("object_interactions", {}).setdefault(execution["room_id"], {})
+                objects.setdefault(str(evidence["object_id"]), {})["last_trigger_completion"] = evidence
+                self.write_exploration(data)
+            return copy.deepcopy(receipt)
+
+    def terminate_pending_transition_observation(
+        self,
+        pending: dict,
+        reason: str,
+        outcome: str,
+        *,
+        state: dict | None = None,
+        diagnostic_type: str | None = None,
+        diagnostic: dict | None = None,
+    ) -> bool:
+        """Atomically retire one pending transition and all of its ownership links."""
+        with self.state_lock:
+            observation_id = pending.get("observation_id")
+            current = self.pending_transition_observation
+            if not isinstance(current, dict) or current.get("observation_id") != observation_id:
+                return False
+            try:
+                object_id = int(pending.get("object_id") or 0)
+            except (TypeError, ValueError):
+                object_id = 0
+            owner = str(pending.get("owner") or "navigation")
+            linked_interaction_id = pending.get("linked_interaction_observation_id")
+            linked_interaction = self.pending_interaction_observation
+            if (
+                linked_interaction_id
+                and isinstance(linked_interaction, dict)
+                and linked_interaction.get("observation_id") == linked_interaction_id
+                and linked_interaction.get("transition_observation_id") == observation_id
+            ):
+                linked_interaction.pop("transition_observation_id", None)
+                self.observations.update_payload(
+                    linked_interaction_id,
+                    transition_observation_id=None,
+                )
+            self.observations.cancel(observation_id, reason)
+            if object_id > 0 and self.navigation_transition_requests.get(object_id) == observation_id:
+                self.navigation_transition_requests.pop(object_id, None)
+            self.observations.consume(observation_id, owner=owner)
+            if outcome == "trigger_completed":
+                self.capture_spatial_completion(pending, state)
+            self.finish_navigation_route(pending.get("from_room"), object_id, outcome)
+            self.pending_transition_observation = None
+            if diagnostic_type:
+                self.append_navigation_diagnostic(
+                    diagnostic_type,
+                    {
+                        "observation_id": observation_id,
+                        "target_id": object_id,
+                        "reason": reason,
+                        **(diagnostic or {}),
+                    },
+                    state,
+                )
+            return True
+
     def clear_pending_transition_observation(self, object_id: int | None = None) -> None:
         pending = self.pending_transition_observation
         if object_id is None or (isinstance(pending, dict) and pending.get("object_id") == object_id):
-            self.pending_transition_observation = None
+            if isinstance(pending, dict):
+                self.terminate_pending_transition_observation(
+                    pending,
+                    "transition_cleared",
+                    "transition_cleared",
+                )
 
-    def mark_pending_transition_observation(self, state: dict, object_id: int) -> None:
+    def mark_pending_transition_observation(
+        self,
+        state: dict,
+        object_id: int,
+        *,
+        owner: str = "navigation",
+        linked_interaction: dict | None = None,
+    ) -> str | None:
         observation = self.transition_observation_from_state(state, object_id)
         if observation is None:
-            return
+            return None
+        if isinstance(self.pending_transition_observation, dict):
+            self.clear_pending_transition_observation()
         native = self.native_trigger_observation(state)
         try:
             baseline_generation = int(native.get("generation") or 0) if native else 0
         except (TypeError, ValueError):
             baseline_generation = 0
-        self.pending_transition_observation = {
+        payload = {
             **observation,
             "frozen_source_state": state,
+            "traversal_context_snapshot": self.transition_task_context_snapshot(),
+            "game_instance_id": str(state.get("game_instance_id") or ""),
             "object_id": int(object_id),
             "sent_at": time.time(),
+            "execution_id": (self.spatial_execution or {}).get("id") if owner == "navigation" else None,
+            "execution_started_object": self.object_snapshot_for_interaction(state, object_id),
             "baseline_trigger_generation": baseline_generation,
             "trigger_generation": None,
+            "control_started_at": None,
+            "control_last_progress_at": None,
+            "control_progress_signature": None,
+            "landing_started_at": None,
             "candidate_room_id": None,
             "stable_snapshots": 0,
             "last_frame": None,
+            "linked_interaction_observation_id": (
+                linked_interaction.get("observation_id")
+                if isinstance(linked_interaction, dict)
+                else None
+            ),
         }
+        intent = self.pending_room_entry_intent
+        if (
+            isinstance(intent, dict)
+            and intent.get("source_room_id") == observation.get("from_room", {}).get("id")
+            and int(intent.get("target_id") or 0) == int(object_id)
+            and intent.get("source_transition_key") == observation.get("transition_key")
+        ):
+            payload["room_entry_intent"] = copy.deepcopy(intent)
+        observation_id = self.observations.register(
+            "transition",
+            owner=owner,
+            timeout=TRANSITION_OBSERVATION_TIMEOUT_SECONDS,
+            payload=payload,
+        )
+        payload["observation_id"] = observation_id
+        payload["owner"] = owner
+        self.pending_transition_observation = payload
+        if isinstance(linked_interaction, dict):
+            linked_interaction["transition_observation_id"] = observation_id
+            self.observations.update_payload(
+                linked_interaction.get("observation_id"),
+                transition_observation_id=observation_id,
+            )
+        if owner == "navigation":
+            previous_id = self.navigation_transition_requests.get(int(object_id))
+            if previous_id and previous_id != observation_id:
+                self.observations.cancel(previous_id, "superseded")
+                self.observations.consume(previous_id, owner="navigation")
+            self.navigation_transition_requests[int(object_id)] = observation_id
+        return observation_id
+
+    def bind_room_entry_intent(
+        self,
+        state: dict,
+        object_id: int,
+        *,
+        intentional_return: bool = False,
+    ) -> dict | None:
+        observation = self.transition_observation_from_state(state, object_id)
+        if not isinstance(observation, dict):
+            self.pending_room_entry_intent = None
+            return None
+        intent = {
+            "source_room_id": (observation.get("from_room") or {}).get("id"),
+            "target_id": int(object_id),
+            "source_transition_key": observation.get("transition_key"),
+            "intentional_return": bool(intentional_return),
+            "armed_at": time.time(),
+        }
+        self.pending_room_entry_intent = intent
+        pending = self.pending_transition_observation
+        if (
+            isinstance(pending, dict)
+            and pending.get("from_room", {}).get("id") == intent.get("source_room_id")
+            and int(pending.get("object_id") or 0) == int(object_id)
+            and pending.get("transition_key") == intent.get("source_transition_key")
+        ):
+            pending["room_entry_intent"] = copy.deepcopy(intent)
+        return intent
+
+    def matching_pending_search_interaction(
+        self,
+        state: dict,
+        object_id: int,
+        trigger_script: int,
+        source: dict,
+    ) -> dict | None:
+        pending = self.pending_interaction_observation
+        if not isinstance(pending, dict) or not pending.get("armed"):
+            return None
+        try:
+            action_buttons = (pending.get("action") or {}).get("buttons") or []
+            matches = (
+                int(pending.get("object_id") or 0) == object_id
+                and int((pending.get("object") or {}).get("trigger_script") or 0) == trigger_script
+                and "search" in action_buttons
+                and int(pending.get("scene_id")) == int(source.get("scene_id"))
+                and int(pending.get("map_id")) == int(source.get("map_id"))
+                and str(pending.get("game_instance_id") or "") == str(state.get("game_instance_id") or "")
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return pending if matches else None
+
+    def complete_linked_transition_interaction(
+        self,
+        pending_transition: dict,
+        state: dict,
+        transition: dict,
+    ) -> dict | None:
+        observation_id = pending_transition.get("linked_interaction_observation_id")
+        pending = self.pending_interaction_observation
+        if (
+            not observation_id
+            or not isinstance(pending, dict)
+            or pending.get("observation_id") != observation_id
+        ):
+            return None
+        object_id = int(pending.get("object_id") or 0)
+        finished_object = self.object_snapshot_for_interaction(state, object_id)
+        payload = {
+            "object_id": object_id,
+            "target_id": object_id,
+            "via_target_id": pending.get("via_target_id"),
+            "started_frame": pending.get("frame"),
+            "started_logical_frame": pending.get("logical_frame"),
+            "started_at": pending.get("sent_at"),
+            "started_room_id": pending.get("room_id"),
+            "started_nav_room_id": pending.get("nav_room_id"),
+            "started_object": pending.get("object"),
+            "finished_object": finished_object,
+            "action": pending.get("action"),
+            "inventory_changes": self.inventory_delta(
+                pending.get("inventory") or {},
+                self.observed_inventory(state),
+            ),
+            "object_changes": self.object_snapshot_delta(
+                pending.get("object") if isinstance(pending.get("object"), dict) else None,
+                finished_object,
+            ),
+            "room_changed": transition.get("from_room_id") != transition.get("to_room_id"),
+            "transition_key": transition.get("transition_key"),
+            "to_room_id": transition.get("to_room_id"),
+        }
+        self.append_event(state, "interaction_effect", payload)
+        self.observations.complete(
+            observation_id,
+            {"type": "interaction_effect", "event": payload, "transition": transition},
+        )
+        self.pending_interaction_observation = None
+        return payload
+
+    def native_transition_observation_owner(
+        self,
+        state: dict,
+        object_id: int,
+        source: dict,
+    ) -> tuple[str, dict]:
+        """Associate a native touch trigger with the route that just reached it."""
+        identity = self.room_identity(state)
+        details = {
+            "owner": "background",
+            "route_age_seconds": None,
+            "expected_position": None,
+            "source_position": {"x": source.get("x"), "y": source.get("y")},
+            "association_rejected_reason": None,
+        }
+        if identity is None:
+            details["association_rejected_reason"] = "navigation_source_room_missing"
+            return "background", details
+
+        execution = self.spatial_execution or {}
+        armed = execution.get("armed_step") or {}
+        if (execution.get("action") == "move_to" and object_id in armed.get("ids", [])
+                and execution.get("room_id") == identity["id"]
+                and execution.get("game_instance_id") == str(state.get("game_instance_id") or "")
+                and 0 <= time.time() - armed.get("sent_at", 0) <= TRANSITION_OBSERVATION_TIMEOUT_SECONDS
+                and all(armed.get(k) == source.get(k) for k in ("x", "y", "scene_id", "map_id"))):
+            return "navigation", {**details, "owner": "navigation", "association": "coordinate_touch_boundary"}
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = (data.get("rooms") or {}).get(identity["id"])
+            last_route = room.get("last_route") if isinstance(room, dict) else None
+
+        if (self.spatial_execution is not None and isinstance(last_route, dict)
+                and last_route.get("execution_id") != self.spatial_execution["id"]):
+            details["association_rejected_reason"] = "navigation_execution_mismatch"
+            return "background", details
+
+        if not isinstance(last_route, dict) or not last_route.get("pending"):
+            details["association_rejected_reason"] = "navigation_route_not_pending"
+            return "background", details
+
+        try:
+            route_target_id = int(last_route.get("target_id") or 0)
+        except (TypeError, ValueError):
+            route_target_id = 0
+        if route_target_id != object_id:
+            details["association_rejected_reason"] = "navigation_target_mismatch"
+            return "background", details
+
+        target_selection = (
+            last_route.get("target_selection")
+            if isinstance(last_route.get("target_selection"), dict)
+            else {}
+        )
+        if target_selection.get("kind") != "touch":
+            details["association_rejected_reason"] = "navigation_target_not_touch"
+            return "background", details
+
+        try:
+            route_age = time.time() - float(last_route.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            route_age = TRANSITION_OBSERVATION_TIMEOUT_SECONDS + 1
+        details["route_age_seconds"] = route_age
+        if route_age < 0 or route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
+            details["association_rejected_reason"] = "navigation_route_outside_observation_window"
+            return "background", details
+
+        expected = last_route.get("expected_node") if isinstance(last_route.get("expected_node"), dict) else {}
+        details["expected_position"] = {"x": expected.get("x"), "y": expected.get("y")}
+        try:
+            expected_matches = (
+                int(expected.get("x")) == int(source.get("x"))
+                and int(expected.get("y")) == int(source.get("y"))
+            )
+        except (TypeError, ValueError):
+            expected_matches = False
+        if not expected_matches:
+            details["association_rejected_reason"] = "navigation_expected_source_mismatch"
+            return "background", details
+
+        try:
+            frozen_source_matches = (
+                int(room.get("scene_id")) == int(source.get("scene_id"))
+                and int(room.get("map_id")) == int(source.get("map_id"))
+                and int(identity.get("scene_id")) == int(source.get("scene_id"))
+                and int(identity.get("map_id")) == int(source.get("map_id"))
+            )
+        except (AttributeError, TypeError, ValueError):
+            frozen_source_matches = False
+        if not frozen_source_matches:
+            details["association_rejected_reason"] = "navigation_source_room_mismatch"
+            return "background", details
+
+        details["owner"] = "navigation"
+        return "navigation", details
 
     def discover_native_transition_observation(self, state: dict) -> None:
         if isinstance(self.pending_transition_observation, dict):
@@ -3491,11 +7798,45 @@ class DebugState:
         from_identity = self.room_identity(previous)
         if from_identity is None:
             return
-        self.mark_pending_transition_observation(previous, object_id)
+        owner, owner_details = self.native_transition_observation_owner(previous, object_id, source)
+        linked_interaction = self.matching_pending_search_interaction(
+            state,
+            object_id,
+            trigger_script,
+            source,
+        )
+        if linked_interaction is not None:
+            owner = "navigation"
+            owner_details = {
+                **owner_details,
+                "owner": owner,
+                "association_rejected_reason": None,
+                "association": "search_interaction",
+                "interaction_observation_id": linked_interaction.get("observation_id"),
+            }
+        self.append_navigation_diagnostic(
+            "native_transition_owner",
+            {
+                "object_id": object_id,
+                "generation": generation,
+                **owner_details,
+            },
+            state,
+        )
+        self.mark_pending_transition_observation(
+            previous,
+            object_id,
+            owner=owner,
+            linked_interaction=linked_interaction,
+        )
         pending = self.pending_transition_observation
         if not isinstance(pending, dict):
             return
         pending["trigger_generation"] = generation
+        pending["control_started_at"] = time.time()
+        pending["control_last_progress_at"] = pending["control_started_at"]
+        pending["control_progress_signature"] = self.game_control_progress_signature(state)
+        self.observations.suspend_timeout(pending.get("observation_id"))
         observed_from = pending.get("observed_from_state") if isinstance(pending, dict) else None
         if isinstance(observed_from, dict):
             observed_from["party_position"] = {"x": source.get("x"), "y": source.get("y")}
@@ -3508,37 +7849,10 @@ class DebugState:
                 "source": source,
                 "from_room_id": from_identity["id"],
                 "completed": native.get("completed") is True,
+                "owner": owner,
             },
             state,
         )
-
-    def nearest_transition_candidate(self, state: dict, position: dict | None = None) -> tuple[int, float] | None:
-        pos = position if isinstance(position, dict) else (
-            state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
-        )
-        try:
-            px, py = int(pos.get("x")), int(pos.get("y"))
-        except (TypeError, ValueError):
-            return None
-        candidates = []
-        for obj in state.get("objects") if isinstance(state.get("objects"), list) else []:
-            if (
-                not isinstance(obj, dict)
-                or not transition_candidate(obj)
-                or int(obj.get("state") or 0) <= 0
-            ):
-                continue
-            try:
-                object_id = int(obj.get("id") or 0)
-                dx, dy = int(obj.get("x")) - px, int(obj.get("y")) - py
-            except (TypeError, ValueError):
-                continue
-            if object_id > 0:
-                candidates.append((dx * dx + dy * dy, object_id))
-        if not candidates:
-            return None
-        distance_squared, object_id = min(candidates, key=lambda item: (item[0], item[1]))
-        return object_id, distance_squared ** 0.5
 
     def state_at_native_destination(self, state: dict, destination: dict | None) -> dict:
         if not isinstance(destination, dict):
@@ -3562,45 +7876,165 @@ class DebugState:
             sent_at = float(pending.get("sent_at") or 0)
             baseline_generation = int(pending.get("baseline_trigger_generation") or 0)
         except (TypeError, ValueError):
-            self.pending_transition_observation = None
-            return None
-        if sent_at and time.time() - sent_at > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
-            self.append_navigation_diagnostic(
-                "native_transition_rejected",
-                {"reason": "destination_unstable_timeout", "object_id": object_id},
-                state,
+            self.terminate_pending_transition_observation(
+                pending,
+                "invalid_transition_observation",
+                "transition_invalid",
             )
-            self.pending_transition_observation = None
             return None
+        now = time.time()
         from_identity = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
         if object_id <= 0 or from_identity is None:
-            self.pending_transition_observation = None
+            self.terminate_pending_transition_observation(
+                pending,
+                "invalid_transition_observation",
+                "transition_invalid",
+            )
             return None
-        native = self.native_trigger_observation(state)
+        if str(state.get("game_instance_id") or "") != str(pending.get("game_instance_id") or ""):
+            linked_interaction_id = pending.get("linked_interaction_observation_id")
+            self.terminate_pending_transition_observation(
+                pending,
+                "game_instance_changed",
+                "game_instance_changed",
+            )
+            interaction = self.pending_interaction_observation
+            if (
+                linked_interaction_id
+                and isinstance(interaction, dict)
+                and interaction.get("observation_id") == linked_interaction_id
+            ):
+                self.observations.cancel(interaction.get("observation_id"), "game_instance_changed")
+                self.pending_interaction_observation = None
+            return None
+        native_generation = self.native_trigger_generation(state)
         if pending.get("trigger_generation") is None:
-            if native is None:
+            if native_generation is None:
+                if sent_at and now - sent_at > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
+                    self.append_navigation_diagnostic(
+                        "native_transition_rejected",
+                        {"reason": "trigger_confirmation_timeout", "object_id": object_id},
+                        state,
+                    )
+                    self.terminate_pending_transition_observation(
+                        pending,
+                        "trigger_confirmation_timeout",
+                        "transition_timeout",
+                    )
                 return None
             try:
-                generation = int(native.get("generation") or 0)
-                native_object_id = int(native.get("event_object_id") or 0)
-                native_script = int(native.get("trigger_script") or 0)
+                generation = int(native_generation.get("generation") or 0)
+                native_object_id = int(native_generation.get("event_object_id") or 0)
+                native_script = int(native_generation.get("trigger_script") or 0)
                 expected_script = int((pending.get("object") or {}).get("trigger_script") or 0)
             except (TypeError, ValueError):
                 return None
             if generation <= baseline_generation or native_object_id != object_id or native_script != expected_script:
                 return None
             pending["trigger_generation"] = generation
-        elif native is None:
+            pending["control_started_at"] = now
+            pending["control_last_progress_at"] = now
+            pending["control_progress_signature"] = self.game_control_progress_signature(state)
+            self.observations.suspend_timeout(pending.get("observation_id"))
+        elif native_generation is None:
             return None
         else:
             try:
-                if (
-                    int(native.get("generation") or 0) != int(pending.get("trigger_generation") or 0)
-                    or int(native.get("event_object_id") or 0) != object_id
-                ):
-                    return None
+                generation = int(native_generation.get("generation") or 0)
+                native_object_id = int(native_generation.get("event_object_id") or 0)
+                native_script = int(native_generation.get("trigger_script") or 0)
+                tracked_generation = int(pending.get("trigger_generation") or 0)
+                tracked_script = int((pending.get("object") or {}).get("trigger_script") or 0)
             except (TypeError, ValueError):
                 return None
+            if generation != tracked_generation:
+                self.terminate_pending_transition_observation(
+                    pending,
+                    "trigger_superseded",
+                    "trigger_superseded",
+                    state=state,
+                    diagnostic_type="native_transition_superseded",
+                    diagnostic={
+                        "tracked_generation": tracked_generation,
+                        "tracked_object_id": object_id,
+                        "tracked_script": tracked_script,
+                        "replacement_generation": generation,
+                        "replacement_object_id": native_object_id,
+                        "replacement_script": native_script,
+                        "replacement_completed": native_generation.get("completed") is True,
+                    },
+                )
+                return None
+            if native_object_id != object_id or native_script != tracked_script:
+                self.terminate_pending_transition_observation(
+                    pending,
+                    "trigger_identity_changed",
+                    "trigger_identity_changed",
+                    state=state,
+                    diagnostic_type="native_transition_superseded",
+                    diagnostic={
+                        "tracked_generation": tracked_generation,
+                        "tracked_object_id": object_id,
+                        "tracked_script": tracked_script,
+                        "replacement_generation": generation,
+                        "replacement_object_id": native_object_id,
+                        "replacement_script": native_script,
+                        "replacement_completed": native_generation.get("completed") is True,
+                    },
+                )
+                return None
+        if native_generation.get("completed") is not True:
+            progress_signature = self.game_control_progress_signature(state)
+            control = self.control_state(state)
+            if control.get("phase") in {"dialog", "battle", "shop"}:
+                pending["control_last_progress_at"] = now
+                pending["control_progress_signature"] = progress_signature
+                return None
+            if progress_signature != pending.get("control_progress_signature"):
+                pending["control_last_progress_at"] = now
+                pending["control_progress_signature"] = progress_signature
+                return None
+            control_last_progress_at = float(
+                pending.get("control_last_progress_at")
+                or pending.get("control_started_at")
+                or now
+            )
+            if now - control_last_progress_at <= GAME_CONTROL_TIMEOUT_SECONDS:
+                return None
+            self.append_navigation_diagnostic(
+                "game_control_timeout",
+                {
+                    "object_id": object_id,
+                    "generation": pending.get("trigger_generation"),
+                    "timeout_seconds": GAME_CONTROL_TIMEOUT_SECONDS,
+                },
+                state,
+            )
+            self.terminate_pending_transition_observation(
+                pending,
+                "game_control_timeout",
+                "game_control_timeout",
+            )
+            return None
+        if pending.get("landing_started_at") is None:
+            pending["landing_started_at"] = now
+            self.observations.reschedule(
+                pending.get("observation_id"),
+                TRANSITION_OBSERVATION_TIMEOUT_SECONDS,
+            )
+        elif now - float(pending.get("landing_started_at") or now) > TRANSITION_OBSERVATION_TIMEOUT_SECONDS:
+            self.append_navigation_diagnostic(
+                "native_transition_rejected",
+                {"reason": "destination_unstable_timeout", "object_id": object_id},
+                state,
+            )
+            self.terminate_pending_transition_observation(
+                pending,
+                "destination_unstable_timeout",
+                "transition_timeout",
+            )
+            return None
+        native = native_generation
         destination = native.get("destination") if isinstance(native.get("destination"), dict) else None
         if destination is not None:
             try:
@@ -3625,7 +8059,16 @@ class DebugState:
         position_changed = (from_pos.get("x"), from_pos.get("y")) != (to_pos.get("x"), to_pos.get("y"))
         same_room = to_identity["id"] == from_identity.get("id")
         if same_room and not position_changed:
-            self.pending_transition_observation = None
+            trigger_completed = (
+                pending.get("owner") == "navigation"
+                and native.get("completed") is True
+            )
+            self.terminate_pending_transition_observation(
+                pending,
+                "trigger_completed" if trigger_completed else "no_position_change",
+                "trigger_completed" if trigger_completed else "no_position_change",
+                state=state,
+            )
             return None
         frame = self.int_frame(state.get("logical_frame", state.get("frame")))
         if frame is None or frame == pending.get("last_frame"):
@@ -3638,7 +8081,6 @@ class DebugState:
             pending["stable_snapshots"] = 1
         if pending["stable_snapshots"] < TRANSITION_STABLE_SNAPSHOTS:
             return None
-        self.pending_transition_observation = None
         record = self.record_transition_destination(
             from_identity,
             object_id,
@@ -3651,7 +8093,46 @@ class DebugState:
             confirmation="native_trigger",
             intra_room_transition=same_room,
             native_destination=destination,
+            traversal_context_snapshot=(
+                pending.get("traversal_context_snapshot")
+                if isinstance(pending.get("traversal_context_snapshot"), dict)
+                else None
+            ),
         )
+        destination_state = self.state_at_native_destination(state, destination)
+        intent = pending.get("room_entry_intent")
+        runtime = getattr(self, "agent_runtime", None)
+        if isinstance(intent, dict) and runtime is not None:
+            runtime._record_confirmed_room_entry(
+                pending.get("frozen_source_state"),
+                destination_state,
+                object_id,
+                record,
+                intentional_return=bool(intent.get("intentional_return")),
+            )
+        candidate = self.infer_destination_entry_candidate(
+            destination_state,
+            from_identity,
+            record,
+        )
+        if candidate is not None:
+            record["destination_entry_candidate"] = candidate
+        else:
+            record.pop("destination_entry_candidate", None)
+        with self.exploration_lock:
+            data = self.read_exploration()
+            stored = (
+                (data.get("transitions") or {}).get(from_identity.get("id"), {})
+                .get(record.get("transition_key"))
+            )
+            if isinstance(stored, dict):
+                if candidate is not None:
+                    stored["destination_entry_candidate"] = candidate
+                else:
+                    stored.pop("destination_entry_candidate", None)
+                self.write_exploration(data)
+        self.pending_room_entry_intent = None
+        self.complete_linked_transition_interaction(pending, state, record)
         self.append_navigation_diagnostic(
             "native_transition_confirmed",
             {
@@ -3663,6 +8144,12 @@ class DebugState:
             },
             state,
         )
+        observation_id = pending.get("observation_id")
+        self.observations.complete(observation_id, {"transition": record})
+        if pending.get("owner") == "background":
+            self.observations.consume(observation_id, owner="background")
+        self.finish_navigation_route(from_identity, object_id, "transitioned")
+        self.pending_transition_observation = None
         return record
 
     def exploration_room(self, data: dict, identity: dict) -> dict:
@@ -3685,7 +8172,6 @@ class DebugState:
                 "blocked_edges": [],
                 "failed_nodes": [],
                 "last_route": None,
-                "complete": False,
                 "updated_at": None,
             }
             rooms[identity["id"]] = room
@@ -3797,8 +8283,10 @@ class DebugState:
             room = self.exploration_room(data, identity)
             room["last_route"] = {
                 "pending": True,
+                "execution_id": (self.spatial_execution or {}).get("id"),
                 "target_id": target_id,
                 "target_selection": target_selection,
+                "started_object": self.object_snapshot_for_interaction(state, target_id),
                 "segment_steps": segment_steps,
                 "remaining_steps": remaining_steps,
                 "expected_node": expected_node,
@@ -3806,6 +8294,166 @@ class DebugState:
                 "updated_at": time.time(),
             }
             self.write_exploration(data)
+
+    def finish_navigation_route(
+        self,
+        from_identity: dict | None,
+        target_id,
+        outcome: str,
+    ) -> None:
+        if not isinstance(from_identity, dict) or not from_identity.get("id"):
+            return
+        try:
+            target_id = int(target_id or 0)
+        except (TypeError, ValueError):
+            return
+        if target_id <= 0:
+            return
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = (data.get("rooms") or {}).get(from_identity["id"])
+            if not isinstance(room, dict):
+                return
+            last_route = room.get("last_route")
+            try:
+                remembered_target_id = int(last_route.get("target_id") or 0) if isinstance(last_route, dict) else 0
+            except (TypeError, ValueError):
+                remembered_target_id = 0
+            if (
+                not isinstance(last_route, dict)
+                or not last_route.get("pending")
+                or remembered_target_id != target_id
+            ):
+                return
+            last_route["pending"] = False
+            last_route["outcome"] = outcome
+            last_route["completed_at"] = time.time()
+            room["updated_at"] = last_route["completed_at"]
+            self.write_exploration(data)
+
+    def pending_touch_route_confirmation(self, state: dict, target_id: int) -> dict | None:
+        """Return a final touch route that is still awaiting its native trigger."""
+        identity = self.room_identity(state)
+        grid = decode_nav_grid(state)
+        if identity is None or grid is None:
+            return None
+        pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        try:
+            current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
+        except (TypeError, ValueError):
+            return None
+        if current is None:
+            return None
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = (data.get("rooms") or {}).get(identity["id"])
+            last_route = room.get("last_route") if isinstance(room, dict) else None
+            if not isinstance(last_route, dict) or not last_route.get("pending"):
+                return None
+            try:
+                remembered_target_id = int(last_route.get("target_id") or 0)
+                remaining_steps = int(last_route.get("remaining_steps") or 0)
+                route_age = time.time() - float(last_route.get("updated_at") or 0)
+                expected = (
+                    last_route.get("expected_node")
+                    if isinstance(last_route.get("expected_node"), dict)
+                    else {}
+                )
+                expected_node = (int(expected.get("grid_x", -1)), int(expected.get("grid_y", -1)))
+            except (TypeError, ValueError):
+                return None
+            selection = (
+                last_route.get("target_selection")
+                if isinstance(last_route.get("target_selection"), dict)
+                else {}
+            )
+            if (
+                remembered_target_id != int(target_id)
+                or remaining_steps != 0
+                or selection.get("kind") != "touch"
+                or route_age < 0
+                or route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS
+                or current != expected_node
+            ):
+                return None
+            return dict(last_route)
+
+    def consume_completed_touch_route(self, state: dict, target_id: int) -> dict | None:
+        """Consume native proof that the final touch route already triggered its script."""
+        receipt = self.consume_spatial_completion(state, target_id)
+        if receipt is not None:
+            return receipt
+        if self.spatial_execution is not None:
+            return None
+        exploration = state.get("_exploration")
+        if isinstance(exploration, dict) and "last_route" in exploration:
+            last_route = exploration.get("last_route") or {}
+            if (last_route.get("target_selection") or {}).get("kind") != "touch":
+                return None
+        identity = self.room_identity(state)
+        grid = decode_nav_grid(state)
+        if identity is None or grid is None:
+            return None
+        pos = state.get("party_position") if isinstance(state.get("party_position"), dict) else {}
+        try:
+            current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
+        except (TypeError, ValueError):
+            return None
+        if current is None:
+            return None
+
+        with self.exploration_lock:
+            data = self.read_exploration()
+            room = (data.get("rooms") or {}).get(identity["id"])
+            last_route = room.get("last_route") if isinstance(room, dict) else None
+            if not isinstance(last_route, dict):
+                return None
+            try:
+                remembered_target_id = int(last_route.get("target_id") or 0)
+                remaining_steps = int(last_route.get("remaining_steps") or 0)
+                expected = (
+                    last_route.get("expected_node")
+                    if isinstance(last_route.get("expected_node"), dict)
+                    else {}
+                )
+                expected_node = (
+                    int(expected.get("grid_x", -1)),
+                    int(expected.get("grid_y", -1)),
+                )
+            except (TypeError, ValueError):
+                return None
+            selection = (
+                last_route.get("target_selection")
+                if isinstance(last_route.get("target_selection"), dict)
+                else {}
+            )
+            if (
+                remembered_target_id != int(target_id)
+                or remaining_steps != 0
+                or selection.get("kind") != "touch"
+                or last_route.get("outcome") != "trigger_completed"
+                or last_route.get("completion_reported_at") is not None
+                or current != expected_node
+            ):
+                return None
+            last_route["completion_reported_at"] = time.time()
+            evidence = {
+                "object_id": target_id,
+                "source": "native_trigger_completion",
+                "completed_at": last_route.get("completed_at"),
+                "object_changes": self.object_snapshot_delta(
+                    last_route.get("started_object"),
+                    self.object_snapshot_for_interaction(state, target_id),
+                ) if isinstance(last_route.get("started_object"), dict) else {},
+            }
+            last_route["trigger_evidence"] = evidence
+            objects = data.setdefault("object_interactions", {}).setdefault(identity["id"], {})
+            objects.setdefault(str(target_id), {"object_id": target_id, "room_id": identity["id"]})[
+                "last_trigger_completion"] = evidence
+            room["updated_at"] = last_route["completion_reported_at"]
+            self.write_exploration(data)
+            return dict(last_route)
 
     def exploration_safe_and_reachable(
         self,
@@ -3820,10 +8468,12 @@ class DebugState:
         if current is not None:
             failed_nodes.discard(current)
         safe.difference_update(failed_nodes)
-        reachable_safe = self.reachable_safe_nodes(grid, current, safe) if current is not None and current in safe else set()
+        reachable_safe = (
+            self.reachable_safe_nodes(grid, current, safe) if failed_nodes else set(safe)
+        ) if current is not None and current in safe else set()
         return safe, reachable_safe, failed_nodes
 
-    def recompute_exploration_room(self, state: dict, grid: dict, room: dict, current: tuple[int, int] | None) -> bool:
+    def recompute_exploration_room(self, state: dict, grid: dict, room: dict, current: tuple[int, int] | None, *, geometry: tuple | None = None) -> bool:
         old = (
             tuple(room.get("visited") or []),
             tuple(room.get("frontier") or []),
@@ -3831,10 +8481,9 @@ class DebugState:
             tuple(room.get("blocked_edges") or []),
             tuple(room.get("failed_nodes") or []),
             json.dumps(room.get("last_route"), sort_keys=True),
-            bool(room.get("complete")),
         )
 
-        safe, reachable_safe, failed_nodes = self.exploration_safe_and_reachable(state, grid, room, current)
+        safe, reachable_safe, failed_nodes = geometry if geometry is not None else self.exploration_safe_and_reachable(state, grid, room, current)
         static_component, _ = self.static_room_component_for_state(state, grid)
         explored = {parse_node_key(key) for key in room.get("visited", [])}
         explored = {node for node in explored if node is not None and node in static_component}
@@ -3848,9 +8497,52 @@ class DebugState:
             route_node_set = self.route_nodes_through(last_route, current) if current is not None else set()
             if route_node_set:
                 explored.update(node for node in route_node_set if node in reachable_safe)
+            pending_transition = self.pending_transition_observation
+            try:
+                pending_object_id = (
+                    int(pending_transition.get("object_id") or 0)
+                    if isinstance(pending_transition, dict)
+                    else 0
+                )
+                remembered_target_id = int(last_route.get("target_id") or 0)
+                remaining_steps = int(last_route.get("remaining_steps") or 0)
+                route_age = time.time() - float(last_route.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                pending_object_id = 0
+                remembered_target_id = -1
+                remaining_steps = -1
+                route_age = TRANSITION_OBSERVATION_TIMEOUT_SECONDS + 1
+            selection = (
+                last_route.get("target_selection")
+                if isinstance(last_route.get("target_selection"), dict)
+                else {}
+            )
+            final_touch_route = selection.get("kind") == "touch" and remaining_steps == 0
+            same_live_transition = (
+                isinstance(pending_transition, dict)
+                and pending_object_id == remembered_target_id
+                and isinstance(pending_transition.get("from_room"), dict)
+                and pending_transition["from_room"].get("id") == room.get("logical_room_id")
+            )
+            confirmation_expired = (
+                not self.action_pending(state)
+                and not same_live_transition
+                and route_age > TRANSITION_OBSERVATION_TIMEOUT_SECONDS
+            )
             if current == expected_node:
                 explored.update(node for node in self.route_nodes_through(last_route, current) if node in reachable_safe)
+                if not final_touch_route:
+                    last_route["pending"] = False
+                    last_route["outcome"] = "expected_node_reached"
+                    last_route["completed_at"] = time.time()
+                elif confirmation_expired:
+                    last_route["pending"] = False
+                    last_route["outcome"] = "confirmation_expired"
+                    last_route["completed_at"] = time.time()
+            elif confirmation_expired:
                 last_route["pending"] = False
+                last_route["outcome"] = "confirmation_expired"
+                last_route["completed_at"] = time.time()
 
         frontier: set[tuple[int, int]] = set()
         blocked_edges: set[str] = set()
@@ -3870,7 +8562,6 @@ class DebugState:
         room["explorable"] = len(reachable_safe)
         room["blocked_edges"] = sorted(blocked_edges)
         room["failed_nodes"] = sorted(node_key(node) for node in failed_nodes)
-        room["complete"] = bool(explored) and not frontier
 
         new = (
             tuple(room.get("visited") or []),
@@ -3879,32 +8570,35 @@ class DebugState:
             tuple(room.get("blocked_edges") or []),
             tuple(room.get("failed_nodes") or []),
             json.dumps(room.get("last_route"), sort_keys=True),
-            bool(room.get("complete")),
         )
         if new != old:
             room["updated_at"] = time.time()
             return True
         return False
 
-    def update_exploration(self, state: dict) -> dict:
+    def update_exploration(self, state: dict, *, include_view: bool = True, observe_reappearances: bool = False) -> dict:
         grid = decode_nav_grid(state)
         identity = self.room_identity(state)
         if grid is None:
-            return {"status": "no_nav_grid", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0, "complete": False}
+            return {"status": "no_nav_grid", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0}
         if identity is None:
-            return {"status": "no_room", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0, "complete": False}
+            return {"status": "no_room", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0}
 
         pos = state.get("party_position") or {}
         current = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         with self.exploration_lock:
             data = self.read_exploration()
             room = self.exploration_room(data, identity)
-            changed = self.recompute_exploration_room(state, grid, room, current)
-            if changed:
+            confirmed = self.confirm_battle_reappearances(state, data) if observe_reappearances else []
+            geometry = self.exploration_safe_and_reachable(state, grid, room, current)
+            changed = self.recompute_exploration_room(state, grid, room, current, geometry=geometry)
+            if changed or confirmed:
                 self.write_exploration(data)
-            return self.exploration_view(state, data, grid, room, status="ok")
+            return self.exploration_view(state, data, grid, room, status="ok", geometry=geometry) if include_view else {
+                "status": "ok", "last_route": copy.deepcopy(room.get("last_route")),
+            }
 
-    def exploration_view(self, state: dict, data: dict, grid: dict, room: dict, status: str = "ok") -> dict:
+    def exploration_view(self, state: dict, data: dict, grid: dict, room: dict, status: str = "ok", *, geometry: tuple | None = None) -> dict:
         identity = self.room_identity(state)
         current = None
         current_node = None
@@ -3922,7 +8616,9 @@ class DebugState:
                     nodes.append(node_payload(grid, node))
             return nodes
 
-        _, explorable_nodes, _ = self.exploration_safe_and_reachable(state, grid, room, current_node) if grid is not None else (set(), set(), set())
+        _, explorable_nodes, _ = geometry if geometry is not None else (
+            self.exploration_safe_and_reachable(state, grid, room, current_node) if grid is not None else (set(), set(), set())
+        )
         visited_nodes = nodes_for(room.get("visited") or [])
         frontier_nodes = nodes_for(room.get("frontier") or [])
         explorable_payload = [node_payload(grid, node) for node in sorted(explorable_nodes, key=lambda item: (item[1], item[0]))] if grid is not None else []
@@ -3945,7 +8641,6 @@ class DebugState:
             "frontier": len(room.get("frontier") or []),
             "blocked_edges": len(room.get("blocked_edges") or []),
             "failed_nodes": len(room.get("failed_nodes") or []),
-            "complete": bool(room.get("complete")),
             "updated_at": room.get("updated_at"),
             "current": current,
             "nodes": {
@@ -3962,9 +8657,9 @@ class DebugState:
         grid = decode_nav_grid(state)
         identity = self.room_identity(state)
         if grid is None:
-            return {"status": "no_nav_grid", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0, "complete": False}
+            return {"status": "no_nav_grid", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0}
         if identity is None:
-            return {"status": "no_room", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0, "complete": False}
+            return {"status": "no_room", "visited": 0, "explored": 0, "explorable": 0, "frontier": 0, "blocked_edges": 0}
         with self.exploration_lock:
             data = self.read_exploration()
             room = self.exploration_room(data, identity)
@@ -3987,7 +8682,6 @@ class DebugState:
                 "nav_room_id": None,
                 "legacy_room_id": None,
                 "legacy_nav_room_id": None,
-                "complete": False,
                 "explored": 0,
                 "explorable": 0,
                 "frontier": 0,
@@ -4015,6 +8709,11 @@ class DebugState:
         from_nav_room_id = self.transition_nav_room_id(from_room_id, state)
         if not from_nav_room_id:
             return {"from_room_id": from_room_id, "from_logical_room_id": None, "from_nav_room_id": None, "known_transitions": {}, "transitions": []}
+        current_identity = self.room_identity(state) if state is not None else None
+        validate_against_current_objects = bool(
+            current_identity is not None
+            and current_identity["id"] == from_nav_room_id
+        )
         with self.exploration_lock:
             data = self.read_exploration()
             transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
@@ -4039,20 +8738,31 @@ class DebugState:
             for object_key, record in sorted(by_transition.items(), key=transition_sort_key):
                 if not isinstance(record, dict):
                     continue
-                if state is not None:
+                if validate_against_current_objects:
                     try:
                         record_object_id = int(record.get("object_id") or 0)
                     except (TypeError, ValueError):
                         record_object_id = 0
                     current_object = self.target_object(state, record_object_id) if record_object_id > 0 else None
                     if current_object is not None:
-                        identity = self.room_identity(state)
                         current_key = self.transition_key_from_fields(
-                            self.transition_key_fields(identity, current_object, record_object_id)
-                        ) if identity is not None else None
+                            self.transition_key_fields(current_identity, current_object, record_object_id)
+                        )
                         recorded_key = record.get("transition_key") or str(object_key)
                         if current_key != recorded_key:
-                            continue
+                            matching_records = [
+                                candidate
+                                for candidate in by_transition.values()
+                                if isinstance(candidate, dict)
+                                and int(candidate.get("object_id") or 0) == record_object_id
+                            ]
+                            stable_search_record = (
+                                trigger_kind(int(current_object.get("trigger_mode") or 0)) == "search"
+                                and record.get("confirmation") in {"native_trigger", "human_confirmed"}
+                                and len(matching_records) == 1
+                            )
+                            if not stable_search_record:
+                                continue
                 payload = {
                     "transition_key": record.get("transition_key") or str(object_key),
                     "transition_key_fields": record.get("transition_key_fields"),
@@ -4082,15 +8792,14 @@ class DebugState:
                     "confirmation": record.get("confirmation"),
                     "observed": bool(record.get("observed")),
                     "observed_at": record.get("observed_at"),
+                    "traversal_count": record.get("traversal_count"),
+                    "last_traversed_at": record.get("last_traversed_at"),
+                    "traversal_contexts": record.get("traversal_contexts"),
                     "observed_from_state": record.get("observed_from_state"),
                     "observed_to_state": record.get("observed_to_state"),
                     "intra_room_transition": bool(record.get("intra_room_transition")),
-                    "from_subregion_id": record.get("from_subregion_id"),
-                    "to_subregion_id": record.get("to_subregion_id"),
-                    "from_location_id": record.get("from_location_id") or record.get("from_room_id"),
-                    "to_location_id": record.get("to_location_id") or record.get("to_room_id"),
-                    "subregion_basis": record.get("subregion_basis"),
-                    "subregion_match_distance": record.get("subregion_match_distance"),
+                    "source_endpoint": record.get("source_endpoint"),
+                    "destination_endpoint": record.get("destination_endpoint"),
                     "native_destination": record.get("native_destination"),
                 }
                 confirmed = record.get("confirmation") in {"native_trigger", "human_confirmed"}
@@ -4117,8 +8826,8 @@ class DebugState:
                             else None
                         ),
                         "destination_exploration": destination,
-                        "destination_priority": self.destination_priority(destination),
                         "returns_to_recent_room": returns_to_recent_room,
+                        "traversal_context": self.transition_traversal_context(record, data),
                     }
                 )
                 if not confirmed:
@@ -4137,6 +8846,291 @@ class DebugState:
                 "known_transitions_by_object": by_object,
                 "transitions": rows,
             }
+
+    @staticmethod
+    def compact_room_exploration_summary(summary: dict) -> dict:
+        return {
+            key: summary.get(key)
+            for key in (
+                "known", "room_id", "scene_id", "map_id",
+                "explored", "explorable", "frontier", "updated_at",
+            )
+        }
+
+    @staticmethod
+    def agent_room_exploration_counts(summary: dict) -> dict:
+        return {
+            key: summary.get(key)
+            for key in ("known", "explored", "explorable", "frontier")
+        }
+
+    @staticmethod
+    def without_nulls(value):
+        if isinstance(value, dict):
+            return {
+                key: DebugState.without_nulls(item)
+                for key, item in value.items()
+                if item is not None
+            }
+        if isinstance(value, list):
+            return [DebugState.without_nulls(item) for item in value]
+        return value
+
+    def compact_agent_room_transition(
+        self,
+        transition: dict,
+        *,
+        direction: str,
+        data: dict,
+    ) -> dict:
+        if direction == "outgoing":
+            other_room_id = transition.get("to_logical_room_id") or transition.get("to_room_id")
+            room_field = "to_room_id"
+        else:
+            other_room_id = transition.get("from_logical_room_id") or transition.get("from_room_id")
+            room_field = "from_room_id"
+        traversal = self.transition_traversal_context(transition, data)
+        compact = {
+            "transition_key": transition.get("transition_key"),
+            "object_id": transition.get("object_id"),
+            room_field: other_room_id,
+            "from_semantic_room": transition.get("from_semantic_room"),
+            "to_semantic_room": transition.get("to_semantic_room"),
+            "confidence": transition.get("confidence"),
+            "confirmation": transition.get("confirmation"),
+            "exploration": self.agent_room_exploration_counts(
+                self.room_exploration_summary_from_data(data, str(other_room_id) if other_room_id else None)
+            ),
+            "traversal": {
+                key: traversal.get(key)
+                for key in ("status", "current_context_count", "total_count")
+            },
+        }
+        if transition.get("intra_room_transition") is True:
+            compact["intra_room_transition"] = True
+            compact["source_endpoint"] = transition.get("source_endpoint")
+            compact["destination_endpoint"] = transition.get("destination_endpoint")
+        if transition.get("returns_to_recent_room") is True:
+            compact["returns_to_recent_room"] = True
+        if transition.get("confirmation") not in {"native_trigger", "human_confirmed"}:
+            compact["unconfirmed_destination"] = True
+        return self.without_nulls(compact)
+
+    def room_dialog_semantic_evidence(self, room_id: str | None) -> dict:
+        matching = []
+        for index, entry in enumerate(self.dialog_history):
+            if not isinstance(entry, dict):
+                continue
+            entry_room_id = entry.get("logical_room_id") or entry.get("room_id")
+            if not room_id or entry_room_id != room_id:
+                continue
+            if entry.get("speaker_hint") == "系统":
+                continue
+            if str(entry.get("dialog_position") or "").startswith("center"):
+                continue
+            text = " ".join(str(entry.get("text") or "").split())
+            if not text:
+                continue
+            if text.startswith(("得到", "失去", "获得", "獲得", "取得")):
+                continue
+            matching.append((index, entry, text))
+
+        participants: dict[tuple[object, object], dict] = {}
+        samples = []
+        for index, entry, text in matching:
+            object_id = self.int_or_none(entry.get("event_object_id"))
+            speaker_hint = str(entry.get("speaker_hint") or "").strip() or None
+            key = (object_id, speaker_hint)
+            summary = participants.setdefault(key, {
+                "event_object_id": object_id,
+                "speaker_hint": speaker_hint,
+                "dialog_turns": 0,
+                "first_frame": self.int_frame(entry.get("frame")),
+                "latest_frame": self.int_frame(entry.get("end_frame", entry.get("frame"))),
+                "_latest_index": index,
+            })
+            summary["dialog_turns"] += 1
+            summary["latest_frame"] = self.int_frame(entry.get("end_frame", entry.get("frame")))
+            summary["_latest_index"] = index
+            message_ids = entry.get("message_ids") if isinstance(entry.get("message_ids"), list) else []
+            if not message_ids:
+                message_id = self.int_or_none(entry.get("message_id"))
+                message_ids = [] if message_id is None else [message_id]
+            samples.append(self.without_nulls({
+                "frame": self.int_frame(entry.get("frame")),
+                "event_object_id": object_id,
+                "message_ids": message_ids,
+                "speaker_hint": speaker_hint,
+                "text": text[:180],
+            }))
+
+        participant_rows = sorted(
+            participants.values(),
+            key=lambda item: (-int(item.get("_latest_index") or 0), -int(item.get("dialog_turns") or 0)),
+        )[:8]
+        participant_rows = [
+            self.without_nulls({key: value for key, value in item.items() if key != "_latest_index"})
+            for item in participant_rows
+        ]
+
+        def sample_key(item: dict) -> str:
+            return json.dumps({
+                key: item.get(key)
+                for key in ("event_object_id", "message_ids", "speaker_hint", "text")
+            }, ensure_ascii=False, sort_keys=True)
+
+        selected_keys = set()
+        latest_reversed = []
+        for item in reversed(samples):
+            key = sample_key(item)
+            if key in selected_keys:
+                continue
+            latest_reversed.append(item)
+            selected_keys.add(key)
+            if len(latest_reversed) == 3:
+                break
+        latest = list(reversed(latest_reversed))
+        return {
+            "dialog_turns_total": len(matching),
+            "speaker_hint_is_metadata": True,
+            "participants": participant_rows,
+            "samples": {"latest": latest},
+        }
+
+    def agent_room_memory(self, room_id: str | None, state: dict) -> dict:
+        exploration = self.room_exploration_summary(room_id, state)
+        transitions = self.known_transitions_summary(room_id, state)
+        resolved_room_id = (
+            transitions.get("from_logical_room_id")
+            or transitions.get("from_room_id")
+            or exploration.get("room_id")
+        )
+        with self.exploration_lock:
+            data = self.read_exploration()
+        outgoing = [
+            self.compact_agent_room_transition(transition, direction="outgoing", data=data)
+            for transition in transitions.get("transitions") or []
+            if isinstance(transition, dict)
+        ]
+        incoming = []
+        entry_candidates = []
+        stored_transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
+        for by_room in stored_transitions.values():
+            if not isinstance(by_room, dict):
+                continue
+            for stored_key, transition in by_room.items():
+                if not isinstance(transition, dict):
+                    continue
+                destination = transition.get("to_logical_room_id") or transition.get("to_room_id")
+                if destination != resolved_room_id:
+                    continue
+                if transition.get("confirmation") not in {"native_trigger", "human_confirmed"}:
+                    continue
+                incoming.append(self.compact_agent_room_transition(
+                    {"transition_key": str(stored_key), **transition},
+                    direction="incoming",
+                    data=data,
+                ))
+                candidate = transition.get("destination_entry_candidate")
+                if isinstance(candidate, dict):
+                    current_records = stored_transitions.get(resolved_room_id, {})
+                    confirmed_reverse = (
+                        current_records.get(candidate.get("transition_key"))
+                        if isinstance(current_records, dict)
+                        else None
+                    )
+                    if not (
+                        isinstance(confirmed_reverse, dict)
+                        and confirmed_reverse.get("confirmation") in {"native_trigger", "human_confirmed"}
+                    ):
+                        entry_candidates.append(self.without_nulls({
+                            "entry_relation": "inferred_entry_return",
+                            "object_id": candidate.get("object_id"),
+                            "transition_key": candidate.get("transition_key"),
+                            "candidate_return_room_id": candidate.get("candidate_return_room_id"),
+                            "source_transition_key": candidate.get("source_transition_key"),
+                            "entry_evidence": candidate.get("evidence"),
+                        }))
+        incoming.sort(key=lambda item: (str(item.get("from_room_id") or ""), str(item.get("transition_key") or "")))
+        entry_candidates.sort(key=lambda item: (int(item.get("object_id") or 0), str(item.get("transition_key") or "")))
+        memo = self.room_memo(resolved_room_id)
+        compact_memo = (
+            {key: memo.get(key) for key in ("text", "source")}
+            if isinstance(memo, dict)
+            else None
+        )
+        result = {
+            "ok": True,
+            "room_id": resolved_room_id,
+            "memo": compact_memo,
+            "exploration": self.agent_room_exploration_counts(exploration),
+            "semantic_evidence": self.room_dialog_semantic_evidence(resolved_room_id),
+            "transitions": {
+                "outgoing": outgoing,
+                "incoming": incoming,
+            },
+        }
+        if entry_candidates:
+            result["transitions"]["entry_candidates"] = entry_candidates
+        return result
+
+    def current_room_memo_view(self) -> dict:
+        state = self.read_live_state()
+        self.attach_logical_room_fields(state)
+        identity = self.room_identity(state)
+        room_id = identity.get("id") if isinstance(identity, dict) else None
+        with self.exploration_lock:
+            data = self.read_exploration()
+        room_memos = data.get("room_memos") if isinstance(data.get("room_memos"), dict) else {}
+        recent_memos = sorted(
+            (
+                dict(memo)
+                for memo_room_id, memo in room_memos.items()
+                if memo_room_id != room_id and isinstance(memo, dict)
+            ),
+            key=lambda memo: (
+                -float(memo.get("created_at") or 0),
+                str(memo.get("room_id") or ""),
+            ),
+        )[:5]
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "memo": self.room_memo(room_id),
+            "recent_memos": recent_memos,
+        }
+
+    def current_battle_memo_view(self) -> dict:
+        state = self.read_live_state()
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        if state.get("in_battle") is not True or battle is None:
+            return {"ok": False, "status": "not_in_battle"}
+        if not self.companion_owner_matches():
+            return {
+                "ok": False,
+                "status": "memory_unavailable",
+                "error": "companion_owner_mismatch",
+            }
+        view = self.current_player_battle_view(state) or {}
+        experience = view.get("experience") if isinstance(view.get("experience"), dict) else {}
+        enemies = [
+            {
+                key: enemy.get(key)
+                for key in ("slot_index", "object_id", "name") if key in enemy
+            }
+            for enemy in view.get("enemies") or []
+            if isinstance(enemy, dict) and enemy.get("present", True) is not False
+        ]
+        return {
+            "ok": True,
+            "status": "in_battle",
+            "battle_generation": int(view.get("generation") or 0),
+            "is_boss": view.get("is_boss") is True,
+            "current_enemies": enemies,
+            "enemy_memories": experience.get("enemy_memories") or [],
+            "support_experience": experience.get("support_actions") or [],
+            "recent_outcomes": view.get("recent_outcomes") or [],
+        }
 
     def goal_nodes(self, state: dict, grid: dict, target: dict) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int]]:
         goals: set[tuple[int, int]] = set()
@@ -4158,11 +9152,82 @@ class DebugState:
                     continue
                 pos = world_pos(grid, node)
                 for direction in (2, 3, 0, 1):
-                    if search_hits(pos, direction, target):
+                    if search_hits(pos, direction, target) and first_search_object(
+                        pos, direction, state.get("objects") or [],
+                    ) == int(target.get("id") or 0):
                         goals.add(node)
                         search_dirs[node] = direction
                         break
         return goals, search_dirs
+
+    def approach_goal_nodes(
+        self,
+        state: dict,
+        grid: dict,
+        target: dict,
+        requirements: list[dict],
+    ) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int], dict[tuple[int, int], dict]]:
+        goals: set[tuple[int, int]] = set()
+        directions: dict[tuple[int, int], int] = {}
+        details: dict[tuple[int, int], dict] = {}
+        if int(target.get("state") or 0) <= 0:
+            return goals, directions, details
+
+        current_direction = int(state.get("party_direction") or 0)
+        direction_order = [current_direction] + [direction for direction in (2, 3, 0, 1) if direction != current_direction]
+        for requirement in requirements:
+            distance_limit = int(requirement.get("distance_limit") or 0)
+            if distance_limit <= 0:
+                continue
+            target_pos = (int(target.get("x") or 0), int(target.get("y") or 0))
+            x_min, x_max, y_min, y_max = self.grid_window_for_world_margin(
+                grid,
+                target_pos,
+                distance_limit + 16,
+                (distance_limit + 16) // 2,
+            )
+            for y in range(y_min, y_max + 1):
+                for x in range(x_min, x_max + 1):
+                    node = (x, y)
+                    if not nav_bit(grid, node):
+                        continue
+                    position = world_pos(grid, node)
+                    for direction in direction_order:
+                        if not facing_event_object_hits(position, direction, target, distance_limit):
+                            continue
+                        goals.add(node)
+                        directions.setdefault(node, direction)
+                        details.setdefault(node, requirement)
+                        break
+        return goals, directions, details
+
+    def route_to_position(self, state: dict, x: int, y: int, face: str | None = None) -> dict:
+        return route_to_position(self, state, x, y, face)
+
+    def move_to_step(self, state: dict, args: dict, cancel_event=None) -> dict:
+        with self.navigation_timed_lock(self.navigation_action_lock):
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "status": "cancelled"}
+            latest = self.read_live_state()
+            if self.navigation_basis(state) != self.navigation_basis(latest):
+                return {"ok": True, "status": "state_changed"}
+            control = self.control_state(latest, self.live_info("state"))
+            if not control["navigation_ready"]:
+                return {"ok": False, "status": control["phase"]}
+            route = self.route_to_position(latest, **args)
+            if not route["ok"] or not route["path"]:
+                return route
+            step = route["path"][0]
+            if self.spatial_execution is not None:
+                self.spatial_execution["armed_step"] = {
+                    "ids": step["trigger_ids"], "x": step["x"], "y": step["y"],
+                    "scene_id": latest.get("scene_id"), "map_id": latest.get("map_id"),
+                    "sent_at": time.time(),
+                }
+            action = self.write_action([step["move"]], 1)
+            return {"ok": True, "status": "stepping", "action": action,
+                    "expected_position": {"x": step["x"], "y": step["y"]},
+                    "trigger_ids": step["trigger_ids"], "remaining_steps": route["steps"] - 1}
 
     def route_between_nodes(
         self,
@@ -4177,12 +9242,12 @@ class DebugState:
         seen = {start}
         parent: dict[tuple[int, int], tuple[tuple[int, int], str]] = {}
         goal: tuple[int, int] | None = start if start in goals else None
+        graph = self.navigation_graph(grid)
 
         while queue and goal is None:
             node = queue.popleft()
-            for move, delta in MOVE_DELTAS.items():
-                next_node = (node[0] + delta[0], node[1] + delta[1])
-                if next_node in seen or next_node in blocked or not nav_bit(grid, next_node):
+            for move, next_node in graph.get(node, ()):
+                if next_node in seen or next_node in blocked:
                     continue
                 seen.add(next_node)
                 parent[next_node] = (node, move)
@@ -4248,6 +9313,8 @@ class DebugState:
         target_id: int,
         avoid_transitions: bool = True,
         context: dict | None = None,
+        approach_item_id: int | None = None,
+        approach_requirement: dict | None = None,
     ) -> dict:
         context = context if isinstance(context, dict) else None
         grid = context.get("grid") if context else decode_nav_grid(state)
@@ -4258,16 +9325,63 @@ class DebugState:
             return {"ok": False, "status": "no_nav_grid", "target_id": target_id}
         if target is None:
             return {"ok": False, "status": "unknown_target", "target_id": target_id}
-        if not target.get("interactable"):
-            return {"ok": False, "status": "target_inactive", "target_id": target_id}
-        destination_payload = self.transition_destination_for_state(state, target_id) if transition_candidate(target) else {}
+        if not target.get("interactable") or int(target.get("state") or 0) <= 0:
+            return {
+                "ok": approach_item_id is not None,
+                "status": "approach_requirement_missing" if approach_item_id is not None else "target_inactive",
+                "target_id": target_id,
+            }
+        if context is None:
+            self.attach_logical_room_fields(state)
+            context = {"grid": grid, **self.navigation_transition_context(state)}
+        destination_payload = self.transition_destination_for_state(state, target_id, context=context)
+        confirmed_transition = bool(destination_payload.get("known_destination"))
+        is_transition = transition_candidate(target) or confirmed_transition
         start = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         if start is None or not nav_bit(grid, start):
             return {"ok": False, "status": "bad_start", "target_id": target_id}
 
-        kind = trigger_kind(int(target.get("trigger_mode") or 0))
+        native_kind = trigger_kind(int(target.get("trigger_mode") or 0))
+        kind = native_kind
+        approach_details_by_node: dict[tuple[int, int], dict] = {}
         touch_nodes_by_id = context.get("touch_nodes_by_id") if context else None
-        if kind == "touch" and isinstance(touch_nodes_by_id, dict):
+        if approach_item_id is not None or isinstance(approach_requirement, dict):
+            requirements = (
+                [approach_requirement]
+                if isinstance(approach_requirement, dict)
+                else self.approach_requirements_by_target(state, approach_item_id).get(target_id, [])
+            )
+            if not requirements:
+                return {
+                    "ok": True,
+                    "target_id": target_id,
+                    "status": "approach_requirement_missing",
+                    "kind": native_kind,
+                }
+            kind = "approach"
+            goals, search_dirs, approach_details_by_node = self.approach_goal_nodes(
+                state,
+                grid,
+                target,
+                requirements,
+            )
+        elif kind == "none":
+            requirements = self.approach_requirements_by_target(state).get(target_id, [])
+            if not requirements:
+                return {
+                    "ok": True,
+                    "target_id": target_id,
+                    "status": "unreachable_static",
+                    "kind": kind,
+                }
+            kind = "approach"
+            goals, search_dirs, approach_details_by_node = self.approach_goal_nodes(
+                state,
+                grid,
+                target,
+                requirements,
+            )
+        elif kind == "touch" and isinstance(touch_nodes_by_id, dict):
             goals = set(touch_nodes_by_id.get(target_id, set()))
             search_dirs = {}
         else:
@@ -4298,7 +9412,11 @@ class DebugState:
                 if int(obj.get("id") or 0) != target_id
             }
         else:
-            blocking_by_node = self.blocking_nodes_by_object(state, grid, target_id)
+            blocking_by_node = self.blocking_nodes_by_object(
+                state,
+                grid,
+                None if kind == "approach" else target_id,
+            )
         dynamic_blocked = set(blocking_by_node)
         blocked = set(transition_blocked) | dynamic_blocked
         route = self.route_between_nodes(grid, start, goals, blocked)
@@ -4330,7 +9448,7 @@ class DebugState:
                             "blocker": interaction["blocker"],
                             **destination_payload,
                         }
-            return {
+            result = {
                 "ok": True,
                 "target_id": target_id,
                 "status": "unreachable_static",
@@ -4338,17 +9456,29 @@ class DebugState:
                 "blocked_by_transition": avoid_transitions,
                 **destination_payload,
             }
+            if avoid_transitions:
+                relaxed = self.route_to_object(
+                    state,
+                    target_id,
+                    avoid_transitions=False,
+                    approach_item_id=approach_item_id,
+                    context=context,
+                )
+                if relaxed.get("status") in {"reachable", "transition"}:
+                    result["status"] = "blocked_by_transition"
+                    result["blocked_route"] = relaxed.get("route")
+            return result
 
-        action = "touch" if kind == "touch" else "search"
+        action = "touch" if kind == "touch" else "approach" if kind == "approach" else "search"
         result = {
             "ok": True,
             "target_id": target_id,
-            "status": "transition" if transition_candidate(target) else "reachable",
+            "status": "transition" if kind != "approach" and is_transition else "reachable",
             "kind": kind,
             "action": action,
             "route": route,
         }
-        if transition_candidate(target):
+        if kind != "approach" and is_transition:
             result["transition_candidate"] = True
             result.update(destination_payload)
         if kind == "search":
@@ -4358,47 +9488,232 @@ class DebugState:
                 route_goal = grid_node(grid, int(route_nodes[-1]["x"]), int(route_nodes[-1]["y"]))
             direction = search_dirs.get(route_goal, int(state.get("party_direction") or 0))
             result["required_direction"] = DIR_TO_BUTTON.get(direction, "down")
+        elif kind == "approach":
+            route_nodes = route.get("nodes") or []
+            route_goal = None
+            if route_nodes:
+                route_goal = grid_node(grid, int(route_nodes[-1]["x"]), int(route_nodes[-1]["y"]))
+            direction = search_dirs.get(route_goal, int(state.get("party_direction") or 0))
+            requirement = approach_details_by_node.get(route_goal, {})
+            result["required_direction"] = DIR_TO_BUTTON.get(direction, "down")
+            result["approach"] = dict(requirement)
+            result["affordance"] = {
+                **dict(requirement),
+                "kind": "item_approach",
+                "status": result["status"],
+                "steps": int(route.get("steps") or 0),
+                "required_direction": result["required_direction"],
+            }
         return result
 
-    def navigation_step(self, state: dict, target_id: int) -> dict:
-        state_info = self.file_info(self.state_path)
+    @staticmethod
+    def navigation_basis(state: dict) -> tuple:
+        grid = state.get("nav_grid") or {}
+        pos = state.get("party_position") or {}
+        return (
+            state.get("game_instance_id"), state.get("scene_id"), state.get("map_id"),
+            (state.get("room") or {}).get("key"), grid,
+            pos.get("x"), pos.get("y"), state.get("party_direction"),
+            (state.get("agent_action") or {}).get("generation"),
+            tuple(tuple(obj.get(k) for k in (
+                "id", "x", "y", "state", "blocking", "interactable", "sprite_id",
+                "trigger_mode", "trigger_script",
+            )) for obj in state.get("objects") or [] if obj.get("blocking") or obj.get("interactable")),
+        )
+
+    def navigation_segment_limit(self, state: dict, target_id: int, remaining: int) -> int:
+        target = self.target_object(state, target_id) or {}
+        key = (state.get("game_instance_id"), state.get("scene_id"), state.get("map_id"),
+               (state.get("room") or {}).get("key"), (state.get("nav_grid") or {}).get("bits"),
+               target_id, target.get("sprite_id"), target.get("trigger_script"), target.get("state"))
+        with self.live_lock:
+            moving = self.navigation_target_positions.get(key, (None, False))[1]
+        return (1 if remaining <= 2 else 2) if moving else MAX_NAVIGATION_SEGMENT_STEPS
+
+    def navigation_action_basis(self, state: dict, target_id: int, buttons: list[str]) -> tuple:
+        grid = decode_nav_grid(state)
+        if grid is None or "search" in buttons:
+            return self.navigation_basis(state)
+        pos = state.get("party_position") or {}
+        node = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
+        if node is None:
+            return self.navigation_basis(state)
+        corridor = {node}
+        for button in buttons:
+            delta = MOVE_DELTAS.get(button)
+            if delta:
+                node = (node[0] + delta[0], node[1] + delta[1])
+                corridor.add(node)
+        relevant = []
+        for obj in state.get("objects") or []:
+            occupied = grid_node(grid, int(obj.get("x") or 0), int(obj.get("y") or 0))
+            if (obj.get("id") == target_id
+                    or (obj.get("blocking") and occupied in corridor)
+                    or (obj.get("interactable") and self.touch_boundary_nodes_for_object(obj, grid) & corridor)):
+                relevant.append(obj)
+        return self.navigation_basis({**state, "objects": relevant})
+
+    def navigation_step(
+        self, state: dict, target_id: int, approach_item_id: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict:
+        with self.measure_navigation("navigation_planning", target_id):
+            return self._validated_navigation_step(state, target_id, approach_item_id, cancel_event)
+
+    def _validated_navigation_step(
+        self, state: dict, target_id: int, approach_item_id: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict:
+        started = time.monotonic()
+        for attempt in range(3):
+            try:
+                result = self._navigation_step(state, target_id, approach_item_id, cancel_event)
+                # A consumed native completion is a historical fact. Revalidating
+                # target geometry here can discard it as the triggered object moves.
+                if (result.get("status") in {"arrived", "approached"}
+                        and result.get("completion") != "trigger_completed"):
+                    latest = self.read_live_state()
+                    if (self.navigation_basis(state) != self.navigation_basis(latest)
+                            or not self.control_state(latest, self.live_info("state"))["navigation_ready"]):
+                        raise NavigationStateChanged()
+                self.append_navigation_diagnostic("navigation_planning_completed", {
+                    "target_id": target_id, "attempts": attempt + 1,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+                    "status": result.get("status"),
+                })
+                return result
+            except NavigationStateChanged:
+                state = self.read_live_state()
+                self.attach_logical_room_fields(state)
+        return {"ok": True, "status": "replanning", "target_id": target_id}
+
+    def _navigation_step(
+        self,
+        state: dict,
+        target_id: int,
+        approach_item_id: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict:
+        def write_navigation_action(buttons: list[str], frames: int) -> dict | None:
+            with self.navigation_timed_lock(self.navigation_action_lock):
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
+                latest = self.read_live_state()
+                if (self.navigation_action_basis(state, target_id, buttons) != self.navigation_action_basis(latest, target_id, buttons)
+                        or not self.control_state(latest, self.live_info("state"))["navigation_ready"]):
+                    raise NavigationStateChanged()
+                action = self.write_action(buttons, frames)
+                target = self.target_object(latest, target_id) or {}
+                self.append_navigation_diagnostic("navigation_action_validated", {
+                    "target_id": target_id, "source_frame": state.get("frame"),
+                    "dispatch_frame": latest.get("frame"),
+                    "target_position": {"x": target.get("x"), "y": target.get("y")},
+                    "action_generation_before": action.get("action_generation_before"),
+                })
+                return action
+
+        if cancel_event is not None and cancel_event.is_set():
+            return {"ok": False, "status": "cancelled", "target_id": target_id}
+        state_info = self.live_info("state")
         if not state_info.get("available") or state_info.get("stale"):
             return {"ok": False, "status": "state_stale", "state_file": state_info, "target_id": target_id}
-        if state.get("in_battle"):
+        control = self.control_state(state, state_info)
+        phase = control["phase"]
+        if phase in {"action_pending", "game_script", "entering_scene"}:
+            return {
+                "ok": True,
+                "status": "waiting_for_control",
+                "control": control,
+                "target_id": target_id,
+            }
+        if phase == "battle":
             return {"ok": False, "status": "in_battle", "target_id": target_id}
-        if (state.get("dialog") or {}).get("active"):
+        if phase == "dialog":
             return {"ok": False, "status": "in_dialog", "target_id": target_id}
+        if phase == "choice":
+            return {"ok": False, "status": "in_choice", "target_id": target_id}
+        if phase == "shop":
+            return {"ok": False, "status": "in_shop", "target_id": target_id}
         if state.get("in_main_game") is False:
             return {"ok": False, "status": "not_in_main_game", "target_id": target_id}
         if not self.room_state_stable(state):
             return {"ok": False, "status": "entering_scene" if state.get("entering_scene") else "unstable_room_state", "target_id": target_id}
-        if self.action_path.exists():
-            return {"ok": False, "status": "action_pending", "target_id": target_id}
 
-        pending = self.pending_transition_observation
-        if isinstance(pending, dict) and pending.get("object_id") == target_id:
-            transition = self.observe_pending_transition_destination(state)
-            if transition is not None:
-                return {
-                    "ok": True,
-                    "status": "transitioned",
-                    "target_id": target_id,
-                    "transition": transition,
-                }
+        with self.state_lock:
+            observation_id = self.navigation_transition_requests.get(target_id)
+            request = self.observations.get(observation_id)
+            if observation_id and request is None:
+                self.navigation_transition_requests.pop(target_id, None)
+                pending = self.pending_transition_observation
+                if isinstance(pending, dict) and pending.get("observation_id") == observation_id:
+                    self.pending_transition_observation = None
+            if request is not None and request.get("status") == "completed":
+                completed = self.observations.consume(observation_id, owner="navigation")
+                self.navigation_transition_requests.pop(target_id, None)
+                transition = (completed or {}).get("result", {}).get("transition")
+                if isinstance(transition, dict):
+                    return {
+                        "ok": True,
+                        "status": "transitioned",
+                        "target_id": target_id,
+                        "transition": transition,
+                        "observation_id": observation_id,
+                    }
+            if request is not None and request.get("status") in {"cancelled", "timed_out"}:
+                self.observations.consume(observation_id, owner="navigation")
+                self.navigation_transition_requests.pop(target_id, None)
+                pending = self.pending_transition_observation
+                if isinstance(pending, dict) and pending.get("observation_id") == observation_id:
+                    self.pending_transition_observation = None
+                request = None
+
             pending = self.pending_transition_observation
-            if isinstance(pending, dict) and pending.get("object_id") == target_id:
-                from_room = pending.get("from_room") if isinstance(pending.get("from_room"), dict) else None
-                current_room = self.room_identity(state)
-                if from_room is not None and current_room is not None and current_room["id"] != from_room.get("id"):
+            if (
+                request is not None
+                and request.get("status") == "pending"
+                and isinstance(pending, dict)
+                and pending.get("object_id") == target_id
+            ):
+                self.observe_pending_transition_destination(state)
+                request = self.observations.get(observation_id)
+                if request is not None and request.get("status") == "completed":
+                    completed = self.observations.consume(observation_id, owner="navigation")
+                    self.navigation_transition_requests.pop(target_id, None)
+                    transition = (completed or {}).get("result", {}).get("transition")
+                    return {
+                        "ok": True,
+                        "status": "transitioned",
+                        "target_id": target_id,
+                        "transition": transition,
+                        "observation_id": observation_id,
+                    }
+                pending = self.pending_transition_observation
+                if request is not None and request.get("status") == "pending":
                     return {
                         "ok": True,
                         "status": "transition_observing",
                         "target_id": target_id,
-                        "stable_snapshots": int(pending.get("stable_snapshots") or 0),
+                        "observation_id": observation_id,
+                        "stable_snapshots": int((pending or {}).get("stable_snapshots") or 0),
                         "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
                     }
 
-        route = self.route_to_object(state, target_id, avoid_transitions=True)
+        completed_touch = self.consume_completed_touch_route(state, target_id)
+        if completed_touch is not None:
+            return {
+                "ok": True,
+                "status": "arrived",
+                "target_id": target_id,
+                "completion": "trigger_completed",
+                "trigger_evidence": completed_touch.get("trigger_evidence"),
+            }
+
+        route = self.route_to_object(
+            state,
+            target_id,
+            avoid_transitions=True,
+            approach_item_id=approach_item_id,
+        )
         if route.get("status") == "blocked_by_interactable":
             interaction = route.get("interaction") or {}
             interaction_route = interaction.get("route") or {}
@@ -4408,12 +9723,14 @@ class DebugState:
                 if move not in MOVE_DELTAS:
                     return {"ok": False, "status": "bad_route", "target_id": target_id}
                 segment_steps = 1
-                for next_move in moves[1:MAX_NAVIGATION_SEGMENT_STEPS]:
+                for next_move in moves[1:self.navigation_segment_limit(state, target_id, len(moves))]:
                     if next_move != move:
                         break
                     segment_steps += 1
                 segment_moves = moves[:segment_steps]
-                action = self.write_action(segment_moves, 1)
+                action = write_navigation_action(segment_moves, 1)
+                if action is None:
+                    return {"ok": False, "status": "cancelled", "target_id": target_id}
                 route_nodes = interaction_route.get("nodes") or []
                 expected_node = route_nodes[segment_steps] if len(route_nodes) > segment_steps else None
                 remaining_steps = max(0, len(moves) - segment_steps)
@@ -4442,20 +9759,36 @@ class DebugState:
 
             direction = interaction.get("required_direction")
             buttons = [button for button in (direction, "search") if button]
-            action = self.write_action(buttons, 1)
             blocker = route.get("blocker") or {}
             blocker_id = int(blocker.get("id") or target_id)
-            self.mark_pending_interaction_observation(
-                state,
-                blocker_id,
-                via_target_id=target_id,
-                action=action,
-                status="interacting",
-            )
+            with self.state_lock:
+                observation_id = self.mark_pending_interaction_observation(
+                    state,
+                    blocker_id,
+                    via_target_id=target_id,
+                    status="interacting",
+                )
+            try:
+                action = write_navigation_action(buttons, 1)
+                if action is None:
+                    return {"ok": False, "status": "cancelled", "target_id": target_id}
+            except Exception:
+                self.observations.cancel(observation_id, "action_write_failed")
+                if (
+                    isinstance(self.pending_interaction_observation, dict)
+                    and self.pending_interaction_observation.get("observation_id") == observation_id
+                ):
+                    self.pending_interaction_observation = None
+                raise
+            self.observations.update_payload(observation_id, action=action, armed=True)
+            if isinstance(self.pending_interaction_observation, dict):
+                self.pending_interaction_observation["action"] = action
+                self.pending_interaction_observation["armed"] = True
             return {
                 "ok": True,
                 "status": "interacting",
                 "target_id": target_id,
+                "observation_id": observation_id,
                 "action": action,
                 "route": route.get("blocked_route"),
                 "blocker": route.get("blocker"),
@@ -4474,24 +9807,89 @@ class DebugState:
 
         moves = route.get("route", {}).get("moves") or []
         if not moves:
+            if route.get("kind") == "approach":
+                target = self.target_object(state, target_id)
+                pos = state.get("party_position") or {}
+                current_pos = (int(pos.get("x") or 0), int(pos.get("y") or 0))
+                current_direction = int(state.get("party_direction") or 0)
+                approach = route.get("approach") if isinstance(route.get("approach"), dict) else {}
+                distance_limit = int(approach.get("distance_limit") or 0)
+                if target is not None and facing_event_object_hits(
+                    current_pos,
+                    current_direction,
+                    target,
+                    distance_limit,
+                ):
+                    return {
+                        "ok": True,
+                        "status": "approached",
+                        "target_id": target_id,
+                        "route": route.get("route"),
+                        "required_direction": DIR_TO_BUTTON.get(current_direction, "down"),
+                        "approach": approach,
+                        "affordance": route.get("affordance"),
+                    }
+                required_direction = route.get("required_direction")
+                current_direction_button = DIR_TO_BUTTON.get(current_direction, "down")
+                if required_direction and required_direction != current_direction_button:
+                    action = write_navigation_action([required_direction], 1)
+                    if action is None:
+                        return {"ok": False, "status": "cancelled", "target_id": target_id}
+                    return {
+                        "ok": True,
+                        "status": "facing",
+                        "target_id": target_id,
+                        "action": action,
+                        "route": route.get("route"),
+                        "required_direction": required_direction,
+                        "approach": approach,
+                        "affordance": route.get("affordance"),
+                    }
+                return {
+                    "ok": False,
+                    "status": "needs_direction",
+                    "target_id": target_id,
+                    "route": route.get("route"),
+                    "required_direction": required_direction,
+                    "approach": approach,
+                    "affordance": route.get("affordance"),
+                }
             if route.get("kind") == "search":
                 target = self.target_object(state, target_id)
                 pos = state.get("party_position") or {}
                 current_pos = (int(pos.get("x") or 0), int(pos.get("y") or 0))
                 current_direction = int(state.get("party_direction") or 0)
-                if target is not None and search_hits(current_pos, current_direction, target):
-                    action = self.write_action(["search"], 1)
-                    self.mark_pending_interaction_observation(
-                        state,
-                        target_id,
-                        via_target_id=target_id,
-                        action=action,
-                        status="interacting",
-                    )
+                if target is not None and first_search_object(
+                    current_pos, current_direction, state.get("objects") or [],
+                ) == target_id:
+                    with self.state_lock:
+                        observation_id = self.mark_pending_interaction_observation(
+                            state,
+                            target_id,
+                            via_target_id=target_id,
+                            status="interacting",
+                        )
+                    try:
+                        action = write_navigation_action(["search"], 1)
+                        if action is None:
+                            return {"ok": False, "status": "cancelled", "target_id": target_id}
+                    except Exception:
+                        self.observations.cancel(observation_id, "action_write_failed")
+                        if (
+                            isinstance(self.pending_interaction_observation, dict)
+                            and self.pending_interaction_observation.get("observation_id") == observation_id
+                        ):
+                            self.pending_interaction_observation = None
+                        raise
+                    self.observations.update_payload(observation_id, action=action, armed=True)
+                    if isinstance(self.pending_interaction_observation, dict):
+                        self.pending_interaction_observation["action"] = action
+                        self.pending_interaction_observation["armed"] = True
                     return {
                         "ok": True,
                         "status": "interacting",
                         "target_id": target_id,
+                        "observation_id": observation_id,
                         "action": action,
                         "route": route.get("route"),
                         "required_direction": DIR_TO_BUTTON.get(current_direction, "down"),
@@ -4499,7 +9897,9 @@ class DebugState:
                 required_direction = route.get("required_direction")
                 current_direction_button = DIR_TO_BUTTON.get(current_direction, "down")
                 if required_direction and required_direction != current_direction_button:
-                    action = self.write_action([required_direction], 1)
+                    action = write_navigation_action([required_direction], 1)
+                    if action is None:
+                        return {"ok": False, "status": "cancelled", "target_id": target_id}
                     return {
                         "ok": True,
                         "status": "facing",
@@ -4515,21 +9915,52 @@ class DebugState:
                     "route": route.get("route"),
                     "required_direction": required_direction,
                 }
+            if (
+                route.get("kind") == "touch"
+                and self.pending_touch_route_confirmation(state, target_id) is not None
+            ):
+                return {
+                    "ok": True,
+                    "status": "transition_observing",
+                    "target_id": target_id,
+                    "stable_snapshots": 0,
+                    "required_snapshots": TRANSITION_STABLE_SNAPSHOTS,
+                }
             return {"ok": True, "status": "arrived", "target_id": target_id, "route": route.get("route")}
 
         move = moves[0]
         if move not in MOVE_DELTAS:
             return {"ok": False, "status": "bad_route", "target_id": target_id}
         segment_steps = 1
-        for next_move in moves[1:MAX_NAVIGATION_SEGMENT_STEPS]:
+        for next_move in moves[1:self.navigation_segment_limit(state, target_id, len(moves))]:
             if next_move != move:
                 break
             segment_steps += 1
         segment_moves = moves[:segment_steps]
-        action = self.write_action(segment_moves, 1)
         route_nodes = route.get("route", {}).get("nodes") or []
         expected_node = route_nodes[segment_steps] if len(route_nodes) > segment_steps else None
         remaining_steps = max(0, len(moves) - segment_steps)
+        observation_id = None
+        if (
+            route.get("status") == "transition"
+            and route.get("kind") == "touch"
+            and segment_steps >= len(moves)
+        ):
+            with self.state_lock:
+                observation_id = self.mark_pending_transition_observation(state, target_id)
+        try:
+            action = write_navigation_action(segment_moves, 1)
+            if action is None:
+                return {"ok": False, "status": "cancelled", "target_id": target_id}
+        except Exception:
+            if observation_id:
+                with self.state_lock:
+                    self.observations.cancel(observation_id, "action_write_failed")
+                    self.navigation_transition_requests.pop(target_id, None)
+                    pending = self.pending_transition_observation
+                    if isinstance(pending, dict) and pending.get("observation_id") == observation_id:
+                        self.pending_transition_observation = None
+            raise
         self.remember_navigation_route(
             state,
             target_id,
@@ -4538,9 +9969,7 @@ class DebugState:
             remaining_steps,
             route.get("status") or "reachable",
         )
-        if route.get("status") == "transition" and segment_steps >= len(moves):
-            self.mark_pending_transition_observation(state, target_id)
-        return {
+        result = {
             "ok": True,
             "status": "stepping",
             "target_id": target_id,
@@ -4552,6 +9981,13 @@ class DebugState:
             "remaining_steps": remaining_steps,
             "route": route.get("route"),
         }
+        if route.get("approach") is not None:
+            result["approach"] = route.get("approach")
+        if route.get("affordance") is not None:
+            result["affordance"] = route.get("affordance")
+        if observation_id:
+            result["observation_id"] = observation_id
+        return result
 
     def reachable_nodes(
         self,
@@ -4559,22 +9995,110 @@ class DebugState:
         start: tuple[int, int],
         blocked: set[tuple[int, int]],
     ) -> tuple[list[tuple[int, int]], dict[tuple[int, int], int]]:
+        order, distance, _ = self.navigation_distance_field(grid, start, blocked)
+        return order, distance
+
+    @staticmethod
+    def navigation_grid_key(grid: dict) -> tuple:
+        return (grid["origin"], grid["step"], int(grid["width"]), int(grid["height"]), str(grid["bits"]))
+
+    def navigation_graph(
+        self,
+        grid: dict,
+    ) -> dict[tuple[int, int], tuple[tuple[str, tuple[int, int]], ...]]:
+        key = self.navigation_grid_key(grid)
+        with self.navigation_graph_lock:
+            cached = self.navigation_graph_cache.get(key)
+            if cached is not None:
+                self.navigation_graph_cache.move_to_end(key)
+                return cached
+
+        graph: dict[tuple[int, int], tuple[tuple[str, tuple[int, int]], ...]] = {}
+        for y in range(grid["height"]):
+            for x in range(grid["width"]):
+                node = (x, y)
+                if not nav_bit(grid, node):
+                    continue
+                neighbors = []
+                for move, delta in MOVE_DELTAS.items():
+                    next_node = (x + delta[0], y + delta[1])
+                    if nav_bit(grid, next_node):
+                        neighbors.append((move, next_node))
+                graph[node] = tuple(neighbors)
+
+        with self.navigation_graph_lock:
+            existing = self.navigation_graph_cache.get(key)
+            if existing is not None:
+                self.navigation_graph_cache.move_to_end(key)
+                return existing
+            self.navigation_graph_cache[key] = graph
+            while len(self.navigation_graph_cache) > NAVIGATION_GRAPH_CACHE_SIZE:
+                self.navigation_graph_cache.popitem(last=False)
+        return graph
+
+    def navigation_distance_field(
+        self,
+        grid: dict,
+        start: tuple[int, int],
+        blocked: set[tuple[int, int]],
+    ) -> tuple[
+        list[tuple[int, int]],
+        dict[tuple[int, int], int],
+        dict[tuple[int, int], tuple[tuple[int, int], str]],
+    ]:
         blocked = set(blocked)
         blocked.discard(start)
         queue = deque([start])
         order = [start]
         distance = {start: 0}
+        parent: dict[tuple[int, int], tuple[tuple[int, int], str]] = {}
+        graph = self.navigation_graph(grid)
 
         while queue:
             node = queue.popleft()
-            for delta in MOVE_DELTAS.values():
-                next_node = (node[0] + delta[0], node[1] + delta[1])
-                if next_node in distance or next_node in blocked or not nav_bit(grid, next_node):
+            for move, next_node in graph.get(node, ()):
+                if next_node in distance or next_node in blocked:
                     continue
                 distance[next_node] = distance[node] + 1
+                parent[next_node] = (node, move)
                 order.append(next_node)
                 queue.append(next_node)
-        return order, distance
+        return order, distance, parent
+
+    def touch_terminal_goal(
+        self,
+        grid: dict,
+        start: tuple[int, int],
+        order: list[tuple[int, int]],
+        distance: dict[tuple[int, int], int],
+        goals: set[tuple[int, int]],
+        terminal_blocked: set[tuple[int, int]],
+    ) -> tuple[tuple[int, int], tuple[int, int] | None, int] | None:
+        if start in goals:
+            return start, None, 0
+        graph = self.navigation_graph(grid)
+        for node in order:
+            for _, next_node in graph.get(node, ()):
+                if next_node in goals and next_node not in terminal_blocked:
+                    return next_node, node, distance[node] + 1
+        return None
+
+    def distance_field_path(
+        self,
+        start: tuple[int, int],
+        goal: tuple[int, int],
+        parent: dict[tuple[int, int], tuple[tuple[int, int], str]],
+        terminal_parent: tuple[int, int] | None = None,
+    ) -> list[tuple[int, int]]:
+        current = terminal_parent if terminal_parent is not None else goal
+        nodes = [current]
+        while current != start:
+            current = parent[current][0]
+            nodes.append(current)
+        nodes.reverse()
+        if terminal_parent is not None:
+            nodes.append(goal)
+        return nodes
 
     def first_search_goal(
         self,
@@ -4619,6 +10143,13 @@ class DebugState:
         return indexes
 
     def navigation(self, state: dict) -> dict:
+        control = self.control_state(state)
+        if not control["navigation_ready"]:
+            return {
+                "status": "waiting_for_control",
+                "control_phase": control["phase"],
+                "targets": [],
+            }
         self.attach_logical_room_fields(state)
         environment_payload = self.navigation_environment_payload(state)
         if not self.room_state_stable(state):
@@ -4633,7 +10164,7 @@ class DebugState:
 
         interactables = [obj for obj in state.get("objects") or [] if obj.get("interactable")]
         transition_context = self.navigation_transition_context(state)
-        affordance_context = self.navigation_affordance_context(state)
+        affordance_context = self.navigation_affordance_context(state, data=transition_context["data"])
         touch_nodes_by_id = {
             int(obj.get("id") or 0): self.touch_boundary_nodes_for_object(obj, grid)
             for obj in interactables
@@ -4644,75 +10175,155 @@ class DebugState:
             all_touch_nodes.update(nodes)
 
         blocking_by_node = self.blocking_nodes_by_object(state, grid)
-        route_context = {
-            "grid": grid,
-            "target_by_id": {int(obj.get("id") or 0): obj for obj in interactables},
-            "touch_nodes_by_id": touch_nodes_by_id,
-            "blocking_by_node": blocking_by_node,
-        }
         dynamic_blocked = set(blocking_by_node)
-        safe_order, safe_distance = self.reachable_nodes(grid, start, all_touch_nodes | dynamic_blocked)
-        no_dynamic_order, no_dynamic_distance = self.reachable_nodes(grid, start, all_touch_nodes)
-        no_touch_order, no_touch_distance = self.reachable_nodes(grid, start, dynamic_blocked)
+        safe_order, safe_distance, _ = self.navigation_distance_field(
+            grid,
+            start,
+            all_touch_nodes | dynamic_blocked,
+        )
+        no_dynamic_order, no_dynamic_distance, no_dynamic_parent = self.navigation_distance_field(
+            grid,
+            start,
+            all_touch_nodes,
+        )
+        no_touch_order, no_touch_distance, _ = self.navigation_distance_field(
+            grid,
+            start,
+            dynamic_blocked,
+        )
+        approach_requirements = self.approach_requirements_by_target(state)
+        interaction_by_blocker_id: dict[int, dict | None] = {}
 
         targets = []
         for obj in interactables:
             target_id = int(obj.get("id") or 0)
-            kind = trigger_kind(int(obj.get("trigger_mode") or 0))
+            native_kind = trigger_kind(int(obj.get("trigger_mode") or 0))
+            kind = native_kind
+            destination_payload = self.transition_destination_for_state(
+                state,
+                target_id,
+                transition_context,
+            )
+            is_transition = transition_candidate(obj) or bool(destination_payload.get("known_destination"))
             status = "unreachable_static"
             steps = None
             required_direction = None
             blocker = None
+            goals: set[tuple[int, int]] = set()
+            strict_goal: tuple[int, int] | None = None
+            relaxed_goal: tuple[int, int] | None = None
+            relaxed_terminal_parent: tuple[int, int] | None = None
+            no_touch_goal: tuple[int, int] | None = None
+            approach_details_by_node: dict[tuple[int, int], dict] = {}
+            approach = None
 
-            if kind == "search":
-                goals, search_dirs = self.goal_nodes(state, grid, obj)
-                route_context.setdefault("goal_nodes_by_id", {})[target_id] = (goals, search_dirs)
-                goal = next((node for node in safe_order if node in goals), None)
-                if goal is not None:
-                    direction = search_dirs.get(goal, int(state.get("party_direction") or 0))
-                    status = "reachable"
-                    steps = safe_distance[goal]
+            if kind == "none" and approach_requirements.get(target_id):
+                kind = "approach"
+                goals, approach_dirs, approach_details_by_node = self.approach_goal_nodes(
+                    state,
+                    grid,
+                    obj,
+                    approach_requirements[target_id],
+                )
+                strict_goal = next((node for node in safe_order if node in goals), None)
+                relaxed_goal = next((node for node in no_dynamic_order if node in goals), None)
+                no_touch_goal = next((node for node in no_touch_order if node in goals), None)
+                selected_goal = strict_goal or relaxed_goal or no_touch_goal
+                if selected_goal is not None:
+                    direction = approach_dirs.get(selected_goal, int(state.get("party_direction") or 0))
                     required_direction = DIR_TO_BUTTON.get(direction, "down")
-                elif any(node in no_dynamic_distance for node in goals):
-                    route = self.route_to_object(state, target_id, avoid_transitions=True, context=route_context)
-                    if route.get("status") == "blocked_by_interactable":
+                    approach = dict(approach_details_by_node.get(selected_goal) or {})
+                elif approach_requirements[target_id]:
+                    approach = dict(approach_requirements[target_id][0])
+                if strict_goal is not None:
+                    status = "reachable"
+                    steps = safe_distance[strict_goal]
+            elif kind == "search":
+                goals, search_dirs = self.goal_nodes(state, grid, obj)
+                strict_goal = next((node for node in safe_order if node in goals), None)
+                relaxed_goal = next((node for node in no_dynamic_order if node in goals), None)
+                no_touch_goal = next((node for node in no_touch_order if node in goals), None)
+                if strict_goal is not None:
+                    direction = search_dirs.get(strict_goal, int(state.get("party_direction") or 0))
+                    status = "transition" if is_transition else "reachable"
+                    steps = safe_distance[strict_goal]
+                    required_direction = DIR_TO_BUTTON.get(direction, "down")
+            elif kind == "touch":
+                goals = touch_nodes_by_id.get(target_id, set())
+                target_node = grid_node(grid, int(obj.get("x") or 0), int(obj.get("y") or 0))
+                target_dynamic_blocked = set(dynamic_blocked)
+                if target_node is not None:
+                    target_dynamic_blocked.discard(target_node)
+                strict_terminal = self.touch_terminal_goal(
+                    grid,
+                    start,
+                    safe_order,
+                    safe_distance,
+                    goals,
+                    target_dynamic_blocked,
+                )
+                relaxed_terminal = self.touch_terminal_goal(
+                    grid,
+                    start,
+                    no_dynamic_order,
+                    no_dynamic_distance,
+                    goals,
+                    set(),
+                )
+                no_touch_terminal = self.touch_terminal_goal(
+                    grid,
+                    start,
+                    no_touch_order,
+                    no_touch_distance,
+                    goals,
+                    target_dynamic_blocked,
+                )
+                if strict_terminal is not None:
+                    strict_goal, _, steps = strict_terminal
+                    status = "transition" if is_transition else "reachable"
+                if relaxed_terminal is not None:
+                    relaxed_goal, relaxed_terminal_parent, _ = relaxed_terminal
+                if no_touch_terminal is not None:
+                    no_touch_goal = no_touch_terminal[0]
+
+            if strict_goal is None and relaxed_goal is not None:
+                relaxed_path = self.distance_field_path(
+                    start,
+                    relaxed_goal,
+                    no_dynamic_parent,
+                    relaxed_terminal_parent,
+                )
+                blocking_object = next(
+                    (
+                        blocking_by_node.get(node)
+                        for node in relaxed_path
+                        if blocking_by_node.get(node) is not None
+                        and int((blocking_by_node.get(node) or {}).get("id") or 0) != target_id
+                    ),
+                    None,
+                )
+                blocker_id = int((blocking_object or {}).get("id") or 0)
+                if blocking_object is not None:
+                    if blocker_id not in interaction_by_blocker_id:
+                        transition_blocked = set(all_touch_nodes)
+                        if kind == "touch":
+                            transition_blocked.difference_update(goals)
+                        interaction_by_blocker_id[blocker_id] = self.blocker_interaction_plan(
+                            state,
+                            grid,
+                            start,
+                            blocking_object,
+                            transition_blocked,
+                            dynamic_blocked,
+                        )
+                    interaction = interaction_by_blocker_id[blocker_id]
+                    if interaction is not None:
                         status = "blocked_by_interactable"
-                        interaction = route.get("interaction") or {}
                         steps = (interaction.get("route") or {}).get("steps")
                         required_direction = interaction.get("required_direction")
-                        blocker = route.get("blocker")
-                elif any(node in no_touch_distance for node in goals):
-                    status = "blocked_by_transition"
-            elif kind == "touch":
-                if transition_candidate(obj):
-                    route = self.route_to_object(state, target_id, avoid_transitions=True, context=route_context)
-                    status = route.get("status") or "unreachable_static"
-                    steps = (route.get("route") or {}).get("steps")
-                else:
-                    goals = touch_nodes_by_id.get(target_id, set())
-                    target_dynamic_blocked = set(dynamic_blocked)
-                    target_node = grid_node(grid, int(obj.get("x") or 0), int(obj.get("y") or 0))
-                    if target_node is not None:
-                        target_dynamic_blocked.discard(target_node)
-                    blocked = (all_touch_nodes - goals) | target_dynamic_blocked
-                    touch_order, touch_distance = self.reachable_nodes(grid, start, blocked)
-                    goal = next((node for node in touch_order if node in goals), None)
-                    if goal is not None:
-                        status = "reachable"
-                        steps = touch_distance[goal]
-                    else:
-                        no_dynamic_blocked = all_touch_nodes - goals
-                        no_dynamic_touch_order, _ = self.reachable_nodes(grid, start, no_dynamic_blocked)
-                        if any(node in goals for node in no_dynamic_touch_order):
-                            route = self.route_to_object(state, target_id, avoid_transitions=True, context=route_context)
-                            if route.get("status") == "blocked_by_interactable":
-                                status = "blocked_by_interactable"
-                                interaction = route.get("interaction") or {}
-                                steps = (interaction.get("route") or {}).get("steps")
-                                required_direction = interaction.get("required_direction")
-                                blocker = route.get("blocker")
-                        elif any(node in no_touch_distance for node in goals):
-                            status = "blocked_by_transition"
+                        blocker = interaction.get("blocker")
+            elif strict_goal is None and no_touch_goal is not None:
+                status = "blocked_by_transition"
 
             target = {
                 "id": target_id,
@@ -4721,13 +10332,40 @@ class DebugState:
                 "steps": steps,
                 "required_direction": required_direction,
             }
-            if transition_candidate(obj):
+            if is_transition:
                 target["transition_candidate"] = True
-                target.update(self.transition_destination_for_state(state, target_id, transition_context))
+                target.update(destination_payload)
+                observation = self.transition_observation_from_state(state, target_id)
+                if isinstance(observation, dict):
+                    target.setdefault("transition_key", observation.get("transition_key"))
+                    target.setdefault("transition_key_fields", observation.get("transition_key_fields"))
             if blocker is not None:
                 target["blocker"] = blocker
+            if approach is not None:
+                target["approach"] = approach
+            affordances = self.item_approach_affordances(
+                state,
+                target_id,
+                approach_requirements.get(target_id, []),
+                grid=grid,
+                reachable_order=safe_order,
+                reachable_distance=safe_distance,
+                fallback_order=no_touch_order,
+            )
+            if affordances:
+                target["affordances"] = affordances
+                if native_kind == "none":
+                    selected = affordances[0]
+                    target.update({
+                        "kind": "approach",
+                        "status": selected["status"],
+                        "steps": selected["steps"],
+                        "required_direction": selected["required_direction"],
+                        "approach": selected,
+                    })
             target = self.decorate_target_affordance(state, target, affordance_context)
             targets.append(target)
+        targets, entry_context = self.decorate_room_entry_navigation(state, targets)
         return {
             "status": "ok",
             **environment_payload,
@@ -4738,9 +10376,17 @@ class DebugState:
                 "height": grid["height"],
             },
             "targets": targets,
+            **({"entry_context": entry_context} if entry_context is not None else {}),
         }
 
     def lightweight_navigation(self, state: dict) -> dict:
+        control = self.control_state(state)
+        if not control["navigation_ready"]:
+            return {
+                "status": "waiting_for_control",
+                "control_phase": control["phase"],
+                "targets": [],
+            }
         self.attach_logical_room_fields(state)
         if not self.room_state_stable(state):
             return {"status": "entering_scene" if state.get("entering_scene") else "unstable_room_state", "targets": []}
@@ -4752,13 +10398,15 @@ class DebugState:
         for obj in state.get("objects") or []:
             if not obj.get("interactable"):
                 continue
+            object_id = int(obj.get("id") or 0)
+            is_transition = transition_candidate(obj)
             target = {
-                "id": int(obj.get("id") or 0),
+                "id": object_id,
                 "kind": trigger_kind(int(obj.get("trigger_mode") or 0)),
-                "status": "transition" if transition_candidate(obj) else "unknown",
+                "status": "transition" if is_transition else "unknown",
                 "steps": None,
                 "required_direction": None,
-                **({"transition_candidate": True} if transition_candidate(obj) else {}),
+                **({"transition_candidate": True} if is_transition else {}),
             }
             targets.append({**target, **self.target_affordance(state, target["id"], affordance_context)})
         return {
@@ -4785,32 +10433,71 @@ class DebugState:
             "stale": age > STALE_AFTER_SECONDS,
         }
 
-    def snapshot(self) -> dict:
-        state = read_json(self.state_path)
-        stable_room_state = self.room_state_stable(state)
-        if stable_room_state:
-            self.attach_logical_room_fields(state)
-        state_info = self.file_info(self.state_path)
-        frame_info = self.file_info(self.frame_path)
-        with self.state_lock:
+    @contextmanager
+    def measure_navigation(self, phase: str, target_id: int | None = None):
+        previous = getattr(self.navigation_timings, "current", None)
+        metrics = {"target_id": target_id}
+        self.navigation_timings.current = metrics
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.navigation_timings.current = previous
+            metrics["elapsed_ms"] = (time.monotonic() - started) * 1000
+            self.append_navigation_diagnostic(phase, {
+                key: round(value, 2) if isinstance(value, float) else value
+                for key, value in metrics.items()
+            })
+
+    @contextmanager
+    def navigation_timed_lock(self, lock):
+        started = time.monotonic()
+        with lock:
+            metrics = getattr(self.navigation_timings, "current", None)
+            if metrics is not None:
+                metrics["lock_wait_ms"] = metrics.get("lock_wait_ms", 0) + (time.monotonic() - started) * 1000
+            yield
+
+    def navigation_snapshot(self) -> dict:
+        with self.measure_navigation("navigation_observation"):
+            return self.snapshot(navigation_only=True)
+
+    def snapshot(self, *, navigation_only: bool = False) -> dict:
+        with self.navigation_timed_lock(self.state_lock):
+            # Sample after acquiring the observation lock. A queued reader must not
+            # reconcile an older frame after another reader has already advanced it.
+            state = self.read_live_state()
+            state_info = self.live_info("state")
+            control = self.control_state(state, state_info)
+            stable_room_state = self.room_state_stable(state)
+            client_stable_room_state = stable_room_state and control["owner"] == "client"
+            if client_stable_room_state:
+                self.attach_logical_room_fields(state)
+            frame_info = self.live_info("frame")
             if state_info.get("available"):
                 self.reset_history_if_frame_restarted(state)
+                self.observe_combat_knowledge(state)
                 self.discover_native_transition_observation(state)
-                if stable_room_state:
-                    self.observe_pending_transition_destination(state)
+                self.observe_pending_transition_destination(state)
+                if client_stable_room_state:
                     self.last_stable_room_state = state
                 elif state.get("entering_scene"):
                     self.append_navigation_diagnostic("unstable_room_state_ignored", {"reason": "entering_scene"}, state)
                 self.record_state_events(state)
+                self.agent_runtime.observe_equipment_state(state)
                 self.record_dialog_event(state)
+                self.observe_dialog_gates(state)
                 self.observe_pending_interaction_outcome(state)
-            if state_info.get("available") and stable_room_state:
-                state["_navigation"] = self.lightweight_navigation(state)
+            if state_info.get("available") and client_stable_room_state:
                 if self.pending_transition_observation is None:
-                    state["_exploration"] = self.update_exploration(state)
+                    state["_exploration"] = self.update_exploration(
+                        state, include_view=not navigation_only, observe_reappearances=True,
+                    )
                 else:
-                    frozen_source = self.pending_transition_observation.get("frozen_source_state")
-                    state["_exploration"] = self.current_exploration(frozen_source if isinstance(frozen_source, dict) else state)
+                    self.observe_battle_reappearances(state)
+                    if not navigation_only:
+                        frozen_source = self.pending_transition_observation.get("frozen_source_state")
+                        state["_exploration"] = self.current_exploration(frozen_source if isinstance(frozen_source, dict) else state)
             recent_actions = list(self.action_log[-20:])
             recent_events = list(self.event_log[-20:])
             recent_dialogs = list(self.dialog_history[-20:])
@@ -4822,6 +10509,12 @@ class DebugState:
                 "last_logical_frame": self.last_logical_frame,
                 "pending_checkpoint_frame_reset": self.pending_checkpoint_frame_reset is not None,
             }
+        if navigation_only:
+            state["control"] = control
+            state["_debug"] = {"runtime_stale": state_info.get("stale", True), "recent_events": recent_events}
+            return state
+        if state_info.get("available") and client_stable_room_state:
+            state["_navigation"] = self.lightweight_navigation(state)
         state["_debug"] = {
             "runtime_dir": str(self.runtime_dir),
             "asset_dir": str(self.asset_dir),
@@ -4829,8 +10522,11 @@ class DebugState:
             "state_file": state_info,
             "frame_file": frame_info,
             "frame_available": frame_info["available"],
-            "runtime_stale": state_info.get("stale", True) or frame_info.get("stale", True),
-            "action_pending": self.action_path.exists(),
+            "live_transport": self.live_transport_snapshot(),
+            "state_stale": state_info.get("stale", True),
+            "frame_stale": frame_info.get("stale", True),
+            "runtime_stale": state_info.get("stale", True),
+            "action_pending": self.action_pending(state),
             "stale_after_seconds": STALE_AFTER_SECONDS,
             "recent_actions": recent_actions,
             "recent_events": recent_events,
@@ -4843,10 +10539,31 @@ class DebugState:
             },
             "recent_agent_decisions": self.read_agent_log(limit=20),
             "agent_status": self.agent_status_snapshot(),
+            "agent_session": self.agent_runtime.compact_snapshot(),
             "dialog_advance_status": self.dialog_advance_status_snapshot(),
             "timeline": timeline,
+            "battle_player_view": self.player_battle_view(state),
         }
+        state["control"] = control
+        self.agent_runtime.observe_game_instance(state.get("game_instance_id"))
+        state["_debug"]["agent_session"] = self.agent_runtime.compact_snapshot()
         return state
+
+    def state_stream_payload(self) -> bytes:
+        with self.state_stream_snapshot_lock:
+            now = time.monotonic()
+            action_pending = self.action_pending()
+            if (
+                self.state_stream_snapshot_payload is not None
+                and now - self.state_stream_snapshot_at < STATE_STREAM_SNAPSHOT_INTERVAL_SECONDS
+                and self.state_stream_snapshot_action_pending == action_pending
+            ):
+                return self.state_stream_snapshot_payload
+            payload = json.dumps(self.snapshot(), ensure_ascii=False).encode("utf-8")
+            self.state_stream_snapshot_payload = payload
+            self.state_stream_snapshot_at = time.monotonic()
+            self.state_stream_snapshot_action_pending = action_pending
+            return payload
 
     def dialog_advance_int(self, value, default: int, lower: int, upper: int) -> int:
         try:
@@ -4871,10 +10588,10 @@ class DebugState:
     def wait_for_action_clear(self, timeout: float = DIALOG_ADVANCE_ACTION_TIMEOUT) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if not self.action_path.exists():
+            if not self.action_pending():
                 return True
             time.sleep(0.05)
-        return not self.action_path.exists()
+        return not self.action_pending()
 
     def dialog_advance_stop_status(self, state: dict) -> str | None:
         if state.get("status") == "waiting_for_game":
@@ -4883,28 +10600,184 @@ class DebugState:
             return "state_parse_error"
         if state.get("_debug", {}).get("runtime_stale"):
             return "runtime_stale"
-        if state.get("in_battle"):
+        if state.get("in_battle") and self.prebattle_interaction(state) not in {"dialog", "choice"}:
             return "in_battle"
         if state.get("in_main_game") is False:
             return "not_in_main_game"
+        if bool((state.get("choice") or {}).get("active")):
+            return "choice_active"
         if not (state.get("dialog") or {}).get("active"):
             return "dialog_inactive"
         return None
 
-    def dialog_advance_confirm_stop_status(self, status: str | None) -> str | None:
-        if status != "dialog_inactive":
-            return status
-        for _ in range(DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS):
+    def dialog_advance_visible(self, state: dict) -> bool:
+        dialog = state.get("dialog") if isinstance(state, dict) else {}
+        if not isinstance(dialog, dict) or not dialog.get("active"):
+            return False
+        if "visible" in dialog:
+            return bool(dialog.get("visible"))
+        return not bool(dialog.get("held"))
+
+    def observe_dialog_gates(self, state: dict, *, confirm_inactive: bool = False) -> None:
+        for request in self.observations.active(kind="dialog_gate"):
+            observation_id = request["id"]
             if self.dialog_advance_cancel.is_set():
-                return "cancelled"
-            time.sleep(DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL)
-            state = self.snapshot()
-            next_status = self.dialog_advance_stop_status(state)
-            if next_status is None:
-                return None
-            if next_status != "dialog_inactive":
-                return next_status
-        return status
+                self.observations.cancel(observation_id, "cancelled")
+                continue
+            stop_status = self.dialog_advance_stop_status(state)
+            if stop_status == "dialog_inactive":
+                payload = request.get("payload", {})
+                if not payload.get("inactive_started"):
+                    # Inactive confirmation is a separate phase from waiting for
+                    # a visible page.  A snapshot can spend longer than the
+                    # visibility timeout finalizing a room transition, so do not
+                    # let that work expire the gate before its owner can collect
+                    # the required stable inactive samples.
+                    self.observations.suspend_timeout(observation_id)
+                    self.observations.update_payload(
+                        observation_id,
+                        inactive_started=True,
+                        inactive_polls=0,
+                    )
+                    continue
+                if not confirm_inactive:
+                    continue
+                inactive_polls = int(payload.get("inactive_polls") or 0) + 1
+                if inactive_polls >= DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS:
+                    self.observations.complete(
+                        observation_id,
+                        {"status": "dialog_inactive", "state": state},
+                    )
+                else:
+                    self.observations.update_payload(
+                        observation_id,
+                        inactive_polls=inactive_polls,
+                    )
+                continue
+            if stop_status:
+                self.observations.complete(
+                    observation_id,
+                    {"status": stop_status, "state": state},
+                )
+                continue
+            if request.get("payload", {}).get("inactive_started"):
+                self.observations.reschedule(
+                    observation_id,
+                    DIALOG_ADVANCE_VISIBILITY_TIMEOUT,
+                )
+                self.observations.update_payload(
+                    observation_id,
+                    inactive_started=False,
+                    inactive_polls=0,
+                )
+            if self.dialog_advance_visible(state):
+                self.observations.complete(
+                    observation_id,
+                    {"status": "ready", "state": state},
+                )
+
+    def dialog_advance_reconcile_visibility_timeout(
+        self,
+        state: dict,
+    ) -> tuple[dict, str | None]:
+        """Recheck a timed-out dialog gate without sending another action."""
+        samples: list[dict] = []
+        inactive_polls = 0
+        observed_state = state
+        recovered_status: str | None = None
+
+        for poll in range(DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS):
+            if poll:
+                time.sleep(DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL)
+            if self.dialog_advance_cancel.is_set():
+                return observed_state, "cancelled"
+
+            observed_state = self.read_live_state()
+            state_info = self.live_info("state")
+            observed_state.setdefault("_debug", {})["runtime_stale"] = bool(
+                state_info.get("stale", True)
+            )
+            stop_status = self.dialog_advance_stop_status(observed_state)
+            visible = self.dialog_advance_visible(observed_state)
+            samples.append({
+                "status": stop_status or ("ready" if visible else "not_visible"),
+                "scene_id": observed_state.get("scene_id"),
+                "map_id": observed_state.get("map_id"),
+                "frame": observed_state.get("frame"),
+                "entering_scene": bool(observed_state.get("entering_scene")),
+            })
+
+            if stop_status == "dialog_inactive":
+                inactive_polls += 1
+                if inactive_polls >= DIALOG_ADVANCE_INACTIVE_CONFIRM_POLLS:
+                    recovered_status = "dialog_inactive"
+                    break
+                continue
+            inactive_polls = 0
+            if stop_status:
+                recovered_status = stop_status
+                break
+            if visible:
+                recovered_status = "ready"
+                break
+
+        if recovered_status is not None:
+            self.append_navigation_diagnostic(
+                "dialog_visibility_timeout_recovered",
+                {"recovered_status": recovered_status, "samples": samples},
+                observed_state,
+            )
+            return (
+                observed_state,
+                None if recovered_status == "ready" else recovered_status,
+            )
+        return observed_state, "dialog_visibility_timeout"
+
+    def dialog_advance_wait_for_visible(self, state: dict) -> tuple[dict, str | None]:
+        observation_id = self.observations.register(
+            "dialog_gate",
+            owner="dialog_advance",
+            timeout=DIALOG_ADVANCE_VISIBILITY_TIMEOUT,
+            payload={"inactive_started": False, "inactive_polls": 0},
+        )
+        self.dialog_advance_observation_id = observation_id
+        try:
+            self.observe_dialog_gates(state, confirm_inactive=True)
+            while True:
+                request = self.observations.get(observation_id)
+                if request is None:
+                    return state, "cancelled"
+                status = request.get("status")
+                if status == "completed":
+                    completed = self.observations.consume(observation_id, owner="dialog_advance")
+                    result = (completed or {}).get("result") or {}
+                    observed_state = result.get("state") if isinstance(result.get("state"), dict) else state
+                    observed_status = result.get("status")
+                    return observed_state, None if observed_status == "ready" else observed_status
+                if status == "timed_out":
+                    self.observations.consume(observation_id, owner="dialog_advance")
+                    return self.dialog_advance_reconcile_visibility_timeout(state)
+                if status == "cancelled":
+                    self.observations.consume(observation_id, owner="dialog_advance")
+                    return state, "cancelled"
+
+                wait_interval = (
+                    DIALOG_ADVANCE_INACTIVE_CONFIRM_INTERVAL
+                    if request.get("payload", {}).get("inactive_started")
+                    else DIALOG_ADVANCE_VISIBILITY_POLL_INTERVAL
+                )
+                self.observations.wait(
+                    observation_id,
+                    timeout=wait_interval,
+                    cancel_event=self.dialog_advance_cancel,
+                )
+                request = self.observations.get(observation_id)
+                if request is not None and request.get("status") == "pending":
+                    state = self.snapshot()
+                    self.observe_dialog_gates(state, confirm_inactive=True)
+        finally:
+            if self.dialog_advance_observation_id == observation_id:
+                self.dialog_advance_observation_id = None
 
     def advance_dialog(self, args: dict | None = None) -> dict:
         options = self.normalize_dialog_advance_args(args)
@@ -4927,6 +10800,61 @@ class DebugState:
                 }
 
             state = self.snapshot()
+            if bool((state.get("choice") or {}).get("active")):
+                return finish_result("choice_active")
+
+            started_in_battle = bool(state.get("in_battle"))
+            initial_prebattle_generation = None
+            if self.prebattle_interaction(state) in {"dialog", "choice"}:
+                try:
+                    initial_prebattle_generation = int(
+                        (state.get("battle") or {}).get("generation") or 0
+                    )
+                except (TypeError, ValueError):
+                    initial_prebattle_generation = None
+
+            def finish_stop_status(stop_status: str) -> dict | None:
+                nonlocal state
+                if stop_status == "in_battle":
+                    stopped_state = state
+                    state = self.snapshot()
+                    interaction = self.prebattle_interaction(state)
+                    stopped_battle = (
+                        stopped_state.get("battle")
+                        if isinstance(stopped_state.get("battle"), dict)
+                        else {}
+                    )
+                    battle = state.get("battle") if isinstance(state.get("battle"), dict) else {}
+                    try:
+                        stopped_generation = int(stopped_battle.get("generation") or 0)
+                        generation = int(battle.get("generation") or 0)
+                    except (TypeError, ValueError):
+                        stopped_generation = generation = 0
+                    if (
+                        interaction is not None
+                        and generation > 0
+                        and generation == stopped_generation
+                    ):
+                        if interaction == "choice":
+                            return finish_result("choice_active")
+                        return None
+                    valid_handoff = generation > 0 and (
+                        not started_in_battle
+                        or generation == initial_prebattle_generation
+                    )
+                    if valid_handoff and battle.get("phase") != "pre_battle":
+                        return finish_result("battle_started")
+                return finish_result(
+                    stop_status,
+                    ok=stop_status in {"dialog_inactive", "choice_active", "cancelled"},
+                )
+
+            state, stop_status = self.dialog_advance_wait_for_visible(state)
+            if stop_status:
+                result = finish_stop_status(stop_status)
+                if result is not None:
+                    return result
+
             previous_active_key = self.dialog_advance_active_event_key(state)
             repeated_active_presses = 0
             observed_event_keys: set[tuple] = set()
@@ -4938,18 +10866,48 @@ class DebugState:
                 detect_repeats=False,
             )
             has_dialog_event_info = bool(event_observation["has_event_info"])
-            stop_status = self.dialog_advance_stop_status(state)
-            stop_status = self.dialog_advance_confirm_stop_status(stop_status)
-            if stop_status:
-                return finish_result(stop_status, ok=stop_status in {"dialog_inactive", "cancelled"})
 
-            while presses < options["max_presses"]:
+            while True:
                 if self.dialog_advance_cancel.is_set():
                     return finish_result("cancelled")
-                if self.action_path.exists():
+                if bool((state.get("choice") or {}).get("active")):
+                    return finish_result("choice_active")
+                state, stop_status = self.dialog_advance_wait_for_visible(state)
+                if stop_status:
+                    result = finish_stop_status(stop_status)
+                    if result is not None:
+                        return result
+
+                event_observation = self.dialog_advance_observe_events(
+                    state,
+                    observed_event_keys,
+                    seen_opponent_keys,
+                    detect_repeats=presses > 0,
+                )
+                has_dialog_event_info = has_dialog_event_info or bool(event_observation["has_event_info"])
+                if options["stop_on_repeat"] and event_observation["repeated"]:
+                    return finish_result("repeated_dialog_opponent_line")
+                active_key = self.dialog_advance_active_event_key(state)
+                if presses > 0:
+                    if not has_dialog_event_info and active_key and active_key == previous_active_key:
+                        repeated_active_presses += 1
+                    else:
+                        repeated_active_presses = 0
+                        previous_active_key = active_key
+                    if options["stop_on_repeat"] and repeated_active_presses >= 2:
+                        return finish_result("repeated_dialog")
+
+                if presses >= options["max_presses"]:
+                    return finish_result("max_presses")
+                if self.action_pending(state):
                     return finish_result("action_pending_timeout", ok=False)
 
-                self.write_action([DIALOG_ADVANCE_BUTTON], 1)
+                self.write_action(
+                    [DIALOG_ADVANCE_BUTTON],
+                    1,
+                    control_action="advance_dialog",
+                    control_state=state,
+                )
                 presses += 1
                 self.update_dialog_advance_status(presses=presses)
                 if not self.wait_for_action_clear():
@@ -4959,29 +10917,6 @@ class DebugState:
                 if self.dialog_advance_cancel.is_set():
                     return finish_result("cancelled")
                 state = self.snapshot()
-                stop_status = self.dialog_advance_stop_status(state)
-                stop_status = self.dialog_advance_confirm_stop_status(stop_status)
-                if stop_status:
-                    return finish_result(stop_status)
-                event_observation = self.dialog_advance_observe_events(
-                    state,
-                    observed_event_keys,
-                    seen_opponent_keys,
-                    detect_repeats=True,
-                )
-                has_dialog_event_info = has_dialog_event_info or bool(event_observation["has_event_info"])
-                if options["stop_on_repeat"] and event_observation["repeated"]:
-                    return finish_result("repeated_dialog_opponent_line")
-                active_key = self.dialog_advance_active_event_key(state)
-                if not has_dialog_event_info and active_key and active_key == previous_active_key:
-                    repeated_active_presses += 1
-                else:
-                    repeated_active_presses = 0
-                    previous_active_key = active_key
-                if options["stop_on_repeat"] and repeated_active_presses >= 2:
-                    return finish_result("repeated_dialog")
-
-            return finish_result("max_presses")
         finally:
             self.dialog_advance_lock.release()
 
@@ -4989,6 +10924,7 @@ class DebugState:
         running = self.dialog_advance_lock.locked()
         if running:
             self.dialog_advance_cancel.set()
+            self.observations.cancel(self.dialog_advance_observation_id, "cancelled")
             self.update_dialog_advance_status(status="cancelling")
         return {"ok": True, "status": "cancelling" if running else "idle", "running": running}
 
@@ -5047,7 +10983,15 @@ class DebugState:
     def executable_task_targets(self, targets: list[dict]) -> list[tuple[dict, dict, str]]:
         """Match active task annotations to targets that can be acted on now."""
         matches = []
+        pending_review_ids = {
+            str(item.get("id"))
+            for item in self.task_review_context().get("tasks") or []
+        }
         for task in self.task_ledger():
+            # The deterministic Rules backend cannot maintain inferred tasks.
+            # Stale tasks therefore lose their override power until an LLM reviews them.
+            if str(task.get("id")) in pending_review_ids:
+                continue
             for target in targets:
                 if target.get("status") not in {"reachable", "transition"}:
                     continue
@@ -5093,9 +11037,9 @@ class DebugState:
             current_tool=None,
             message="Inspecting local state.",
         )
-        state = state or read_json(self.state_path)
-        state_info = self.file_info(self.state_path)
-        frame_info = self.file_info(self.frame_path)
+        state = state or self.read_live_state()
+        state_info = self.live_info("state")
+        frame_info = self.live_info("frame")
         navigation = self.navigation(state)
         dialogs = self.dialogs_view(limit=20)
         events = self.event_log[-20:]
@@ -5125,7 +11069,7 @@ class DebugState:
             self.append_agent_decision(state, decision)
             return decision
 
-        if not state_info.get("available") or state_info.get("stale") or (frame_info.get("available") and frame_info.get("stale")):
+        if not state_info.get("available") or state_info.get("stale"):
             decision["evidence"]["state_file"] = state_info
             decision["evidence"]["frame_file"] = frame_info
             decision.update(
@@ -5133,7 +11077,7 @@ class DebugState:
                     "summary": "运行时状态已过期或不可用。",
                     "recommended_intent": "wait_runtime",
                     "recommended_action": self.action_preview("no_op", {"reason": "runtime_stale"}),
-                    "risk": "可见游戏状态可能已经与 runtime/state.json 不一致。",
+                    "risk": "可见游戏状态可能已经与实时 socket 数据不一致。",
                 }
             )
             self.append_agent_decision(state, decision)
@@ -5146,6 +11090,20 @@ class DebugState:
                     "recommended_intent": "wait_runtime",
                     "recommended_action": self.action_preview("no_op", {"reason": "battle_state_not_modeled"}),
                     "risk": "战斗 UI 状态暴露不足，无法给出可靠的 dry-run 建议。",
+                }
+            )
+            self.append_agent_decision(state, decision)
+            return decision
+
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else None
+        if choice and choice.get("active"):
+            decision.update(
+                {
+                    "summary": "剧情选单正在等待显式选择。",
+                    "recommended_intent": "wait_runtime",
+                    "recommended_action": self.action_preview("no_op", {"reason": "choice_requires_model"}),
+                    "evidence": {**decision["evidence"], "choice": choice},
+                    "risk": "规则后端不会替模型猜测剧情选择。",
                 }
             )
             self.append_agent_decision(state, decision)
@@ -5222,21 +11180,45 @@ class DebugState:
             target for target in targets
             if target.get("status") in {"reachable", "transition"} and target.get("transition_candidate")
         ]
-        def transition_sort_key(target: dict) -> tuple[int, int, int, int]:
-            destination_rank = {
-                "unknown": 0,
-                "unexplored": 1,
-                "partial": 2,
-                "complete": 3,
-            }.get(str(target.get("destination_priority") or "unknown"), 0)
+        def transition_sort_key(target: dict) -> tuple[int, int, int, int, int, int, int, int]:
+            unknown_rank = 0 if not target.get("known_destination") else 1
+            traversal = target.get("traversal_context") if isinstance(target.get("traversal_context"), dict) else {}
+            context_rank = 0 if traversal.get("status") == "untraversed_current_context" else 1
             backtrack_rank = 1 if target.get("returns_to_recent_room") or target.get("agent_priority") == "avoid_backtrack" else 0
+            destination = target.get("destination_exploration") if isinstance(target.get("destination_exploration"), dict) else {}
+            frontier_rank = 0 if int(destination.get("frontier") or 0) > 0 else 1
             try:
                 steps = int(target.get("steps"))
             except (TypeError, ValueError):
                 steps = 999999
-            return (backtrack_rank, destination_rank, steps, int(target.get("id") or 0))
+            return (
+                unknown_rank,
+                context_rank,
+                backtrack_rank,
+                frontier_rank,
+                int(traversal.get("current_context_count") or 0),
+                int(traversal.get("total_count") or 0),
+                steps,
+                int(target.get("id") or 0),
+            )
 
         transitions.sort(key=transition_sort_key)
+        if (
+            transitions
+            and (
+                transitions[0].get("returns_to_recent_room")
+                or transitions[0].get("agent_priority") == "avoid_backtrack"
+            )
+            and any(
+                target.get("interaction_state") == "stale_no_effect"
+                and target.get("agent_priority") == "soft_avoid"
+                for target in reachable
+            )
+        ):
+            # A stale failure remains negative evidence, but an immediate return
+            # should not make it a permanent dead end after the observable
+            # narrative or task context has changed.
+            transitions = []
         if transitions:
             target = transitions[0]
             route = self.route_to_object(state, int(target.get("id") or 0), avoid_transitions=True)
@@ -5254,8 +11236,8 @@ class DebugState:
                             "status": target.get("status"),
                             "steps": target.get("steps"),
                             "known_destination_room_id": target.get("known_destination_room_id"),
-                            "destination_priority": target.get("destination_priority"),
                             "destination_exploration": target.get("destination_exploration"),
+                            "traversal_context": target.get("traversal_context"),
                             "returns_to_recent_room": target.get("returns_to_recent_room"),
                             "agent_priority": target.get("agent_priority"),
                             "route_steps": (route.get("route") or {}).get("steps"),
@@ -5465,6 +11447,10 @@ class DebugState:
         return self.dialog_feedback_by_object(same_room, limit_per_object=limit_per_object)
 
     def dialog_feedback_context(self, state: dict) -> dict:
+        with self.state_lock:
+            return self._dialog_feedback_context(state)
+
+    def _dialog_feedback_context(self, state: dict) -> dict:
         current_turn = self.current_agent_turn()
         same_room: list[dict] = []
         stale_different_room: list[dict] = []
@@ -5489,11 +11475,14 @@ class DebugState:
             ),
         }
 
-    def navigation_affordance_context(self, state: dict) -> dict:
+    def navigation_affordance_context(self, state: dict, *, data: dict | None = None) -> dict:
+        if data is None:
+            data = self.read_exploration()
         return {
+            "exploration_data": data,
             **self.dialog_feedback_context(state),
-            "recently_cleared_target_ids": self.recently_cleared_target_ids(state),
-            "recent_interaction_outcomes_by_target": self.recent_interaction_outcomes_by_target(state),
+            "recently_cleared_target_ids": self.recently_cleared_target_ids(state, data=data),
+            "recent_interaction_outcomes_by_target": self.recent_interaction_outcomes_by_target(state, data=data),
         }
 
     def latest_feedback_agent_turn(self, feedback: list[dict]) -> int | None:
@@ -5682,7 +11671,7 @@ class DebugState:
         except (TypeError, ValueError):
             return False
 
-    def recently_cleared_target_ids(self, state: dict, event_limit: int = 50) -> set[int]:
+    def recently_cleared_target_ids(self, state: dict, event_limit: int = 50, *, data: dict | None = None) -> set[int]:
         objects_by_id = {
             int(obj.get("id") or 0): obj
             for obj in state.get("objects") or []
@@ -5691,7 +11680,8 @@ class DebugState:
         cleared: set[int] = set()
         cleared_scripts: set[int] = set()
         identity = self.room_identity(state)
-        data = self.read_exploration()
+        if data is None:
+            data = self.read_exploration()
         interaction_rooms = data.get("object_interactions") if isinstance(data.get("object_interactions"), dict) else {}
         persistent_objects = (
             interaction_rooms.get(identity["id"])
@@ -5750,10 +11740,16 @@ class DebugState:
                     cleared.add(obj_id)
         return cleared
 
-    def recent_interaction_outcomes_by_target(self, state: dict, event_limit: int = 80) -> dict[int, dict]:
+    def recent_interaction_outcomes_by_target(self, state: dict, event_limit: int = 80, *, data: dict | None = None) -> dict[int, dict]:
         outcomes: dict[int, dict] = {}
         identity = self.room_identity(state)
-        data = self.read_exploration()
+        if data is None:
+            data = self.read_exploration()
+        current_context = (
+            self.interaction_context_from_data(data)
+            if isinstance(data.get("interaction_observable_context"), dict)
+            else self.interaction_context_snapshot()
+        )
         interaction_rooms = data.get("object_interactions") if isinstance(data.get("object_interactions"), dict) else {}
         persistent_objects = (
             interaction_rooms.get(identity["id"])
@@ -5776,10 +11772,16 @@ class DebugState:
             if not self.object_snapshot_compatible(current, recorded):
                 continue
             last_event = entry.get("last_event") if isinstance(entry.get("last_event"), dict) else {}
+            failure_evidence = (
+                self.interaction_failure_evidence(state, entry, data, current_context)
+                if entry.get("last_result") == "no_effect"
+                else None
+            )
             outcomes[obj_id] = {
                 **last_event,
                 "type": "interaction_no_effect" if entry.get("last_result") == "no_effect" else "interaction_effect",
                 "persistent": True,
+                **({"interaction_evidence": failure_evidence} if failure_evidence is not None else {}),
             }
         for event in reversed(self.event_log[-event_limit:]):
             if event.get("type") not in {"interaction_effect", "interaction_no_effect"}:
@@ -5798,10 +11800,36 @@ class DebugState:
             recorded = event.get("finished_object") or event.get("started_object")
             if isinstance(recorded, dict) and not self.object_snapshot_compatible(current, recorded):
                 continue
-            outcomes[obj_id] = event
+            if event.get("type") == "interaction_no_effect":
+                ephemeral_entry = {
+                    "object_id": obj_id,
+                    "no_effect_count": 1,
+                    "history": [event],
+                }
+                outcomes[obj_id] = {
+                    **event,
+                    "interaction_evidence": self.interaction_failure_evidence(
+                        state,
+                        ephemeral_entry,
+                        data,
+                        current_context,
+                    ),
+                }
+            else:
+                outcomes[obj_id] = event
         return outcomes
 
     def target_affordance(self, state: dict, target_id: int, context: dict | None = None) -> dict:
+        reappearance = self.battle_reappearance_for_target(
+            state, target_id, data=context.get("exploration_data") if isinstance(context, dict) else None,
+        )
+        if reappearance is not None:
+            return {
+                "interaction_state": "reappeared_battle_trigger",
+                "agent_priority": "avoid_repeat",
+                "battle_reappearance_history": reappearance,
+                "deprioritize_reason": "该对象已确认在战斗胜利后消失并再次可交互；不要为了清点房间、距离近或重新可交互而主动追逐。",
+            }
         recently_cleared = (
             context.get("recently_cleared_target_ids")
             if isinstance(context, dict) and isinstance(context.get("recently_cleared_target_ids"), set)
@@ -5819,17 +11847,32 @@ class DebugState:
             outcomes = self.recent_interaction_outcomes_by_target(state)
         outcome = outcomes.get(target_id)
         if outcome:
+            motion = self.motion_history.view(state, target_id, limit=2)
+            if (motion.get("moved_at") and outcome.get("time")
+                    and motion["moved_at"] > outcome["time"]):
+                return {"interaction_state": "moved_since_interaction", "agent_priority": "normal",
+                        "deprioritize_reason": "该对象在上次交互后发生了位置变化；历史交互位置可能已过时。"}
             no_effect = outcome.get("type") == "interaction_no_effect"
+            evidence = outcome.get("interaction_evidence") if isinstance(outcome.get("interaction_evidence"), dict) else {}
+            stale_only = (
+                no_effect
+                and int(evidence.get("compatible_no_effect_count") or 0) > 0
+                and int(evidence.get("same_context_no_effect_count") or 0) == 0
+                and int(evidence.get("unknown_context_no_effect_count") or 0) == 0
+            )
             return {
-                "interaction_state": "previously_tried",
-                "agent_priority": "avoid_repeat",
+                "interaction_state": "stale_no_effect" if stale_only else "previously_tried",
+                "agent_priority": "soft_avoid" if stale_only else "avoid_repeat",
                 "interaction_feedback_state": "no_effect" if no_effect else "effect",
                 "deprioritize_reason": (
-                    "该目标此前已尝试交互，但没有观察到状态、物品或房间变化。"
+                    "该目标只在旧的可观察上下文中失败过；失败仍是负面证据，但应结合新剧情、任务和路线价值重新判断。"
+                    if stale_only
+                    else "该目标此前已尝试交互，但没有观察到状态、物品或房间变化。"
                     if no_effect
                     else "该目标此前交互后已经产生了状态、物品或房间变化。"
                 ),
                 "previous_interaction_outcome": outcome,
+                **({"interaction_evidence": evidence} if no_effect else {}),
             }
         dialog_feedback = self.dialog_feedback_for_target(state, target_id, context)
         if dialog_feedback:
@@ -5873,6 +11916,108 @@ class DebugState:
         if target.get("agent_priority") == "avoid_backtrack" and affordance.get("agent_priority") == "normal":
             affordance = {key: value for key, value in affordance.items() if key not in {"agent_priority", "deprioritize_reason"}}
         return {**target, **affordance}
+
+    def active_task_binds_navigation_target(self, state: dict, target_id: int) -> bool:
+        try:
+            target_id = int(target_id)
+        except (TypeError, ValueError):
+            return False
+        transition = self.transition_observation_from_state(state, target_id)
+        transition_key = transition.get("transition_key") if isinstance(transition, dict) else None
+        for task in self.task_ledger(limit=None):
+            if task.get("status") != "active":
+                continue
+            try:
+                object_id = int(task.get("object_id") or 0)
+            except (TypeError, ValueError):
+                object_id = 0
+            if object_id == target_id:
+                return True
+            if transition_key and task.get("transition_key") == transition_key:
+                return True
+        return False
+
+    def room_entry_navigation_context(self, state: dict) -> dict | None:
+        runtime = getattr(self, "agent_runtime", None)
+        if runtime is None:
+            return None
+        return runtime.room_entry_context_for_state(state)
+
+    def decorate_room_entry_navigation(self, state: dict, targets: list[dict]) -> tuple[list[dict], dict | None]:
+        context = self.room_entry_navigation_context(state)
+        if not isinstance(context, dict):
+            return targets, None
+        status = context.get("status")
+        identity = self.room_identity(state)
+        with self.exploration_lock:
+            exploration = self.read_exploration()
+        decorated = []
+        for original in targets:
+            target = dict(original)
+            try:
+                target_id = int(target.get("id") or 0)
+            except (TypeError, ValueError):
+                target_id = 0
+            if status == "recovery_pending":
+                matches_target = target_id == int(context.get("source_target_id") or 0)
+                matches_key = bool(
+                    context.get("source_transition_key")
+                    and target.get("transition_key") == context.get("source_transition_key")
+                )
+                if matches_target or matches_key:
+                    target.update({
+                        "entry_relation": "recovery_route",
+                        "recovery_route": True,
+                        "agent_priority": "resume_interrupted_entry",
+                    })
+                    target.pop("deprioritize_reason", None)
+            elif status in {"entered", "progressed"} and target.get("transition_candidate") is True:
+                known_return = bool(
+                    target.get("known_destination")
+                    and target.get("known_destination_room_id") == context.get("source_room_id")
+                )
+                candidate = self.destination_entry_candidate_for_target(
+                    exploration,
+                    identity.get("id") if isinstance(identity, dict) else "",
+                    target_id,
+                    target.get("transition_key"),
+                )
+                inferred_return = bool(
+                    isinstance(candidate, dict)
+                    and candidate.get("candidate_return_room_id") == context.get("source_room_id")
+                    and candidate.get("source_transition_key") == context.get("source_transition_key")
+                )
+                if known_return or inferred_return:
+                    target.update({
+                        "entry_relation": (
+                            "confirmed_entry_return" if known_return
+                            else "inferred_entry_return"
+                        ),
+                        "possible_entry_return": True,
+                        "agent_priority": "avoid_immediate_backtrack" if status == "entered" else target.get("agent_priority", "normal"),
+                        "deprioritize_reason": (
+                            "当前房间已有探索进展；可根据剩余目标和任务决定是否经入口离开。"
+                            if status == "progressed"
+                            else
+                            "该传送已确认返回刚离开的逻辑房间；先探索当前房间的其他可执行目标。"
+                            if known_return
+                            else "该未知传送是落点附近唯一可执行传送，可能是刚使用入口的返回侧；先探索其他可执行目标。"
+                        ),
+                    })
+                    if inferred_return:
+                        target["candidate_return_room_id"] = candidate.get("candidate_return_room_id")
+                        target["entry_evidence"] = candidate.get("evidence")
+            decorated.append(target)
+        return decorated, context
+
+    def navigation_target_is_entry_return(self, state: dict, target_id: int) -> bool:
+        navigation = self.navigation(state)
+        return any(
+            isinstance(target, dict)
+            and int(target.get("id") or 0) == int(target_id)
+            and target.get("possible_entry_return") is True
+            for target in navigation.get("targets") or []
+        )
 
     def agent_recent_decision_context(self, limit: int = 5) -> list[dict]:
         context = []
@@ -5920,8 +12065,10 @@ class DebugState:
             party_direction = int(state.get("party_direction") or 0)
         except (TypeError, ValueError):
             party_direction = 0
-        state_info = self.file_info(self.state_path)
-        frame_info = self.file_info(self.frame_path)
+        state_info = self.live_info("state")
+        frame_info = self.live_info("frame")
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else None
         return {
             "status": state.get("status", "ok"),
             "frame": state.get("frame"),
@@ -5942,6 +12089,8 @@ class DebugState:
             "party_direction": state.get("party_direction"),
             "party_direction_button": DIR_TO_BUTTON.get(party_direction, "down"),
             "cash": state.get("cash"),
+            "shop": self.agent_shop(state).get("shop") if shop and shop.get("active") else None,
+            "choice": choice if choice and choice.get("active") else None,
             "party": [
                 {
                     "role_id": role.get("role_id"),
@@ -5951,6 +12100,12 @@ class DebugState:
                     "max_hp": role.get("max_hp"),
                     "mp": role.get("mp"),
                     "max_mp": role.get("max_mp"),
+                    "status_effects": role.get("status_effects") or [],
+                    "poisons": [
+                        {"name": poison.get("name")}
+                        for poison in role.get("poisons") or []
+                        if isinstance(poison, dict) and poison.get("name")
+                    ],
                 }
                 for role in party[:6]
                 if isinstance(role, dict)
@@ -5966,43 +12121,513 @@ class DebugState:
             },
             "state_file": state_info,
             "frame_file": frame_info,
-            "runtime_stale": state_info.get("stale", True) or frame_info.get("stale", True),
-            "action_pending": self.action_path.exists(),
+            "state_stale": state_info.get("stale", True),
+            "frame_stale": frame_info.get("stale", True),
+            "runtime_stale": state_info.get("stale", True),
+            "action_pending": self.action_pending(state),
             "exploration": self.agent_exploration_summary(self.agent_current_exploration(state)),
         }
 
-    def agent_inventory(self, state: dict, limit: int = 100) -> dict:
+    def agent_shop(self, state: dict, item_id: int | None = None) -> dict:
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
+        if not shop or shop.get("active") is not True:
+            return {"ok": False, "error": "shop_inactive", "shop": None}
+
+        items = shop.get("items") if isinstance(shop.get("items"), list) else []
+        compact_keys = (
+            "index", "item_id", "name", "price", "inventory_count",
+            "equipped_count", "owned_count", "affordable", "selected",
+            "usable", "equipable", "sellable", "amount", "amount_in_use",
+            "available_count", "sell_price", "can_sell",
+        )
+        compact_items = [
+            {key: item.get(key) for key in compact_keys if key in item}
+            for item in items
+            if isinstance(item, dict)
+        ]
+        summary = {
+            "active": True,
+            "mode": shop.get("mode"),
+            "store_id": shop.get("store_id"),
+            "phase": shop.get("phase"),
+            "selected_index": shop.get("selected_index"),
+            "selected_item_id": shop.get("selected_item_id"),
+            "cash": state.get("cash"),
+            "items": compact_items,
+        }
+        if item_id is None:
+            return {"ok": True, "shop": summary}
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            item_id = 0
+        candidate = next(
+            (
+                item for item in items
+                if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+            ),
+            None,
+        )
+        if item_id <= 0 or not isinstance(candidate, dict):
+            error = "item_not_sellable" if shop.get("mode") == "sell" else "item_not_offered"
+            return {"ok": False, "error": error, "item_id": item_id, "shop": summary}
+        detail = dict(candidate)
+        result = {"ok": True, "shop": summary, "item": detail}
+        if candidate.get("equipable") is True:
+            result["equipment_comparisons"] = self.equipment_comparisons(state, candidate)
+        return result
+
+    def player_battle_view(self, state: dict, *, all_outcomes: bool = False) -> dict | None:
+        """Purely project one native battle value onto player-visible facts."""
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        if battle is None:
+            return None
+
+        view = {
+            key: battle.get(key)
+            for key in (
+                "generation", "command_generation", "result", "phase",
+                "current_player_index", "awaiting_ack", "is_boss",
+            )
+            if key in battle
+        }
+        view["players"] = []
+        for player in battle.get("players") or []:
+            if not isinstance(player, dict):
+                continue
+            visible = {
+                key: player.get(key)
+                for key in (
+                    "index", "role_id", "name", "hp", "max_hp", "mp", "max_mp",
+                    "level", "attack_strength", "magic_strength", "defense",
+                    "dexterity", "flee_rate", "defending", "submitted_action", "command_status",
+                )
+                if key in player
+            }
+            visible["status_effects"] = [
+                {
+                    key: effect.get(key)
+                    for key in ("status_id", "key", "remaining_rounds", "persistent")
+                    if key in effect
+                }
+                for effect in player.get("status_effects") or []
+                if isinstance(effect, dict) and effect.get("key")
+            ]
+            visible["poisons"] = [
+                {"name": poison.get("name")}
+                for poison in player.get("poisons") or []
+                if isinstance(poison, dict) and poison.get("name")
+            ]
+            view["players"].append(visible)
+
+        view["enemies"] = [
+            {
+                key: enemy.get(key)
+                for key in ("slot_index", "present", "object_id", "name")
+                if key in enemy
+            }
+            for enemy in battle.get("enemies") or []
+            if isinstance(enemy, dict)
+        ]
+        view["available_actions"] = []
+        for action in battle.get("available_actions") or []:
+            if not isinstance(action, dict):
+                continue
+            visible = {
+                key: action.get(key)
+                for key in (
+                    "action_type", "object_id", "name", "target_side", "target_mode",
+                    "valid_target_indices", "submission_target_indices", "description",
+                )
+                if key in action
+            }
+            if action.get("action_type") == "magic" and "mp_cost" in action:
+                visible["mp_cost"] = action.get("mp_cost")
+            view["available_actions"].append(visible)
+        existing_outcomes = battle.get("recent_outcomes")
+        if isinstance(existing_outcomes, list):
+            view["recent_outcomes"] = copy.deepcopy(existing_outcomes if all_outcomes else existing_outcomes[-8:])
+        else:
+            view["recent_outcomes"] = [
+                self._visible_outcome_sample(outcome, 0)
+                | {
+                    "actor_side": str((outcome.get("actor") or {}).get("side") or ""),
+                    "enemy_changes": [
+                        {
+                            key: change.get(key)
+                            for key in ("slot_index", "object_id", "name", "amount", "kind", "defeated")
+                            if key in change
+                        }
+                        for change in outcome.get("enemy_changes") or []
+                        if isinstance(change, dict)
+                    ],
+                    "target": {
+                        key: (outcome.get("target") or {}).get(key)
+                        for key in ("index", "side", "object_id", "name", "mode")
+                        if key in (outcome.get("target") or {})
+                    },
+                }
+                for outcome in (
+                    (battle.get("visible_outcomes") or [])
+                    if all_outcomes else (battle.get("visible_outcomes") or [])[-8:]
+                )
+                if isinstance(outcome, dict)
+            ]
+        return view
+
+    def current_player_battle_view(self, state: dict) -> dict | None:
+        """Build the current-turn battle prompt, including knowledge known right now."""
+        view = self.player_battle_view(state, all_outcomes=True)
+        if view is None:
+            return None
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        view["experience"] = self.combat_experience(battle)
+        return view
+
+    @staticmethod
+    def player_battle_item_effect(effect: object) -> dict | None:
+        """Project a native item-script preview onto player-usable effect facts."""
+        if not isinstance(effect, dict):
+            return None
+        visible_effect_keys = (
+            "kind", "conditional", "amount", "apply_to_all", "max_hp_percent",
+            "poison_name", "max_poison_level", "status", "duration",
+        )
+        effects = [
+            {
+                key: entry.get(key)
+                for key in visible_effect_keys
+                if key in entry
+            }
+            for entry in effect.get("effects") or []
+            if isinstance(entry, dict) and entry.get("kind")
+        ]
+        return {
+            "source": "dos_script_preview",
+            "preview_complete": effect.get("preview_complete") is True,
+            "effects": effects,
+        }
+
+    @staticmethod
+    def player_battle_inventory_item(item: dict) -> dict:
+        """Return inventory and sanitized DOS handbook-equivalent effect facts."""
+        visible = {
+            key: item.get(key)
+            for key in (
+                "slot", "item_id", "name", "description", "amount", "amount_in_use",
+                "equipped_count", "usable", "throwable", "consuming", "apply_to_all",
+            )
+            if key in item
+        } | {
+            "available_amount": max(
+                0,
+                int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
+            ),
+        }
+        for key in ("use_effect", "throw_effect"):
+            projected = DebugState.player_battle_item_effect(item.get(key))
+            if projected is not None:
+                visible[key] = projected
+        return visible
+
+    @staticmethod
+    def compact_inventory_item(item: dict) -> dict:
+        return {
+            "slot": item.get("slot"),
+            "item_id": item.get("item_id"),
+            "name": item.get("name"),
+            "amount": item.get("amount"),
+            "amount_in_use": item.get("amount_in_use"),
+            "equipped_count": item.get("equipped_count"),
+            "usable": item.get("usable"),
+            "throwable": item.get("throwable"),
+            "apply_to_all": item.get("apply_to_all"),
+            "target_mode": (
+                "implicit_event_context"
+                if item.get("apply_to_all") is True
+                else "party_role"
+            ),
+            "sellable": item.get("sellable"),
+            "consuming": item.get("consuming"),
+            "available_amount": max(
+                0,
+                int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
+            ),
+            "flags": item.get("flags"),
+            "price": item.get("price"),
+            "effect_available": bool(item.get("use_effect") or item.get("throw_effect")),
+        }
+
+    def agent_inventory(
+        self,
+        state: dict,
+        limit: int = 100,
+        item_id: int | None = None,
+    ) -> dict:
         inventory = state.get("inventory") if isinstance(state.get("inventory"), list) else []
+        if item_id is not None:
+            try:
+                normalized_item_id = int(item_id)
+            except (TypeError, ValueError):
+                normalized_item_id = 0
+            candidate = next(
+                (
+                    item for item in inventory
+                    if isinstance(item, dict)
+                    and int(item.get("item_id") or 0) == normalized_item_id
+                ),
+                None,
+            )
+            if normalized_item_id <= 0 or not isinstance(candidate, dict):
+                return {
+                    "ok": False,
+                    "error": "item_not_in_inventory",
+                    "item_id": normalized_item_id,
+                }
+            detail = self.compact_inventory_item(candidate)
+            for key in ("script_on_use", "script_on_throw", "use_effect", "throw_effect"):
+                if key in candidate:
+                    detail[key] = candidate.get(key)
+            return {"ok": True, "item": detail}
         items = []
         for item in inventory[:limit]:
             if not isinstance(item, dict):
                 continue
-            items.append(
+            items.append(self.compact_inventory_item(item))
+        return {"inventory": items, "total": len(inventory), "returned": len(items)}
+
+    @staticmethod
+    def compact_equipment_item(item: dict | None) -> dict | None:
+        if not isinstance(item, dict):
+            return None
+        return {
+            key: item.get(key)
+            for key in (
+                "item_id", "name", "price", "amount", "amount_in_use",
+                "equipped_count", "total_count", "usable", "equipable",
+                "equipable_role_ids", "equipment_effect",
+            )
+            if key in item
+        }
+
+    @staticmethod
+    def equipment_item_by_id(state: dict, item_id: int) -> dict | None:
+        for item in state.get("inventory") or []:
+            if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id:
+                return item
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            for item in role.get("equipment") or []:
+                if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id:
+                    return item
+        return None
+
+    @staticmethod
+    def equipment_trait_map(effect: dict | None) -> dict[str, dict]:
+        if not isinstance(effect, dict):
+            return {}
+        result = {}
+        for trait in effect.get("traits") or []:
+            if not isinstance(trait, dict):
+                continue
+            kind = str(trait.get("kind") or "")
+            if kind:
+                key = kind
+                if kind == "status":
+                    key = f"{kind}:{trait.get('status_id')}"
+                elif kind == "persistent_poison":
+                    key = f"{kind}:{trait.get('poison_id')}"
+                result[key] = trait
+        return result
+
+    def equipment_comparisons(self, state: dict, candidate: dict) -> list[dict]:
+        effect = candidate.get("equipment_effect") if isinstance(candidate.get("equipment_effect"), dict) else {}
+        try:
+            slot_id = int(effect.get("slot_id"))
+        except (TypeError, ValueError):
+            slot_id = -1
+        eligible_ids = set()
+        for value in candidate.get("equipable_role_ids") or []:
+            try:
+                eligible_ids.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        stat_keys = (
+            "attack_strength", "magic_strength", "defense",
+            "dexterity", "flee_rate", "poison_resistance",
+        )
+        candidate_modifiers = effect.get("stat_modifiers") if isinstance(effect.get("stat_modifiers"), dict) else {}
+        candidate_elements = effect.get("elemental_resistance") if isinstance(effect.get("elemental_resistance"), list) else []
+        candidate_traits = self.equipment_trait_map(effect)
+        comparisons = []
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            try:
+                role_id = int(role.get("role_id"))
+            except (TypeError, ValueError):
+                continue
+            if role_id not in eligible_ids:
+                continue
+            current_item = None
+            for item in role.get("equipment") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    current_slot = int(item.get("slot_id"))
+                except (TypeError, ValueError):
+                    current_slot = -1
+                if current_slot == slot_id:
+                    current_item = item
+                    break
+            current_effect = (
+                current_item.get("equipment_effect")
+                if isinstance(current_item, dict) and isinstance(current_item.get("equipment_effect"), dict)
+                else {}
+            )
+            current_modifiers = (
+                current_effect.get("stat_modifiers")
+                if isinstance(current_effect.get("stat_modifiers"), dict)
+                else {}
+            )
+            stat_delta = {
+                key: int(candidate_modifiers.get(key) or 0) - int(current_modifiers.get(key) or 0)
+                for key in stat_keys
+            }
+            current_elements = (
+                current_effect.get("elemental_resistance")
+                if isinstance(current_effect.get("elemental_resistance"), list)
+                else []
+            )
+            elemental_delta = [
+                int(candidate_elements[index] if index < len(candidate_elements) else 0)
+                - int(current_elements[index] if index < len(current_elements) else 0)
+                for index in range(5)
+            ]
+            current_stats = {
+                key: role.get(key)
+                for key in stat_keys
+                if role.get(key) is not None
+            }
+            resulting_stats = {
+                key: int(current_stats[key]) + stat_delta[key]
+                for key in ("attack_strength", "magic_strength", "defense", "dexterity", "flee_rate")
+                if key in current_stats
+            }
+            old_traits = self.equipment_trait_map(current_effect)
+            gained_effects = [
+                trait for kind, trait in candidate_traits.items()
+                if kind not in old_traits
+            ]
+            lost_effects = [
+                trait for kind, trait in old_traits.items()
+                if kind not in candidate_traits
+            ]
+            changed_effects = [
                 {
-                    "slot": item.get("slot"),
-                    "item_id": item.get("item_id"),
-                    "name": item.get("name"),
-                    "amount": item.get("amount"),
-                    "amount_in_use": item.get("amount_in_use"),
-                    "equipped_count": item.get("equipped_count"),
-                    "usable": item.get("usable"),
-                    "apply_to_all": item.get("apply_to_all"),
-                    "target_mode": (
-                        "implicit_event_context"
-                        if item.get("apply_to_all") is True
-                        else "party_role"
-                    ),
-                    "sellable": item.get("sellable"),
-                    "consuming": item.get("consuming"),
-                    "available_amount": max(
-                        0,
-                        int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
-                    ),
-                    "flags": item.get("flags"),
-                    "price": item.get("price"),
+                    "kind": candidate_traits[kind].get("kind") or old_traits[kind].get("kind"),
+                    "from": old_traits[kind],
+                    "to": candidate_traits[kind],
+                }
+                for kind in sorted(set(old_traits) & set(candidate_traits))
+                if old_traits[kind] != candidate_traits[kind]
+            ]
+            comparisons.append(
+                {
+                    "role_id": role_id,
+                    "role_name": role.get("name"),
+                    "current_item": self.compact_equipment_item(current_item),
+                    "current_stats": current_stats,
+                    "stat_delta": stat_delta,
+                    "elemental_resistance_delta": elemental_delta,
+                    "resulting_stats": resulting_stats,
+                    "gained_effects": gained_effects,
+                    "lost_effects": lost_effects,
+                    "changed_effects": changed_effects,
                 }
             )
-        return {"inventory": items, "total": len(inventory), "returned": len(items)}
+        return comparisons
+
+    def agent_equipment(self, state: dict, item_id: int | None = None) -> dict:
+        explicit_item = item_id is not None
+        pending = self.agent_runtime.pending_equipment_review()
+        if item_id is None and isinstance(pending, dict):
+            try:
+                item_id = int(pending.get("item_id") or 0)
+            except (TypeError, ValueError):
+                item_id = 0
+        if item_id is not None:
+            try:
+                item_id = int(item_id)
+            except (TypeError, ValueError):
+                item_id = 0
+            candidate = self.equipment_item_by_id(state, item_id)
+            source = "equipped"
+            if any(
+                isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+                for item in state.get("inventory") or []
+            ):
+                source = "inventory"
+            if candidate is None and explicit_item:
+                shop = state.get("shop")
+                if isinstance(shop, dict) and shop.get("active") is True and shop.get("mode") == "buy":
+                    candidate = next(
+                        (
+                            item for item in shop.get("items") or []
+                            if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+                        ),
+                        None,
+                    )
+                    source = "shop"
+            if item_id <= 0 or not isinstance(candidate, dict):
+                return {"ok": False, "error": "equipment item was not found"}
+            if candidate.get("equipable") is not True:
+                return {"ok": False, "error": "item is not equipable", "item_id": item_id}
+            available = 0
+            for item in state.get("inventory") or []:
+                if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id:
+                    available = max(
+                        0,
+                        int(item.get("amount") or 0) - int(item.get("amount_in_use") or 0),
+                    )
+                    break
+            return {
+                "ok": True,
+                "pending_review": pending if source != "shop" and isinstance(pending, dict) and int(pending.get("item_id") or 0) == item_id else None,
+                "source": source,
+                "candidate": self.compact_equipment_item(candidate),
+                "available_count": available,
+                "comparisons": self.equipment_comparisons(state, candidate),
+            }
+
+        current = []
+        for role in state.get("party") or []:
+            if not isinstance(role, dict):
+                continue
+            current.append(
+                {
+                    "role_id": role.get("role_id"),
+                    "role_name": role.get("name"),
+                    "equipment": [
+                        self.compact_equipment_item(item)
+                        for item in role.get("equipment") or []
+                        if isinstance(item, dict)
+                    ],
+                }
+            )
+        candidates = [
+            self.compact_equipment_item(item)
+            for item in state.get("inventory") or []
+            if isinstance(item, dict) and item.get("equipable") is True
+        ]
+        return {
+            "ok": True,
+            "pending_review": None,
+            "current_equipment": current,
+            "candidates": candidates[:40],
+            "candidates_total": len(candidates),
+        }
 
     def agent_current_exploration(self, state: dict) -> dict:
         existing = state.get("_exploration")
@@ -6029,126 +12654,187 @@ class DebugState:
             "legacy_nav_room_id": exploration.get("legacy_nav_room_id"),
             "explored": exploration.get("explored", exploration.get("visited")),
             "visited": exploration.get("visited"),
+            "explorable": exploration.get("explorable"),
             "frontier": exploration.get("frontier"),
-            "complete": exploration.get("complete"),
             "last_route": {
                 "segment_steps": last_route.get("segment_steps"),
                 "remaining_steps": last_route.get("remaining_steps"),
                 "target_selection": target_selection,
-                "pending": last_route.get("pending"),
             },
         }
 
     def agent_tool_specs(self) -> list[dict]:
-        decision_properties = {
-            "summary": {"type": "string"},
-            "recommended_intent": {
-                "type": "string",
-                "enum": ["advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"],
-            },
-            "recommended_action": {
-                "type": "object",
-                "description": (
-                    "Dry-run action. For use_item, args must contain item_id and either role_id for "
-                    "target_mode=party_role or target='all' for target_mode=implicit_event_context. "
-                    "The compatibility name 'all' dispatches 0xFFFF and may reuse the most recent event object; "
-                    "it is not necessarily a whole-party effect. target_object_id is not supported."
-                ),
-                "properties": {
-                    "tool": {
-                        "type": "string",
-                        "enum": ["no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"],
-                    },
-                    "args": {
-                        "type": "object",
-                        "description": (
-                            "use_item examples: {item_id:88,role_id:0} for a party member, or "
-                            "{item_id:272,target:'all'} for implicit event context after interacting with an NPC."
-                        ),
-                    },
-                    "dry_run": {"type": "boolean"},
-                },
-                "required": ["tool", "args"],
-            },
-            "evidence": {"type": "object"},
-            "risk": {"type": "string"},
-            "alternatives": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "intent": {"type": "string"},
-                        "action": {"type": "object"},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["intent", "action", "reason"],
-                },
-            },
-        }
         return [
             {
                 "type": "function",
                 "function": {
+                    "name": "upsert_task",
+                    "description": (
+                        "创建或更新本地 agent 任务记忆，不执行游戏动作。已有 id 会更新；未知自选 id 或省略 id 的创建必须先完整读取 "
+                        "closed-inclusive summary 账本，并在后一模型批次提供最终页 review_token。省略 id 创建时自动生成 task-* id。"
+                        "对已有 id 不提供变化字段表示明确确认继续，也会刷新该任务的证据审计快照。"
+                        "新增或改变非空 room_id 前，必须在同一工具周期查询该房间的 get_room_memory。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1},
+                            "priority": {"type": "integer"},
+                            "status": {"type": "string", "enum": ["active", "dormant", "completed", "abandoned"]},
+                            "object_id": {"type": "integer", "minimum": 1},
+                            "transition_key": {"type": "string"}, "room_id": {"type": "string"},
+                            "rationale": {"type": "string", "minLength": 1},
+                            "review_token": {"type": "string", "minLength": 1},
+                            "source_inbox_ids": {
+                                "type": "array", "maxItems": 20,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                            "review_watch": {
+                                "type": "object",
+                                "properties": {
+                                    "cash": {"type": "boolean"},
+                                    "inventory_item_ids": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                                    "party_role_ids": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+                                },
+                                "additionalProperties": False,
+                            },
+                            "status_reason": {"type": "string", "minLength": 1},
+                            "status_evidence": {
+                                "type": "array", "minItems": 1, "maxItems": 20,
+                                "items": {"type": "string", "minLength": 1},
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_tasks",
-                    "description": "返回 agent 自行维护的任务账本。任务是推断记忆，不是引擎事实；默认仅返回 active 任务。",
+                    "description": (
+                        "分页查询任务账本。默认兼容旧行为：active、full、offset=0。创建任务或执行恢复/压缩后的全账本对账时，"
+                        "必须从 offset=0 开始用 include_closed=true、detail=summary 连续读取到 complete=true；最终页返回下一模型批次使用的 review_token。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "include_closed": {"type": "boolean", "default": False},
+                            "detail": {"type": "string", "enum": ["summary", "full"], "default": "full"},
+                            "offset": {"type": "integer", "minimum": 0, "default": 0},
                             "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
                         },
+                        "additionalProperties": False,
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "upsert_task",
-                    "description": "创建或更新本地 agent 任务记忆，不执行游戏动作。新任务必须提供 description 和 rationale；用 status 标记 completed 或 abandoned，记录会保留历史。",
+                    "name": "review_task_inbox",
+                    "description": (
+                        "逐条归档已完成对话产生的 task_inbox 证据，不执行游戏动作。明确召唤、委托、约定或其他未完成行动使用 new_task；"
+                        "已有任务进展使用 task_updated；只有闲聊、重复证据或已观察完成的证据使用 no_follow_up。任务类结论必须先 get_tasks，"
+                        "再用 source_inbox_ids 成功 upsert 对应任务。所有 resolution 成功后才会结案；成功结果会返回下一批 pending_batches。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"}, "description": {"type": "string"},
-                            "priority": {"type": "integer"},
-                            "status": {"type": "string", "enum": ["active", "completed", "abandoned"]},
-                            "object_id": {"type": "integer", "minimum": 1},
-                            "transition_key": {"type": "string"}, "room_id": {"type": "string"},
-                            "rationale": {"type": "string"},
+                            "resolutions": {
+                                "type": "array", "minItems": 1, "maxItems": 20,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "inbox_id": {"type": "string", "minLength": 1},
+                                        "outcome": {
+                                            "type": "string",
+                                            "enum": ["new_task", "task_updated", "no_follow_up"],
+                                        },
+                                        "task_ids": {
+                                            "type": "array", "maxItems": 20,
+                                            "items": {"type": "string", "minLength": 1},
+                                        },
+                                        "reason_code": {
+                                            "type": "string",
+                                            "enum": ["chatter", "duplicate_evidence", "already_completed"],
+                                        },
+                                        "rationale": {"type": "string", "minLength": 1, "maxLength": 500},
+                                    },
+                                    "required": ["inbox_id", "outcome", "rationale"],
+                                    "additionalProperties": False,
+                                },
+                            },
                         },
+                        "required": ["resolutions"],
+                        "additionalProperties": False,
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "get_state_summary",
-                    "description": "返回当前游戏状态的轻量级只读摘要。",
-                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                    "name": "preview_item_placement",
+                    "description": "预览放置型物品的站位、朝向与实际落点；省略位置使用当前位置，省略 face 返回四方向。合法不代表任务有效。",
+                    "parameters": {
+                        "type": "object", "properties": {
+                            "item_id": {"type": "integer", "minimum": 1},
+                            "x": {"type": "integer"}, "y": {"type": "integer"},
+                            "face": {"type": "string", "enum": ["up", "down", "left", "right"]}},
+                        "required": ["item_id"], "additionalProperties": False,
+                    },
                 },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "get_navigation",
-                    "description": "返回导航目标。full 模式包含路线状态、传送目的房间和目的地探索摘要；比较候选目标时优先使用 full 模式。",
+                    "description": (
+                        "返回紧凑的可交互候选、路线成本、交互状态和已知传送目的地。"
+                        "只有 status=reachable、transition 或 blocked_by_interactable 的目标可提交 navigate；"
+                        "blocked_by_transition 和 unreachable_static 不能直接提交。"
+                        "若 targets_returned < targets_total，可用 limit=40 获取更多候选详情。"
+                        "affordances 中 kind=item_approach 表示物品脚本要求靠近该对象；"
+                        "选择该路线时提交 navigate 并携带对应 item_id。"
+                    ),
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "mode": {"type": "string", "enum": ["lightweight", "full"], "default": "lightweight"},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
-                        },
+                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 40, "default": 20}},
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "get_dialogs",
-                    "description": "返回最近观察到的对话条目，可按 speaker_hint 过滤。",
+                    "name": "observe_target",
+                    "description": "不发送按键，定点观察指定对象 0.4–5 秒，返回最新位置、移动、角色距离、触发事件和中断原因；不推断移动机制。",
+                    "parameters": {"type": "object", "properties": {
+                        "id": {"type": "integer", "minimum": 1},
+                        "seconds": {"type": "number", "minimum": 0.4, "maximum": 5, "default": 2}},
+                        "required": ["id"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect_target",
+                    "description": "返回目标状态、交互证据、路线及已有低权威外观注释；visual 表明是否可按需查看当前或最近可见画面。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer", "minimum": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8}, "motion_offset": {"type": "integer", "minimum": 0}, "motion_limit": {"type": "integer", "minimum": 1, "maximum": 128}},
+                        "required": ["id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_observations",
+                    "description": "返回最近对话、状态事件或说话者摘要；默认返回对话和事件。",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+                            "kind": {"type": "string", "enum": ["both", "dialogs", "events", "speakers"], "default": "both"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
                             "speaker": {"type": "string"},
                         },
                     },
@@ -6157,11 +12843,35 @@ class DebugState:
             {
                 "type": "function",
                 "function": {
-                    "name": "get_dialog_speakers",
-                    "description": "返回已知的非系统对话说话者，以及其最近观察到的对话元数据。",
+                    "name": "get_shop",
+                    "description": (
+                        "查询当前购买或出售菜单。无参数返回模式、商品或物品、价格和可操作状态；"
+                        "购买模式下指定 item_id 还会返回装备比较，出售模式返回可出售数量和卖价。"
+                    ),
                     "parameters": {
                         "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 300, "default": 100}},
+                        "properties": {"item_id": {"type": "integer", "minimum": 1}},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_equipment",
+                    "description": (
+                        "比较装备。无参数时优先返回最早待审查的新装备；也可指定背包、已穿戴或当前购买商店中的 item_id。"
+                        "source 标明 inventory/equipped/shop；available_count 只表示背包可用数量，商店商品需先购买才能穿戴。"
+                        "商品价格及购买状态用 get_shop(item_id) 查询；查询失败不代表装备没有收益。"
+                        "返回每个可装备角色的当前同槽装备、属性差值、换装后属性和特殊效果变化。"
+                        "装备与普通使用是独立能力；usable=true 不排除 equipable=true。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "item_id": {"type": "integer", "minimum": 1},
+                        },
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -6171,88 +12881,97 @@ class DebugState:
                     "name": "get_inventory",
                     "description": (
                         "返回当前只读物品栏详情，包括可用数量、目标派发模式和是否消耗。"
+                        "指定 item_id 时返回脚本解析出的 use_effect/throw_effect；"
+                        "preview_complete=false 表示存在未解析或条件效果，不可把它当作完整描述。"
                         "target_mode=implicit_event_context 时用 target='all'，底层以 0xFFFF 沿用最近事件对象；"
-                        "兼容字段名 all 不一定表示全队效果。用途仍需根据名称与上下文谨慎推断。"
+                        "兼容字段名 all 不一定表示全队效果。"
                     ),
                     "parameters": {
                         "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 300, "default": 100}},
+                        "properties": {
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 40},
+                            "item_id": {"type": "integer", "minimum": 1},
+                        },
+                        "additionalProperties": False,
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "get_events",
-                    "description": "返回最近观察到的状态变化事件。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10}},
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_object_history",
-                    "description": "返回某个 object/event_object_id 的当前对象快照，以及最近的状态变化和对话历史。",
+                    "name": "upsert_room_memo",
+                    "description": (
+                        "为当前或指定稳定 logical_room_id 写入、整体更新或清除一条地点语义注释。"
+                        "memo 是可能过期的 Agent annotation，不替代结构化探索证据或 task；"
+                        "行动相关线索必须另建独立 task。operation=set 需要 text，clear 幂等。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "integer", "minimum": 1},
-                            "object_id": {"type": "integer", "minimum": 1},
-                            "event_object_id": {"type": "integer", "minimum": 1},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                            "room_id": {"type": "string", "pattern": LOGICAL_ROOM_ID_RE.pattern},
+                            "operation": {"type": "string", "enum": ["set", "clear"], "default": "set"},
+                            "text": {"type": "string", "minLength": 1, "maxLength": MAX_ROOM_MEMO_TEXT},
                         },
+                        "additionalProperties": False,
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "get_agent_history",
-                    "description": "返回最近的 dry-run agent 决策历史。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5}},
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_route",
-                    "description": "返回某个对象 id 的路线和状态详情。用于检查已选候选目标，不要用它扫描所有目标。",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "integer", "minimum": 1},
-                            "object_id": {"type": "integer", "minimum": 1},
-                            "avoid_transitions": {"type": "boolean", "default": True},
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_room_exploration",
-                    "description": "返回某个已知 room id 的简要持久化探索状态。",
+                    "name": "get_room_memory",
+                    "description": (
+                        "返回当前或指定稳定 logical_room_id 的 memo、紧凑探索摘要、房间级对话原始证据，"
+                        "以及明确分向的 transitions.outgoing/incoming。incoming 只含真实持久化的已确认有向记录；"
+                        "speaker_hint 只是元数据，任何边都不得伪造成反向可走路线。"
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {"room_id": {"type": "string"}},
-                        "required": ["room_id"],
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "get_known_transitions",
-                    "description": "返回某个房间已观察到的传送目的地和人工语义房间标签；默认使用当前房间。",
+                    "name": "inspect_screen",
+                    "description": (
+                        "按需检查当前游戏 PNG 的低权威视觉注释。只有 get_navigation、get_room_memory、inspect_target 等"
+                        "结构化证据无法解释布局、出口、通道或目标外观时调用；每个工具周期最多一次未缓存请求。"
+                        "focus=object 必须提供 target_id；只描述系统绑定对象的当前或最近可见画面，无需接近或交互。"
+                        "结果不能猜测未标记对象 ID、确认 transition、说话者、脚本语义、task 或 Room Memo。"
+                    ),
                     "parameters": {
                         "type": "object",
-                        "properties": {"from_room_id": {"type": "string"}},
+                        "properties": {
+                            "focus": {
+                                "type": "string",
+                                "enum": ["room_layout", "passage", "ui_text", "object"],
+                                "default": "room_layout",
+                            },
+                            "question": {"type": "string", "maxLength": 200},
+                            "target_id": {"type": "integer", "minimum": 1},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_tool_output",
+                    "description": (
+                        "分页读取当前 Agent session 中已归档的完整工具输出；每次最多返回 6000 个字符。"
+                        "必须沿 next_offset 连续读取到 complete=true，不能根据部分分页输出断言没有其他候选或证据。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "output_ref": {"type": "string"},
+                            "offset": {"type": "integer", "minimum": 0, "default": 0},
+                        },
+                        "required": ["output_ref"],
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -6260,55 +12979,74 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "submit_decision",
-                    "description": "提交最终 dry-run 决策。这是结束本轮的唯一方式。",
+                    "description": "提交最小 dry-run 动作；仅填写当前 action 所需字段。",
                     "parameters": {
                         "type": "object",
-                        "properties": decision_properties,
-                        "required": [
-                            "summary",
-                            "recommended_intent",
-                            "recommended_action",
-                            "evidence",
-                            "risk",
-                            "alternatives",
-                        ],
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": [
+                                    "advance_dialog", "select_choice", "navigate", "move_to", "use_item",
+                                    "equip_item", "buy_item", "sell_item", "leave_shop",
+                                ],
+                            },
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"},
+                            "face": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                            "target_id": {"type": "integer", "minimum": 1},
+                            "item_id": {"type": "integer", "minimum": 1},
+                            "role_id": {"type": "integer", "minimum": 0},
+                            "target": {"type": "string", "enum": ["all"]},
+                            "option_index": {"type": "integer", "minimum": 0},
+                            "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+                        },
+                        "required": ["action", "reason"],
+                        "additionalProperties": False,
                     },
                 },
             },
         ]
 
     def agent_tool_initial_context(self, state: dict) -> dict:
-        return {
+        if not self.companion_owner_matches():
+            self.agent_runtime.emit(
+                "isolation",
+                "paused",
+                "Companion memory ownership mismatch; withholding memory.",
+            )
+            return {
+                "state_summary": self.agent_state_summary(state),
+                "isolation_error": "companion_owner_mismatch",
+                "room_memo": None,
+                "active_tasks": [],
+                "task_reconciliation": {"pending": False, "reason": "companion_owner_mismatch"},
+            }
+        identity = self.room_identity(state)
+        room_id = identity.get("id") if isinstance(identity, dict) else None
+        context = {
             "state_summary": self.agent_state_summary(state),
-            "available_query_tools": [
-                "get_tasks",
-                "get_state_summary",
-                "get_navigation",
-                "get_dialogs",
-                "get_dialog_speakers",
-                "get_inventory",
-                "get_events",
-                "get_object_history",
-                "get_agent_history",
-                "get_route",
-                "get_room_exploration",
-                "get_known_transitions",
-            ],
-            "active_tasks": self.active_task_summary(),
-            "completion_tool": "submit_decision",
-            "constraints": [
-                "所有建议都只能是 dry-run 预览。",
-                "任务是 agent 从对话和事件推断的记忆，不是游戏引擎事实；发现、调整、完成或作废任务时调用 upsert_task。",
-                "不要声称已经执行了动作。",
-                "不要编造工具结果之外的对象标签、剧情事实或房间身份。",
-                "针对特定对象使用 get_route，不要一开始就请求大体积路线 payload。",
-                "当 dialog.active 为 true 时，建议 advance_dialog，而不是原始按键。",
-                "只有针对明确对象目标时才使用 navigation_step(id)；否则建议 no_op 搭配 wait_runtime。",
-                "建议使用物品前调用 get_inventory；用途证据不足时不要仅因 usable=true 就建议使用。",
-                "target_mode=implicit_event_context 的物品使用 target='all'：它以 0xFFFF 沿用最近事件对象，字段名 all 不一定表示全队。",
-                "NPC 索要匹配物品且刚与该 NPC 交互后，应考虑 use_item target='all'；不要提交 target_object_id。",
-            ],
+            "room_memo": self.room_memo(room_id),
+            **self.active_task_context(state),
+            "task_reconciliation": self.task_reconciliation_context(),
+            "room_entry_context": self.agent_runtime.room_entry_context_for_state(state),
+            "recent_transition_chain": self.agent_runtime.recent_transition_chain(state),
         }
+        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+        review = self.agent_runtime.pending_equipment_review()
+        if (
+            isinstance(review, dict)
+            and state.get("in_main_game")
+            and not state.get("in_battle")
+            and not dialog.get("active")
+            and not self.live_info("state").get("stale", True)
+        ):
+            context["equipment_review"] = {
+                "pending": True,
+                "item_id": review.get("item_id"),
+                "name": review.get("name"),
+                "new_count": review.get("new_count"),
+            }
+        return context
 
     def agent_tool_messages(self, state: dict) -> list[dict]:
         return [
@@ -6335,89 +13073,621 @@ class DebugState:
             parsed = default
         return max(1, min(parsed, upper))
 
-    def run_agent_tool(self, name: str, arguments: dict | None = None, state: dict | None = None) -> dict:
-        arguments = arguments if isinstance(arguments, dict) else {}
-        state = state or read_json(self.state_path)
-        if name == "get_tasks":
-            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
-            return {"ok": True, "tasks": self.task_ledger(include_closed=arguments.get("include_closed") is True, limit=limit)}
-        if name == "upsert_task":
-            return self.upsert_agent_task(arguments)
-        if name == "get_state_summary":
-            return {"ok": True, "state": self.agent_state_summary(state)}
-        if name == "get_navigation":
-            mode = arguments.get("mode") if arguments.get("mode") in {"lightweight", "full"} else "lightweight"
-            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
-            navigation = self.navigation(state) if mode == "full" else self.lightweight_navigation(state)
-            targets = navigation.get("targets") if isinstance(navigation.get("targets"), list) else []
-            return {
-                "ok": True,
-                "mode": mode,
-                "navigation": {
-                    **navigation,
-                    "targets": targets[:limit],
-                    "targets_returned": min(len(targets), limit),
-                    "targets_total": len(targets),
-                },
-            }
-        if name == "get_dialogs":
-            limit = self.agent_tool_limit(arguments.get("limit"), 10, 100)
-            speaker = arguments.get("speaker")
-            speaker = str(speaker).strip() if speaker is not None else None
-            return {"ok": True, **self.dialogs_view(limit=limit, speaker=speaker or None)}
-        if name == "get_dialog_speakers":
-            limit = self.agent_tool_limit(arguments.get("limit"), 100, 300)
-            return {"ok": True, **self.dialog_speakers_view(limit=limit)}
-        if name == "get_inventory":
-            limit = self.agent_tool_limit(arguments.get("limit"), 100, 300)
-            return {"ok": True, **self.agent_inventory(state, limit=limit)}
-        if name == "get_events":
-            limit = self.agent_tool_limit(arguments.get("limit"), 10, 100)
-            return {"ok": True, "events": self.event_log[-limit:], "total": len(self.event_log)}
-        if name == "get_object_history":
-            try:
-                object_id = int(
-                    arguments.get("id")
-                    or arguments.get("object_id")
-                    or arguments.get("event_object_id")
-                    or 0
+    def compact_interaction_outcome(self, outcome: dict) -> dict:
+        """Project durable interaction evidence for the navigation hot path."""
+        compact = {
+            key: outcome.get(key)
+            for key in ("type", "time", "reason")
+            if outcome.get(key) is not None
+        }
+        changes = (
+            outcome.get("object_changes")
+            if isinstance(outcome.get("object_changes"), dict)
+            else {}
+        )
+        if not changes:
+            before = outcome.get("started_object")
+            after = outcome.get("finished_object")
+            if isinstance(before, dict) or isinstance(after, dict):
+                changes = self.object_snapshot_delta(
+                    before if isinstance(before, dict) else None,
+                    after if isinstance(after, dict) else None,
                 )
-            except (TypeError, ValueError):
-                object_id = 0
-            if object_id <= 0:
-                return {"ok": False, "error": "get_object_history requires a positive id, object_id, or event_object_id"}
-            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
-            return {"ok": True, **self.object_history_view(state, object_id, limit=limit)}
-        if name == "get_agent_history":
-            limit = self.agent_tool_limit(arguments.get("limit"), 5, 50)
-            history = self.agent_recent_decision_context(limit=limit)
-            return {"ok": True, "decisions": history, "total_returned": len(history)}
-        if name == "get_route":
+        changes = semantic_object_changes(changes)
+        if changes:
+            compact["object_changes"] = changes
+
+        inventory_changes = outcome.get("inventory_changes")
+        if isinstance(inventory_changes, list):
+            projected_inventory = [
+                {
+                    key: change.get(key)
+                    for key in ("item_id", "delta", "amount")
+                    if change.get(key) is not None
+                }
+                for change in inventory_changes
+                if isinstance(change, dict)
+            ]
+            projected_inventory = [change for change in projected_inventory if change]
+            if projected_inventory:
+                compact["inventory_changes"] = projected_inventory
+        if outcome.get("room_changed") is True:
+            compact["room_changed"] = True
+        return compact
+
+    AGENT_DIALOG_FIELDS = (
+        "time", "agent_turn", "logical_frame", "scene_id", "map_id",
+        "logical_room_id", "event_object_id", "message_ids", "speaker_hint", "text",
+    )
+
+    @classmethod
+    def project_agent_dialog(cls, entry: dict) -> list:
+        return [entry.get(key) for key in cls.AGENT_DIALOG_FIELDS]
+
+    def project_agent_event(self, event: dict) -> dict:
+        base_keys = (
+            "type", "time", "logical_frame", "scene_id", "map_id", "logical_room_id",
+        )
+        compact = {key: event.get(key) for key in base_keys if key in event}
+        if event.get("type") in {"interaction_effect", "interaction_no_effect"}:
+            for key in ("object_id", "target_id", "via_target_id", "action", "transition"):
+                if key in event:
+                    compact[key] = event.get(key)
+            compact.update(self.compact_interaction_outcome(event))
+            return compact
+        redundant = {
+            "frame", "raw_frame", "room_id", "logical_room_label", "room_key",
+            "region_key", "nav_room_id", "legacy_room_id", "legacy_nav_room_id",
+            *base_keys,
+        }
+        compact.update({key: value for key, value in event.items() if key not in redundant})
+        return compact
+
+    def project_agent_observations(self, result: dict) -> dict:
+        """Compact get_observations for model input without changing stored/API evidence."""
+        if result.get("ok") is not True:
+            return result
+        if result.get("kind") == "speakers":
+            return result
+        projected = {
+            key: result.get(key)
+            for key in ("ok", "kind", "total", "events_total")
+            if key in result
+        }
+        if isinstance(result.get("dialogs"), list):
+            projected["dialog_fields"] = list(self.AGENT_DIALOG_FIELDS)
+            projected["dialogs"] = [
+                self.project_agent_dialog(entry)
+                for entry in result["dialogs"]
+                if isinstance(entry, dict)
+            ]
+        if isinstance(result.get("events"), list):
+            projected["events"] = [
+                self.project_agent_event(entry)
+                for entry in result["events"]
+                if isinstance(entry, dict)
+            ]
+        return projected
+
+    def compact_agent_navigation(self, state: dict, limit: int = 20) -> dict:
+        navigation = self.navigation(state)
+        executable_statuses = {"reachable", "transition", "blocked_by_interactable"}
+
+        def target_sort_key(target: dict) -> tuple[int, bool, int, int]:
+            status = str(target.get("status") or "")
+            priority = str(target.get("agent_priority") or "normal")
+            if target.get("recovery_route") is True:
+                rank = 0
+            elif (
+                status == "reachable"
+                and target.get("kind") == "search"
+                and target.get("interaction_state") == "fresh"
+                and priority == "normal"
+            ):
+                rank = 1
+            elif status in executable_statuses and priority != "avoid_repeat":
+                rank = 2
+            elif status in executable_statuses:
+                rank = 3
+            elif status == "blocked_by_transition":
+                rank = 4
+            else:
+                rank = 5
             try:
-                target_id = int(arguments.get("id") or arguments.get("object_id") or 0)
+                steps = int(target.get("steps"))
+                missing_steps = False
+            except (TypeError, ValueError):
+                steps = 0
+                missing_steps = True
+            try:
+                target_id = int(target.get("id"))
+            except (TypeError, ValueError):
+                target_id = 0
+            return rank, missing_steps, steps, target_id
+
+        all_targets = [
+            target for target in (navigation.get("targets") or [])
+            if isinstance(target, dict)
+        ]
+        sorted_targets = sorted(all_targets, key=target_sort_key)
+        target_keys = (
+            "id", "kind", "status", "steps", "remaining_steps", "segment_steps",
+            "required_direction", "transition_candidate", "known_destination",
+            "to_room_id", "to_semantic_room", "confidence", "traversal_context",
+            "destination_exploration", "returns_to_recent_room", "agent_priority",
+            "interaction_state", "previously_tried", "previously_cleared",
+            "battle_reappearance_history",
+            "soft_avoid", "deprioritize_reason", "blocker",
+            "transition_key", "dialog_feedback_state", "recent_dialog_feedback",
+            "stale_dialog_feedback", "previous_interaction_outcome",
+            "interaction_feedback_state", "interaction_evidence",
+            "known_destination_room_id", "known_destination_observed_at",
+            "approach", "affordances", "entry_relation", "possible_entry_return",
+            "recovery_route", "candidate_return_room_id", "entry_evidence",
+            "known_destination_basis",
+        )
+        targets = []
+        for target in sorted_targets[:limit]:
+            compact = {key: target.get(key) for key in target_keys if target.get(key) is not None}
+            annotation = self.object_vision.annotation(state, int(target.get("id") or 0))
+            if annotation:
+                compact["appearance"] = {"authority": "visual_annotation", **annotation["report"]}
+            outcome = compact.get("previous_interaction_outcome")
+            if isinstance(outcome, dict):
+                compact["previous_interaction_outcome"] = self.compact_interaction_outcome(outcome)
+            if isinstance(compact.get("destination_exploration"), dict):
+                compact["destination_exploration"] = self.compact_room_exploration_summary(
+                    compact["destination_exploration"]
+                )
+            targets.append(compact)
+        return {
+            "status": navigation.get("status"),
+            "environment_key": navigation.get("environment_key"),
+            **({"entry_context": navigation.get("entry_context")} if navigation.get("entry_context") is not None else {}),
+            "targets": targets,
+            "targets_returned": len(targets),
+            "targets_total": len(all_targets),
+            "executable_target_ids": [
+                int(target.get("id"))
+                for target in sorted_targets
+                if target.get("status") in executable_statuses
+                and isinstance(target.get("id"), int)
+            ],
+            "fresh_search_target_ids": [
+                int(target.get("id"))
+                for target in sorted_targets
+                if target.get("status") == "reachable"
+                and target.get("kind") == "search"
+                and target.get("interaction_state") == "fresh"
+                and str(target.get("agent_priority") or "normal") == "normal"
+                and isinstance(target.get("id"), int)
+            ],
+        }
+
+    def observe_target(self, target_id: int, seconds: float) -> dict:
+        if type(target_id) is not int or target_id <= 0 or isinstance(seconds, bool):
+            return {"ok": False, "error": "invalid_observation_arguments"}
+        try:
+            seconds = float(seconds)
+        except (ValueError, TypeError):
+            return {"ok": False, "error": "invalid_observation_arguments"}
+        if not 0.4 <= seconds <= 5.0:
+            return {"ok": False, "error": "seconds_must_be_between_0.4_and_5"}
+        with self.navigation_action_lock:
+            start = self.navigation_snapshot()
+            identity = spatial_room_key(start)
+            obj = self.target_object(start, target_id)
+            if not obj or not obj.get("state"):
+                return {"ok": False, "error": "target_not_present"}
+            cursor = self.motion_history.serial
+            continuity = self.motion_history.view(start, target_id).get("continuity_token")
+            initial_player = start.get("party_position")
+            initial_trigger = (self.native_trigger_generation(start) or {}).get("generation")
+            began = time.monotonic()
+            end = start
+            status = "completed"
+            triggers = []
+            distances = []
+            while True:
+                obj = self.target_object(end, target_id)
+                if self.agent_runtime.cancel_event.is_set():
+                    status = "cancelled"
+                    break
+                if spatial_room_key(end) != identity:
+                    status = "room_or_instance_changed"
+                    break
+                if not obj or not obj.get("state"):
+                    status = "target_disappeared"
+                    break
+                if self.motion_history.view(end, target_id).get("position_is_current") is not True:
+                    status = "observation_unavailable"
+                    break
+                if self.motion_history.view(end, target_id).get("continuity_token") != continuity:
+                    status = "observation_interrupted"
+                    break
+                player = end.get("party_position") or {}
+                distances.append(((obj['x'] - player['x']) ** 2 + (obj['y'] - player['y']) ** 2) ** .5)
+                native = self.native_trigger_generation(end) or {}
+                if native.get("generation") != initial_trigger and native not in triggers:
+                    triggers.append(copy.deepcopy(native))
+                if player != initial_player:
+                    status = "player_moved"
+                    break
+                if (end.get("in_battle") or end.get("entering_scene")
+                        or any((end.get(k) or {}).get("active") for k in ("dialog", "choice", "shop"))
+                        or self.action_pending(end)):
+                    status = "control_interrupted"
+                    break
+                if time.monotonic() - began >= seconds:
+                    break
+                self.wait_navigation_update(timeout=max(0.0, min(.05, seconds - (time.monotonic() - began))))
+                end = self.navigation_snapshot()
+            motion = self.motion_history.view(end, target_id, since=cursor, limit=32)
+            summary = {
+                "action": "observe_target", "status": status, "requested_seconds": seconds,
+                "elapsed_seconds": round(time.monotonic() - began, 3), "buttons_sent": 0,
+                "player_start": initial_player, "player_end": end.get("party_position"),
+                "player_moved": end.get("party_position") != initial_player,
+                "target_start": {k: (self.target_object(start, target_id) or {}).get(k) for k in ("x", "y")},
+                "target_end": {k: (self.target_object(end, target_id) or {}).get(k) for k in ("x", "y")},
+                "trigger_events": triggers, "movement_rule": "not_inferred",
+                "distance_world_pixels": {"min": min(distances), "max": max(distances)} if distances else None,
+                **{k: motion.get(k) for k in ("moved", "current_status", "sample_frame", "observed_stationary_seconds")},
+            }
+            self.motion_history.record_window(start, target_id, summary)
+            return {"ok": status == "completed", "id": target_id, "observation": summary, "motion": motion}
+
+    def run_agent_tool(
+        self,
+        name: str,
+        arguments: dict | None = None,
+        state: dict | None = None,
+        *,
+        tool_cycle: dict | None = None,
+    ) -> dict:
+        arguments = arguments if isinstance(arguments, dict) else {}
+        state = state or self.read_live_state()
+        if name == "upsert_task":
+            room_review_error = self.task_room_memory_review_error(arguments, tool_cycle)
+            if room_review_error is not None:
+                return room_review_error
+            reconciliation_pending = self.agent_runtime.task_reconciliation_pending()
+            result = self.upsert_agent_task(arguments, tool_cycle, state)
+            if result.get("ok") and isinstance(tool_cycle, dict):
+                task_id = str((result.get("task") or {}).get("id") or "")
+                if tool_cycle.get("tasks_queried"):
+                    upserted = tool_cycle.setdefault("upserted_task_ids", [])
+                    if task_id and task_id not in upserted:
+                        upserted.append(task_id)
+                if tool_cycle.get("tasks_queried") and task_id in set(tool_cycle.get("required_task_ids") or []):
+                    reviewed = tool_cycle.setdefault("reviewed_task_ids", [])
+                    if task_id not in reviewed:
+                        reviewed.append(task_id)
+                if reconciliation_pending:
+                    reconciled = tool_cycle.setdefault("reconciled_task_ids", [])
+                    if task_id and task_id not in reconciled:
+                        reconciled.append(task_id)
+                audit = tool_cycle.get("task_query_audit")
+                if isinstance(audit, dict) and audit.get("complete") is True:
+                    # This cycle has already seen the complete ledger and receives
+                    # every successful write result, so keep the audited revision
+                    # current while it creates or updates multiple related tasks.
+                    with self.exploration_lock:
+                        audit["revision"] = self.task_ledger_revision(self.read_exploration())
+                self.maybe_clear_task_reconciliation(tool_cycle)
+            return result
+        if name == "get_tasks":
+            if isinstance(tool_cycle, dict):
+                tool_cycle["tasks_queried"] = True
+            include_closed = arguments.get("include_closed") is True
+            detail = arguments.get("detail", "full")
+            if detail not in {"summary", "full"}:
+                return {"ok": False, "error": "detail must be summary or full"}
+            try:
+                offset = int(arguments.get("offset") or 0)
+            except (TypeError, ValueError):
+                offset = -1
+            if offset < 0:
+                return {"ok": False, "error": "offset must be a non-negative integer"}
+            limit = self.agent_tool_limit(arguments.get("limit"), 20, 100)
+            page = self.task_ledger_page(
+                include_closed=include_closed,
+                detail=detail,
+                offset=offset,
+                limit=limit,
+            )
+            result = {
+                "ok": True,
+                "include_closed": include_closed,
+                "detail": detail,
+                **page,
+            }
+            qualifying = include_closed and detail == "summary"
+            if qualifying and isinstance(tool_cycle, dict):
+                audit = tool_cycle.get("task_query_audit")
+                if offset == 0:
+                    audit = {
+                        "revision": page["revision"],
+                        "next_offset": page["next_offset"],
+                        "complete": False,
+                        "active_task_ids": [],
+                    }
+                    tool_cycle["task_query_audit"] = audit
+                elif (
+                    not isinstance(audit, dict)
+                    or audit.get("complete") is True
+                    or audit.get("revision") != page["revision"]
+                    or audit.get("next_offset") != offset
+                ):
+                    tool_cycle["task_query_audit"] = None
+                    result["audit_valid"] = False
+                    result["audit_error"] = "pagination must restart at offset 0 after a revision or page-order change"
+                    return result
+                active_ids = audit.setdefault("active_task_ids", [])
+                active_ids.extend(
+                    str(task.get("id"))
+                    for task in page["tasks"]
+                    if task.get("status") == "active" and str(task.get("id") or "") not in active_ids
+                )
+                audit["next_offset"] = page["next_offset"]
+                if page["complete"]:
+                    token = hashlib.sha256(
+                        f"{tool_cycle.get('task_review_nonce')}:{page['revision']}".encode("utf-8")
+                    ).hexdigest()
+                    audit["complete"] = True
+                    audit["review_token"] = token
+                    result["review_token"] = token
+                    result["audit_valid"] = True
+                    self.maybe_clear_task_reconciliation(tool_cycle)
+            return result
+        if name == "review_task_inbox":
+            result = self.review_agent_task_inbox(arguments, state, tool_cycle)
+            if result.get("ok") and isinstance(tool_cycle, dict):
+                audit = tool_cycle.get("task_query_audit")
+                if isinstance(audit, dict) and audit.get("complete") is True:
+                    with self.exploration_lock:
+                        audit["revision"] = self.task_ledger_revision(self.read_exploration())
+            return result
+        if name == "observe_target":
+            return self.observe_target(arguments.get("id"), arguments.get("seconds", 2.0))
+        if name == "preview_item_placement":
+            return preview_placement(self, state, **arguments)
+        if name == "get_navigation":
+            limit = self.agent_tool_limit(arguments.get("limit"), 20, 40)
+            return {"ok": True, "navigation": self.compact_agent_navigation(state, limit)}
+        if name == "inspect_target":
+            latest = self.read_live_state()
+            if latest.get("game_instance_id") == state.get("game_instance_id") and latest.get("objects") is not None:
+                state = latest
+            try:
+                target_id = int(arguments.get("id") or 0)
             except (TypeError, ValueError):
                 target_id = 0
             if target_id <= 0:
-                return {"ok": False, "error": "get_route requires a positive id or object_id"}
-            avoid_transitions = arguments.get("avoid_transitions")
-            route = self.route_to_object(state, target_id, avoid_transitions=avoid_transitions is not False)
+                return {"ok": False, "error": "inspect_target requires a positive id"}
+            limit = self.agent_tool_limit(arguments.get("limit"), 8, 20)
+            history = self.object_history_view(state, target_id, limit=limit)
+            route = self.route_to_object(state, target_id, avoid_transitions=True)
             route.update(self.target_affordance(state, target_id))
-            return {"ok": True, "route": route}
-        if name == "get_room_exploration":
+            entry_target = next((
+                target for target in self.navigation(state).get("targets") or []
+                if isinstance(target, dict) and int(target.get("id") or 0) == target_id
+            ), None)
+            if isinstance(entry_target, dict):
+                for key in (
+                    "entry_relation", "possible_entry_return", "recovery_route",
+                    "agent_priority", "deprioritize_reason",
+                    "candidate_return_room_id", "entry_evidence",
+                ):
+                    if key in entry_target:
+                        route[key] = entry_target[key]
+            route_keys = (
+                "ok", "kind", "status", "steps", "remaining_steps", "segment_steps",
+                "required_direction", "move", "blocker", "agent_priority",
+                "interaction_state", "known_destination", "known_destination_room_id",
+                "battle_reappearance_history",
+                "known_destination_observed_at", "traversal_context",
+                "destination_exploration", "transition_key", "to_room_id",
+                "to_semantic_room", "confidence", "returns_to_recent_room",
+                "approach", "interaction_feedback_state", "interaction_evidence",
+                "entry_relation", "possible_entry_return", "recovery_route",
+                "candidate_return_room_id", "entry_evidence", "known_destination_basis",
+            )
+            compact_route = {key: route.get(key) for key in route_keys if key in route}
+            if isinstance(compact_route.get("destination_exploration"), dict):
+                compact_route["destination_exploration"] = self.compact_room_exploration_summary(
+                    compact_route["destination_exploration"]
+                )
+            return {
+                "ok": True,
+                "id": target_id,
+                "current": history.get("current"),
+                "history": (history.get("history") or [])[-limit:],
+                "history_total": history.get("total", len(history.get("history") or [])),
+                "interaction_summary": history.get("interaction_summary"),
+                "motion": self.motion_history.view(state, target_id, arguments.get("motion_offset"), arguments.get("motion_limit", 32)),
+                "visual": self.object_vision.view(state, target_id),
+                "route": compact_route,
+            }
+        if name == "get_observations":
+            kind = arguments.get("kind") if arguments.get("kind") in {"both", "dialogs", "events", "speakers"} else "both"
+            limit = self.agent_tool_limit(arguments.get("limit"), 10, 30)
+            if kind == "speakers":
+                return {"ok": True, "kind": kind, **self.dialog_speakers_view(limit=limit)}
+            speaker = arguments.get("speaker")
+            speaker = str(speaker).strip() if speaker is not None else None
+            result = {"ok": True, "kind": kind}
+            if kind in {"both", "dialogs"}:
+                result.update(self.dialogs_view(limit=limit, speaker=speaker or None))
+            if kind in {"both", "events"}:
+                result["events"] = self.event_log[-limit:]
+                result["events_total"] = len(self.event_log)
+            return result
+        if name == "get_inventory":
+            limit = self.agent_tool_limit(arguments.get("limit"), 40, 100)
+            result = self.agent_inventory(
+                state,
+                limit=limit,
+                item_id=arguments.get("item_id"),
+            )
+            if "ok" in result:
+                return result
+            return {"ok": True, **result}
+        if name == "get_shop":
+            return self.agent_shop(state, arguments.get("item_id"))
+        if name == "get_equipment":
+            result = self.agent_equipment(state, arguments.get("item_id"))
+            candidate = result.get("candidate") if isinstance(result.get("candidate"), dict) else {}
+            if result.get("ok") and result.get("source") != "shop" and isinstance(tool_cycle, dict) and candidate.get("item_id"):
+                tool_cycle["equipment_review_item_id"] = int(candidate["item_id"])
+            return result
+        if name == "upsert_room_memo":
+            return self.upsert_room_memo(arguments, state)
+        if name == "get_room_memory":
             room_id = arguments.get("room_id")
             room_id = str(room_id) if room_id is not None else None
-            return {"ok": True, "exploration": self.room_exploration_summary(room_id, state)}
-        if name == "get_known_transitions":
-            from_room_id = arguments.get("from_room_id")
-            from_room_id = str(from_room_id) if from_room_id is not None else None
-            return {"ok": True, **self.known_transitions_summary(from_room_id, state)}
+            result = self.agent_room_memory(room_id, state)
+            resolved_room_id = result.get("room_id")
+            if isinstance(tool_cycle, dict) and isinstance(resolved_room_id, str) and resolved_room_id:
+                queried = tool_cycle.setdefault("room_memory_queried_ids", [])
+                if resolved_room_id not in queried:
+                    queried.append(resolved_room_id)
+            return result
+        if name == "inspect_screen":
+            validated = self.screen_inspector.validate_arguments(arguments)
+            if isinstance(validated, dict):
+                return validated
+            if arguments.get("focus") == "object":
+                return self.object_vision.inspect(arguments, state, tool_cycle)
+            frame_info = self.live_info("frame")
+            if not frame_info.get("available"):
+                return {"ok": False, "error": {"code": "frame_unavailable", "message": "No live frame is available."}}
+            if frame_info.get("stale", True):
+                return {"ok": False, "error": {"code": "frame_stale", "message": "The live frame is stale."}}
+            latest = self.latest_frame_png()
+            if latest is None:
+                return {"ok": False, "error": {"code": "frame_unavailable", "message": "No live frame is available."}}
+            frame_sequence, png = latest
+            visual_hash = hashlib.sha256(png).hexdigest()
+            return self.screen_inspector.inspect(
+                arguments,
+                state,
+                frame_sequence,
+                png,
+                visual_hash,
+                tool_cycle,
+            )
+        if name == "get_tool_output":
+            return self.agent_runtime.get_tool_output(
+                arguments.get("output_ref"),
+                arguments.get("offset", 0),
+            )
         if name == "submit_decision":
             submission_error = self.agent_decision_submission_error(arguments)
             if submission_error is not None:
                 return submission_error
-            decision = self.normalize_agent_decision(arguments)
+            latest = self.read_live_state()
+            latest_battle = latest.get("battle") if isinstance(latest.get("battle"), dict) else None
+            if (
+                latest.get("in_battle") is True
+                and latest_battle is not None
+                and self.prebattle_interaction(latest) is None
+            ):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "battle_started",
+                        "message": "A formal battle started; ordinary decision gates are superseded.",
+                        "battle_generation": int(latest_battle.get("generation") or 0),
+                    },
+                }
+            action = arguments.get("action")
+            reconciliation = self.task_reconciliation_context(tool_cycle)
+            if (
+                reconciliation.get("pending")
+                and action in {"navigate", "move_to", "use_item"}
+                and (
+                    not reconciliation.get("audit_complete")
+                    or reconciliation.get("missing_active_task_ids")
+                )
+            ):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "task_reconciliation_required",
+                        "message": (
+                            "Restore/compaction reconciliation must finish before navigate, move_to or use_item. "
+                            "Read the complete closed-inclusive summary ledger, then confirm every active task "
+                            "with the returned review_token in a later model batch."
+                        ),
+                        "audit_complete": bool(reconciliation.get("audit_complete")),
+                        "missing_active_task_ids": reconciliation.get("missing_active_task_ids") or [],
+                    },
+                }
+            inbox = self.task_inbox_gate_context(
+                state,
+                action=action,
+                target_id=arguments.get("target_id"),
+            )
+            dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
+            choice = state.get("choice") if isinstance(state.get("choice"), dict) else {}
+            continuing_active_prompt = (
+                (action == "advance_dialog" and dialog.get("active"))
+                or (action == "select_choice" and choice.get("active"))
+            )
+            if inbox.get("review_required") and not continuing_active_prompt:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "task_inbox_review_required",
+                        "message": (
+                            "Pending dialog evidence must be resolved before crossing a transition or using an item. "
+                            "For task outcomes, call get_tasks and upsert_task with source_inbox_ids before "
+                            "review_task_inbox; otherwise use a structured no_follow_up reason."
+                        ),
+                        "required_batch_ids": [
+                            str(batch.get("id")) for batch in inbox.get("batches") or [] if batch.get("id")
+                        ],
+                        "pending_total": inbox.get("pending_total"),
+                        "reasons": inbox.get("reasons") or [],
+                    },
+                }
+            if action in {"navigate", "move_to", "use_item"} and isinstance(tool_cycle, dict):
+                required = set(tool_cycle.get("required_task_ids") or [])
+                reviewed = set(tool_cycle.get("reviewed_task_ids") or [])
+                missing = sorted(required - reviewed)
+                if required and (not tool_cycle.get("tasks_queried") or missing):
+                    return {
+                        "ok": False,
+                        "error": {
+                            "code": "task_review_required",
+                            "message": (
+                                "New plot evidence requires task review before navigate/use_item. "
+                                "Call get_tasks, then upsert_task once for every affected task; an unchanged upsert confirms continue."
+                            ),
+                            "required_task_ids": sorted(required),
+                            "missing_task_ids": missing,
+                            "get_tasks_called": bool(tool_cycle.get("tasks_queried")),
+                        },
+                    }
+            decision = self.normalize_agent_submission(arguments, state)
             self.attach_decision_context(state, decision)
             self.validate_agent_decision(decision)
+            validation = decision.get("validation") if isinstance(decision.get("validation"), dict) else {}
+            if (
+                reconciliation.get("pending")
+                and reconciliation.get("audit_complete")
+                and not reconciliation.get("missing_active_task_ids")
+                and validation.get("status") != "rejected"
+            ):
+                self.maybe_clear_task_reconciliation(tool_cycle)
+            reviewed_item_id = tool_cycle.get("equipment_review_item_id") if isinstance(tool_cycle, dict) else None
+            if (
+                reviewed_item_id
+                and validation.get("status") != "rejected"
+                and action != "equip_item"
+            ):
+                self.agent_runtime.resolve_equipment_review(reviewed_item_id)
             return {"ok": True, "decision": decision}
         raise RuntimeError(f"unsupported agent tool: {name}")
 
@@ -6449,14 +13719,7 @@ class DebugState:
 
     def compact_agent_tool_arguments(self, name: str, arguments: dict) -> dict:
         if name == "submit_decision":
-            action = arguments.get("recommended_action") if isinstance(arguments.get("recommended_action"), dict) else {}
-            return {
-                "recommended_intent": arguments.get("recommended_intent"),
-                "recommended_action": {
-                    "tool": action.get("tool"),
-                    "args": action.get("args") if isinstance(action.get("args"), dict) else {},
-                },
-            }
+            return {key: arguments.get(key) for key in ("action", "target_id", "item_id", "role_id", "target", "option_index", "reason") if key in arguments}
         payload = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
         if len(payload.encode("utf-8")) <= 800:
             return arguments
@@ -6490,6 +13753,7 @@ class DebugState:
         pos = state.get("party_position") or {}
         dialog = state.get("dialog") or {}
         latest = dialog.get("latest_event") or {}
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else None
         identity = self.room_identity(state)
         room = state.get("room") if isinstance(state.get("room"), dict) else {}
         room_payload = dict(room)
@@ -6541,12 +13805,20 @@ class DebugState:
                 "legacy_nav_room_id": identity.get("legacy_nav_room_id") if identity else None,
                 "in_main_game": state.get("in_main_game"),
                 "in_battle": state.get("in_battle"),
+                "cash": state.get("cash"),
+                "shop": state.get("shop") if isinstance(state.get("shop"), dict) else None,
                 "party_position": {"x": pos.get("x"), "y": pos.get("y")},
                 "party_direction": state.get("party_direction"),
                 "party": [
                     {
                         "role_id": role.get("role_id"),
                         "scene_sprite_id": role.get("scene_sprite_id"),
+                        "status_effects": role.get("status_effects") or [],
+                        "poisons": [
+                            {"name": poison.get("name")}
+                            for poison in role.get("poisons") or []
+                            if isinstance(poison, dict) and poison.get("name")
+                        ],
                     }
                     for role in state.get("party", [])
                     if isinstance(role, dict)
@@ -6559,13 +13831,14 @@ class DebugState:
                     "message_id": latest.get("message_id"),
                     "event_object_id": latest.get("event_object_id"),
                 },
+                "choice": choice,
             },
             "navigation": {
                 "status": navigation.get("status"),
                 "targets": targets,
             },
             "exploration": self.agent_exploration_summary(self.agent_current_exploration(state)),
-            "active_tasks": self.active_task_summary(),
+            **self.active_task_context(state),
             "dialogs": recent_dialogs,
             "dialog_feedback_by_object": {str(obj_id): entries for obj_id, entries in feedback_by_object.items()},
             "events": events[-10:],
@@ -6575,22 +13848,27 @@ class DebugState:
     def agent_system_prompt(self) -> str:
         return (
             "你是 PALPAL 的只读游戏自动化顾问。"
-            "返回一个符合此 schema 的 JSON object："
-            "{summary:string,recommended_intent:string,recommended_action:{tool:string,args:object,dry_run:true},"
-            "evidence:object,risk:string,alternatives:[{intent:string,action:{tool:string,args:object,dry_run:true},reason:string}]}。"
-            "允许的 intents：advance_dialog、inspect_target、enter_transition、use_inventory_item、wait_runtime。"
-            "建议中允许的 tools：no_op、press_buttons、advance_dialog、navigation_step、use_item。"
-            "当 dialog.active 为 true 时，使用 recommended_action {tool:'advance_dialog', args:{}, dry_run:true}。"
-            "当建议 inspect_target 或 enter_transition 时，把选中的对象 id 放入 evidence.target.id，"
-            "并使用 recommended_action {tool:'navigation_step', args:{id:<target id>}, dry_run:true}。"
-            "建议非战斗物品使用时，使用 intent use_inventory_item 和 action "
-            "{tool:'use_item', args:{item_id:<id>,role_id:<role id>}, dry_run:true}；"
-            "target_mode=implicit_event_context 的物品将 args 改为 "
-            "{item_id:<id>,target:'all'}。"
+            "必须调用 submit_decision 结束本轮，只提交最小动作和一句简短 reason。"
+            "dialog.active=true 时提交 {action:'advance_dialog',reason:'...'}。"
+            "choice.active=true 时必须阅读 prompt 和 options，并提交 "
+            "{action:'select_choice',option_index:<index>,reason:'...'}；不得依赖默认项。"
+            "检查对象或进入传送时提交 {action:'navigate',target_id:<id>,reason:'...'}；服务端根据目标推导语义。"
+            "选择 affordances 中的 item_approach 时提交 "
+            "{action:'navigate',target_id:<id>,item_id:<affordance.item_id>,reason:'...'}；"
+            "该动作只移动到满足物品脚本距离的站位并调整朝向，完成后仍需另行提交 use_item。"
+            "shop.active=true 时先调用 get_shop；mode=buy 时购买一件商品提交 "
+            "{action:'buy_item',item_id:<id>,reason:'...'}；mode=sell 时出售一件物品提交 "
+            "{action:'sell_item',item_id:<id>,reason:'...'}；退出提交 "
+            "{action:'leave_shop',reason:'...'}。商店选择必须由模型根据现金、持有物和装备比较显式决定。"
+            "使用普通队员物品时提交 {action:'use_item',item_id:<id>,role_id:<role>,reason:'...'}；"
+            "target_mode=implicit_event_context 时改为 {action:'use_item',item_id:<id>,target:'all',reason:'...'}。"
+            "equipment_review.pending=true 时先调用 get_equipment；综合角色定位、属性差值和特殊效果决定是否提交 "
+            "{action:'equip_item',item_id:<id>,role_id:<role>,reason:'...'}，不要仅按价格判断。"
             "注意 target:'all' 是兼容字段名：对 target_mode=implicit_event_context 的物品，SDLPAL 实际以 0xFFFF "
-            "运行使用脚本并沿用最近事件对象，不一定表示对全体队员生效。use_item 不接受 target_object_id。"
-            "没有明确安全目标时，建议 wait_runtime 搭配 no_op。"
-            "不要调用工具，不要声称动作已经执行，也不要包含密钥或 prompts。"
+            "运行使用脚本并沿用最近事件对象，不一定表示对全体队员生效。"
+            "不要提交 intent、recommended_action、evidence、risk、alternatives、dry_run 或原始按键。"
+            "不要用固定价格阈值、物品名称规则或规则后端替代模型的购买、出售或退出决策。"
+            "不要执行游戏控制，不要声称动作已经执行，也不要包含密钥或 prompts。"
         )
 
     def agent_policy_prompt(self) -> str:
@@ -6602,32 +13880,107 @@ class DebugState:
             "最近对话历史是角色/对象时间线上下文；重复反馈只限定在逻辑房间和目标对象范围内。"
             "recent_dialog_feedback 表示该对象在此逻辑房间产生过对话；除非状态变化或其他具体进展使重试有意义，否则不要再次建议与同一目标交互。"
             "比较目标时，分别报告 recent_dialog、soft_avoid、previously_cleared 和 previously_tried。"
+            "interaction_evidence 将无效果尝试按可观察上下文分类；same_context_no_effect_count 是当前上下文中的强负面证据，"
+            "stale_context_no_effect_count 只表示旧上下文中的失败。不要因为 stale_no_effect 自动重试，也不要把一次旧失败当成永久事实；"
+            "结合 no_effect_count、failed_context_count、context_changes_since_latest、active task 和路线价值判断。"
+            "同一上下文连续失败或多个不同上下文均失败时，应比单次久远失败更谨慎。"
             "将 agent_priority、interaction_state、recent_dialog_feedback、对象历史、目的地探索状态、路线成本和最近决策作为决策信号；不要把任何单一信号变成无条件优先规则。"
             "距离是成本信号，不是优先级规则；当近处目标重复陈旧或无效果行为时，它仍可能比更远目标或传送更差。"
-            "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 get_object_history。"
+            "在没有明确剧情时限、直接关键目标、战斗或资源风险，且不会明显绕路时，对 fresh、reachable 的非传送 search 目标给予温和正向偏好。"
+            "同样可以探索尚未尝试、fresh、reachable 且 transition_candidate=false 的 touch 目标，但优先处理仍有价值的 search，再一次只尝试一个 touch。"
+            "准备离开当前房间或进入传送前，要认真比较这类目标；路线成本较低的目标可以先检查，每次交互后都根据新状态重新评估。"
+            "这不要求扫空房间，也不设置固定步数或搜刮数量；只有后续目标仍然顺路且有探索价值时才继续。"
+            "active 任务本身不等于紧急；明确的剧情时限、直接可执行的关键目标、明显绕路或风险可以压过顺路搜索。"
+            "search 和 touch 只是引擎交互方式，不证明目标是物资、宝箱或 NPC；不要据此编造标签或预期掉落，尝试 touch 属于探索而不是已确认的搜刮。"
+            "touch 可能触发战斗、控制接管或此前未知的房间切换；发生任一情况时停止当前房间的连续探索并重新决策。"
+            "reappeared_battle_trigger 表示同一逻辑房间、对象 ID 和 trigger_script 已确认在战斗胜利后消失并再次可交互。"
+            "不得因为目标刷新为可交互、距离近或需要清点房间而主动选择它；只有明确战斗任务、它是唯一有意义的推进路径，或确实无法绕行时才允许再次接触。"
+            "transition_candidate=true 的 touch 应作为有意选择的离房路线，不要为了遍历 touch 而提前进入。"
+            "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 inspect_target。"
+            "运行时会在首次进入本会话尚未成功查看的新逻辑房间时自动提供一次 room_layout 视觉注释。"
+            "优先使用 get_navigation、get_room_memory、inspect_target 等结构化证据；如果自动视觉注释和这些证据仍不足以解释布局、出口、UI 文本或疑似通道，可以按需再次调用 inspect_screen。"
+            "inspect_screen 只是低权威 visual_annotation，即使 confidence=high 也不得直接写 Room Memo、创建或确认 transition、修改 task/dialog/observation 事实，"
+            "目标外观不明时可调用 inspect_screen(focus=object,target_id=目标编号)，无需靠近或成功交互；"
+            "仅系统绑定的对象允许按编号描述，不得猜未标记对象编号。外观可作为行动假设，不能据此确认剧情身份或用途；"
+            "historical 表示曾经看见，不代表当前位置或状态。不要仅为识别外观反复追逐。"
+            "导航 completion=trigger_completed 表示原生已完成目标触发，不能当作仅到达未互动；也不等于任务成功或身份确认。"
+            "也不得推断 event object ID、speaker identity 或脚本语义。疑似密道必须通过真实 native action、房间变化和现有 transition observation/native trigger 才能确认。"
             "若当前目标 transition_candidate=true、最近对象历史显示它由非传送目标变为传送目标、且 known_destination=false，"
             "应将它视为刚解锁的探索路线并优先建议 enter_transition；解锁动作本身产生的 previously_tried 或 avoid_repeat 不应降低它的优先级。"
             "一旦该传送已有 known destination，则停止使用刚解锁优先级，恢复目的地探索价值、任务和回退风险的正常比较。"
-            "当最近建议看起来反复访问同一房间、目标或传送循环时，使用 get_agent_history。"
-            "传送目标包含 transition_key、to_semantic_room、confidence、destination_priority、destination_exploration 和 returns_to_recent_room。"
-            "任务是 agent 从对话和事件推断的记忆，不是引擎事实。发现、调整、完成或作废任务时调用 upsert_task；不要自动关闭或过期任务。"
+            "当最近建议看起来反复访问同一房间、目标或传送循环时，依据持久 session 中的最近决策和 get_room_memory 判断。"
+            "room_entry_context 表示刚完成的有向跨房传送及其落点；logical_room_id 相同就是回到同一房间，region_key 单独变化不代表进入新房间或取得进展。"
+            "possible_entry_return=true 的传送紧邻新房间落点或已确认返回来源房间；存在其他可执行目标时先探索其他目标。"
+            "recovery_pending 表示发生了未预期的 A→B→A 即时折返；优先选择 recovery_route，不要改走无关目标。"
+            "传送目标包含稳定 transition_key、to_semantic_room、confidence、destination_exploration、traversal_context 和 returns_to_recent_room。"
+            "frontier>0 只提供温和的正向探索价值；frontier=0 仅表示当前没有未走邻格，不能据此声称目的地是死路、噪音或剧情已经耗尽。"
+            "任务是 agent 从对话和事件推断的记忆，不是引擎事实；结构化任务账本是任务状态的唯一权威来源，压缩摘要不是。"
+            "自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
+            "任何尚未解决、将影响未来行动的委托、线索或自发调查目标都必须成为独立 task，不要求 NPC 明说请去做；普通且不会影响后续行动的探索不必为每个对象创建 task。"
+            "room_memo 只是可能过期的地点语义注释和普通 companion 数据，不是引擎事实，也不得覆盖 native transition、房间范围对话或 human-confirmed semantic annotation。"
+            "第一次获得稳定、高置信的地点身份或用途时立即用 upsert_room_memo 写入短 memo；新证据细化或否定地点身份时整体更新或清除。"
+            "memo 只记录地点语义、稳定功能和重要人物关系；不要重复坐标、传送列表、拾取记录或结构化探索，行动相关线索必须保留为独立 task。"
+            "根据地点语义比较候选入口，或准备给 task 新增、改变非空 room_id 时，必须先查询每个候选房间的 get_room_memory；证据不足则保持 task 未绑定房间。"
+            "不要用 memo 代替 task inbox 审查或 task reconciliation。"
+            "发现、调整或改变任务状态时调用 upsert_task。active 表示当前有可验证执行路径；dormant 表示任务未解决但当前没有可验证路径，后续相关证据可恢复 active；"
+            "completed 只用于明确成功，abandoned 只用于明确取消、不可逆失败或错过明确期限。不得因时间久或没有新证据自动关闭或反复确认任务。"
+            "任何状态变化必须提供非空 status_reason 和来自当前 dialog/event/transition/task-inbox 历史的 status_evidence。创建未知 id 或无 id 任务前，必须在前一模型批次完整分页读取 include_closed=true、detail=summary 的账本，"
+            "并使用最终页 review_token；只查 active、漏页、账本 revision 变化或同批并行 get_tasks+upsert_task 都不能创建。"
+            "若审计发现语义等价的 completed/abandoned 任务，不得创建新 id；确有新证据要求重开则更新原 id，只有不同剧情阶段才创建后继任务并在 rationale 注明前序 id。"
+            "task_inbox 是尚未归档为任务结论的持久对话证据，不等于任务；每个说话轮次独立归档。应及时审查 pending 证据；普通同房间探索可以继续，"
+            "但进入 transition_candidate 或 use_item 前必须完成所有 pending 证据。"
+            "明确召唤即使准备立刻执行，也必须先建立可恢复的短期 active task；未知目标对象时可暂不填 object_id，实际交互确认后再绑定并完成。"
+            "调用 review_task_inbox 时，未完成的召唤、委托、约定或阶段目标使用 new_task；已有任务进展使用 task_updated；"
+            "只有闲聊、重复证据或已有可观察完成效果时才用 no_follow_up，并选择结构化 reason_code。"
+            "任务类结论必须先 get_tasks，再用 source_inbox_ids 成功 upsert 对应任务后归档；禁止写‘下轮另建’并提前结案。"
+            "task_reconciliation.pending=true 表示 checkpoint 恢复、上下文压缩或旧状态升级后必须重建全账本可见性：完整读取 closed-inclusive summary 索引，"
+            "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。全部 active 任务完成 upsert 后立即解除对账；"
+            "完成前不可 navigate、use_item 或创建任务，对话可继续。"
+            "task_review.required=true 表示新剧情证据晚于相关 active task 的上次审计。对话仍可继续 advance_dialog；对话结束后若要 navigate 或 use_item，"
+            "必须先调用 get_tasks，再只对 task_review.tasks 中真正受影响的 id 调用 upsert_task，选择确认继续、改写、dormant、completed 或 abandoned。无字段变化的 upsert_task 只刷新 review snapshot，不得改写 rationale。"
+            "现金、背包与角色 sprite 变化只影响 review_watch 显式订阅对应 cash、item id 或 role id 的任务；不得从任务文字或物品名称猜测关联。"
+            "新证据改变对象身份或任务阶段时，应关闭或改写旧 task，并按需创建后继 task；把新对话与稳定状态变化写入 rationale，但不要把 sprite 数字硬编码成剧情语义。"
+            "背包里没有对应道具，不能否定由相邻对话和稳定 scene_sprite_id 净变化共同证明的剧情携带状态；短暂 sprite 动画若恢复原值则不算阶段变化。"
             "只有 active 任务明确关联到当前可执行对象、当前可达传送，或可达且已知通往任务 room_id 的传送时，才可压过探索策略；不可执行任务不得阻塞探索。"
-            "没有可执行 active 任务时，非回退的 unknown 目的地具有最高探索价值，其后是 unexplored、partial、complete；unknown 不代表独立风险。"
-            "比较传送时，要在这些目的地探索价值、循环风险、当前房间剩余有用目标之间权衡。"
+            "若 active 任务绑定 goal room_id，但当前没有可达且已确认直达该房间的入口，先调用 get_room_memory(goal_room_id)。"
+            "目标房间的有向出边只能说明它曾到达哪些相邻房间，是调查替代入口的空间线索；绝不能据此声称反向边存在或可走。"
+            "可沿当前房间已经确认的正向 transition 前往这些相关邻接房间，再检查其中 fresh、reachable 的 search 或 touch 目标；"
+            "只有实际 native trigger 和稳定落点证据才能学习真正的反向有向边。不要为此执行自动多跳 BFS，也不要把规则后端改造成剧情寻路器。"
+            "比较传送时依次考虑：显式 task 绑定、未知目的地、当前 active task 结构下尚未穿越、非近期回退、目的地 frontier>0，"
+            "然后比较当前上下文次数、总穿越次数、距离和对象 ID。无 active task 时按总次数与近期回退比较；legacy_observed 不要求为了补字段重走旧路线。"
+            "未知目的地不代表独立风险，也不会自动压过路线成本较低的 fresh、reachable 非传送 search。"
+            "当前任务上下文由 active task 的 id、描述、优先级及对象/transition/房间绑定构成；rationale、审计时间、重复确认、no_follow_up 和重复台词不重开路线评估。"
             "有人类确认的 to_semantic_room 时，优先用它理解房间连接；不要只根据 object id 推断目的地。"
             "将 returns_to_recent_room 和 agent_priority avoid_backtrack 视为回退风险信号；如果选择它们，需要明确说明理由。"
             "对话反馈可以创建或改变目标，但要从提供的对话和状态推断目标，不要匹配固定剧情短语。"
-            "如果 dialog.active 为 true，优先选择 advance_dialog。如果 runtime stale、waiting 或 parse-error，建议 wait_runtime。"
+            "如果 dialog.active 为 true，优先选择 advance_dialog。runtime stale、waiting 或 parse-error 由运行器内部等待，不是可提交动作。"
+            "如果 choice.active=true，必须根据问题与选项文本显式选择 select_choice；此时不要推进对话或导航。"
+            "如果 shop.active=true，先用 get_shop 查看商品；装备类候选用 get_shop(item_id) 查看 equipment_comparisons，"
+            "也可用 get_equipment(item_id) 查询当前在售装备的 comparisons；查询失败不代表没有收益或没有同类装备可比。"
+            "mode=buy 时综合现金、已有数量、角色定位、属性差值、特殊效果和任务上下文，显式选择买一件或退出；"
+            "mode=sell 时只出售 can_sell=true 且明确值得放弃的一件物品，否则退出。"
+            "不确定物品用途或收益时可以退出，但不得把价格或名称当作固定购买或出售规则。"
             "只有在主游戏、非战斗、非对话状态下才可建议 use_inventory_item。先调用 get_inventory，确认物品 usable、"
             "available_amount 大于零，并严格匹配 apply_to_all 的目标形式。可结合物品名称、队伍 HP/MP、任务与剧情上下文"
-            "保守推断用途；用途或收益证据不足时不要仅因 usable=true 就建议使用，并在 risk 中说明误用或浪费风险。"
+            "保守推断用途；用途或收益证据不足时不要仅因 usable=true 就建议使用，并在 reason 中说明关键权衡。"
             "当 NPC 明确索要某物、背包存在匹配的 target_mode=implicit_event_context 物品、且刚与该 NPC 交互并结束对话时，"
-            "应优先考虑 use_item {item_id:<id>,target:'all'}；这会让 0xFFFF 使用脚本沿用最近 NPC/事件对象上下文。"
+            "应优先考虑 submit_decision {action:'use_item',item_id:<id>,target:'all',reason:'...'}；这会让 0xFFFF 使用脚本沿用最近 NPC/事件对象上下文。"
             "不要因 target_object_id 被拒绝就推断剧情物品只能靠重复 NPC 交互自动使用。进程重启或载入存档不会恢复最近事件对象，"
             "因此应先重新与目标 NPC 交互，再使用这种物品。普通全局效果脚本可能忽略事件上下文，不要把所有 apply_to_all 物品都视为剧情物品。"
-            "对于任何明确的 search/touch 目标，使用 inspect_target 或 enter_transition，并搭配 navigation_step(id)。"
-            "不要建议无目标的房间探索；如果没有明确目标，建议 wait_runtime 搭配 no_op。"
-            "使用 get_navigation(full) 比较传送目的地；只对你认真考虑的一两个目标调用 get_route。"
+            "对于任何明确的 search/touch 或 transition 目标，提交 navigate 和 target_id；"
+            "空间任务可提交 move_to(x,y,face)：精确站位且不自动调查，到达须同时满足位置和朝向。"
+            "放置物品前调用 preview_item_placement 检查实际落点与站位；合法只代表可放置，不代表任务有效。"
+            "inspect_target.motion 是已观察移动轨迹，默认最近一段，可用 motion_offset 从 0 分页读取；不代表未来路线。"
+            "motion.moved 仅指历史移动；current_status 和 observed_stationary_seconds 描述当前观测，unknown 不代表停住。"
+            "observe_target 可在不发送按键的情况下进行短时定点观察；observation_windows 是有限历史样本，不证明对象永远静止或移动的必然原因。"
+            "位置只对 sample_frame 有效；position_is_stationary=false 时不得把坐标当成已确认停留点，执行前可重新查询。"
+            "latest_action_association 仅区分原生确认触发与动作期间观测，不提供移动规则或未来路线。"
+            "只有 get_navigation 中 status=reachable、transition 或 blocked_by_interactable 的目标可提交 navigate；"
+            "blocked_by_transition 和 unreachable_static 不能直接提交。targets_returned < targets_total 时可用 limit=40 获取更多候选详情。"
+            "使用 get_tool_output 时必须沿 next_offset 连续读取到 complete=true；不能根据部分分页输出声称没有其他候选或证据。"
+            "若选择同一目标上的 item_approach affordance，必须同时提交该 affordance 的 item_id。"
+            "稳定且可操作时必须选择真实动作；没有明确目标时应根据当前可达对象或传送进行探索和试错。"
+            "使用 get_navigation 比较传送目的地；只对你认真考虑的一两个目标调用 inspect_target。"
             "解释所选目标背后的权衡，包括相关的陈旧反馈、重复/无效果交互风险、离开房间风险和回退风险。"
         )
 
@@ -6658,281 +14011,285 @@ class DebugState:
         )
         return {key: usage[key] for key in keys if key in usage}
 
-    def normalize_agent_decision(self, raw: dict) -> dict:
-        allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"}
-        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"}
-
-        def positive_int(value) -> int:
-            try:
-                parsed = int(value or 0)
-            except (TypeError, ValueError):
-                return 0
-            return parsed if parsed > 0 else 0
-
-        def target_id_from_mapping(payload: dict) -> int:
-            for key in ("target_id", "object_id"):
-                target_id = positive_int(payload.get(key))
-                if target_id > 0:
-                    return target_id
-            target = payload.get("target")
-            if isinstance(target, dict):
-                target_id = positive_int(target.get("id"))
-                if target_id > 0:
-                    return target_id
-            return 0
-
-        def target_id_from_action(action: dict) -> int:
-            if not isinstance(action, dict):
-                return 0
-            args = action.get("args") if isinstance(action.get("args"), dict) else {}
-            return positive_int(args.get("id"))
-
-        def explicit_target_id(action: dict, evidence: dict, args: dict) -> int:
-            return (
-                target_id_from_mapping(evidence)
-                or target_id_from_action(action)
-                or positive_int(args.get("id"))
+    def normalize_agent_submission(self, raw: dict, state: dict) -> dict:
+        """Expand the model's minimal action into the stable internal decision shape."""
+        action = raw["action"]
+        reason = str(raw["reason"]).strip()
+        evidence: dict = {"submitted_action": action}
+        risk = "Server validation will run again immediately before execution."
+        if action == "advance_dialog":
+            intent, preview = "advance_dialog", self.action_preview("advance_dialog", self.normalize_dialog_advance_args({}))
+            risk = "Dialogue advancement uses the server safety limits and stable-state observer."
+        elif action == "select_choice":
+            option_index = int(raw["option_index"])
+            choice = state.get("choice") if isinstance(state.get("choice"), dict) else {}
+            option = next(
+                (item for item in choice.get("options") or [] if int(item.get("index", -1)) == option_index),
+                None,
             )
-
-        def normalize_recommended_action(
-            intent: str,
-            action: dict,
-            evidence: dict,
-        ) -> tuple[str, str, dict, list[str]]:
-            warnings: list[str] = []
-            if intent not in allowed_intents:
-                intent = "wait_runtime"
-                warnings.append("normalized unknown intent to wait_runtime")
-            tool = action.get("tool") if isinstance(action.get("tool"), str) else "no_op"
-            raw_args = action.get("args") if isinstance(action.get("args"), dict) else {}
-            args = self.normalize_action_args(tool, raw_args)
-
-            if intent in {"inspect_target", "enter_transition"}:
-                target_id = explicit_target_id(action, evidence, args)
-                if target_id > 0:
-                    if tool != "navigation_step" or args.get("id") != target_id:
-                        warnings.append(f"normalized {intent} action to navigation_step")
-                    return intent, "navigation_step", {"id": target_id}, warnings
-                warnings.append(f"normalized {intent} action to wait_runtime")
-                return "wait_runtime", "no_op", {"reason": f"missing target id for {intent}"}, warnings
-            if intent == "advance_dialog":
-                if tool != "advance_dialog":
-                    warnings.append("normalized advance_dialog action to advance_dialog")
-                return intent, "advance_dialog", self.normalize_dialog_advance_args(raw_args), warnings
-            if intent == "use_inventory_item":
-                if tool != "use_item":
-                    warnings.append("normalized use_inventory_item action to wait_runtime")
-                    return "wait_runtime", "no_op", {"reason": "use_item_action_required"}, warnings
-                return intent, tool, args, warnings
-            if tool not in allowed_tools:
-                warnings.append("normalized unknown action tool to no_op")
-                return "wait_runtime", "no_op", {"reason": "unsupported_tool", "tool": str(tool or "")}, warnings
-            if intent == "wait_runtime" and tool != "no_op":
-                warnings.append("normalized wait_runtime action to no_op")
-                return intent, "no_op", {"reason": "wait_runtime"}, warnings
-            return intent, tool, args, warnings
-
-        decision = {
-            "summary": str(raw.get("summary") or "No summary returned."),
-            "recommended_intent": str(raw.get("recommended_intent") or "wait_runtime"),
-            "recommended_action": raw.get("recommended_action") if isinstance(raw.get("recommended_action"), dict) else {},
-            "evidence": raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {},
-            "risk": str(raw.get("risk") or "No risk assessment returned."),
-            "alternatives": raw.get("alternatives") if isinstance(raw.get("alternatives"), list) else [],
+            intent = "select_choice"
+            preview = self.action_preview("choice_select", {
+                "generation": int(choice.get("generation") or 0),
+                "option_index": option_index,
+            })
+            evidence["choice"] = {"prompt": choice.get("prompt"), "option": option}
+            risk = "The active choice generation and selected option will be revalidated before confirmation."
+        elif action == "move_to":
+            args = {key: raw[key] for key in ("x", "y", "face") if key in raw}
+            intent, preview = "position_player", self.action_preview("move_to", args)
+        elif action == "navigate":
+            target_id = int(raw["target_id"])
+            target = next((item for item in state.get("objects") or [] if str(item.get("id")) == str(target_id)), None)
+            is_transition = bool(target and transition_candidate(target))
+            navigation_target = next(
+                (
+                    item for item in self.navigation(state).get("targets") or []
+                    if int(item.get("id") or 0) == target_id
+                ),
+                {},
+            )
+            approach = navigation_target.get("approach") if isinstance(navigation_target.get("approach"), dict) else {}
+            affordances = navigation_target.get("affordances") if isinstance(navigation_target.get("affordances"), list) else []
+            args = {"id": target_id}
+            approach_item_id = int(raw.get("item_id") or 0)
+            if approach_item_id > 0:
+                args["item_id"] = approach_item_id
+            matching_affordance = next(
+                (
+                    entry for entry in affordances
+                    if isinstance(entry, dict) and int(entry.get("item_id") or 0) == approach_item_id
+                ),
+                None,
+            )
+            intent = "approach_target" if matching_affordance is not None else "enter_transition" if is_transition else "inspect_target"
+            preview = self.action_preview("navigation_step", args)
+            evidence["target"] = {
+                "id": target_id,
+                "transition_candidate": is_transition,
+                "kind": navigation_target.get("kind"),
+            }
+            if approach:
+                evidence["approach"] = approach
+            if affordances:
+                evidence["affordances"] = affordances
+            risk = "May leave the current room." if is_transition else "The target and route will be revalidated before movement."
+        elif action == "use_item":
+            args = {"item_id": int(raw["item_id"])}
+            if "role_id" in raw:
+                args["role_id"] = int(raw["role_id"])
+            else:
+                args["target"] = "all"
+            intent, preview = "use_inventory_item", self.action_preview("use_item", args)
+            evidence["item_id"] = args["item_id"]
+            risk = "Item availability, target mode, and consumption risk will be validated against the latest inventory."
+        elif action == "buy_item":
+            item_id = int(raw["item_id"])
+            args = {"item_id": item_id}
+            shop = self.agent_shop(state, item_id)
+            intent, preview = "purchase_shop_item", self.action_preview("shop_buy", args)
+            evidence["item_id"] = item_id
+            evidence["shop_item"] = shop.get("item")
+            evidence["equipment_comparisons"] = shop.get("equipment_comparisons")
+            risk = "The active store, offered item, price, and cash will be revalidated before buying exactly one item."
+        elif action == "sell_item":
+            item_id = int(raw["item_id"])
+            args = {"item_id": item_id}
+            shop = self.agent_shop(state, item_id)
+            intent, preview = "sell_shop_item", self.action_preview("shop_sell", args)
+            evidence["item_id"] = item_id
+            evidence["shop_item"] = shop.get("item")
+            risk = "The active sell menu, available quantity, sellable flag, and price will be revalidated before selling exactly one item."
+        elif action == "leave_shop":
+            intent, preview = "leave_shop", self.action_preview("shop_leave", {})
+            risk = "The active shop menu will be closed without buying or selling an item."
+        else:
+            item_id = int(raw["item_id"])
+            role_id = int(raw["role_id"])
+            args = {"item_id": item_id, "role_id": role_id}
+            equipment = self.agent_equipment(state, item_id)
+            comparison = next(
+                (
+                    entry for entry in equipment.get("comparisons") or []
+                    if isinstance(entry, dict) and int(entry.get("role_id", -1)) == role_id
+                ),
+                None,
+            )
+            current_item = comparison.get("current_item") if isinstance(comparison, dict) else None
+            if isinstance(current_item, dict):
+                args["expected_slot_item_id"] = int(current_item.get("item_id") or 0)
+            intent, preview = "equip_inventory_item", self.action_preview("equip_item", args)
+            evidence["item_id"] = item_id
+            evidence["role_id"] = role_id
+            evidence["equipment_comparison"] = comparison
+            risk = "Inventory, role eligibility, and the compared equipment slot will be revalidated immediately before equipping."
+        return {
+            "summary": reason,
+            "recommended_intent": intent,
+            "recommended_action": preview,
+            "evidence": evidence,
+            "risk": risk,
+            "alternatives": [],
         }
-        evidence = decision["evidence"]
-        intent, tool, args, warnings = normalize_recommended_action(
-            decision["recommended_intent"],
-            decision["recommended_action"],
-            evidence,
-        )
-        decision["recommended_intent"] = intent
-        if warnings:
-            evidence["normalization_warnings"] = warnings
-        decision["recommended_action"] = self.action_preview(tool, args)
-
-        alternatives = []
-        for alternative in decision["alternatives"][:3]:
-            if not isinstance(alternative, dict):
-                continue
-            alt_intent = str(alternative.get("intent") or "wait_runtime")
-            alt_action = alternative.get("action") if isinstance(alternative.get("action"), dict) else {}
-            alt_evidence = alternative.get("evidence") if isinstance(alternative.get("evidence"), dict) else {}
-            reason = str(alternative.get("reason") or "")
-            alt_intent, alt_tool, alt_args, alt_warnings = normalize_recommended_action(
-                alt_intent,
-                alt_action,
-                alt_evidence,
-            )
-            if alt_warnings:
-                reason = (reason + " " if reason else "") + f"Normalization: {'; '.join(alt_warnings)}."
-            alternatives.append(
-                {
-                    "intent": alt_intent,
-                    "action": self.action_preview(alt_tool, alt_args),
-                    "reason": reason,
-                }
-            )
-        decision["alternatives"] = alternatives
-        return decision
 
     def agent_decision_submission_error(self, raw: dict) -> dict | None:
-        """Return a repairable contract error for an LLM decision submission."""
-        allowed_intents = {"advance_dialog", "inspect_target", "enter_transition", "use_inventory_item", "wait_runtime"}
-        allowed_tools = {"no_op", "press_buttons", "advance_dialog", "navigation_step", "use_item"}
+        """Return a repairable error for the minimal submit_decision contract."""
         issues: list[dict] = []
-        intent = raw.get("recommended_intent")
-        action = raw.get("recommended_action")
-        evidence = raw.get("evidence")
+        allowed_keys = {"action", "target_id", "item_id", "role_id", "target", "option_index", "reason", "x", "y", "face"}
+        for key in raw:
+            if key not in allowed_keys:
+                issues.append({"field": key, "code": "unsupported_field", "message": f"{key} is not part of the minimal decision contract"})
+        action = raw.get("action")
+        allowed_actions = {
+            "advance_dialog", "select_choice", "navigate", "move_to", "use_item", "equip_item",
+            "buy_item", "sell_item", "leave_shop",
+        }
+        if action not in allowed_actions:
+            issues.append({
+                "field": "action",
+                "code": "invalid_action",
+                "message": (
+                    "action must be advance_dialog, select_choice, navigate, move_to, use_item, "
+                    "equip_item, buy_item, sell_item, or leave_shop"
+                ),
+            })
+        if not isinstance(raw.get("reason"), str) or not raw.get("reason", "").strip():
+            issues.append({"field": "reason", "code": "invalid_reason", "message": "reason must be a non-empty string"})
+        elif len(raw["reason"]) > 300:
+            issues.append({"field": "reason", "code": "reason_too_long", "message": "reason must be at most 300 characters"})
 
-        if intent not in allowed_intents:
-            issues.append({
-                "field": "recommended_intent",
-                "code": "invalid_intent",
-                "message": "recommended_intent must be one of advance_dialog, inspect_target, enter_transition, use_inventory_item, wait_runtime",
-            })
-        if not isinstance(action, dict):
-            issues.append({
-                "field": "recommended_action",
-                "code": "missing_action",
-                "message": "recommended_action must be an object with tool and args",
-            })
-            action = {}
-        if not isinstance(raw.get("summary"), str):
-            issues.append({"field": "summary", "code": "invalid_summary", "message": "summary must be a string"})
-        if not isinstance(evidence, dict):
-            issues.append({"field": "evidence", "code": "invalid_evidence", "message": "evidence must be an object"})
-            evidence = {}
-        if not isinstance(raw.get("risk"), str):
-            issues.append({"field": "risk", "code": "invalid_risk", "message": "risk must be a string"})
-        if not isinstance(raw.get("alternatives"), list):
-            issues.append({"field": "alternatives", "code": "invalid_alternatives", "message": "alternatives must be an array"})
-
-        tool = action.get("tool")
-        args = action.get("args")
-        if tool not in allowed_tools:
-            issues.append({
-                "field": "recommended_action.tool",
-                "code": "invalid_tool",
-                "message": "recommended_action.tool must be one of no_op, press_buttons, advance_dialog, navigation_step, use_item",
-            })
-        if not isinstance(args, dict):
-            issues.append({
-                "field": "recommended_action.args",
-                "code": "invalid_args",
-                "message": "recommended_action.args must be an object",
-            })
-            args = {}
-
-        if intent in {"inspect_target", "enter_transition"}:
-            target_id = 0
-            for candidate in (args.get("id"), evidence.get("target_id")):
-                try:
-                    target_id = int(candidate or 0)
-                except (TypeError, ValueError):
-                    target_id = 0
-                if target_id > 0:
-                    break
-            if target_id <= 0:
-                evidence_target = evidence.get("target")
-                try:
-                    target_id = int(evidence_target.get("id") or 0) if isinstance(evidence_target, dict) else 0
-                except (TypeError, ValueError):
-                    target_id = 0
-            if tool != "navigation_step":
-                issues.append({
-                    "field": "recommended_action.tool",
-                    "code": "intent_tool_mismatch",
-                    "message": f"{intent} requires recommended_action.tool to be navigation_step",
-                })
-            if target_id <= 0:
-                issues.append({
-                    "field": "recommended_action.args.id",
-                    "code": "missing_target_id",
-                    "message": f"{intent} requires a positive target id in recommended_action.args.id or evidence.target.id",
-                })
-        elif intent == "advance_dialog" and tool != "advance_dialog":
-            issues.append({
-                "field": "recommended_action.tool",
-                "code": "intent_tool_mismatch",
-                "message": "advance_dialog requires recommended_action.tool to be advance_dialog",
-            })
-        elif intent == "use_inventory_item":
-            if tool != "use_item":
-                issues.append({
-                    "field": "recommended_action.tool",
-                    "code": "intent_tool_mismatch",
-                    "message": "use_inventory_item requires recommended_action.tool to be use_item",
-                })
+        def positive_int(field: str, *, allow_zero: bool = False) -> int | None:
             try:
-                item_id = int(args.get("item_id") or 0)
+                value = int(raw.get(field))
             except (TypeError, ValueError):
-                item_id = 0
-            has_all_target = args.get("target") == "all"
-            has_role_target = "role_id" in args and args.get("role_id") is not None
-            has_object_target = "target_object_id" in args
-            try:
-                role_id = int(args.get("role_id")) if has_role_target else -1
-            except (TypeError, ValueError):
-                role_id = -1
-            if item_id <= 0:
-                issues.append({
-                    "field": "recommended_action.args.item_id",
-                    "code": "invalid_item_id",
-                    "message": "use_item requires a positive item_id",
-                })
-            if has_object_target:
-                issues.append({
-                    "field": "recommended_action.args.target_object_id",
-                    "code": "unsupported_item_object_target",
-                    "message": (
-                        "use_item cannot directly select a world object. For an apply_to_all item, first interact "
-                        "with the NPC to establish the event context, then submit target='all'; SDLPAL dispatches "
-                        "0xFFFF to the most recent event object."
-                    ),
-                })
-            elif has_all_target == has_role_target or (has_role_target and role_id < 0):
-                issues.append({
-                    "field": "recommended_action.args",
-                    "code": "invalid_item_target",
-                    "message": (
-                        "use_item requires exactly one target: role_id for party_role, or target='all' for "
-                        "implicit_event_context. The compatibility name 'all' dispatches 0xFFFF to the most "
-                        "recent event object and is not necessarily a whole-party effect."
-                    ),
-                })
-        elif intent == "wait_runtime" and tool != "no_op":
-            issues.append({
-                "field": "recommended_action.tool",
-                "code": "intent_tool_mismatch",
-                "message": "wait_runtime requires recommended_action.tool to be no_op",
-            })
+                return None
+            return value if value >= (0 if allow_zero else 1) else None
 
+        if action == "move_to":
+            for key in ("x", "y"):
+                if type(raw.get(key)) is not int:
+                    issues.append({"field": key, "code": "invalid_coordinate", "message": "move_to requires integer world coordinates"})
+            if "face" in raw and raw["face"] not in MOVE_DELTAS:
+                issues.append({"field": "face", "code": "invalid_direction", "message": "face must be up, down, left, or right"})
+        if action == "navigate" and positive_int("target_id") is None:
+            issues.append({"field": "target_id", "code": "invalid_target_id", "message": "navigate requires a positive target_id"})
+        if action == "navigate" and "item_id" in raw and positive_int("item_id") is None:
+            issues.append({"field": "item_id", "code": "invalid_item_id", "message": "navigate approach item_id must be positive"})
+        if action == "select_choice" and positive_int("option_index", allow_zero=True) is None:
+            issues.append({"field": "option_index", "code": "invalid_option_index", "message": "select_choice requires a non-negative option_index"})
+        if action == "use_item":
+            if positive_int("item_id") is None:
+                issues.append({"field": "item_id", "code": "invalid_item_id", "message": "use_item requires a positive item_id"})
+            has_role = "role_id" in raw and positive_int("role_id", allow_zero=True) is not None
+            has_all = raw.get("target") == "all"
+            if has_role == has_all:
+                issues.append({"field": "role_id|target", "code": "invalid_item_target", "message": "use_item requires exactly one of role_id or target='all'"})
+        if action == "equip_item":
+            if positive_int("item_id") is None:
+                issues.append({"field": "item_id", "code": "invalid_item_id", "message": "equip_item requires a positive item_id"})
+            if positive_int("role_id", allow_zero=True) is None:
+                issues.append({"field": "role_id", "code": "invalid_role_id", "message": "equip_item requires a non-negative role_id"})
+        if action in {"buy_item", "sell_item"} and positive_int("item_id") is None:
+            issues.append({"field": "item_id", "code": "invalid_item_id", "message": f"{action} requires a positive item_id"})
+        relevant_keys = {
+            "advance_dialog": {"action", "reason"},
+            "select_choice": {"action", "option_index", "reason"},
+            "navigate": {"action", "target_id", "item_id", "reason"},
+            "move_to": {"action", "x", "y", "face", "reason"},
+            "use_item": {"action", "item_id", "role_id", "target", "reason"},
+            "equip_item": {"action", "item_id", "role_id", "reason"},
+            "buy_item": {"action", "item_id", "reason"},
+            "sell_item": {"action", "item_id", "reason"},
+            "leave_shop": {"action", "reason"},
+        }.get(action)
+        if relevant_keys:
+            for key in raw.keys() - relevant_keys:
+                if key in allowed_keys:
+                    issues.append({"field": key, "code": "irrelevant_field", "message": f"{key} is not used by action={action}"})
         if not issues:
             return None
-        return {
-            "ok": False,
-            "error": {
-                "code": "invalid_decision_submission",
-                "message": "submit_decision was not accepted. Correct the listed fields and call submit_decision again.",
-                "issues": issues,
-            },
-        }
+        error_code = (
+            "invalid_action"
+            if isinstance(action, str)
+            and any(issue.get("field") == "action" and issue.get("code") == "invalid_action" for issue in issues)
+            else "invalid_decision_submission"
+        )
+        return {"ok": False, "error": {"code": error_code, "message": "submit_decision was not accepted. Correct the listed fields and call submit_decision again.", "issues": issues}}
+
+    def shop_action_validation_error(
+        self,
+        state: dict,
+        action: str,
+        args: dict,
+        check_pending: bool = True,
+    ) -> str | None:
+        if state.get("status") not in {None, "ok"}:
+            return str(state.get("status"))
+        if not state.get("in_main_game"):
+            return "not_in_main_game"
+        if self.live_info("state").get("stale", True):
+            return "runtime_stale"
+        control_error = self.action_control_error(state, action)
+        shop = state.get("shop") if isinstance(state.get("shop"), dict) else None
+        if (
+            control_error == "in_shop"
+            and shop
+            and shop.get("active") is True
+            and action in {"shop_buy", "shop_sell"}
+        ):
+            mode = shop.get("mode")
+            if (action == "shop_buy" and mode != "buy") or (action == "shop_sell" and mode != "sell"):
+                return "shop_mode_mismatch"
+        if control_error is not None and (check_pending or control_error != "action_pending"):
+            return control_error
+        if not shop or shop.get("active") is not True:
+            return "shop_inactive"
+        if action == "shop_leave":
+            return None
+        mode = shop.get("mode")
+        if action not in {"shop_buy", "shop_sell"}:
+            return "invalid_shop_action"
+        if (action == "shop_buy" and mode != "buy") or (action == "shop_sell" and mode != "sell"):
+            return "shop_mode_mismatch"
+        try:
+            item_id = int(args.get("item_id") or 0)
+        except (TypeError, ValueError):
+            item_id = 0
+        item = next(
+            (
+                entry for entry in shop.get("items") or []
+                if isinstance(entry, dict) and int(entry.get("item_id") or 0) == item_id
+            ),
+            None,
+        )
+        if item_id <= 0 or not isinstance(item, dict):
+            return "item_not_sellable" if action == "shop_sell" else "item_not_offered"
+        if action == "shop_sell":
+            try:
+                available_count = int(item.get("available_count") or 0)
+            except (TypeError, ValueError):
+                return "invalid_shop_state"
+            if item.get("can_sell") is not True or available_count <= 0:
+                return "item_not_sellable"
+            return None
+        try:
+            price = int(item.get("price") or 0)
+            cash = int(state.get("cash") or 0)
+        except (TypeError, ValueError):
+            return "invalid_shop_state"
+        if price > cash or item.get("affordable") is not True:
+            return "insufficient_cash"
+        return None
 
     def use_item_validation_error(self, state: dict, args: dict, check_pending: bool = True) -> str | None:
         if state.get("status") not in {None, "ok"}:
             return str(state.get("status"))
         if not state.get("in_main_game"):
             return "not_in_main_game"
-        if state.get("in_battle"):
-            return "in_battle"
-        dialog = state.get("dialog") if isinstance(state.get("dialog"), dict) else {}
-        if dialog.get("active"):
-            return "in_dialog"
-        if self.file_info(self.state_path).get("stale", True):
+        if self.live_info("state").get("stale", True):
             return "runtime_stale"
-        if check_pending and self.action_path.exists():
-            return "action_pending"
+        control_error = self.action_control_error(state, "use_item")
+        if control_error is not None and (check_pending or control_error != "action_pending"):
+            return control_error
 
         try:
             item_id = int(args.get("item_id") or 0)
@@ -6985,10 +14342,220 @@ class DebugState:
             return "role_not_in_party"
         return None
 
+    def equip_item_validation_error(self, state: dict, args: dict, check_pending: bool = True) -> str | None:
+        if state.get("status") not in {None, "ok"}:
+            return str(state.get("status"))
+        if not state.get("in_main_game"):
+            return "not_in_main_game"
+        if self.live_info("state").get("stale", True):
+            return "runtime_stale"
+        control_error = self.action_control_error(state, "equip_item")
+        if control_error is not None and (check_pending or control_error != "action_pending"):
+            return control_error
+        try:
+            item_id = int(args.get("item_id") or 0)
+            role_id = int(args.get("role_id"))
+        except (TypeError, ValueError):
+            return "invalid_equipment_target"
+        candidate = next(
+            (
+                item for item in state.get("inventory") or []
+                if isinstance(item, dict) and int(item.get("item_id") or 0) == item_id
+            ),
+            None,
+        )
+        if item_id <= 0 or not isinstance(candidate, dict):
+            return "not_in_inventory"
+        try:
+            available = int(candidate.get("amount") or 0) - int(candidate.get("amount_in_use") or 0)
+        except (TypeError, ValueError):
+            available = 0
+        if available <= 0:
+            return "not_available"
+        if candidate.get("equipable") is not True:
+            return "not_equipable"
+        eligible = set()
+        for value in candidate.get("equipable_role_ids") or []:
+            try:
+                eligible.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        if role_id not in eligible:
+            return "role_not_eligible"
+        role = next(
+            (
+                entry for entry in state.get("party") or []
+                if isinstance(entry, dict) and int(entry.get("role_id", -1)) == role_id
+            ),
+            None,
+        )
+        if not isinstance(role, dict):
+            return "role_not_in_party"
+        effect = candidate.get("equipment_effect") if isinstance(candidate.get("equipment_effect"), dict) else {}
+        try:
+            slot_id = int(effect.get("slot_id"))
+        except (TypeError, ValueError):
+            slot_id = -1
+        if slot_id < 0:
+            return "invalid_equip_script"
+        if "expected_slot_item_id" in args:
+            current = next(
+                (
+                    item for item in role.get("equipment") or []
+                    if isinstance(item, dict) and int(item.get("slot_id", -1)) == slot_id
+                ),
+                None,
+            )
+            try:
+                current_item_id = int((current or {}).get("item_id") or 0)
+                expected_item_id = int(args.get("expected_slot_item_id") or 0)
+            except (TypeError, ValueError):
+                return "equipment_context_stale"
+            if current_item_id != expected_item_id:
+                return "equipment_context_stale"
+        return None
+
+    @staticmethod
+    def reject_agent_decision(decision: dict, reason: str, **details) -> None:
+        decision["validation"] = {
+            "status": "rejected",
+            "reason": reason,
+            **details,
+        }
+
+    def room_entry_navigation_rejection(self, state: dict, target_id: int) -> dict | None:
+        navigation = self.navigation(state)
+        targets = [target for target in navigation.get("targets") or [] if isinstance(target, dict)]
+        selected = next((target for target in targets if int(target.get("id") or 0) == target_id), None)
+        if not isinstance(selected, dict):
+            return None
+        context = navigation.get("entry_context") if isinstance(navigation.get("entry_context"), dict) else None
+        if not isinstance(context, dict):
+            return None
+        task_override = self.active_task_binds_navigation_target(state, target_id)
+        executable = {"reachable", "transition", "blocked_by_interactable"}
+        if (context.get("status") == "entered"
+                and selected.get("entry_relation") == "inferred_entry_return" and not task_override):
+            alternatives = [
+                target for target in targets
+                if int(target.get("id") or 0) != target_id
+                and target.get("status") in executable
+                and target.get("possible_entry_return") is not True
+                and target.get("agent_priority") not in {
+                    "avoid_repeat", "soft_avoid", "avoid_backtrack", "avoid_immediate_backtrack",
+                }
+            ]
+            if alternatives:
+                return {
+                    "reason": "immediate_entry_return",
+                    "entry_relation": selected.get("entry_relation"),
+                    "source_room_id": context.get("source_room_id"),
+                    "destination_room_id": context.get("destination_room_id"),
+                    "alternative_target_ids": [int(target.get("id") or 0) for target in alternatives[:10]],
+                }
+        if context.get("status") == "recovery_pending" and selected.get("recovery_route") is not True:
+            recovery = next((
+                target for target in targets
+                if target.get("recovery_route") is True and target.get("status") in executable
+            ), None)
+            if recovery is not None and not task_override:
+                return {
+                    "reason": "transition_recovery_required",
+                    "source_room_id": context.get("source_room_id"),
+                    "destination_room_id": context.get("destination_room_id"),
+                    "recovery_target_id": int(recovery.get("id") or 0),
+                }
+        return None
+
     def validate_agent_decision(self, decision: dict) -> dict:
         action = decision.get("recommended_action") if isinstance(decision.get("recommended_action"), dict) else {}
+        tool = action.get("tool")
+        latest_state = self.read_live_state()
+        shop = latest_state.get("shop") if isinstance(latest_state.get("shop"), dict) else {}
+        shop_active = shop.get("active") is True
+        choice = latest_state.get("choice") if isinstance(latest_state.get("choice"), dict) else None
+        choice_active = bool(choice and choice.get("active"))
+        if tool == "choice_select":
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            error = self.choice_action_validation_error(
+                latest_state,
+                int(args.get("generation") or 0),
+                int(args.get("option_index", -1)),
+            )
+            if error is None:
+                return decision
+            self.reject_agent_decision(decision, "choice_action_invalid", error=error)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview("no_op", {"reason": error})
+            return decision
+        if choice_active:
+            self.reject_agent_decision(decision, "in_choice", action=tool)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "in_choice", "required_action": "select_choice"}
+            )
+            decision["risk"] = "A story choice is active; only an explicit select_choice decision is executable."
+            return decision
+        if tool in {"shop_buy", "shop_sell", "shop_leave"}:
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            error = self.shop_action_validation_error(latest_state, tool, args)
+            if error is None:
+                return decision
+            self.reject_agent_decision(
+                decision,
+                "shop_action_invalid",
+                action=tool,
+                item_id=args.get("item_id"),
+                error=error,
+            )
+            decision.setdefault("evidence", {})["validation_state_context"] = self.state_context(latest_state)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "shop_action_invalid", "error": error}
+            )
+            decision["risk"] = (
+                f"{decision.get('risk') or ''} Latest-state validation rejected the shop action: {error}."
+            ).strip()
+            return decision
+        if shop_active:
+            mode = shop.get("mode")
+            required_actions = ["sell_item", "leave_shop"] if mode == "sell" else ["buy_item", "leave_shop"]
+            self.reject_agent_decision(
+                decision,
+                "in_shop",
+                action=tool,
+                store_id=shop.get("store_id"),
+                phase=shop.get("phase"),
+            )
+            decision.setdefault("evidence", {})["validation_state_context"] = self.state_context(latest_state)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "in_shop", "required_actions": required_actions}
+            )
+            decision["risk"] = f"A {mode or 'shop'} menu is active; only an explicit matching shop decision is executable."
+            return decision
+        if action.get("tool") == "equip_item":
+            args = action.get("args") if isinstance(action.get("args"), dict) else {}
+            error = self.equip_item_validation_error(latest_state, args)
+            if error is None:
+                return decision
+            self.reject_agent_decision(
+                decision,
+                "equip_item_invalid",
+                item_id=args.get("item_id"),
+                role_id=args.get("role_id"),
+                error=error,
+            )
+            decision.setdefault("evidence", {})["validation_state_context"] = self.state_context(latest_state)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": "equip_item_invalid", "error": error}
+            )
+            decision["risk"] = (
+                f"{decision.get('risk') or ''} Latest-state validation rejected equipment change: {error}."
+            ).strip()
+            return decision
         if action.get("tool") == "use_item":
-            latest_state = read_json(self.state_path)
             args = action.get("args") if isinstance(action.get("args"), dict) else {}
             error = self.use_item_validation_error(latest_state, args)
             if error is None:
@@ -7011,24 +14578,58 @@ class DebugState:
             decision["recommended_action"] = self.action_preview(
                 "no_op", {"reason": "use_item_invalid", "error": error}
             )
+            self.reject_agent_decision(
+                decision,
+                "use_item_invalid",
+                item_id=args.get("item_id"),
+                error=error,
+            )
             decision["risk"] = (
                 f"{decision.get('risk') or ''} Latest-state validation rejected item use: {error}."
             ).strip()
+            return decision
+        if tool == "move_to":
+            args = action.get("args") or {}
+            route = self.route_to_position(latest_state, **args)
+            if not route["ok"]:
+                self.reject_agent_decision(decision, "position_invalid", error=route["status"])
             return decision
         if action.get("tool") != "navigation_step":
             return decision
         args = action.get("args") if isinstance(action.get("args"), dict) else {}
         try:
             target_id = int(args.get("id") or 0)
+            approach_item_id = int(args.get("item_id") or 0) or None
         except (TypeError, ValueError):
             target_id = 0
+            approach_item_id = None
         if target_id <= 0:
             return decision
 
-        latest_state = read_json(self.state_path)
-        route = self.route_to_object(latest_state, target_id, avoid_transitions=True)
+        latest_state = self.read_live_state()
+        route = self.route_to_object(
+            latest_state,
+            target_id,
+            avoid_transitions=True,
+            approach_item_id=approach_item_id,
+        )
         route_status = route.get("status")
         if route_status in {"reachable", "transition", "blocked_by_interactable"}:
+            entry_rejection = self.room_entry_navigation_rejection(latest_state, target_id)
+            if entry_rejection is None:
+                return decision
+            reason = str(entry_rejection.pop("reason"))
+            decision.setdefault("evidence", {})["room_entry_context"] = self.room_entry_navigation_context(latest_state)
+            decision["recommended_intent"] = "wait_runtime"
+            decision["recommended_action"] = self.action_preview(
+                "no_op", {"reason": reason, "target_id": target_id, **entry_rejection}
+            )
+            self.reject_agent_decision(decision, reason, target_id=target_id, **entry_rejection)
+            decision["risk"] = (
+                "The navigation would immediately return through the newly entered room's likely entrance."
+                if reason == "immediate_entry_return"
+                else "The navigation would abandon a pending recovery after an immediate room return."
+            )
             return decision
 
         evidence = decision.setdefault("evidence", {})
@@ -7056,6 +14657,13 @@ class DebugState:
                 "target_id": target_id,
                 "route_status": route_status,
             },
+        )
+        self.reject_agent_decision(
+            decision,
+            "navigation_target_invalid",
+            target_id=target_id,
+            route_status=route_status,
+            route_ok=route.get("ok"),
         )
         if decision.get("risk"):
             decision["risk"] = f"{decision['risk']} Latest-state validation rejected the navigation target."
@@ -7092,9 +14700,16 @@ class DebugState:
             return self.normalize_dialog_advance_args(args)
         if tool == "navigation_step":
             try:
-                return {"id": int(args.get("id") or args.get("target_id") or 0)}
+                result = {"id": int(args.get("id") or args.get("target_id") or 0)}
             except (TypeError, ValueError):
                 return {"id": 0}
+            try:
+                item_id = int(args.get("item_id") or 0)
+            except (TypeError, ValueError):
+                item_id = 0
+            if item_id > 0:
+                result["item_id"] = item_id
+            return result
         if tool == "use_item":
             try:
                 item_id = int(args.get("item_id") or 0)
@@ -7107,6 +14722,26 @@ class DebugState:
             except (TypeError, ValueError):
                 role_id = -1
             return {"item_id": item_id, "role_id": role_id}
+        if tool == "equip_item":
+            try:
+                item_id = int(args.get("item_id") or 0)
+                role_id = int(args.get("role_id"))
+            except (TypeError, ValueError):
+                item_id, role_id = 0, -1
+            result = {"item_id": item_id, "role_id": role_id}
+            if "expected_slot_item_id" in args:
+                try:
+                    result["expected_slot_item_id"] = int(args.get("expected_slot_item_id") or 0)
+                except (TypeError, ValueError):
+                    pass
+            return result
+        if tool in {"shop_buy", "shop_sell"}:
+            try:
+                return {"item_id": int(args.get("item_id") or 0)}
+            except (TypeError, ValueError):
+                return {"item_id": 0}
+        if tool == "shop_leave":
+            return {}
         return dict(args)
 
     def parse_model_json(self, content: str) -> dict:
@@ -7129,7 +14764,7 @@ class DebugState:
         return DEFAULT_DEEPSEEK_MODEL
 
     def deepseek_decide_agent(self, state: dict | None = None, model: str | None = None) -> dict:
-        state = state or read_json(self.state_path)
+        state = state or self.read_live_state()
         api_key = self.config_value("DEEPSEEK_API_KEY")
         if not api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is not configured")
@@ -7150,6 +14785,7 @@ class DebugState:
         total_tool_calls = 0
         rounds_attempted = 0
         decision_repairs = 0
+        tool_cycle = self.new_agent_tool_cycle(state)
 
         try:
             for _round_index in range(MAX_AGENT_TOOL_ROUNDS):
@@ -7369,7 +15005,7 @@ class DebugState:
                         raise RuntimeError(error)
 
                     if name == "submit_decision":
-                        result = self.run_agent_tool(name, arguments, state)
+                        result = self.run_agent_tool(name, arguments, state, tool_cycle=tool_cycle)
                         tool_trace.append(self.agent_tool_trace_entry(name, arguments, result))
                         if not result.get("ok"):
                             decision_repairs += 1
@@ -7395,7 +15031,7 @@ class DebugState:
                         return decision
 
                     try:
-                        result = self.run_agent_tool(name, arguments, state)
+                        result = self.run_agent_tool(name, arguments, state, tool_cycle=tool_cycle)
                     except Exception as exc:
                         tool_trace.append(self.agent_tool_trace_entry(name, arguments, error=str(exc)))
                         raise RuntimeError(f"Agent tool {name or 'unknown'} failed: {exc}") from exc
@@ -7432,20 +15068,34 @@ class DebugState:
         self.finish_agent_status()
         return decision
 
-    def write_action(self, buttons: list[str], frames: int) -> dict:
+    def write_action(
+        self,
+        buttons: list[str],
+        frames: int,
+        *,
+        control_action: str = "press_buttons",
+        control_state: dict | None = None,
+    ) -> dict:
         invalid = [button for button in buttons if button not in VALID_BUTTONS]
         if invalid:
             raise ValueError(f"invalid buttons: {', '.join(invalid)}")
         frames = max(1, min(int(frames), 300))
         with self.action_lock:
-            if self.action_path.exists():
-                raise RuntimeError("action_pending")
+            state = control_state if isinstance(control_state, dict) else self.read_live_state()
+            state_info = None if control_state is not None else self.live_info("state")
+            control_error = self.action_control_error(state, control_action, state_info)
+            if control_error is not None:
+                raise RuntimeError(control_error)
 
             lines = [f"frames {frames}"]
             lines.extend(f"button {button}" for button in buttons)
-            self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")
-
             entry = {"time": time.time(), "buttons": buttons, "frames": frames}
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")
+            except Exception:
+                self.pending_written_action = None
+                raise
             self.action_log.append(entry)
             self.append_navigation_diagnostic("action_written", {"action": entry})
             return entry
@@ -7467,7 +15117,7 @@ class DebugState:
             target_value = str(role_value)
 
         with self.action_lock:
-            state = read_json(self.state_path)
+            state = self.read_live_state()
             args = {"item_id": item_id, "target": "all"} if target_value == "all" else {
                 "item_id": item_id,
                 "role_id": role_value,
@@ -7480,9 +15130,6 @@ class DebugState:
             except FileNotFoundError:
                 pass
 
-            lines = [f"use_item {item_id} {target_value}"]
-            self.atomic_write_text(self.action_path, "\n".join(lines) + "\n", encoding="ascii")
-
             entry = {
                 "time": time.time(),
                 "command": "use_item",
@@ -7490,9 +15137,369 @@ class DebugState:
                 "role_id": role_value,
                 "target": "all" if target_value == "all" else "role",
             }
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(
+                    self.action_path,
+                    f"use_item {item_id} {target_value}\n",
+                    encoding="ascii",
+                )
+            except Exception:
+                self.pending_written_action = None
+                raise
             self.action_log.append(entry)
             self.append_navigation_diagnostic("action_written", {"action": entry})
             return entry
+
+    def wait_for_item_action_result(
+        self,
+        action: str,
+        item_id: int,
+        role_id: int,
+        start_time: float,
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = self.file_info(self.action_result_path)
+            if info.get("available") and float(info.get("mtime") or 0) >= start_time:
+                result = read_optional_json(self.action_result_path)
+                try:
+                    result_item_id = int(result.get("item_id"))
+                    result_role_id = int(result.get("role_id"))
+                except (TypeError, ValueError):
+                    result_item_id = result_role_id = -1
+                if (
+                    result.get("action") == action
+                    and result_item_id == item_id
+                    and result_role_id == role_id
+                ):
+                    return result
+            time.sleep(0.03)
+        raise TimeoutError(f"{action} {item_id} {role_id} did not complete")
+
+    def current_action_result(self) -> dict:
+        return read_optional_json(self.action_result_path)
+
+    def write_equip_item_action(
+        self,
+        item_id: int,
+        role_id: int,
+        expected_slot_item_id: int | None = None,
+    ) -> dict:
+        try:
+            item_id = int(item_id)
+            role_id = int(role_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("item_id and role_id must be integers") from exc
+        args = {"item_id": item_id, "role_id": role_id}
+        if expected_slot_item_id is not None:
+            args["expected_slot_item_id"] = int(expected_slot_item_id)
+        start_time = time.time()
+        with self.action_lock:
+            state = self.read_live_state()
+            error = self.equip_item_validation_error(state, args)
+            if error is not None:
+                raise RuntimeError(error)
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            entry = {
+                "time": start_time,
+                "command": "equip_item",
+                "item_id": item_id,
+                "role_id": role_id,
+            }
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(
+                    self.action_path,
+                    f"equip_item {item_id} {role_id}\n",
+                    encoding="ascii",
+                )
+            except Exception:
+                self.pending_written_action = None
+                raise
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+        result = self.wait_for_item_action_result(
+            "equip_item", item_id, role_id, start_time
+        )
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or result.get("status") or "equip_item_failed"))
+        return {**entry, "result": result}
+
+    def wait_for_shop_action_result(
+        self,
+        action: str,
+        item_id: int,
+        start_time: float,
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = self.file_info(self.action_result_path)
+            if info.get("available") and float(info.get("mtime") or 0) >= start_time:
+                result = read_optional_json(self.action_result_path)
+                try:
+                    result_item_id = int(result.get("item_id") or 0)
+                except (TypeError, ValueError):
+                    result_item_id = -1
+                if result.get("action") == action and result_item_id == item_id:
+                    return result
+            time.sleep(0.03)
+        raise TimeoutError(f"{action} {item_id} did not complete")
+
+    def choice_action_validation_error(self, state: dict, generation: int, option_index: int) -> str | None:
+        choice = state.get("choice") if isinstance(state.get("choice"), dict) else None
+        if not choice or choice.get("active") is not True:
+            return "choice_inactive"
+        if generation != int(choice.get("generation") or 0):
+            return "stale_choice_command"
+        options = choice.get("options") if isinstance(choice.get("options"), list) else []
+        if option_index not in {
+            int(option.get("index")) for option in options
+            if isinstance(option, dict) and option.get("index") is not None
+        }:
+            return "invalid_choice_option"
+        if choice.get("command_pending"):
+            return "choice_action_pending"
+        control_error = self.action_control_error(state, "choice_select")
+        return control_error
+
+    def wait_for_choice_action_result(
+        self,
+        generation: int,
+        start_time: float,
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = self.file_info(self.action_result_path)
+            if info.get("available") and float(info.get("mtime") or 0) >= start_time:
+                result = read_optional_json(self.action_result_path)
+                if (
+                    result.get("action") == "choice_select"
+                    and int(result.get("generation") or 0) == generation
+                ):
+                    return result
+            time.sleep(0.02)
+        raise TimeoutError(f"choice_select generation {generation} did not complete")
+
+    def write_choice_action(self, generation: int, option_index: int) -> dict:
+        try:
+            generation = int(generation)
+            option_index = int(option_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("generation and option_index must be integers") from exc
+        start_time = time.time()
+        with self.action_lock:
+            state = self.read_live_state()
+            error = self.choice_action_validation_error(state, generation, option_index)
+            if error is not None:
+                raise RuntimeError(error)
+            choice = state["choice"]
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            entry = {
+                "time": start_time,
+                "command": "choice_select",
+                "generation": generation,
+                "option_index": option_index,
+                "prompt": choice.get("prompt"),
+                "option": next(
+                    (item for item in choice.get("options") or [] if int(item.get("index", -1)) == option_index),
+                    None,
+                ),
+            }
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(
+                    self.action_path,
+                    f"choice_select {generation} {option_index}\n",
+                    encoding="ascii",
+                )
+            except Exception:
+                self.pending_written_action = None
+                raise
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+        result = self.wait_for_choice_action_result(generation, start_time)
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or result.get("status") or "choice_select_failed"))
+        return {**entry, "result": result}
+
+    def write_shop_action(self, action: str, item_id: int | None = None) -> dict:
+        if action not in {"shop_buy", "shop_sell", "shop_leave"}:
+            raise ValueError("action must be shop_buy, shop_sell, or shop_leave")
+        try:
+            normalized_item_id = int(item_id or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("item_id must be an integer") from exc
+        args = {"item_id": normalized_item_id} if action in {"shop_buy", "shop_sell"} else {}
+        start_time = time.time()
+        with self.action_lock:
+            state = self.read_live_state()
+            error = self.shop_action_validation_error(state, action, args)
+            if error is not None:
+                raise RuntimeError(error)
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            entry = {
+                "time": start_time,
+                "command": action,
+                "item_id": normalized_item_id,
+            }
+            self.begin_written_action(entry)
+            line = (
+                f"shop_buy {normalized_item_id}\n"
+                if action == "shop_buy"
+                else f"shop_sell {normalized_item_id}\n"
+                if action == "shop_sell"
+                else "shop_leave 1\n"
+            )
+            try:
+                self.atomic_write_text(self.action_path, line, encoding="ascii")
+            except Exception:
+                self.pending_written_action = None
+                raise
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+        result = self.wait_for_shop_action_result(
+            action, normalized_item_id, start_time
+        )
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or result.get("status") or f"{action}_failed"))
+        return {**entry, "result": result}
+
+    def battle_action_validation_error(self, state: dict, args: dict) -> str | None:
+        if not state.get("in_battle"):
+            return "not_in_battle"
+        battle = state.get("battle") if isinstance(state.get("battle"), dict) else None
+        if battle is None:
+            return "battle_state_unavailable"
+        try:
+            battle_generation = int(args.get("battle_generation"))
+            command_generation = int(args.get("command_generation"))
+            player_index = (
+                int(args["player_index"])
+                if args.get("player_index") is not None
+                else None
+            )
+            object_id = int(args.get("object_id") or 0)
+            target_index = int(args.get("target_index", -2))
+        except (TypeError, ValueError):
+            return "invalid_battle_action"
+        if (
+            battle_generation != int(battle.get("generation") or 0)
+            or command_generation != int(battle.get("command_generation") or 0)
+            or (
+                player_index is not None
+                and player_index != int(battle.get("current_player_index") or 0)
+            )
+        ):
+            return "stale_battle_command"
+        if self.action_pending(state):
+            return "action_pending"
+        action_type = str(args.get("action_type") or "")
+        available = battle.get("available_actions") if isinstance(battle.get("available_actions"), list) else []
+        match = next(
+            (
+                action for action in available
+                if isinstance(action, dict)
+                and action.get("action_type") == action_type
+                and int(action.get("object_id") or 0) == object_id
+            ),
+            None,
+        )
+        if match is None:
+            return "action_unavailable"
+        mode = match.get("target_mode")
+        if mode == "all" and target_index != -1:
+            return "invalid_target"
+        if mode == "none" and target_index != -2:
+            return "invalid_target"
+        if mode == "single" and target_index not in {
+            int(value) for value in match.get("valid_target_indices") or []
+        }:
+            return "invalid_target"
+        return None
+
+    def wait_for_battle_action_result(
+        self,
+        battle_generation: int,
+        command_generation: int,
+        start_time: float,
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = self.file_info(self.action_result_path)
+            if info.get("available") and float(info.get("mtime") or 0) >= start_time:
+                result = read_optional_json(self.action_result_path)
+                if (
+                    result.get("action") == "battle_action"
+                    and int(result.get("battle_generation") or 0) == battle_generation
+                    and int(result.get("command_generation") or 0) == command_generation
+                ):
+                    return result
+            time.sleep(0.02)
+        raise TimeoutError("battle action did not complete")
+
+    def write_battle_action(self, args: dict) -> dict:
+        start_time = time.time()
+        with self.action_lock:
+            state = self.read_live_state()
+            error = self.battle_action_validation_error(state, args)
+            if error is not None:
+                raise RuntimeError(error)
+            battle = state["battle"]
+            battle_generation = int(battle["generation"])
+            command_generation = int(battle["command_generation"])
+            player_index = int(battle.get("current_player_index") or 0)
+            action_type = str(args["action_type"])
+            object_id = int(args.get("object_id") or 0)
+            target_index = int(args.get("target_index", -2))
+            try:
+                self.action_result_path.unlink()
+            except FileNotFoundError:
+                pass
+            entry = {
+                "time": start_time,
+                "command": "battle_action",
+                "battle_generation": battle_generation,
+                "command_generation": command_generation,
+                "player_index": player_index,
+                "action_type": action_type,
+                "object_id": object_id,
+                "target_index": target_index,
+            }
+            self.begin_written_action(entry)
+            try:
+                self.atomic_write_text(
+                    self.action_path,
+                    (
+                        f"battle_action {battle_generation} {command_generation} "
+                        f"{player_index} {action_type} {object_id} {target_index}\n"
+                    ),
+                    encoding="ascii",
+                )
+            except Exception:
+                self.pending_written_action = None
+                raise
+            self.action_log.append(entry)
+            self.append_navigation_diagnostic("action_written", {"action": entry})
+        result = self.wait_for_battle_action_result(
+            battle_generation, command_generation, start_time
+        )
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or result.get("status") or "battle_action_failed"))
+        return {**entry, "result": result}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -7500,16 +15507,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/navigation/status":
+            self.send_json(self.server.state.navigation_status())
+            return
         if parsed.path == "/state":
             self.send_json(self.server.state.snapshot())
             return
         if parsed.path == "/navigation":
-            state = read_json(self.server.state.state_path)
-            self.server.state.attach_logical_room_fields(state)
-            self.send_json(self.server.state.navigation(state))
+            state = self.server.state.read_live_state()
+            control = self.server.state.control_state(
+                state,
+                self.server.state.live_info("state"),
+            )
+            if not control["navigation_ready"]:
+                self.send_json({
+                    "status": "waiting_for_control",
+                    "control_phase": control["phase"],
+                    "targets": [],
+                })
+            else:
+                self.send_json(self.server.state.navigation(state))
             return
         if parsed.path == "/navigation/transitions":
-            state = read_json(self.server.state.state_path)
+            state = self.server.state.read_live_state()
             self.server.state.attach_logical_room_fields(state)
             identity = self.server.state.room_identity(state)
             from_room_id = identity["id"] if identity else None
@@ -7533,18 +15553,41 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/navigation/route":
             query = parse_qs(parsed.query)
             target = int((query.get("id") or ["0"])[0])
-            state = read_json(self.server.state.state_path)
+            approach_item = int((query.get("item_id") or ["0"])[0]) or None
+            state = self.server.state.read_live_state()
+            control = self.server.state.control_state(
+                state,
+                self.server.state.live_info("state"),
+            )
+            if not control["navigation_ready"]:
+                self.send_json({
+                    "ok": True,
+                    "status": "waiting_for_control",
+                    "control": control,
+                    "target_id": target,
+                })
+                return
             self.server.state.attach_logical_room_fields(state)
-            route = self.server.state.route_to_object(state, target, avoid_transitions=True)
+            route = self.server.state.route_to_object(
+                state,
+                target,
+                avoid_transitions=True,
+                approach_item_id=approach_item,
+            )
             if route.get("status") == "unreachable_static":
-                relaxed = self.server.state.route_to_object(state, target, avoid_transitions=False)
+                relaxed = self.server.state.route_to_object(
+                    state,
+                    target,
+                    avoid_transitions=False,
+                    approach_item_id=approach_item,
+                )
                 if relaxed.get("status") == "reachable":
                     route["status"] = "blocked_by_transition"
                     route["blocked_route"] = relaxed.get("route")
             self.send_json(route)
             return
         if parsed.path == "/exploration":
-            state = read_json(self.server.state.state_path)
+            state = self.server.state.read_live_state()
             self.server.state.attach_logical_room_fields(state)
             self.server.state.update_exploration(state)
             self.send_json(self.server.state.current_exploration(state))
@@ -7553,7 +15596,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"events": self.server.state.event_log[-100:]})
             return
         if parsed.path == "/dialogs":
-            state = read_json(self.server.state.state_path)
+            state = self.server.state.read_live_state()
             self.server.state.attach_logical_room_fields(state)
             self.server.state.record_dialog_event(state)
             query = parse_qs(parsed.query)
@@ -7574,6 +15617,15 @@ class Handler(BaseHTTPRequestHandler):
                 limit = 100
             self.send_json({"decisions": self.server.state.read_agent_log(limit=limit)})
             return
+        if parsed.path == "/agent/tasks":
+            self.send_json(self.server.state.agent_tasks_view())
+            return
+        if parsed.path == "/agent/room-memo":
+            self.send_json(self.server.state.current_room_memo_view())
+            return
+        if parsed.path == "/agent/battle-memo":
+            self.send_json(self.server.state.current_battle_memo_view())
+            return
         if parsed.path == "/agent/llm-log":
             query = parse_qs(parsed.query)
             raw_limit = (query.get("limit") or ["100"])[0]
@@ -7582,6 +15634,35 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 100
             self.send_json({"requests": self.server.state.read_agent_llm_log(limit=limit)})
+            return
+        if parsed.path == "/agent/session":
+            self.send_json({"ok": True, "session": self.server.state.agent_runtime.snapshot()})
+            return
+        if parsed.path == "/agent/session/events":
+            query = parse_qs(parsed.query)
+            if "turn_limit" in query or "before_turn" in query:
+                try:
+                    turn_limit = int((query.get("turn_limit") or ["5"])[0])
+                    before_raw = (query.get("before_turn") or [None])[0]
+                    before_turn = int(before_raw) if before_raw is not None else None
+                except ValueError:
+                    self.send_json({"ok": False, "error": "before_turn and turn_limit must be integers"}, HTTPStatus.BAD_REQUEST)
+                    return
+                self.send_json({
+                    "ok": True,
+                    **self.server.state.agent_runtime.event_turn_page(before_turn, turn_limit),
+                })
+                return
+            try:
+                after = int((query.get("after") or ["0"])[0])
+                limit = int((query.get("limit") or ["200"])[0])
+            except ValueError:
+                self.send_json({"ok": False, "error": "after and limit must be integers"}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"ok": True, "events": self.server.state.agent_runtime.events(after, limit)})
+            return
+        if parsed.path == "/agent/session/stream":
+            self.handle_agent_events_websocket(parsed)
             return
         if parsed.path == "/checkpoints":
             self.send_json(self.server.state.list_checkpoints())
@@ -7608,6 +15689,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/action":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 buttons = payload.get("buttons", [])
@@ -7620,6 +15703,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/inventory/use":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 result = self.server.state.write_use_item_action(
@@ -7632,7 +15717,52 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
 
+        if self.path == "/inventory/equip":
+            if self.reject_if_agent_running():
+                return
+            try:
+                payload = self.read_body_json()
+                result = self.server.state.write_equip_item_action(
+                    payload.get("item_id"),
+                    payload.get("role_id"),
+                )
+                self.send_json({"ok": True, "action": result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path in {"/shop/buy", "/shop/sell", "/shop/leave"}:
+            if self.reject_if_agent_running():
+                return
+            try:
+                payload = self.read_body_json()
+                action = {
+                    "/shop/buy": "shop_buy",
+                    "/shop/sell": "shop_sell",
+                    "/shop/leave": "shop_leave",
+                }[self.path]
+                result = self.server.state.write_shop_action(
+                    action,
+                    payload.get("item_id") if action in {"shop_buy", "shop_sell"} else None,
+                )
+                self.send_json({"ok": True, "action": result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/battle/action":
+            if self.reject_if_agent_running():
+                return
+            try:
+                result = self.server.state.write_battle_action(self.read_body_json())
+                self.send_json({"ok": True, "action": result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
         if self.path == "/dialog/advance":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 result = self.server.state.advance_dialog(payload)
@@ -7643,6 +15773,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/dialog/advance/stop":
+            if self.reject_if_agent_running():
+                return
             result = self.server.state.cancel_dialog_advance()
             self.send_json(result)
             return
@@ -7657,17 +15789,64 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
 
+        if self.path == "/agent/session/run":
+            try:
+                payload = self.read_body_json()
+                session = self.server.state.agent_runtime.start(
+                    payload.get("model"), payload.get("max_turns", 10)
+                )
+                self.send_json({"ok": True, "session": session}, HTTPStatus.ACCEPTED)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
+        if self.path == "/agent/session/decide":
+            try:
+                payload = self.read_body_json()
+                session = self.server.state.agent_runtime.start(payload.get("model"), 1, decide_only=True)
+                self.send_json({"ok": True, "session": session}, HTTPStatus.ACCEPTED)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
+        if self.path == "/agent/session/interrupt":
+            self.send_json({"ok": True, "session": self.server.state.agent_runtime.interrupt()})
+            return
+
+        if self.path == "/agent/session/execute":
+            try:
+                result = self.server.state.agent_runtime.execute()
+                self.send_json({"ok": True, "execution": result, "session": self.server.state.agent_runtime.snapshot()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
+        if self.path == "/agent/session/reset":
+            try:
+                result = self.server.state.reset_agent_session()
+                self.send_json(result)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
         if self.path == "/navigation/step":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 target = int(payload.get("id") or 0)
-                state = read_json(self.server.state.state_path)
-                self.server.state.attach_logical_room_fields(state)
-                result = self.server.state.navigation_step(state, target)
+                approach_item = int(payload.get("item_id") or 0) or None
+                state = self.server.state.navigation_snapshot()
+                result = self.server.state.navigation_step(
+                    state,
+                    target,
+                    approach_item_id=approach_item,
+                )
                 self.server.state.append_navigation_diagnostic(
                     "navigation_step",
                     {
                         "target_id": target,
+                        "approach_item_id": approach_item,
                         "ok": bool(result.get("ok")),
                         "status": result.get("status"),
                         "move": result.get("move"),
@@ -7688,7 +15867,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/diagnostics/navigation":
             try:
                 payload = self.read_body_json()
-                state = read_json(self.server.state.state_path)
+                state = self.server.state.read_live_state()
                 self.server.state.attach_logical_room_fields(state)
                 event_type = str(payload.get("type") or "client_event")
                 details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
@@ -7723,6 +15902,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/checkpoints/save":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 result = self.server.state.save_checkpoint(payload.get("id"), payload.get("label"))
@@ -7732,6 +15913,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/checkpoints/load":
+            if self.reject_if_agent_running():
+                return
             try:
                 payload = self.read_body_json()
                 result = self.server.state.load_checkpoint(str(payload.get("id") or ""))
@@ -7740,7 +15923,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
             return
 
+        if self.path == "/checkpoints/prune":
+            if self.reject_if_agent_running():
+                return
+            try:
+                payload = self.read_body_json()
+                raw_ids = payload.get("session_ids")
+                session_ids = (
+                    {str(session_id) for session_id in raw_ids if str(session_id)}
+                    if isinstance(raw_ids, list)
+                    else None
+                )
+                result = self.server.state.prune_orphan_sessions(session_ids)
+                self.send_json({"ok": True, **result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+            return
+
         if self.path == "/startup/new":
+            if self.reject_if_agent_running():
+                return
             try:
                 result = self.server.state.start_new_game()
                 self.send_json(result)
@@ -7777,6 +15979,15 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(size) if size else b"{}"
         return json.loads(raw.decode("utf-8"))
 
+    def reject_if_agent_running(self) -> bool:
+        if not self.server.state.agent_runtime.is_running():
+            return False
+        self.send_json(
+            {"ok": False, "error": "agent_session_running", "code": "agent_session_running"},
+            HTTPStatus.CONFLICT,
+        )
+        return True
+
     def send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
@@ -7805,15 +16016,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_frame_png(self) -> None:
         try:
-            raw = self.server.state.frame_path.read_bytes()
-        except FileNotFoundError:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        try:
-            png = pfrm_to_png(raw)
+            latest = self.server.state.latest_frame_png()
         except ValueError as exc:
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             return
+        if latest is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        _, png = latest
         self.send_bytes(png, "image/png", no_cache=True)
 
     def handle_websocket_upgrade(self) -> bool:
@@ -7837,7 +16047,7 @@ class Handler(BaseHTTPRequestHandler):
         last = None
         self.connection.settimeout(1.0)
         while True:
-            payload = json.dumps(self.server.state.snapshot(), ensure_ascii=False).encode("utf-8")
+            payload = self.server.state.state_stream_payload()
             if payload != last:
                 try:
                     self.connection.sendall(websocket_frame(payload, opcode=0x1))
@@ -7849,24 +16059,62 @@ class Handler(BaseHTTPRequestHandler):
     def handle_frame_websocket(self) -> None:
         if not self.handle_websocket_upgrade():
             return
-        last_signature = None
+        last_sequence = 0
         self.connection.settimeout(1.0)
         while True:
             try:
-                stat = self.server.state.frame_path.stat()
-            except FileNotFoundError:
-                time.sleep(0.05)
-                continue
+                sequence = self.server.state.wait_for_frame(last_sequence, 0.25)
+                if sequence <= last_sequence:
+                    continue
+                latest = self.server.state.latest_frame_png()
+                if latest is None:
+                    continue
+                sequence, payload = latest
+                self.connection.sendall(websocket_frame(payload, opcode=0x2))
+                last_sequence = sequence
+            except ValueError:
+                last_sequence = sequence
+            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                return
 
-            signature = (stat.st_mtime_ns, stat.st_size)
-            if signature != last_signature:
+    def handle_agent_events_websocket(self, parsed) -> None:
+        query = parse_qs(parsed.query)
+        try:
+            after = int((query.get("after") or ["0"])[0])
+        except ValueError:
+            after = 0
+        current_session_id = str(self.server.state.agent_runtime.snapshot().get("session_id") or "")
+        session_id = str((query.get("session_id") or [current_session_id])[0] or "")
+        if not self.handle_websocket_upgrade():
+            return
+        if not session_id or session_id != current_session_id:
+            return
+        self.connection.settimeout(1.0)
+        while True:
+            events, session_current = self.server.state.agent_runtime.wait_for_events(
+                after=after,
+                limit=200,
+                session_id=session_id,
+                timeout=0.25,
+            )
+            if not session_current:
+                return
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if readable:
+                    preview = self.connection.recv(2, socket.MSG_PEEK)
+                    if not preview or (preview[0] & 0x0F) == 0x8:
+                        return
+            except (OSError, ValueError):
+                return
+            for event in events:
                 try:
-                    payload = self.server.state.frame_path.read_bytes()
-                    self.connection.sendall(websocket_frame(payload, opcode=0x2))
-                except (FileNotFoundError, BrokenPipeError, ConnectionResetError, socket.timeout):
+                    self.connection.sendall(
+                        websocket_frame(json.dumps(event, ensure_ascii=False).encode("utf-8"), opcode=0x1)
+                    )
+                except (BrokenPipeError, ConnectionResetError, socket.timeout):
                     return
-                last_signature = signature
-            time.sleep(0.02)
+                after = max(after, int(event.get("seq") or 0))
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"{self.address_string()} - {fmt % args}")
@@ -7874,6 +16122,13 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     state: DebugState
+
+    def server_close(self) -> None:
+        state = getattr(self, "state", None)
+        if state is not None:
+            state.cancel_runtime_observations("server_closed")
+            state.stop_live_bridge()
+        super().server_close()
 
 
 def main() -> int:
@@ -7885,12 +16140,17 @@ def main() -> int:
     parser.add_argument("--game-binary", default="vendor/sdlpal/unix/sdlpal")
     args = parser.parse_args()
 
+    if not valid_poe_api_key(read_env_file(ROOT / ".env")):
+        print("POE_API_KEY is required for Agent screen inspection", file=sys.stderr)
+        return 2
+
     server = Server((args.host, args.port), Handler)
     server.state = DebugState(
         Path(args.runtime_dir).resolve(),
         Path(args.asset_dir).resolve(),
         Path(args.game_binary).resolve(),
     )
+    server.state.start_live_bridge()
     print(f"debug console: http://{args.host}:{args.port}")
     print(f"runtime dir: {server.state.runtime_dir}")
     try:

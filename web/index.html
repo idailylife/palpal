@@ -7,8 +7,12 @@
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main class="layout">
-      <aside class="navigationPane">
+    <div id="disconnectAlert" class="disconnectAlert" role="alert" hidden>
+      <strong id="disconnectMessage"></strong>
+      <button id="disconnectRefresh" type="button">Refresh Page</button>
+    </div>
+    <main id="layout" class="layout">
+      <aside id="navigationPane" class="navigationPane">
         <section>
           <h2>Exploration</h2>
           <div id="exploration" class="exploration"></div>
@@ -20,10 +24,29 @@
       </aside>
       <section class="screenPane">
         <div class="toolbar">
-          <strong>PALPAL Debug</strong>
-          <span id="connection">connecting</span>
+          <div class="toolbarTitle">
+            <strong>PALPAL Debug</strong>
+            <button id="navigationPaneToggle" class="paneToggle" type="button" aria-controls="navigationPane" aria-expanded="true">Hide sidebar</button>
+          </div>
+          <div id="statusBar" class="statusBar" aria-label="Runtime status">
+            <div class="statusChip" data-status-kind="state" data-tone="pending" title="State: Reconnecting">
+              <span>State</span>
+              <strong id="stateStatusValue">Reconnecting</strong>
+            </div>
+            <div class="statusChip" data-status-kind="frames" data-tone="pending" title="Frames: Reconnecting">
+              <span>Frames</span>
+              <strong id="framesStatusValue">Reconnecting</strong>
+            </div>
+            <div class="statusChip" data-status-kind="game" data-tone="pending" title="Game: Waiting">
+              <span>Game</span>
+              <strong id="gameStatusValue">Waiting</strong>
+            </div>
+            <div class="statusChip" data-status-kind="agent" data-tone="idle" title="Agent: Idle">
+              <span>Agent</span>
+              <strong id="agentStatusValue">Idle</strong>
+            </div>
+          </div>
         </div>
-        <div id="runtimeStatus" class="runtimeStatus" hidden></div>
         <div class="screenWrap">
           <canvas id="frame" width="320" height="200" aria-label="latest game frame"></canvas>
           <canvas id="overlay" width="640" height="400"></canvas>
@@ -74,51 +97,60 @@
         </div>
       </section>
       <aside class="statePane">
-        <section>
-          <div id="checkpoints" class="checkpoints"></div>
-        </section>
-        <section>
-          <div class="sectionHeader">
-            <h2>Agent</h2>
-            <span class="agentMode">manual execute</span>
-          </div>
-          <div id="agent" class="agent"></div>
-        </section>
-        <section>
-          <h2>Dialog History</h2>
-          <div id="dialogs" class="dialogs"></div>
-        </section>
-        <section>
-          <h2>Events</h2>
-          <div id="events" class="events"></div>
-        </section>
-        <section>
-          <h2>Inventory</h2>
-          <div id="inventory" class="inventory"></div>
-        </section>
-        <section>
-          <h2>Equipment</h2>
-          <div id="equipment" class="equipment"></div>
-        </section>
-        <section>
-          <details class="objectsDetails">
-            <summary>Objects</summary>
-            <div id="objects" class="objects"></div>
-          </details>
-        </section>
-        <section class="jsonSection">
-          <details id="jsonDetails">
-            <summary>
-              <span class="jsonTitle">JSON</span>
-              <span id="jsonStatus"></span>
-            </summary>
-            <div class="jsonControls">
-              <label><input id="jsonLive" type="checkbox" /> live</label>
-              <button id="jsonRefresh" type="button">Refresh</button>
-            </div>
-            <pre id="json"></pre>
-          </details>
-        </section>
+        <div class="stateTabs" role="tablist" aria-label="Right sidebar mode">
+          <button id="normalTab" type="button" role="tab" aria-selected="true" aria-controls="normalPanel" tabindex="0">Normal</button>
+          <button id="agentTab" type="button" role="tab" aria-selected="false" aria-controls="agentPanel" tabindex="-1">Agent</button>
+        </div>
+        <div id="normalPanel" class="stateTabPanel" role="tabpanel" aria-labelledby="normalTab">
+          <section>
+            <div id="checkpoints" class="checkpoints"></div>
+          </section>
+          <section id="battleSection" hidden>
+            <h2>Battle</h2>
+            <div id="battleStatus" class="battleStatus"></div>
+          </section>
+          <section>
+            <h2>Dialog History</h2>
+            <div id="dialogs" class="dialogs"></div>
+          </section>
+          <section>
+            <h2>Events</h2>
+            <div id="events" class="events"></div>
+          </section>
+          <section>
+            <h2>Inventory</h2>
+            <div id="inventory" class="inventory"></div>
+          </section>
+          <section>
+            <h2>Equipment</h2>
+            <div id="equipment" class="equipment"></div>
+          </section>
+          <section>
+            <details class="objectsDetails">
+              <summary>Objects</summary>
+              <div id="objects" class="objects"></div>
+            </details>
+          </section>
+          <section class="jsonSection">
+            <details id="jsonDetails">
+              <summary>
+                <span class="jsonTitle">JSON</span>
+                <span id="jsonStatus"></span>
+              </summary>
+              <div class="jsonControls">
+                <label><input id="jsonLive" type="checkbox" /> live</label>
+                <button id="jsonRefresh" type="button">Refresh</button>
+              </div>
+              <pre id="json"></pre>
+            </details>
+          </section>
+        </div>
+        <div id="agentPanel" class="stateTabPanel agentPanel" role="tabpanel" aria-labelledby="agentTab" hidden>
+          <header id="agentSessionHeader" class="agentSessionHeader"></header>
+          <div id="agentSessionControls" class="agentSessionControls"></div>
+          <div id="agentTimeline" class="agentTimeline" role="log" aria-live="polite" aria-label="Agent activity"></div>
+          <button id="agentJumpLatest" class="agentJumpLatest" type="button" hidden>Jump to latest</button>
+        </div>
       </aside>
     </main>
     <dialog id="transitionsDialog" class="transitionsDialog" aria-labelledby="transitionsTitle">
@@ -130,6 +162,26 @@
         <button id="transitionsClose" class="transitionsClose" type="button" aria-label="Close transitions">Close</button>
       </div>
       <div id="transitionsContent" class="transitionsContent" aria-live="polite"></div>
+    </dialog>
+    <dialog id="goalsDialog" class="goalsDialog" aria-labelledby="goalsTitle">
+      <div class="goalsDialogHeader">
+        <div>
+          <h2 id="goalsTitle">Agent Goals</h2>
+          <div id="goalsSummary" class="goalsSummary"></div>
+        </div>
+        <button id="goalsClose" class="goalsClose" type="button" aria-label="Close agent goals">Close</button>
+      </div>
+      <div id="goalsContent" class="goalsContent" aria-live="polite"></div>
+    </dialog>
+    <dialog id="roomMemoDialog" class="goalsDialog roomMemoDialog" aria-labelledby="roomMemoTitle">
+      <div class="goalsDialogHeader">
+        <div>
+          <h2 id="roomMemoTitle">Room Memo</h2>
+          <div id="roomMemoRoom" class="goalsSummary"></div>
+        </div>
+        <button id="roomMemoClose" class="goalsClose" type="button" aria-label="Close room memo">Close</button>
+      </div>
+      <div id="roomMemoContent" class="goalsContent roomMemoContent" aria-live="polite"></div>
     </dialog>
     <script src="/app.js"></script>
   </body>

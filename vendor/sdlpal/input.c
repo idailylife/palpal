@@ -1341,6 +1341,7 @@ PAL_ProcessEvent(
    PAL_TouchRepeatCheck();
 #endif
    PALPAL_AgentPollAction();
+   PALPAL_AgentPollFrame();
    if (PALPAL_AgentEnabled())
    {
       DWORD dwNow = SDL_GetTicks();

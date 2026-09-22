@@ -4,6 +4,7 @@ import struct
 import pytest
 
 from palpal.debug_server import (
+    indexed_to_png,
     decode_nav_grid,
     edge_key,
     grid_node,
@@ -133,6 +134,23 @@ def test_websocket_and_png_helpers_validate_sizes_and_headers():
         rgba_to_png(0, 1, b"")
     with pytest.raises(ValueError, match="invalid RGBA payload size"):
         rgba_to_png(1, 1, b"")
+
+    indexed = indexed_to_png(
+        2,
+        1,
+        b"\x00\x00\x00\xff\xff\x00\x00\xff",
+        b"\x00\x01",
+    )
+    assert indexed.startswith(b"\x89PNG\r\n\x1a\n")
+    indexed_raw = (
+        b"PFRM"
+        + struct.pack("<HHHH", 2, 2, 1, 2)
+        + struct.pack("<I", 2)
+        + struct.pack("<I", 1)
+        + struct.pack("<I", 10)
+        + b"\x00\x00\x00\xff\xff\x00\x00\xff\x00\x01"
+    )
+    assert pfrm_to_png(indexed_raw).startswith(b"\x89PNG")
 
     raw = b"PFRM" + struct.pack("<HHHH", 1, 1, 1, 1) + b"\x00" * 8 + struct.pack("<I", 4) + b"\x00\x00\x00\xff"
     assert pfrm_to_png(raw).startswith(b"\x89PNG")

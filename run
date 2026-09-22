@@ -5,6 +5,7 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PYTHON="${PYTHON:-python3}"
 NODE="${NODE:-node}"
 RUNTIME_DIR="${PALPAL_RUNTIME_DIR:-$ROOT/runtime}"
+SOCKET_PATH="${PALPAL_AGENT_SOCKET:-$RUNTIME_DIR/live.sock}"
 ASSET_DIR="${PALPAL_ASSET_DIR:-$ROOT/data/pal}"
 GAME_BIN="${PALPAL_GAME_BIN:-$ROOT/vendor/sdlpal/unix/sdlpal}"
 HOST="${PALPAL_HOST:-127.0.0.1}"
@@ -13,6 +14,7 @@ SAVE_SLOT="${PALPAL_SAVE_SLOT:-0}"
 CHECKPOINT_SLOT="${PALPAL_CHECKPOINT_SLOT:-99}"
 START_MODE="${PALPAL_START_MODE:-wait}"
 HEADLESS="${PALPAL_HEADLESS:-1}"
+GAME_INSTANCE_ID="${PALPAL_GAME_INSTANCE_ID:-}"
 
 usage() {
     printf '%s\n' \
@@ -31,9 +33,10 @@ usage() {
         '  help    Show this help' \
         '' \
         'Useful environment variables:' \
-        '  PYTHON, NODE, PALPAL_RUNTIME_DIR, PALPAL_ASSET_DIR, PALPAL_GAME_BIN' \
+        '  PYTHON, NODE, PALPAL_RUNTIME_DIR, PALPAL_AGENT_SOCKET, PALPAL_ASSET_DIR, PALPAL_GAME_BIN' \
         '  PALPAL_HOST, PALPAL_PORT, PALPAL_SAVE_SLOT, PALPAL_CHECKPOINT_SLOT, PALPAL_START_MODE, PALPAL_HEADLESS' \
-        '  PALPAL_HEADLESS=0 starts a visible SDL window for video debugging.'
+        '  PALPAL_HEADLESS=0 starts a visible SDL window for video debugging.' \
+        '  PALPAL_GAME_INSTANCE_ID is normally generated automatically for each game process.'
 }
 
 need_cmake() {
@@ -50,6 +53,7 @@ ensure_runtime() {
 prepare_live_runtime() {
     ensure_runtime
     rm -f \
+        "$SOCKET_PATH" \
         "$RUNTIME_DIR/action.txt" \
         "$RUNTIME_DIR/action.txt.tmp" \
         "$RUNTIME_DIR/action_result.json" \
@@ -89,7 +93,7 @@ configure_build() {
 run_debug() {
     ensure_runtime
     cd "$ROOT"
-    exec "$PYTHON" -m palpal.debug_server \
+    exec env PALPAL_AGENT_SOCKET="$SOCKET_PATH" "$PYTHON" -m palpal.debug_server \
         --host "$HOST" \
         --port "$PORT" \
         --runtime-dir "$RUNTIME_DIR" \
@@ -100,6 +104,9 @@ run_debug() {
 run_game() {
     ensure_runtime
     check_game_inputs
+    if [ -z "$GAME_INSTANCE_ID" ]; then
+        GAME_INSTANCE_ID="$($PYTHON -c 'import uuid; print(uuid.uuid4().hex)')"
+    fi
     cd "$ASSET_DIR"
     if [ "$HEADLESS" = "1" ]; then
         exec env \
@@ -107,18 +114,22 @@ run_game() {
             PALPAL_AGENT=1 \
             PALPAL_HEADLESS=1 \
             PALPAL_RUNTIME_DIR="$RUNTIME_DIR" \
+            PALPAL_AGENT_SOCKET="$SOCKET_PATH" \
             PALPAL_SAVE_SLOT="$SAVE_SLOT" \
             PALPAL_CHECKPOINT_SLOT="$CHECKPOINT_SLOT" \
             PALPAL_START_MODE="$START_MODE" \
+            PALPAL_GAME_INSTANCE_ID="$GAME_INSTANCE_ID" \
             "$GAME_BIN"
     else
         exec env \
             PALPAL_AGENT=1 \
             PALPAL_HEADLESS=0 \
             PALPAL_RUNTIME_DIR="$RUNTIME_DIR" \
+            PALPAL_AGENT_SOCKET="$SOCKET_PATH" \
             PALPAL_SAVE_SLOT="$SAVE_SLOT" \
             PALPAL_CHECKPOINT_SLOT="$CHECKPOINT_SLOT" \
             PALPAL_START_MODE="$START_MODE" \
+            PALPAL_GAME_INSTANCE_ID="$GAME_INSTANCE_ID" \
             "$GAME_BIN"
     fi
 }
@@ -140,13 +151,16 @@ run_all() {
         i=0
         while [ "$i" -lt 20 ]; do
             if ! kill -0 "$debug_pid" 2>/dev/null && ! kill -0 "$game_pid" 2>/dev/null; then
-                return
+                break
             fi
             i=$((i + 1))
             sleep 0.1
         done
-        kill -KILL "$debug_pid" "$game_pid" 2>/dev/null || true
+        if kill -0 "$debug_pid" 2>/dev/null || kill -0 "$game_pid" 2>/dev/null; then
+            kill -KILL "$debug_pid" "$game_pid" 2>/dev/null || true
+        fi
         wait "$debug_pid" "$game_pid" 2>/dev/null || true
+        rm -f "$SOCKET_PATH"
     }
     trap cleanup EXIT INT TERM
 
@@ -204,7 +218,7 @@ run_visual_smoke() {
     check_game_inputs
     mkdir -p "$RUNTIME_DIR/logs"
 
-    PALPAL_HEADLESS=1 run_game >"$RUNTIME_DIR/logs/game.log" 2>&1 &
+    HEADLESS=1 START_MODE=slot run_game >"$RUNTIME_DIR/logs/game.log" 2>&1 &
     game_pid=$!
 
     run_debug >"$RUNTIME_DIR/logs/debug.log" 2>&1 &
@@ -216,13 +230,16 @@ run_visual_smoke() {
         i=0
         while [ "$i" -lt 20 ]; do
             if ! kill -0 "$debug_pid" 2>/dev/null && ! kill -0 "$game_pid" 2>/dev/null; then
-                return
+                break
             fi
             i=$((i + 1))
             sleep 0.1
         done
-        kill -KILL "$debug_pid" "$game_pid" 2>/dev/null || true
+        if kill -0 "$debug_pid" 2>/dev/null || kill -0 "$game_pid" 2>/dev/null; then
+            kill -KILL "$debug_pid" "$game_pid" 2>/dev/null || true
+        fi
         wait "$debug_pid" "$game_pid" 2>/dev/null || true
+        rm -f "$SOCKET_PATH"
     }
     trap cleanup EXIT INT TERM
 
@@ -259,6 +276,7 @@ case "$command" in
         ;;
     clean)
         prepare_live_runtime
+        rm -rf "$RUNTIME_DIR/checkpoint_migration_backups"
         ;;
     help|-h|--help)
         usage
