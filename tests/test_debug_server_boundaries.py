@@ -601,13 +601,13 @@ def test_native_action_handshake_closes_consumed_file_race(tmp_path):
             {"shop": {"active": True, "mode": "buy"}},
             "shop",
             "client",
-            ["shop_buy", "shop_leave"],
+            ["shop_buy", "shop_leave", "press_buttons"],
         ),
         (
             {"shop": {"active": True, "mode": "sell"}},
             "shop",
             "client",
-            ["shop_sell", "shop_leave"],
+            ["shop_sell", "shop_leave", "press_buttons"],
         ),
     ],
 )
@@ -631,6 +631,37 @@ def test_control_state_priority_and_allowed_actions(
     assert control["owner"] == owner
     assert control["allowed_actions"] == allowed
     assert control["navigation_ready"] is False
+
+
+@pytest.mark.parametrize("mode", ["buy", "sell"])
+@pytest.mark.parametrize("phase", ["select", "confirm"])
+@pytest.mark.parametrize("button", ["down", "search", "menu"])
+def test_http_shop_accepts_manual_buttons_and_blocks_pending_actions(
+    http_server, mode, phase, button,
+):
+    base_url, debug = http_server
+    state = make_state()
+    state["shop"] = {"active": True, "mode": mode, "phase": phase}
+    state["trigger_observation"] = {"generation": 4, "completed": False}
+    write_state(debug, state)
+
+    status, _, raw = http_request(base_url, "/state")
+    assert status == 200
+    assert "press_buttons" in json.loads(raw)["control"]["allowed_actions"]
+
+    status, _, raw = http_request(
+        base_url, "/action", method="POST", payload={"buttons": [button], "frames": 1},
+    )
+    assert status == 200
+    assert json.loads(raw)["ok"] is True
+    assert debug.action_path.read_text(encoding="ascii") == f"frames 1\nbutton {button}\n"
+
+    status, _, raw = http_request(
+        base_url, "/action", method="POST", payload={"buttons": [button], "frames": 1},
+    )
+    assert status == 400
+    assert json.loads(raw)["error"] == "action_pending"
+    assert debug.action_path.read_text(encoding="ascii") == f"frames 1\nbutton {button}\n"
 
 
 def test_battle_control_exposes_only_command_windows(tmp_path):

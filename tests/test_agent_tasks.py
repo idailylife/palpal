@@ -54,6 +54,93 @@ def test_task_ledger_create_update_close_and_filtering(tmp_path):
     assert not debug.run_agent_tool("upsert_task", {"description": "missing reason"})["ok"]
 
 
+def test_projected_merged_dialog_reference_completes_task_without_reconstructing_frames(tmp_path):
+    debug = make_debug_state(tmp_path)
+    create_agent_task(debug, {"id": "rescue", "description": "Rescue", "rationale": "Missing person."})
+    entry = {"source_key": "dialog:77:24:763427:5:5053:爹～您先醫治李少俠",
+             "raw_frame": 763427, "logical_frame": 1661753,
+             "message_ids": [5053, 5054], "text": "爹～您先醫治李少俠", "time": 100}
+    debug.dialog_history.append(entry)
+    projected = debug.project_agent_observations({"ok": True, "dialogs": [entry]})
+    evidence = dict(zip(projected["dialog_fields"], projected["dialogs"][0]))
+    args = {"id": "rescue", "status": "completed", "status_reason": "Person returned.",
+            "status_evidence": [evidence["source_key"].replace("763427", "1661753")]}
+    before = debug.read_exploration()
+    failed = debug.run_agent_tool("upsert_task", args)
+    assert failed["error"]["code"] == "invalid_status_evidence"
+    assert failed["error"]["missing_references"] == args["status_evidence"]
+    assert debug.read_exploration() == before
+    args["status_evidence"] = [evidence["source_key"]]
+    assert debug.run_agent_tool("upsert_task", args)["task"]["status"] == "completed"
+
+
+def test_six_task_reconciliation_and_forty_inbox_recovery(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = make_state(objects=[make_object(51, sprite_id=0, trigger_mode=5)])
+    state["dialog"] = {"active": False}
+    write_state(debug, state)
+    for index in range(6):
+        assert create_agent_task(debug, {
+            "id": f"task-{index}", "description": f"Task {index}", "rationale": "Follow up.",
+        })["ok"]
+    debug.record_task_inbox_entries([
+        inbox_dialog(source_key=f"evidence-{index}", text=f"Progress {index}") for index in range(40)
+    ])
+    pending = [record["id"] for record in debug.task_inbox_pending()]
+    assert len(pending) == 40
+    debug.agent_runtime.mark_task_reconciliation_pending("context_compacted")
+    cycle = debug.new_agent_tool_cycle(state)
+    audit = debug.run_agent_tool("get_tasks", {
+        "include_closed": True, "detail": "summary", "limit": 100,
+    }, state, tool_cycle=cycle)
+    before = debug.read_exploration()
+    failed = debug.run_agent_tool("upsert_task", {
+        "id": "task-0", "review_token": "wrong-token",
+    }, state, tool_cycle=cycle)
+    assert failed["error"]["code"] == "task_reconciliation_required"
+    assert debug.read_exploration() == before
+    for index in range(6):
+        args = {"id": f"task-{index}", "review_token": audit["review_token"]}
+        if index == 0:
+            args.update(status="completed", status_reason="Rescue succeeded.", status_evidence=[pending[0]])
+        assert debug.run_agent_tool("upsert_task", args, state, tool_cycle=cycle)["ok"]
+    assert not debug.agent_runtime.task_reconciliation_pending()
+    blocked = debug.run_agent_tool("submit_decision", {
+        "action": "navigate", "target_id": 51, "reason": "Continue.",
+    }, state, tool_cycle=cycle)
+    assert blocked["error"]["code"] == "task_inbox_review_required"
+    for offset in range(0, 40, 3):
+        batch = pending[offset:offset + 3]
+        resolutions = {"resolutions": [
+            {"inbox_id": inbox_id, "outcome": "task_updated", "task_ids": ["task-0", "task-1"],
+             "rationale": "Rescue and next task progress."} for inbox_id in batch
+        ]}
+        before = debug.read_exploration()
+        failed = debug.run_agent_tool("review_task_inbox", resolutions, state, tool_cycle=cycle)
+        assert failed["missing_inbox_links"] == [
+            {"inbox_id": inbox_id, "task_id": task_id}
+            for inbox_id in batch for task_id in ("task-0", "task-1")
+        ]
+        assert debug.read_exploration() == before
+        for task_id in ("task-0", "task-1"):
+            assert debug.run_agent_tool("upsert_task", {
+                "id": task_id, "source_inbox_ids": batch,
+            }, state, tool_cycle=cycle)["ok"]
+        assert debug.run_agent_tool("review_task_inbox", resolutions, state, tool_cycle=cycle)["ok"]
+    assert debug.task_inbox_pending() == []
+    tasks = debug.read_exploration()["tasks"]
+    assert tasks["task-0"]["status"] == "completed"
+    assert set(tasks["task-0"]["provenance"]["task_inbox_batch_ids"]) == set(pending)
+    accepted = debug.run_agent_tool("submit_decision", {
+        "action": "navigate", "target_id": 51, "reason": "Continue.",
+    }, state, tool_cycle=cycle)
+    assert accepted["ok"]
+    assert accepted["decision"].get("validation", {}).get("status") != "rejected"
+    assert accepted["decision"]["recommended_action"] == {
+        "tool": "navigation_step", "args": {"id": 51}, "dry_run": True,
+    }
+
+
 def test_completed_tasks_return_most_recent_completion_first_and_recompletion_refreshes_frame(tmp_path):
     debug = make_debug_state(tmp_path)
     older = create_agent_task(debug, {

@@ -3383,8 +3383,28 @@ class AgentRuntime:
 
             async def invoke(_context: Any, raw_arguments: str) -> str:
                 nonlocal submitted_decision
-                arguments = runtime._parse_tool_arguments(raw_arguments)
                 started = _now()
+                try:
+                    arguments = runtime._parse_tool_arguments(raw_arguments)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    result = {"ok": False, "error": {
+                        "code": "invalid_tool_arguments",
+                        "message": "Tool arguments must be a valid JSON object. Correct the arguments and retry; the tool was not executed.",
+                    }}
+                    raw = raw_arguments or ""
+                    position = exc.pos if isinstance(exc, json.JSONDecodeError) else 0
+                    start = max(0, position - 160)
+                    runtime.emit("tool", "rejected", f"Tool {name} arguments rejected.", {
+                        "name": name,
+                        "call_id": getattr(_context, "tool_call_id", None),
+                        "parse_error": str(exc),
+                        "position": position,
+                        "arguments_excerpt": raw[start:start + 320],
+                        "excerpt_offset": start,
+                        "arguments_length": len(raw),
+                        "result": result,
+                    }, started=started)
+                    return json.dumps(result, ensure_ascii=False)
                 tool_state = runtime.debug.snapshot()
                 if name == "inspect_screen":
                     result = await asyncio.to_thread(

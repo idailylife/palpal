@@ -3537,6 +3537,21 @@ def test_sdk_rejected_submit_returns_to_model_and_recovers_in_same_tool_cycle(tm
         async def stream_events(self):
             by_name = {tool.name: tool for tool in self.agent.tools}
             submit = by_name["submit_decision"]
+            for name, raw in (("upsert_task", '{"id" "broken"}'),
+                              ("upsert_task", '[]'), ("submit_decision", 'null')):
+                tool = by_name[name]
+                context = types.SimpleNamespace(tool_call_id="malformed-call")
+                output = await tool.kwargs["on_invoke_tool"](context, raw)
+                assert json.loads(output)["error"]["code"] == "invalid_tool_arguments"
+                assert captured["calls"] == []
+                rejected = types.SimpleNamespace(tool=tool, output=output)
+                assert self.agent.tool_use_behavior(None, [rejected]).is_final_output is False
+            with monkeypatch.context() as patch:
+                def broken_tool(*args, **kwargs):
+                    raise ValueError("internal business failure")
+                patch.setattr(debug, "run_agent_tool", broken_tool)
+                with pytest.raises(ValueError, match="internal business failure"):
+                    await by_name["upsert_task"].kwargs["on_invoke_tool"](None, '{}')
             rejected_output = await submit.kwargs["on_invoke_tool"](None, json.dumps(submission("navigate", target_id=63)))
             assert json.loads(rejected_output)["error"]["code"] == "task_review_required"
             rejected = types.SimpleNamespace(tool=submit, output=rejected_output)
@@ -3588,6 +3603,13 @@ def test_sdk_rejected_submit_returns_to_model_and_recovers_in_same_tool_cycle(tm
         ("submitted", "Recommendation submitted."),
     ]
     assert decision_events[0]["details"]["result"]["error"]["code"] == "task_review_required"
+    malformed_events = [event for event in runtime.events()
+                        if event["type"] == "tool" and event["phase"] == "rejected"]
+    assert len(malformed_events) == 3
+    for event in malformed_events:
+        assert event["details"]["call_id"] == "malformed-call"
+        assert len(event["details"]["arguments_excerpt"]) <= 320
+    assert malformed_events[0]["details"]["position"] > 0
 
 
 def test_sdk_parallel_task_query_and_create_cannot_bypass_review_result(tmp_path, monkeypatch):

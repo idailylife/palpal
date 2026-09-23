@@ -1082,7 +1082,7 @@ class DebugState:
         elif shop_active:
             shop = state.get("shop") or {}
             shop_action = "shop_sell" if shop.get("mode") == "sell" else "shop_buy"
-            owner, phase, allowed = "client", "shop", [shop_action, "shop_leave"]
+            owner, phase, allowed = "client", "shop", [shop_action, "shop_leave", "press_buttons"]
         elif trigger is not None and trigger.get("completed") is not True:
             owner, phase, allowed = "game", "game_script", []
         else:
@@ -5263,13 +5263,17 @@ class DebugState:
                     add(f"transition:{key}", "transition", record, key)
         return catalog
 
-    def resolve_task_evidence(self, refs: object, data: dict) -> tuple[list[dict] | None, str | None]:
+    def resolve_task_evidence(self, refs: object, data: dict) -> tuple[list[dict] | None, str | dict | None]:
         if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
             return None, "status_evidence must be a non-empty list of evidence references"
         catalog = self.task_evidence_catalog(data)
         missing = [ref.strip() for ref in refs if ref.strip() not in catalog]
         if missing:
-            return None, f"status_evidence references were not found: {', '.join(missing)}"
+            return None, {
+                "code": "invalid_status_evidence",
+                "message": "Copy exact source_key references from get_observations, or use task inbox IDs. Do not reconstruct references from frame or message IDs.",
+                "missing_references": list(dict.fromkeys(missing)),
+            }
         return [catalog[ref.strip()] for ref in dict.fromkeys(refs)], None
 
     def task_review_for(self, task: dict, state: dict | None = None) -> dict | None:
@@ -5802,18 +5806,25 @@ class DebugState:
             if missing_batches:
                 return {"ok": False, "error": "unknown or already resolved task inbox batch", "missing_batch_ids": missing_batches}
             tasks = data.get("tasks") if isinstance(data.get("tasks"), dict) else {}
+            missing_links = []
             for item in task_outcomes:
-                record = inbox[item["inbox_id"]]
                 for task_id in item["task_ids"]:
                     task = tasks.get(task_id)
                     provenance = task.get("provenance") if isinstance(task, dict) else None
                     linked_ids = provenance.get("task_inbox_batch_ids") if isinstance(provenance, dict) else None
                     if not isinstance(linked_ids, list) or item["inbox_id"] not in linked_ids:
-                        return {
-                            "ok": False,
-                            "error": "every referenced task must durably link the resolved inbox evidence",
-                            "missing_inbox_links": [{"inbox_id": item["inbox_id"], "task_id": task_id}],
-                        }
+                        missing_links.append({"inbox_id": item["inbox_id"], "task_id": task_id})
+            if missing_links:
+                return {
+                    "ok": False,
+                    "error": "every referenced task must durably link the resolved inbox evidence",
+                    "missing_inbox_links": missing_links,
+                    "repair_hint": "For each task_id, upsert_task with the listed inbox IDs in source_inbox_ids. Read successful results before retrying review_task_inbox.",
+                }
+            for item in task_outcomes:
+                record = inbox[item["inbox_id"]]
+                for task_id in item["task_ids"]:
+                    task = tasks.get(task_id)
                     if item["outcome"] == "new_task":
                         created_turn = int(task.get("created_agent_turn") or 0)
                         evidence_turn = int(record.get("created_agent_turn") or 0)
@@ -12707,6 +12718,9 @@ class DebugState:
                         "创建或更新本地 agent 任务记忆，不执行游戏动作。已有 id 会更新；未知自选 id 或省略 id 的创建必须先完整读取 "
                         "closed-inclusive summary 账本，并在后一模型批次提供最终页 review_token。省略 id 创建时自动生成 task-* id。"
                         "对已有 id 不提供变化字段表示明确确认继续，也会刷新该任务的证据审计快照。"
+                        "无状态变化的确认只提交 id 和必要的 review_token；不要重写 rationale 或添加无关证据。"
+                        "status_evidence 逐字复制 get_observations 返回的 source_key 或 task inbox ID，禁止自行拼接。"
+                        "归档任务类 inbox 前，须用 source_inbox_ids 建立关联并读取更新成功结果。"
                         "新增或改变非空 room_id 前，必须在同一工具周期查询该房间的 get_room_memory。"
                     ),
                     "parameters": {
@@ -13152,6 +13166,7 @@ class DebugState:
     AGENT_DIALOG_FIELDS = (
         "time", "agent_turn", "logical_frame", "scene_id", "map_id",
         "logical_room_id", "event_object_id", "message_ids", "speaker_hint", "text",
+        "source_key",
     )
 
     @classmethod
@@ -13967,6 +13982,9 @@ class DebugState:
             "调用 review_task_inbox 时，未完成的召唤、委托、约定或阶段目标使用 new_task；已有任务进展使用 task_updated；"
             "只有闲聊、重复证据或已有可观察完成效果时才用 no_follow_up，并选择结构化 reason_code。"
             "任务类结论必须先 get_tasks，再用 source_inbox_ids 成功 upsert 对应任务后归档；禁止写‘下轮另建’并提前结案。"
+            "按依赖顺序分批调用：完整读账本 → 后一批更新任务 → 读取成功结果 → 归档 inbox → 读取成功结果 → submit_decision。"
+            "不要将有依赖的更新、归档和行动提交放在同一批；未收到成功结果前不得声称任务已更新或证据已归档。"
+            "status_evidence 必须逐字复制 source_key 或使用 task inbox ID；不得用逻辑帧、消息编号或对话文字重建引用。"
             "task_reconciliation.pending=true 表示 checkpoint 恢复、上下文压缩或旧状态升级后必须重建全账本可见性：完整读取 closed-inclusive summary 索引，"
             "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。全部 active 任务完成 upsert 后立即解除对账；"
             "完成前不可 navigate、use_item 或创建任务，对话可继续。"

@@ -69,6 +69,7 @@ def test_model_observation_projection_shrinks_dialogs_and_archives_exact_raw(tmp
             "scene_id": 3, "map_id": 10, "logical_room_id": "room-a",
             "event_object_id": 57, "message_ids": [1000 + index],
             "speaker_hint": "李大娘", "text": f"对话 {index} " + "内容" * 30,
+            "source_key": f"dialog:3:10:{index}:57:{1000 + index}:对话",
             "raw": "R" * 1200, "room_key": "legacy", "legacy_nav_room_id": "old",
             "provenance": {"huge": "P" * 1000},
         })
@@ -82,6 +83,8 @@ def test_model_observation_projection_shrinks_dialogs_and_archives_exact_raw(tmp
     assert all(entry["event_object_id"] == 57 for entry in restored_dialogs)
     assert all(entry["logical_room_id"] == "room-a" for entry in restored_dialogs)
     assert [entry["text"] for entry in restored_dialogs] == [entry["text"] for entry in dialogs]
+    assert projected["dialog_fields"][-1] == "source_key"
+    assert [entry["source_key"] for entry in restored_dialogs] == [entry["source_key"] for entry in dialogs]
     assert projected["full_result_archived"] is True
     assert runtime.get_tool_output(projected["output_ref"])["content"] == raw[:6000]
     pages = []
