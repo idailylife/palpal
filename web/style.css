@@ -227,15 +227,20 @@ body {
 
 .controls {
   display: grid;
-  grid-template-columns: auto minmax(180px, 260px) minmax(220px, 1fr);
+  grid-template-columns: 204px minmax(180px, 260px);
   align-items: start;
-  gap: 12px;
+  justify-content: center;
+  gap: 32px;
   margin-top: 12px;
   width: min(100%, 960px);
 }
 
 .controlGroup {
   min-width: 0;
+}
+
+.controls > .controlGroup + .controlGroup {
+  margin-top: 0;
 }
 
 .controlGroup h2 {
@@ -249,34 +254,10 @@ body {
   gap: 6px;
 }
 
-.actionButtons,
-.advancedButtons {
+.actionButtons {
   display: grid;
   gap: 8px;
-}
-
-.actionButtons {
   grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.advancedGroup {
-  border: 1px solid #2b333b;
-  border-radius: 6px;
-  background: #0f1317;
-  padding: 8px;
-}
-
-.advancedGroup summary {
-  color: #9fb1c1;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 700;
-  text-transform: uppercase;
-}
-
-.advancedButtons {
-  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
-  margin-top: 10px;
 }
 
 button {
@@ -1704,14 +1685,6 @@ pre {
 
   .screenPane {
     order: 1;
-  }
-
-  .controls {
-    grid-template-columns: auto minmax(180px, 1fr);
-  }
-
-  .advancedGroup {
-    grid-column: 1 / -1;
   }
 
   .statePane {
