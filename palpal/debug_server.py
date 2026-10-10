@@ -8955,6 +8955,11 @@ class DebugState:
             compact["intra_room_transition"] = True
             compact["source_endpoint"] = transition.get("source_endpoint")
             compact["destination_endpoint"] = transition.get("destination_endpoint")
+        # The source is already in transition_key. Preserve only the missing
+        # historical landing, on demand, without frames or state snapshots.
+        position = transition.get("native_destination")
+        if isinstance(position, dict) and all(type(position.get(k)) is int for k in ("x", "y")):
+            compact["landing_position"] = {k: position[k] for k in ("x", "y")}
         if transition.get("returns_to_recent_room") is True:
             compact["returns_to_recent_room"] = True
         if transition.get("confirmation") not in {"native_trigger", "human_confirmed"}:
@@ -11996,6 +12001,22 @@ class DebugState:
         identity = self.room_identity(state)
         with self.exploration_lock:
             exploration = self.read_exploration()
+        # A shared destination room does not identify the entrance used. Compare
+        # against the original landing, not the party's changing current position.
+        landing_nodes = set()
+        grid = decode_nav_grid(state)
+        landing = context.get("landing_position")
+        if grid is not None and isinstance(landing, dict) and all(
+            type(landing.get(k)) is int for k in ("x", "y")
+        ):
+            start = grid_node(grid, landing["x"], landing["y"])
+            if start is not None and nav_bit(grid, start):
+                graph = self.navigation_graph(grid)
+                landing_nodes = {start}
+                frontier = {start}
+                for _ in range(IMMEDIATE_ENTRY_RETURN_MAX_STEPS):
+                    frontier = {neighbor for node in frontier for _, neighbor in graph.get(node, ())} - landing_nodes
+                    landing_nodes.update(frontier)
         decorated = []
         for original in targets:
             target = dict(original)
@@ -12017,10 +12038,21 @@ class DebugState:
                     })
                     target.pop("deprioritize_reason", None)
             elif status in {"entered", "progressed"} and target.get("transition_candidate") is True:
-                known_return = bool(
+                same_room_return = bool(
                     target.get("known_destination")
                     and target.get("known_destination_room_id") == context.get("source_room_id")
                 )
+                obj = self.target_object(state, target_id)
+                near_entry = bool(
+                    grid is not None and obj is not None
+                    and landing_nodes.intersection(self.touch_boundary_nodes_for_object(obj, grid))
+                )
+                known_return = same_room_return and near_entry
+                if same_room_return and not near_entry:
+                    target["entry_relation"] = "same_room_return"
+                    if target.get("agent_priority") == "avoid_backtrack":
+                        target["agent_priority"] = "normal"
+                        target.pop("deprioritize_reason", None)
                 candidate = self.destination_entry_candidate_for_target(
                     exploration,
                     identity.get("id") if isinstance(identity, dict) else "",
@@ -12031,6 +12063,7 @@ class DebugState:
                     isinstance(candidate, dict)
                     and candidate.get("candidate_return_room_id") == context.get("source_room_id")
                     and candidate.get("source_transition_key") == context.get("source_transition_key")
+                    and (not same_room_return or near_entry)
                 )
                 if known_return or inferred_return:
                     target.update({
