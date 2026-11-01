@@ -113,6 +113,8 @@ def survival_risk(view: dict, previous: dict | None) -> tuple[dict, dict]:
             **{key: player[key] for key in (
                 "index", "hp", "max_hp", "mp", "max_mp", "status_effects", "poisons",
             ) if key in player},
+            "within_observed_single_loss": 0 < player.get("hp", 0) <= maxima.get(
+                str(player["index"]), {}).get("single_outcome_hp_loss", 0),
             "observed_maxima": maxima.get(str(player["index"]), {
                 "single_outcome_hp_loss": 0, "window_hp_loss": 0,
             }),
@@ -137,4 +139,32 @@ def decision_feedback(view: dict, new_outcomes: list[dict]) -> dict:
         "status": "effects_observed" if events else "no_new_effects",
         "submission_is_not_execution": True,
         "events": events,
+    }
+
+
+def survival_review(view: dict, action: dict) -> dict | None:
+    """Request deliberation, never predict damage or choose an action."""
+    legal = next((a for a in view.get("available_actions", [])
+                  if a.get("action_type") == action.get("action_type")
+                  and a.get("object_id", 0) == action.get("object_id", 0)), {})
+    offensive = action.get("action_type") in ("attack", "throw_item") or (
+        action.get("action_type") in ("magic", "coop_magic")
+        and legal.get("target_side") == "enemy")
+    risk = view.get("survival_risk") or {}
+    endangered = [p for p in risk.get("players", [])
+                  if p.get("within_observed_single_loss")]
+    if not offensive or not endangered:
+        return None
+    return {
+        "ok": False, "accepted": False, "status": "survival_review_required",
+        "endangered_players": endangered,
+        "history_incomplete": risk.get("history_incomplete", True),
+        "instruction": (
+            "No native action has been submitted. Reconsider once using current legal "
+            "recovery/protection actions and allies' committed actions. Compare recovery "
+            "timing and evidence for a kill. Unknown enemy HP cannot establish a finishing "
+            "blow; previous attack order does not establish healing order. Observed damage "
+            "is not a future upper bound. Submit your final legal choice; it may remain "
+            "offensive and will not require another review in this command window."
+        ),
     }

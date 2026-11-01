@@ -104,7 +104,8 @@ def test_fox_decision_fixtures_preserve_real_gap_and_danger():
 
 
 @pytest.mark.parametrize("interrupted", [False, True])
-def test_sdk_delivery_commits_only_after_completed_request(tmp_path, monkeypatch, interrupted):
+@pytest.mark.parametrize("review_needed", [False, True])
+def test_sdk_delivery_commits_only_after_completed_request(tmp_path, monkeypatch, interrupted, review_needed):
     from agents import Runner
 
     debug = make_debug_state(tmp_path)
@@ -118,6 +119,12 @@ def test_sdk_delivery_commits_only_after_completed_request(tmp_path, monkeypatch
     monkeypatch.setattr(debug, "snapshot", lambda: copy.deepcopy(state))
     monkeypatch.setattr(debug, "battle_action_validation_error", lambda *args: None)
     monkeypatch.setattr(debug.agent_runtime, "_final_model_tool_output", lambda *args: "archived preview")
+
+    if review_needed:
+        monkeypatch.setattr("palpal.agent_runtime.survival_review", lambda *args: {
+            "ok": False, "accepted": False, "status": "survival_review_required",
+        })
+    reviews = []
 
     class Stream:
         context_wrapper = None
@@ -140,7 +147,13 @@ def test_sdk_delivery_commits_only_after_completed_request(tmp_path, monkeypatch
             if interrupted:
                 raise asyncio.CancelledError()
             tool = next(t for t in self.agent.tools if t.name == "submit_battle_action")
-            await tool.on_invoke_tool(None, json.dumps({"action_type": "attack", "object_id": 0, "target_index": 0}))
+            raw = json.dumps({"action_type": "attack", "object_id": 0, "target_index": 0})
+            reply = json.loads(await tool.on_invoke_tool(None, raw))
+            if reply.get("status") == "survival_review_required":
+                reviews.append(reply)
+                assert not reply["accepted"]
+                reply = json.loads(await tool.on_invoke_tool(None, raw))
+            assert reply["accepted"]
             if False:
                 yield
 
@@ -161,6 +174,7 @@ def test_sdk_delivery_commits_only_after_completed_request(tmp_path, monkeypatch
         assert delegate._control()["survival_observations"]["last_sequence"] == 2
         asyncio.run(delegate._sdk_action(state, ""))
         assert delegate._control()["last_sent_outcome_sequence"] == 3
+        assert len(reviews) == int(review_needed)
         delegate._begin(state)
         assert delegate._control()["survival_observations"]["last_sequence"] == 3
         state["game_instance_id"] = "another-game"
@@ -184,3 +198,23 @@ def test_model_replay_is_observation_only_and_variants_use_same_evidence():
         assert revised["available_actions"] == baseline["available_actions"]
         assert "survival_risk" in revised and "survival_risk" not in baseline
     assert instructions(True) == instructions(False) + BATTLE_SURVIVAL_INSTRUCTIONS
+
+
+@pytest.mark.parametrize('hp,action_type,target_side,expected', [
+    (52, 'attack', 'enemy', True), (15, 'magic', 'enemy', True),
+    (123, 'magic', 'enemy', False), (111, 'magic', 'player', False),
+    (0, 'attack', 'enemy', False), (52, 'use_item', 'player', False),
+])
+def test_survival_review_uses_single_loss_not_old_roster_window(hp, action_type, target_side, expected):
+    from palpal.battle_observations import survival_review
+    view = {'players': [{'index': 0, 'hp': hp}], 'recent_outcomes': [],
+            'available_actions': [{'action_type': action_type, 'object_id': 0,
+                                   'target_side': target_side}]}
+    previous = {'observed_maxima': {'0': {'single_outcome_hp_loss': 73,
+                                         'window_hp_loss': 162}}}
+    view['survival_risk'], _ = survival_risk(view, previous)
+    result = survival_review(view, {'action_type': action_type, 'object_id': 0})
+    assert bool(result) == expected
+    if result:
+        assert result['accepted'] is False
+        assert result['endangered_players'][0]['hp'] == hp

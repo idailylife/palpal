@@ -15,7 +15,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable
 
-from palpal.battle_observations import decision_feedback, outcome_delta, survival_risk
+from palpal.battle_observations import decision_feedback, outcome_delta, survival_risk, survival_review
 from palpal.battle_items import BattleItemDetails, ITEM_DETAILS_DESCRIPTION, ITEM_DETAILS_SCHEMA
 
 
@@ -64,9 +64,7 @@ order and the latest survival_risk window: effective recovery, total incoming da
 new controls, poison and knockouts. Delivery completeness concerns sequence delivery
 only; unresolved HP accounting means additional unknown effects, not zero damage.
 An accepted submission is not execution. Reassess when enemy_roster_changes appears.
-Read battle_messages as player-visible feedback for that action. An explicit failure
-or no-effect message is negative evidence for that attempt; prefer supported alternatives
-over repeating it unchanged. One failure does not prove permanent immunity.
+Read battle_messages as player-visible feedback for that action. Failure/no-effect messages favor alternatives, but do not prove permanent immunity.
 no_numeric_change_observed alone does not mean failure: control spells can succeed
 without damage, and unreported enemy status is unknown. enemy_targets lists intended
 recipients, not confirmed effects. Area-action messages do not prove every target failed.
@@ -80,7 +78,10 @@ If not everyone can be protected, preserve the team's feasible recovery and acti
 capacity, not a fixed favored character. Do not rely on a later rescue or speculative
 finishing blow. Compare area damage and removal of enemy actions, not only boss damage;
 value waking an ally and an item's other supported uses as well as direct damage.
-Action order varies with action type and condition; the last round is not a fixed order.
+Preserve a recovery window before attacking. Unknown HP and accumulated damage cannot
+prove a kill. Attack order does not establish healing/item/defense order.
+On survival_review_required, nothing was submitted: compare recovery and ally actions,
+then submit your final choice.
 Waking an ally during resolution does not allow a fresh spell selection that round.
 When safe, purposefully sample a promising untested spell and update comparisons using
 observed effects, MP and consumable scarcity. Saving resources must not override survival.
@@ -414,7 +415,8 @@ class BattleDelegate:
                 player["committed_action"] = old_action
         risk = compact.get("survival_risk")
         if isinstance(risk, dict):
-            risk["players"] = [{"index": p["index"], "observed_maxima": p["observed_maxima"]}
+            risk["players"] = [{"index": p["index"], "observed_maxima": p["observed_maxima"],
+                                    "within_observed_single_loss": p.get("within_observed_single_loss", False)}
                                for p in risk.get("players") or []]
         compact["decision_feedback"] = decision_feedback(compact, new_outcomes)
         experience = view.get("experience")
@@ -819,6 +821,18 @@ class BattleDelegate:
                     {"tool": "submit_battle_action", "output": output},
                 )
                 return json.dumps(output, ensure_ascii=False)
+            review = survival_review(latest_sent_battle, args)
+            prior_review = self._control().get("survival_review") or {}
+            if review and prior_review.get("window") != frozen_window:
+                self._persist_control(survival_review={"window": frozen_window, "action": args})
+                self._emit("tool_output", "Battle action requires one survival review.",
+                           {"tool": "submit_battle_action", "output": review, "action": args})
+                return json.dumps(review, ensure_ascii=False)
+            if prior_review.get("window") == frozen_window:
+                self._emit("review_completed", "Battle survival review completed.", {
+                    "first_action": prior_review["action"], "final_action": args,
+                    "changed": prior_review["action"] != args,
+                })
             submitted = args
             output = {"ok": True, "accepted": True}
             self._emit(
