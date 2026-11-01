@@ -365,7 +365,7 @@ structured action summary and recent complete command cycles.
 
 The persistent model sees these tools: `upsert_task`, `upsert_room_memo`, `get_tasks`,
 `get_navigation`, `inspect_target`, `preview_item_placement`, `get_observations`, `get_shop`,
-`get_equipment`, `get_inventory`, `get_room_memory`, `inspect_screen`,
+`get_equipment`, `get_inventory`, `get_room_memory`, `compare_map_region`, `inspect_screen`,
 `get_tool_output`, `review_task_inbox`, and `submit_decision`. `get_tasks`
 remains backward compatible by defaulting to active tasks with full records, and
 also supports summary/full detail plus offset pagination. Creating a task
@@ -639,3 +639,16 @@ runtime should be treated as GPL-3.0 compatible work.
 The DOS game resources are not licensed by this repository. Keep resources in
 gitignored local paths such as `data/pal/`, and do not commit or redistribute
 them from this project.
+
+### Local map layout correspondence
+
+`compare_map_region(source_map_id, target_map_id, x, y)` reads the configured
+local DOS `MAP.MKF` and `GOP.MKF` resources and compares a bounded patch at the
+same coordinates. It compares both layers by image content, including maps
+whose tile sprite indices differ. Collision and height differences are reported
+separately. A complete, non-uniform patch match establishes only a local
+coordinate candidate; it does not identify a landmark, establish a transition,
+or merge logical rooms. Use current navigation after changing maps to check
+nearby targets and reachability. Missing, malformed, or non-YJ_1 resources return
+an unavailable result. Game resources and comparison results are not committed
+or written into live exploration memory by this tool.

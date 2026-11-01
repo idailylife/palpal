@@ -909,7 +909,7 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
         'get_exploration_options',
         'get_observations', 'get_inventory', 'get_shop', 'get_equipment',
         'get_room_memory', 'inspect_screen', 'get_tool_output', 'review_task_inbox',
-        'submit_decision', 'preview_item_placement', 'observe_target',
+        'submit_decision', 'preview_item_placement', 'observe_target', 'compare_map_region',
     }
     dialog_properties = by_name['get_observations']['function']['parameters']['properties']
     assert 'speaker' in dialog_properties

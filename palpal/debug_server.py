@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from palpal.map_layout import compare_region
 from palpal.spatial import MotionHistory, recovery_options, route_to_position, preview_placement, route_diagnostic, exploration_options, room_key as spatial_room_key
 from palpal.agent_runtime import AgentRuntime
 from palpal.checkpoints import CheckpointSupport, EpochData, memory_access
@@ -13117,6 +13118,28 @@ class DebugState(CheckpointSupport):
             {
                 "type": "function",
                 "function": {
+                    "name": "compare_map_region",
+                    "description": (
+                        "对比两张地图指定坐标附近的底层图块图像，验证局部同坐标布局。"
+                        "用于隔墙看到设施后，在另一地图同方位寻找入口；不证明可达、地标身份或整图相同。"
+                        "只读本地资源，不改变游戏；不支持或缺失资源时返回 unavailable。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "source_map_id": {"type": "integer", "minimum": 1},
+                            "target_map_id": {"type": "integer", "minimum": 1},
+                            "x": {"type": "integer", "minimum": 0, "maximum": 2047},
+                            "y": {"type": "integer", "minimum": 0, "maximum": 2047},
+                        },
+                        "required": ["source_map_id", "target_map_id", "x", "y"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_room_memory",
                     "description": (
                         "返回当前或指定稳定 logical_room_id 的 memo、紧凑探索摘要、房间级对话原始证据，"
@@ -13755,6 +13778,8 @@ class DebugState(CheckpointSupport):
             return result
         if name == "upsert_room_memo":
             return self.upsert_room_memo(arguments, state)
+        if name == "compare_map_region":
+            return compare_region(self.asset_dir, arguments)
         if name == "get_room_memory":
             room_id = arguments.get("room_id")
             room_id = str(room_id) if room_id is not None else None
@@ -14126,6 +14151,11 @@ class DebugState(CheckpointSupport):
             "准备把出口解释为井口、密道等具体用途，或现有地点理解与对话、导航、画面矛盾时，先调用 inspect_screen 核对当前视野，再决定验证动作。"
             "question 应提出具体待验证问题，并允许不可见或无法判断；例如询问人物与井之间是否隔着墙、有无可见连接通路，不预设人物已在井边或出口就是井口。"
             "区分对话发生地、对话提及的地点、画面可见位置和实际可达位置；对话记录的 room_id 只标识对话发生地，隔墙看见设施不证明人物就在设施旁或能直接走到。"
+            "logical_room 是通行区域，不是独立地理空间；不同 map_id 也可能采用相同局部布局。"
+            "看到隔墙或高差另一侧设施时，保留观察地图、估计坐标/方位和依据作为 task progress 的待验证假设，不因不可达丢弃位置线索。"
+            "有另一地图的空间线索时，用 compare_map_region 验证该坐标附近布局；same_coordinate_local_layout 允许把同坐标作为另一地图的核查候选，"
+            "换图后用 get_navigation/inspect_target 检查附近实际目标。阻挡或高度不同不否定位置对应，但绝不据此合并 logical_room 或确认通路。"
+            "not_established 只表示该局部对照未建立，不证明两图没有任何关系。不要凭数值接近就绑定对象身份，也不要把视觉猜测写成已确认 Room Memo。"
             "画面未显示目标或连接时保留未知，不能据此断言目标不存在或无路可达。"
             "同一视野、同一疑点已有有效观察时复用结果；移动或剧情带来相关变化后再补看，不为凑次数逐回合截图。"
             "inspect_screen 只是低权威 visual_annotation，即使 confidence=high 也不得直接写 Room Memo、创建或确认 transition、修改 task/dialog/observation 事实，"
