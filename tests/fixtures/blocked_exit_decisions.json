@@ -1,0 +1,12 @@
+{
+  "source": "Sanitized facts from events.jsonl turns 1678, 1690-1693, 1744-1749; no native map geometry",
+  "exit_id": 1712,
+  "encounter_id": 1713,
+  "objective": "Investigate the untraversed exit; after an encounter refresh its route.",
+  "chronology": [
+    {"turn": 1678, "kind": "dialog", "summary": "Party decides to leave the inn and pursue the thief."},
+    {"turn": 1693, "kind": "dialog", "object_id": 1860, "summary": "Room occupant asks the party to leave."},
+    {"turn": 1744, "kind": "battle", "object_id": 1713, "summary": "Ordinary encounter won without new story dialogue."},
+    {"turn": 1749, "kind": "dialog", "object_id": 1860, "summary": "Same request to leave, without new information."}
+  ]
+}

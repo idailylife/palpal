@@ -54,6 +54,7 @@ PAL_GameMain(
          dwTime = SDL_GetTicks();
          while (!PALPAL_AgentStartupReady())
          {
+            PALPAL_AgentCheckpointWait();
             PALPAL_AgentWriteState();
             PAL_ClearKeyState();
             PAL_DelayUntil(dwTime);
@@ -86,7 +87,9 @@ PAL_GameMain(
       //
       // Load the game resources if needed.
       //
+      PALPAL_AgentCheckpointWait();
       PAL_LoadResources();
+      PALPAL_AgentCheckpointLoaded();
       PALPAL_AgentWriteState();
 
       //
@@ -107,6 +110,8 @@ PAL_GameMain(
       //
       // Run the main frame routine.
       //
+      PALPAL_AgentCheckpointWait();
+      if (PALPAL_AgentCheckpointLoading()) continue;
       PAL_StartFrame();
       PALPAL_AgentAfterFrame();
       PALPAL_AgentWriteState();

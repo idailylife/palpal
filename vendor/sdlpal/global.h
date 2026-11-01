@@ -574,13 +574,15 @@ PAL_FreeGlobals(
    VOID
 );
 
-VOID
+BOOL PAL_ValidateSaveFile(const char *path);
+
+BOOL
 PAL_SaveGame(
    int           iSaveSlot,
    WORD          wSavedTimes
 );
 
-VOID
+BOOL
 PAL_InitGameData(
    INT           iSaveSlot
 );

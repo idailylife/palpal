@@ -7,6 +7,11 @@
 
 PAL_C_LINKAGE_BEGIN
 
+VOID PALPAL_AgentCheckpointWait(VOID);
+BOOL PALPAL_AgentCheckpointLoading(VOID);
+VOID PALPAL_AgentCheckpointLoaded(VOID);
+VOID PALPAL_AgentCheckpointLoadFailed(VOID);
+
 /* Pixel provenance for visible scene objects; never exposes hidden sprites. */
 VOID PALPAL_AgentSceneBegin(VOID);
 VOID PALPAL_AgentSceneObject(WORD object_id, BOOL clipped);

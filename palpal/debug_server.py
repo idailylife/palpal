@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+import uuid
 from collections import OrderedDict, deque
 from contextlib import contextmanager
 from http import HTTPStatus
@@ -25,8 +26,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from palpal.spatial import MotionHistory, route_to_position, preview_placement, room_key as spatial_room_key
+from palpal.spatial import MotionHistory, recovery_options, route_to_position, preview_placement, route_diagnostic, exploration_options, room_key as spatial_room_key
 from palpal.agent_runtime import AgentRuntime
+from palpal.checkpoints import CheckpointSupport, EpochData, memory_access
 from palpal.observations import ObservationCoordinator
 from palpal.object_vision import ObjectVision
 from palpal.screen_inspection import ScreenInspector, valid_poe_api_key
@@ -680,19 +682,20 @@ class LiveBridge:
                 pass
 
 
-class DebugState:
+class DebugState(CheckpointSupport):
     def __init__(self, runtime_dir: Path, asset_dir: Path, game_binary: Path):
         self.runtime_dir = runtime_dir
         self.asset_dir = asset_dir
         self.game_binary = game_binary
         self.env_file = read_env_file(ROOT / ".env")
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.init_checkpoints()
         # Immutable serialized data only: every reader owns its decoded dictionaries.
         self.exploration_read_cache: tuple[tuple, str] | None = None
         self.navigation_timings = threading.local()
         self.action_log: list[dict] = []
         self.event_log: list[dict] = self.read_events()
-        if self.events_path.exists():
+        if self.events_path.exists() and not self.checkpoint_operation:
             self.write_events()
         self.dialog_history: list[dict] = self.read_dialog_history()
         self.dialog_source_keys: set[str] = self.dialog_history_source_keys(self.dialog_history)
@@ -712,7 +715,7 @@ class DebugState:
         self.last_raw_frame: int | None = None
         self.last_logical_frame: int | None = None
         self.pending_checkpoint_frame_reset: dict | None = None
-        self.state_lock = threading.RLock()
+        self.state_lock = self.checkpoint_lock
         self.live_lock = threading.RLock()
         self.live_condition = threading.Condition(self.live_lock)
         self.live_state: dict | None = None
@@ -754,14 +757,15 @@ class DebugState:
         }
         self.action_lock = threading.RLock()
         self.pending_written_action: dict | None = None
-        self.exploration_lock = threading.Lock()
+        self.exploration_lock = self.checkpoint_lock
         self.dialog_advance_lock = threading.Lock()
         self.dialog_advance_cancel = threading.Event()
         self.dialog_advance_status_lock = threading.Lock()
         self.dialog_advance_status = self.empty_dialog_advance_status()
         self.agent_status_lock = threading.Lock()
         self.agent_status = self.empty_agent_status()
-        self.recover_object_interactions_from_agent_llm_log()
+        if not self.checkpoint_operation:
+            self.recover_object_interactions_from_agent_llm_log()
         self.agent_runtime = AgentRuntime(self, self.runtime_dir)
         self.screen_inspector = ScreenInspector(self)
         self.object_vision = ObjectVision(self)
@@ -953,7 +957,9 @@ class DebugState:
                     "status": "waiting_for_game",
                     "message": "no live state received from the game",
                 }
-            return copy.deepcopy(self.live_state)
+            state = EpochData(copy.deepcopy(self.live_state))
+            state.epoch = self.checkpoint_epoch
+            return state
 
     def navigation_status(self) -> dict:
         """Small, coherent control observation; never runs exploration or presentation."""
@@ -1281,6 +1287,8 @@ class DebugState:
             with tmp.open("w", encoding=encoding) as stream:
                 stream.write(text)
                 stream.flush()
+                if path == self.checkpoint_journal_path:
+                    os.fsync(stream.fileno())
                 os.replace(tmp, path)
                 # Stat the file we wrote, even if another writer replaces the path.
                 return os.fstat(stream.fileno())
@@ -1423,7 +1431,9 @@ class DebugState:
             slot = int(raw or DEFAULT_CHECKPOINT_SLOT)
         except ValueError:
             slot = DEFAULT_CHECKPOINT_SLOT
-        return max(0, min(slot, 999))
+        if not 1 <= slot <= 255:
+            raise ValueError("checkpoint_slot_must_be_1_to_255")
+        return slot
 
     def save_slot_path(self, slot: int | None = None) -> Path:
         return self.asset_dir / f"{self.checkpoint_slot if slot is None else int(slot)}.rpg"
@@ -1588,6 +1598,10 @@ class DebugState:
             raise RuntimeError("startup_waiting")
         if state.get("in_main_game") is False:
             raise RuntimeError("not_in_main_game")
+        checkpoint = state.get("checkpoint") or {}
+        if (self.checkpoint_operation and self.checkpoint_operation.get("previous_operation")
+                and checkpoint.get("paused") and checkpoint.get("load_failed")):
+            return
         control = self.control_state(state, state_info)
         if control["owner"] == "game" and control["phase"] not in {"battle", "entering_scene", "action_pending"}:
             raise RuntimeError("game_controlled")
@@ -1616,6 +1630,7 @@ class DebugState:
         if self.action_pending(state):
             raise RuntimeError("action_pending")
 
+    @memory_access
     def refresh_companion_caches(self) -> None:
         self.motion_history.clear()
         if hasattr(self, "object_vision"):
@@ -1764,9 +1779,13 @@ class DebugState:
                 values.append(frame)
         return max(values) if values else None
 
+    @memory_access
     def write_slot_action(self, command: str, slot: int) -> dict:
         if command not in {"save_slot", "load_slot", "start_slot"}:
             raise ValueError("unsupported slot command")
+        slot = int(slot)
+        if (command == "start_slot" and slot != 0) or (command != "start_slot" and not 1 <= slot <= 255):
+            raise ValueError("invalid_slot")
         with self.action_lock:
             if self.action_pending():
                 raise RuntimeError("action_pending")
@@ -1774,10 +1793,12 @@ class DebugState:
                 self.action_result_path.unlink()
             except FileNotFoundError:
                 pass
-            entry = {"time": time.time(), "command": command, "slot": int(slot)}
+            request_id = uuid.uuid4().hex
+            self.slot_request_id = request_id
+            entry = {"time": time.time(), "command": command, "slot": int(slot), "request_id": request_id}
             self.begin_written_action(entry)
             try:
-                self.atomic_write_text(self.action_path, f"{command} {int(slot)}\n", encoding="ascii")
+                self.atomic_write_text(self.action_path, f"request_id {request_id}\n{command} {int(slot)}\n", encoding="ascii")
             except Exception:
                 self.pending_written_action = None
                 raise
@@ -1796,14 +1817,21 @@ class DebugState:
                 except (TypeError, ValueError):
                     result_slot = -1
                 if result.get("action") == command and result_slot == int(slot):
-                    return result
+                    expected_id = getattr(self, "slot_request_id", None)
+                    final = {"save_slot": "saved", "load_slot": "loaded", "start_slot": "started"}[command]
+                    if (not expected_id or result.get("request_id") == expected_id) and (not result.get("ok") or result.get("status") == final):
+                        return result
             time.sleep(0.03)
         raise TimeoutError(f"{command} {slot} did not complete")
 
+    @memory_access
     def run_slot_command(self, command: str, slot: int) -> dict:
         start_time = time.time()
         action = self.write_slot_action(command, slot)
         result = self.wait_for_slot_result(command, slot, start_time)
+        # A correlated final result acknowledges consumption, including failures.
+        with self.action_lock:
+            self.pending_written_action = None
         if not result.get("ok"):
             raise RuntimeError(str(result.get("error") or result.get("status") or "slot_command_failed"))
         return {"action": action, "result": result}
@@ -1819,6 +1847,7 @@ class DebugState:
         os.replace(tmp, target)
         return self.file_info(target)
 
+    @memory_access
     def copy_game_save_from_checkpoint(self, checkpoint_dir: Path, slot: int) -> dict:
         source = checkpoint_dir / "game.rpg"
         if not source.exists():
@@ -1830,6 +1859,7 @@ class DebugState:
         os.replace(tmp, target)
         return self.file_info(target)
 
+    @memory_access
     def copy_companion_to_checkpoint(self, checkpoint_dir: Path) -> dict:
         copied: dict[str, dict] = {}
         companion_dir = checkpoint_dir / "companion"
@@ -1849,38 +1879,23 @@ class DebugState:
         return copied
 
     def checkpoint_companion_compatible(self, checkpoint_dir: Path, manifest: dict | None = None) -> bool:
-        if isinstance(manifest, dict):
-            try:
-                if int(manifest.get("companion_version")) == EXPLORATION_VERSION:
-                    return True
-            except (TypeError, ValueError):
-                pass
         exploration = read_optional_json(self.companion_checkpoint_path(checkpoint_dir, Path("exploration.json")))
         try:
             return int(exploration.get("version")) == EXPLORATION_VERSION
         except (TypeError, ValueError):
             return False
 
+    @memory_access
     def restore_companion_from_checkpoint(self, checkpoint_dir: Path) -> dict:
         restored: dict[str, dict] = {}
         manifest = self.checkpoint_manifest(checkpoint_dir)
         compatible = self.checkpoint_companion_compatible(checkpoint_dir, manifest)
+        if not compatible:
+            raise ValueError("checkpoint_exploration_incompatible")
         for relative_path in CHECKPOINT_COMPANION_FILES:
             source = self.companion_checkpoint_path(checkpoint_dir, relative_path)
             target = self.companion_live_path(relative_path)
             key = relative_path.as_posix()
-            if not compatible and relative_path in CHECKPOINT_COMPANION_RESET_FILES:
-                try:
-                    target.unlink()
-                except FileNotFoundError:
-                    pass
-                restored[key] = {
-                    "available": False,
-                    "discarded": True,
-                    "reason": "incompatible_companion_version",
-                    "expected_version": EXPLORATION_VERSION,
-                }
-                continue
             if not source.exists():
                 try:
                     target.unlink()
@@ -1898,99 +1913,35 @@ class DebugState:
             self.recover_object_interactions_from_agent_llm_log()
         return restored
 
-    def save_checkpoint(self, checkpoint_id: str | None = None, label: str | None = None) -> dict:
-        state = self.read_live_state()
-        self.preflight_checkpoint_action(state)
-        checkpoint_id = self.checkpoint_id(checkpoint_id)
-        checkpoint_dir = self.checkpoint_dir(checkpoint_id)
-        if checkpoint_dir.exists():
-            raise FileExistsError(f"checkpoint already exists: {checkpoint_id}")
-        checkpoint_dir.mkdir(parents=True, exist_ok=False)
-
-        try:
-            slot = self.checkpoint_slot
-            command_result = self.run_slot_command("save_slot", slot)
-            self.copy_game_save_to_checkpoint(checkpoint_dir, slot)
-            companion = self.copy_companion_to_checkpoint(checkpoint_dir)
-            agent_bundle = self.agent_runtime.export_checkpoint(checkpoint_dir)
-            manifest = {
-                "version": CHECKPOINT_MANIFEST_VERSION,
-                "id": checkpoint_id,
-                "label": (label or "").strip()[:120],
-                "created_at": utc_timestamp(),
-                "companion_version": EXPLORATION_VERSION,
-                "checkpoint_slot": slot,
-                "state": self.checkpoint_context(state),
-                "native_result": command_result["result"],
-                "companion": companion,
-                "agent_bundle": agent_bundle,
-            }
-            tmp = checkpoint_dir / "manifest.json.tmp"
-            tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            os.replace(tmp, checkpoint_dir / "manifest.json")
-            self.write_companion_owner("save_checkpoint")
-            return {"ok": True, "checkpoint": self.checkpoint_manifest(checkpoint_dir)}
-        except Exception:
-            shutil.rmtree(checkpoint_dir, ignore_errors=True)
-            raise
-
-    def load_checkpoint(self, checkpoint_id: str) -> dict:
-        state = self.read_live_state()
-        self.preflight_checkpoint_action(state, allow_startup_waiting=True)
-        checkpoint_dir = self.checkpoint_dir(checkpoint_id)
-        manifest = self.checkpoint_manifest(checkpoint_dir)
-        if manifest is None:
-            raise FileNotFoundError(f"checkpoint not found: {checkpoint_id}")
-
-        slot = self.checkpoint_slot
-        self.copy_game_save_from_checkpoint(checkpoint_dir, slot)
-        command_result = self.run_slot_command("load_slot", slot)
-        restored = self.restore_companion_from_checkpoint(checkpoint_dir)
-        self.refresh_companion_caches()
-        self.mark_checkpoint_frame_reset_pending(checkpoint_id, state)
-        self.append_navigation_diagnostic(
-            "checkpoint_restored",
-            {"checkpoint_id": checkpoint_id, "restored": restored},
-            state=state,
-        )
-        result = {
-            "ok": True,
-            "checkpoint": self.checkpoint_manifest(checkpoint_dir),
-            "restored": restored,
-            "native_result": command_result["result"],
-        }
-        self.agent_runtime.restore_checkpoint(
-            checkpoint_dir,
-            checkpoint_id,
-            state.get("game_instance_id"),
-        )
-        self.write_companion_owner("load_checkpoint")
-        return result
-
     def start_new_game(self) -> dict:
-        state = self.read_live_state()
-        self.preflight_start_new_game(state)
-        old_session_id = str(self.agent_runtime.snapshot().get("session_id") or "")
-        command_result = self.run_slot_command("start_slot", 0)
-        self.clear_runtime_history(reason="start_new_game", state=state)
-        self.logical_frame_offset = 0
-        self.last_raw_frame = None
-        self.last_logical_frame = None
-        self.last_snapshot_frame = None
-        self.pending_checkpoint_frame_reset = None
-        result = {
-            "ok": True,
-            "native_result": command_result["result"],
-        }
-        self.agent_runtime.reset("start_new_game", game_instance_id=state.get("game_instance_id"))
-        if old_session_id:
-            try:
-                self.agent_runtime.prune_sessions({old_session_id})
-            except Exception:
-                pass
-        self.write_companion_owner("new_game")
-        return result
+        with self.checkpoint_transaction("new_game"):
+            state = self.read_live_state()
+            self.preflight_start_new_game(state)
+            old_session_id = str(self.agent_runtime.snapshot().get("session_id") or "")
+            self.checkpoint_phase("native_start")
+            command_result = self.run_slot_command("start_slot", 0)
+            self.clear_runtime_history(reason="start_new_game", state=state)
+            self.logical_frame_offset = 0
+            self.last_raw_frame = None
+            self.last_logical_frame = None
+            self.last_snapshot_frame = None
+            self.pending_checkpoint_frame_reset = None
+            result = {
+                "ok": True,
+                "native_result": command_result["result"],
+            }
+            self.agent_runtime.reset("start_new_game", game_instance_id=state.get("game_instance_id"))
+            if old_session_id:
+                try:
+                    self.agent_runtime.prune_sessions({old_session_id})
+                except Exception:
+                    pass
+            self.write_companion_owner("new_game")
+            self.checkpoint_phase("resume")
+            self.checkpoint_native_control("resume")
+            return result
 
+    @memory_access
     def reset_agent_session(self) -> dict:
         runtime = self.agent_runtime
         if runtime.is_running():
@@ -2001,8 +1952,8 @@ class DebugState:
             auto_id = "auto-reset-" + time.strftime("%Y%m%d-%H%M%S", time.localtime())
             archived = self.save_checkpoint(auto_id, "auto archive before reset")
             archived_checkpoint_id = (archived.get("checkpoint") or {}).get("id")
-        except Exception:
-            archived_checkpoint_id = None
+        except Exception as exc:
+            raise RuntimeError("checkpoint_archive_failed") from exc
         self.clear_runtime_history(reason="user_reset")
         session = runtime.reset("user_reset")
         if archived_checkpoint_id is not None and old_session_id:
@@ -2025,6 +1976,7 @@ class DebugState:
         result["pruned_total"] = len(result.get("pruned_session_ids") or [])
         return result
 
+    @memory_access
     def delete_checkpoint(self, checkpoint_id: str) -> dict:
         checkpoint_dir = self.checkpoint_dir(checkpoint_id)
         if not checkpoint_dir.exists() or not checkpoint_dir.is_dir():
@@ -2214,6 +2166,7 @@ class DebugState:
             handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
         return entry
 
+    @memory_access
     def clear_runtime_history(self, reason: str = "reset", state: dict | None = None) -> None:
         with self.state_lock:
             self.cancel_runtime_observations(reason)
@@ -2267,6 +2220,7 @@ class DebugState:
             cleaned.append(event)
         return cleaned[-200:]
 
+    @memory_access
     def write_events(self) -> None:
         self.atomic_write_text(
             self.events_path,
@@ -2281,6 +2235,7 @@ class DebugState:
             return []
         return self.clean_dialog_history_entries(data) if isinstance(data, list) else []
 
+    @memory_access
     def write_dialog_history(self) -> None:
         self.atomic_write_text(
             self.dialogs_path,
@@ -2288,6 +2243,7 @@ class DebugState:
             encoding="utf-8",
         )
 
+    @memory_access
     def append_event(self, state: dict, event_type: str, payload: dict) -> dict:
         if event_type in {"interaction_effect", "interaction_no_effect"} and not isinstance(
             payload.get("interaction_context"), dict
@@ -2596,6 +2552,7 @@ class DebugState:
             if message_id not in message_ids:
                 message_ids.append(message_id)
 
+    @memory_access
     def record_dialog_event(self, state: dict) -> None:
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
             return
@@ -3232,6 +3189,7 @@ class DebugState:
             ]
         return observed
 
+    @memory_access
     def record_state_events(self, state: dict) -> None:
         if state.get("status") in {"waiting_for_game", "state_parse_error"}:
             return
@@ -3960,7 +3918,9 @@ class DebugState:
     def read_exploration(self) -> dict:
         started = time.monotonic()
         try:
-            return self._read_exploration_cached()
+            data = EpochData(self._read_exploration_cached())
+            data.epoch = self.checkpoint_epoch
+            return data
         finally:
             metrics = getattr(self.navigation_timings, "current", None)
             if metrics is not None:
@@ -4095,6 +4055,7 @@ class DebugState:
             data["task_inbox_initialized"] = False
         return data
 
+    @memory_access
     def write_exploration(self, data: dict) -> None:
         canonical = self.normalize_exploration(data)
         text = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
@@ -4242,6 +4203,7 @@ class DebugState:
             "tracking_version": COMBAT_HP_TRACKING_VERSION,
         }
 
+    @memory_access
     def observe_combat_knowledge(self, state: dict) -> None:
         if not self.companion_owner_matches():
             return
@@ -4502,6 +4464,7 @@ class DebugState:
                 self._combat_trim_keys(knowledge["active_battles"], COMBAT_ACTIVE_BATTLE_CAPACITY)
                 self.write_exploration(data)
 
+    @memory_access
     def observe_visible_item_use(
         self,
         before: dict,
@@ -4809,6 +4772,7 @@ class DebugState:
         memo = room_memos.get(room_id) if isinstance(room_memos, dict) else None
         return dict(memo) if isinstance(memo, dict) else None
 
+    @memory_access
     def upsert_room_memo(self, arguments: dict, state: dict) -> dict:
         operation = arguments.get("operation", "set")
         if operation not in {"set", "clear"}:
@@ -5043,7 +5007,7 @@ class DebugState:
                 "dormant_at", "dormant_agent_turn", "abandoned_at", "abandoned_agent_turn",
                 "last_reviewed_at", "last_reviewed_agent_turn",
                 "provenance", "review_watch", "status_reason", "status_evidence",
-                "origin_evidence", "recent_evidence",
+                "origin_evidence", "recent_evidence", "progress", "reconciliation_review",
             )
         }
         result["last_reviewed_at"] = task.get("last_reviewed_at", task.get("updated_at"))
@@ -5067,14 +5031,14 @@ class DebugState:
                 for key in (
                     "id", "status", "object_id",
                     "transition_key", "room_id",
-                    "review_watch", "status_reason", "status_evidence",
+                    "review_watch", "status_reason", "status_evidence", "reconciliation_review",
                     "completed_at", "completed_frame", "completed_raw_frame",
                     "completed_agent_turn",
                 )
                 if task.get(key) is not None
             },
             "description": description,
-            "rationale": rationale,
+            **({"progress": copy.deepcopy(task["progress"])} if task.get("progress") else {"rationale": rationale}),
         }
 
     def task_ledger_page(
@@ -5591,6 +5555,7 @@ class DebugState:
             self._prune_task_inbox_locked(data)
         return changed
 
+    @memory_access
     def record_task_inbox_entries(self, entries: list[dict]) -> None:
         if not entries:
             return
@@ -5971,6 +5936,40 @@ class DebugState:
             }
         return None
 
+    def resolve_task_progress(self, value: object, data: dict, task: dict) -> tuple[dict | None, str | dict | None]:
+        """Keep observed evidence separate from agent hypotheses and intent."""
+        if not isinstance(value, dict) or set(value) != {"evidence_refs", "hypotheses", "next_step"}:
+            return None, "progress requires only evidence_refs, hypotheses, and next_step"
+        refs = value["evidence_refs"]
+        if (not isinstance(refs, list) or len(refs) > 3
+                or any(not isinstance(ref, str) or not ref.strip() for ref in refs)):
+            return None, "progress.evidence_refs must contain at most 3 non-empty references"
+        hypotheses = value["hypotheses"]
+        if (not isinstance(hypotheses, list) or len(hypotheses) > 3
+                or any(not isinstance(text, str) or not 0 < len(text.strip()) <= 160 for text in hypotheses)):
+            return None, "progress.hypotheses must contain at most 3 non-empty strings of at most 160 characters"
+        next_step = value["next_step"]
+        if not isinstance(next_step, str) or len(next_step.strip()) > 160:
+            return None, "progress.next_step must be a string of at most 160 characters"
+        # Retain immutable excerpts even after the original inbox is pruned.
+        previous = task.get("progress") or {}
+        catalog = self.task_evidence_catalog(data)
+        catalog.update({entry["ref"]: entry for entry in previous.get("evidence", [])})
+        refs = list(dict.fromkeys(ref.strip() for ref in refs))
+        missing = [ref for ref in refs if ref not in catalog]
+        if missing:
+            return None, {
+                "code": "invalid_progress_evidence",
+                "message": "Copy exact source_key references or task inbox IDs; do not invent route evidence.",
+                "missing_references": missing,
+            }
+        return {
+            "evidence_refs": refs,
+            "evidence": [copy.deepcopy(catalog[ref]) for ref in refs],
+            "hypotheses": [text.strip() for text in hypotheses],
+            "next_step": next_step.strip(),
+        }, None
+
     def upsert_agent_task(
         self,
         arguments: dict,
@@ -6076,7 +6075,49 @@ class DebugState:
                     if review_error is not None:
                         review_error["error"]["code"] = "task_reconciliation_required"
                         return review_error
+            progress = None
+            if "progress" in arguments:
+                description = arguments.get("description")
+                if not isinstance(description, str) or not description.strip():
+                    return {"ok": False, "error": "progress updates require the current goal in description"}
+                progress, progress_error = self.resolve_task_progress(arguments["progress"], data, existing)
+                if progress_error is not None:
+                    return {"ok": False, "error": progress_error}
             requested_status = status if status is not None else existing.get("status")
+            reconciliation_review = None
+            needs_review = (
+                self.agent_runtime.task_reconciliation_pending()
+                and previous_status is not None
+                and requested_status in {"active", "dormant"}
+            )
+            if needs_review or "reconciliation_review" in arguments:
+                raw_review = arguments.get("reconciliation_review")
+                fields = {"stage_assessment", "execution_basis", "resume_condition", "evidence_refs"}
+                review_error = None
+                if not isinstance(raw_review, dict) or set(raw_review) != fields:
+                    review_error = "reconciliation_review requires stage_assessment, execution_basis, resume_condition, and evidence_refs"
+                elif any(not isinstance(raw_review[key], str) or len(raw_review[key].strip()) > 400
+                         for key in fields - {"evidence_refs"}):
+                    review_error = "review text must be strings of at most 400 characters"
+                elif not raw_review["stage_assessment"].strip():
+                    review_error = "Explain whether the goal and latest progress describe the same current stage"
+                elif requested_status == "active" and not raw_review["execution_basis"].strip():
+                    review_error = "Keeping active requires a verified execution path; otherwise use dormant"
+                elif requested_status == "dormant" and not raw_review["resume_condition"].strip():
+                    review_error = "Dormant tasks require a concrete condition for resuming"
+                elif any(not isinstance(arguments.get(key), str) or not arguments[key].strip()
+                         for key in ("description", "rationale")):
+                    review_error = "Resubmit the current goal in description and consistent reasoning in rationale"
+                if review_error:
+                    return {"ok": False, "error": {"code": "task_reconciliation_review_required", "message": review_error}}
+                resolved, evidence_error = self.resolve_task_evidence(raw_review["evidence_refs"], data)
+                if evidence_error is not None:
+                    return {"ok": False, "error": evidence_error}
+                reconciliation_review = {
+                    **{key: raw_review[key].strip() for key in fields - {"evidence_refs"}},
+                    "evidence_refs": [entry["ref"] for entry in resolved],
+                    "evidence": copy.deepcopy(resolved),
+                }
             status_changed = previous_status is not None and requested_status != previous_status
             if previous_status is None and requested_status != "active":
                 status_changed = True
@@ -6105,6 +6146,16 @@ class DebugState:
                 if existing.get(key) != value:
                     changed[key] = {"from": existing.get(key), "to": value}
                     existing[key] = value
+            if progress is not None:
+                if existing.get("progress") != progress:
+                    changed["progress"] = {"from": existing.get("progress"), "to": progress}
+                    existing["progress"] = progress
+            elif "progress" in existing and (reconciliation_review is not None or set(changed).intersection({
+                "description", "rationale", "status", "transition_key", "room_id",
+            })):
+                # Legacy callers may still update narrative text. Do not keep an
+                # older structured next step alongside a newer narrative.
+                changed["progress"] = {"from": existing.pop("progress"), "to": None}
             if source_inbox_ids:
                 provenance = existing.setdefault("provenance", {})
                 linked_ids = provenance.setdefault("task_inbox_batch_ids", [])
@@ -6124,6 +6175,12 @@ class DebugState:
                 existing["status_evidence"] = resolved_status_evidence
                 changed["status_reason"] = {"to": existing["status_reason"]}
                 changed["status_evidence"] = {"to": resolved_status_evidence}
+            if reconciliation_review is not None:
+                if existing.get("reconciliation_review") != reconciliation_review:
+                    changed["reconciliation_review"] = {
+                        "from": existing.get("reconciliation_review"), "to": reconciliation_review,
+                    }
+                    existing["reconciliation_review"] = reconciliation_review
             if existing.get("status") == "completed" and previous_status != "completed":
                 state = state if isinstance(state, dict) else self.read_live_state()
                 existing["completed_at"] = now
@@ -6163,6 +6220,10 @@ class DebugState:
                 if existing.get(key) != value:
                     changed[key] = {"from": existing.get(key), "to": value}
                     existing[key] = value
+            if reconciliation_review is None and "reconciliation_review" in existing and set(changed).intersection({
+                "description", "rationale", "status", "progress", "object_id", "transition_key", "room_id",
+            }):
+                changed["reconciliation_review"] = {"from": existing.pop("reconciliation_review"), "to": None}
             if not existing.get("history"):
                 changed = {"created": True, **changed}
             structural_changes = {
@@ -6182,6 +6243,10 @@ class DebugState:
                 if inbox_id in catalog:
                     linked_evidence.append(catalog[inbox_id])
             linked_evidence.extend(resolved_status_evidence)
+            if reconciliation_review is not None:
+                linked_evidence.extend(reconciliation_review["evidence"])
+            if progress is not None:
+                linked_evidence.extend(progress["evidence"])
             if operation == "updated":
                 review = self.task_review_for(existing, state)
                 for reason in (review or {}).get("reasons") or []:
@@ -6222,15 +6287,11 @@ class DebugState:
 
     def active_task_summary(self, limit: int = MAX_ACTIVE_TASK_CONTEXT) -> list[dict]:
         limit = max(0, int(limit))
-        def compact_description(value) -> str:
-            description = str(value or "")
-            if len(description) <= MAX_ACTIVE_TASK_DESCRIPTION:
-                return description
-            return description[:MAX_ACTIVE_TASK_DESCRIPTION - 1] + "…"
         return [
             {
                 **{key: task.get(key) for key in ("id", "priority", "object_id", "transition_key", "room_id")},
-                "description": compact_description(task.get("description")),
+                **{key: value for key, value in self.task_summary_view(task).items()
+                   if key in {"description", "rationale", "progress"}},
             }
             for task in self.task_ledger(limit=limit)
         ]
@@ -6252,7 +6313,11 @@ class DebugState:
         if pending:
             result["requirements"] = (
                 "Read every get_tasks page with include_closed=true and detail=summary, then in a later model "
-                "batch upsert every active task with the returned review_token. Preserve completed tasks; mark "
+                "batch upsert every active task with the returned review_token. Keeping active or choosing dormant "
+                "requires reconciliation_review with stage_assessment, execution_basis, resume_condition, and "
+                "non-empty evidence_refs, plus current description and rationale. Active needs a verified execution "
+                "path; without one choose dormant and explain the resume condition. Check for completed or superseded "
+                "stages and correct stale descriptions. Preserve completed tasks; mark "
                 "semantic duplicates abandoned with their relationship. The audit clears as soon as every active "
                 "task has been reconciled."
             )
@@ -6328,6 +6393,7 @@ class DebugState:
                 snapshot[key] = change.get("to")
         return snapshot
 
+    @memory_access
     def record_persistent_object_event(
         self,
         event: dict,
@@ -7246,6 +7312,7 @@ class DebugState:
                 matches.append(candidate)
         return copy.deepcopy(matches[0]) if len(matches) == 1 else None
 
+    @memory_access
     def record_transition_destination(
         self,
         from_identity: dict,
@@ -7381,15 +7448,15 @@ class DebugState:
 
     @contextmanager
     def spatial_execution_scope(self, action: str, target_id=None, cancel_event=None):
-        state = self.read_live_state()
-        execution = {
-            "id": time.monotonic_ns(), "action": action, "target_id": target_id,
-            "room_id": (self.room_identity(state) or {}).get("id"),
-            "game_instance_id": str(state.get("game_instance_id") or ""),
-            "baseline_generation": (self.native_trigger_generation(state) or {}).get("generation", 0),
-            "cancel_event": cancel_event, "receipt": None,
-        }
-        with self.state_lock:
+        with self.checkpoint_access():
+            state = self.read_live_state()
+            execution = {
+                "id": time.monotonic_ns(), "action": action, "target_id": target_id,
+                "room_id": (self.room_identity(state) or {}).get("id"),
+                "game_instance_id": str(state.get("game_instance_id") or ""),
+                "baseline_generation": (self.native_trigger_generation(state) or {}).get("generation", 0),
+                "cancel_event": cancel_event, "receipt": None,
+            }
             self.spatial_execution = execution
         try:
             yield execution
@@ -8621,6 +8688,7 @@ class DebugState:
             return True
         return False
 
+    @memory_access
     def update_exploration(self, state: dict, *, include_view: bool = True, observe_reappearances: bool = False) -> dict:
         grid = decode_nav_grid(state)
         identity = self.room_identity(state)
@@ -9277,7 +9345,8 @@ class DebugState:
             action = self.write_action([step["move"]], 1)
             return {"ok": True, "status": "stepping", "action": action,
                     "expected_position": {"x": step["x"], "y": step["y"]},
-                    "trigger_ids": step["trigger_ids"], "remaining_steps": route["steps"] - 1}
+                    "trigger_ids": step["trigger_ids"], "remaining_steps": route["steps"] - 1,
+                    "recovery": bool(route.get("recovery"))}
 
     def route_between_nodes(
         self,
@@ -10210,7 +10279,9 @@ class DebugState:
         pos = state.get("party_position") or {}
         start = grid_node(grid, int(pos.get("x") or 0), int(pos.get("y") or 0))
         if start is None or not nav_bit(grid, start):
-            return {"status": "bad_start", "targets": [], **environment_payload}
+            return {"status": "bad_start", "targets": [], **environment_payload,
+                    "recovery_options": recovery_options(self, state),
+                    "meaning": "Starting cell is not walkable; prefer the recommended recovery unless a current target justifies another component. Counts describe current safe geometry, not task progress. Use move_to once, then refresh navigation."}
 
         interactables = [obj for obj in state.get("objects") or [] if obj.get("interactable")]
         transition_context = self.navigation_transition_context(state)
@@ -10513,6 +10584,11 @@ class DebugState:
             return self.snapshot(navigation_only=True)
 
     def snapshot(self, *, navigation_only: bool = False) -> dict:
+        if self.checkpoint_operation is not None:
+            state = self.read_live_state()
+            state["checkpoint_operation"] = self.checkpoint_status()
+            state["control"] = {"owner": "server", "phase": "checkpoint", "can_act": False}
+            return state
         with self.navigation_timed_lock(self.state_lock):
             # Sample after acquiring the observation lock. A queued reader must not
             # reconcile an older frame after another reader has already advanced it.
@@ -10831,8 +10907,9 @@ class DebugState:
 
     def advance_dialog(self, args: dict | None = None) -> dict:
         options = self.normalize_dialog_advance_args(args)
-        if not self.dialog_advance_lock.acquire(blocking=False):
-            return {"ok": False, "status": "already_running", **options}
+        with self.checkpoint_access():
+            if not self.dialog_advance_lock.acquire(blocking=False):
+                return {"ok": False, "status": "already_running", **options}
         try:
             self.dialog_advance_cancel.clear()
             self.begin_dialog_advance_status(options)
@@ -12751,10 +12828,13 @@ class DebugState:
                         "创建或更新本地 agent 任务记忆，不执行游戏动作。已有 id 会更新；未知自选 id 或省略 id 的创建必须先完整读取 "
                         "closed-inclusive summary 账本，并在后一模型批次提供最终页 review_token。省略 id 创建时自动生成 task-* id。"
                         "对已有 id 不提供变化字段表示明确确认继续，也会刷新该任务的证据审计快照。"
-                        "无状态变化的确认只提交 id 和必要的 review_token；不要重写 rationale 或添加无关证据。"
+                        "普通无状态变化的确认只提交 id；恢复/压缩对账时不能只提交 id，须按 reconciliation_review 要求重审。"
                         "status_evidence 逐字复制 get_observations 返回的 source_key 或 task inbox ID，禁止自行拼接。"
                         "归档任务类 inbox 前，须用 source_inbox_ids 建立关联并读取更新成功结果。"
                         "新增或改变非空 room_id 前，必须在同一工具周期查询该房间的 get_room_memory。"
+                        "description 用短句先写当前目标；阶段变化时同步改写，不堆积历史或保留过期的‘无线索’结论。"
+                        "更新行动相关进展时同时提供当前 description 和 progress：evidence_refs 引用实际观察，hypotheses 单列尚未验证的推测，next_step 写下一步验证。"
+                        "服务端只从引用生成 evidence 摘录，不会把 rationale、hypotheses 或 next_step 当成已确认事实。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -12765,7 +12845,33 @@ class DebugState:
                             "object_id": {"type": "integer", "minimum": 1},
                             "transition_key": {"type": "string"}, "room_id": {"type": "string"},
                             "rationale": {"type": "string", "minLength": 1},
+                            "progress": {
+                                "type": "object",
+                                "description": "整体替换当前进展；保留仍有效的证据，删除已否定的假设。路线用途推测不能作为观察证据。",
+                                "properties": {
+                                    "evidence_refs": {"type": "array", "maxItems": 3,
+                                                      "items": {"type": "string", "minLength": 1}},
+                                    "hypotheses": {"type": "array", "maxItems": 3,
+                                                   "items": {"type": "string", "minLength": 1, "maxLength": 160}},
+                                    "next_step": {"type": "string", "maxLength": 160},
+                                },
+                                "required": ["evidence_refs", "hypotheses", "next_step"],
+                                "additionalProperties": False,
+                            },
                             "review_token": {"type": "string", "minLength": 1},
+                            "reconciliation_review": {
+                                "type": "object",
+                                "description": "恢复/压缩对账保留 active 或转 dormant 时必填，且同时提交当前 description、rationale。阶段审查和路径解释是 Agent 判断，不是引擎事实。active 必须有执行依据，dormant 必须有恢复条件；证据引用必须可解析。",
+                                "properties": {
+                                    "stage_assessment": {"type": "string", "minLength": 1, "maxLength": 400},
+                                    "execution_basis": {"type": "string", "maxLength": 400},
+                                    "resume_condition": {"type": "string", "maxLength": 400},
+                                    "evidence_refs": {"type": "array", "minItems": 1,
+                                                      "items": {"type": "string", "minLength": 1}},
+                                },
+                                "required": ["stage_assessment", "execution_basis", "resume_condition", "evidence_refs"],
+                                "additionalProperties": False,
+                            },
                             "source_inbox_ids": {
                                 "type": "array", "maxItems": 20,
                                 "items": {"type": "string", "minLength": 1},
@@ -12873,6 +12979,7 @@ class DebugState:
                         "返回紧凑的可交互候选、路线成本、交互状态和已知传送目的地。"
                         "只有 status=reachable、transition 或 blocked_by_interactable 的目标可提交 navigate；"
                         "blocked_by_transition 和 unreachable_static 不能直接提交。"
+                        "blocked_by_transition 表示路线受其他触发区域阻隔，不等于剧情锁门；用 inspect_target 查询首个阻路触发点。"
                         "若 targets_returned < targets_total，可用 limit=40 获取更多候选详情。"
                         "affordances 中 kind=item_approach 表示物品脚本要求靠近该对象；"
                         "选择该路线时提交 navigate 并携带对应 item_id。"
@@ -12881,6 +12988,16 @@ class DebugState:
                         "type": "object",
                         "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 40, "default": 20}},
                     },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_exploration_options",
+                    "description": "只读返回当前网格验证过的安全未访问站位；可用 move_to 前往。空列表不代表房间已探索完，执行前仍会重新校验。",
+                    "parameters": {"type": "object", "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5}},
+                        "additionalProperties": False},
                 },
             },
             {
@@ -12898,7 +13015,7 @@ class DebugState:
                 "type": "function",
                 "function": {
                     "name": "inspect_target",
-                    "description": "返回目标状态、交互证据、路线及已有低权威外观注释；visual 表明是否可按需查看当前或最近可见画面。",
+                    "description": "返回目标状态、交互证据、路线及已有低权威外观注释；route.diagnostic 解释候选路径首个阻路触发点，不保证触发后通行。visual 表明是否可按需查看当前或最近可见画面。",
                     "parameters": {
                         "type": "object",
                         "properties": {"id": {"type": "integer", "minimum": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8}, "motion_offset": {"type": "integer", "minimum": 0}, "motion_limit": {"type": "integer", "minimum": 1, "maximum": 128}},
@@ -13017,8 +13134,10 @@ class DebugState:
                 "function": {
                     "name": "inspect_screen",
                     "description": (
-                        "按需检查当前游戏 PNG 的低权威视觉注释。只有 get_navigation、get_room_memory、inspect_target 等"
-                        "结构化证据无法解释布局、出口、通道或目标外观时调用；每个工具周期最多一次未缓存请求。"
+                        "主动检查当前游戏 PNG，获取低权威视觉注释；与 get_navigation、get_room_memory、inspect_target 配合使用，"
+                        "无需等结构化查询失败。入口自动观察只覆盖当时视野；同房间移动后可再次观察。"
+                        "剧情引入新地点且空间关系不明、准备判断出口用途或现场证据矛盾时，应先观察。"
+                        "question 写具体待验证的空间问题，允许看不见或无法判断；每个工具周期最多一次未缓存请求。"
                         "focus=object 必须提供 target_id；只描述系统绑定对象的当前或最近可见画面，无需接近或交互。"
                         "结果不能猜测未标记对象 ID、确认 transition、说话者、脚本语义、task 或 Room Memo。"
                     ),
@@ -13325,6 +13444,12 @@ class DebugState:
         return {
             "status": navigation.get("status"),
             "environment_key": navigation.get("environment_key"),
+            **({"recovery_options": navigation["recovery_options"], "meaning": navigation.get("meaning")}
+               if "recovery_options" in navigation else {}),
+            "status_meanings": {
+                "blocked_by_transition": "路线受其他触发区域阻隔，不等于剧情锁门；用 inspect_target 检查首个阻路触发点。",
+                "unreachable_static": "当前约束下未找到路径，不证明房间或剧情已经耗尽。",
+            },
             **({"entry_context": navigation.get("entry_context")} if navigation.get("entry_context") is not None else {}),
             "targets": targets,
             "targets_returned": len(targets),
@@ -13419,6 +13544,7 @@ class DebugState:
             self.motion_history.record_window(start, target_id, summary)
             return {"ok": status == "completed", "id": target_id, "observation": summary, "motion": motion}
 
+    @memory_access
     def run_agent_tool(
         self,
         name: str,
@@ -13537,6 +13663,9 @@ class DebugState:
         if name == "get_navigation":
             limit = self.agent_tool_limit(arguments.get("limit"), 20, 40)
             return {"ok": True, "navigation": self.compact_agent_navigation(state, limit)}
+        if name == "get_exploration_options":
+            limit = self.agent_tool_limit(arguments.get("limit"), 5, 10)
+            return exploration_options(self, state, limit)
         if name == "inspect_target":
             latest = self.read_live_state()
             if latest.get("game_instance_id") == state.get("game_instance_id") and latest.get("objects") is not None:
@@ -13576,6 +13705,7 @@ class DebugState:
                 "candidate_return_room_id", "entry_evidence", "known_destination_basis",
             )
             compact_route = {key: route.get(key) for key in route_keys if key in route}
+            compact_route["diagnostic"] = route_diagnostic(self, state, target_id, route)
             if isinstance(compact_route.get("destination_exploration"), dict):
                 compact_route["destination_exploration"] = self.compact_room_exploration_summary(
                     compact_route["destination_exploration"]
@@ -13700,7 +13830,8 @@ class DebugState:
                         "message": (
                             "Restore/compaction reconciliation must finish before navigate, move_to or use_item. "
                             "Read the complete closed-inclusive summary ledger, then confirm every active task "
-                            "with the returned review_token in a later model batch."
+                            "with the returned review_token in a later model batch. Keeping active or choosing dormant "
+                            "requires an evidence-backed reconciliation_review and current description/rationale."
                         ),
                         "audit_complete": bool(reconciliation.get("audit_complete")),
                         "missing_active_task_ids": reconciliation.get("missing_active_task_ids") or [],
@@ -13977,10 +14108,26 @@ class DebugState:
             "touch 可能触发战斗、控制接管或此前未知的房间切换；发生任一情况时停止当前房间的连续探索并重新决策。"
             "reappeared_battle_trigger 表示同一逻辑房间、对象 ID 和 trigger_script 已确认在战斗胜利后消失并再次可交互。"
             "不得因为目标刷新为可交互、距离近或需要清点房间而主动选择它；只有明确战斗任务、它是唯一有意义的推进路径，或确实无法绕行时才允许再次接触。"
+            "没有 fresh 交互对象不等于区域已探索完；普通战斗没有新剧情不否定远端出口的价值。"
+            "准备回退而仍有未走通出口时，先 inspect_target 检查该出口的 route.diagnostic；blocked_by_transition 不是剧情锁门。"
+            "diagnostic 只描述一条候选路径的首个触发点，不证明唯一通路或战后必通；若 first_triggers 有多个对象，不能假定只触发其中一个。"
+            "仅在具体推进目标和路线证据支持时再次接触重现敌人；可安全绕行时先绕行，不能把 avoid_repeat 扩大成放弃整条道路。"
+            "继续调查某出口时，将目标编号、房间和观测依据写入现有相关任务 rationale；战斗、对话或房间变化后刷新导航并重新评估原出口。"
+            "不要自动连续穿越触发点，也不要把假设路径写成已确认的传送。"
+            "需要探索站位时调用 get_exploration_options，再用 move_to 前往候选坐标；不猜坐标，invalid_position 只否定该坐标。bad_start 表示起点无效，不代表没有网格；仅选择服务端 recovery_options 或 purpose=recover_start 的候选。恢复候选按 safe_reachable_cells 排序，默认优先 recommended=true；只有当前目标的可达性证据支持另一连通区时才改选，避免脱困后进入只能折返的小区域；reachable_target_ids 最多列10个，可达格数不代表剧情进展。move_to 一步后重新查询导航；无候选则报告阻塞，不猜方向或远处坐标。"
+            "该工具无候选只说明当前没有安全 frontier；结合未走通出口调查，不据此宣布区域耗尽。"
+            "重试旧 NPC 必须引用晚于上次交互的相关证据并核对事件时间；重复台词、普通移动和任务审计本身不算新线索。"
             "transition_candidate=true 的 touch 应作为有意选择的离房路线，不要为了遍历 touch 而提前进入。"
             "对于刚刚交互过、可能没有产生有效变化，或可能改变了 trigger kind、script、transition status 的目标，使用 inspect_target。"
             "运行时会在首次进入本会话尚未成功查看的新逻辑房间时自动提供一次 room_layout 视觉注释。"
-            "优先使用 get_navigation、get_room_memory、inspect_target 等结构化证据；如果自动视觉注释和这些证据仍不足以解释布局、出口、UI 文本或疑似通道，可以按需再次调用 inspect_screen。"
+            "自动观察只覆盖触发时的局部视野，通常在入口附近，不是整张地图；房间看过不代表当前位置看过。"
+            "主动使用 inspect_screen 了解当前环境、布局、出口、UI 文本和目标外观，并结合 get_navigation、get_room_memory、inspect_target 核对可达性与历史；无需等结构化查询失败。"
+            "同一房间内移动到新观察位置后，若旧画面不足以支持当前空间判断，应再次观察；剧情或对话引入新设施、地点线索且空间关系不明时，待画面无遮挡后先观察再选择相关路线。"
+            "准备把出口解释为井口、密道等具体用途，或现有地点理解与对话、导航、画面矛盾时，先调用 inspect_screen 核对当前视野，再决定验证动作。"
+            "question 应提出具体待验证问题，并允许不可见或无法判断；例如询问人物与井之间是否隔着墙、有无可见连接通路，不预设人物已在井边或出口就是井口。"
+            "区分对话发生地、对话提及的地点、画面可见位置和实际可达位置；对话记录的 room_id 只标识对话发生地，隔墙看见设施不证明人物就在设施旁或能直接走到。"
+            "画面未显示目标或连接时保留未知，不能据此断言目标不存在或无路可达。"
+            "同一视野、同一疑点已有有效观察时复用结果；移动或剧情带来相关变化后再补看，不为凑次数逐回合截图。"
             "inspect_screen 只是低权威 visual_annotation，即使 confidence=high 也不得直接写 Room Memo、创建或确认 transition、修改 task/dialog/observation 事实，"
             "目标外观不明时可调用 inspect_screen(focus=object,target_id=目标编号)，无需靠近或成功交互；"
             "仅系统绑定的对象允许按编号描述，不得猜未标记对象编号。外观可作为行动假设，不能据此确认剧情身份或用途；"
@@ -13998,6 +14145,13 @@ class DebugState:
             "frontier>0 只提供温和的正向探索价值；frontier=0 仅表示当前没有未走邻格，不能据此声称目的地是死路、噪音或剧情已经耗尽。"
             "任务是 agent 从对话和事件推断的记忆，不是引擎事实；结构化任务账本是任务状态的唯一权威来源，压缩摘要不是。"
             "自动上下文只是 active 任务的精简索引；需要完整描述、理由、历史或关闭任务时先调用 get_tasks。"
+            "索引提供当前 progress，旧任务无 progress 时提供最新 rationale；description 是当前目标，不应累积旧阶段流水账，阶段变化时同步改写并把目标放在开头。"
+            "rationale 是 agent 推理，可能过期或包含假设，不能当作已确认的地点或路线事实。"
+            "记录行动相关进展时使用 progress，evidence_refs 只复制实际对话、事件或已记录有向 transition 的引用；"
+            "返回的 progress.evidence 是服务端保存的观察摘录，只证明其原始内容，不证明 agent 对地点或路线用途的解释。"
+            "将这些解释单列在 hypotheses，把待验证动作写入 next_step；证伪后更新或删除假设，不得在反复压缩或对账中升级为事实。"
+            "新的地点或设施线索不证明附近旧出口具有新用途；已走过的旧通道只能按已观察的起终点记录，实际触发和房间证据确认前不得重命名。"
+            "旧任务没有 progress 时参考最新 rationale 并重新验证，不要根据旧 description 自动认定无线索；普通确认继续仍只提交 id。"
             "任何尚未解决、将影响未来行动的委托、线索或自发调查目标都必须成为独立 task，不要求 NPC 明说请去做；普通且不会影响后续行动的探索不必为每个对象创建 task。"
             "room_memo 只是可能过期的地点语义注释和普通 companion 数据，不是引擎事实，也不得覆盖 native transition、房间范围对话或 human-confirmed semantic annotation。"
             "第一次获得稳定、高置信的地点身份或用途时立即用 upsert_room_memo 写入短 memo；新证据细化或否定地点身份时整体更新或清除。"
@@ -14019,7 +14173,11 @@ class DebugState:
             "不要将有依赖的更新、归档和行动提交放在同一批；未收到成功结果前不得声称任务已更新或证据已归档。"
             "status_evidence 必须逐字复制 source_key 或使用 task inbox ID；不得用逻辑帧、消息编号或对话文字重建引用。"
             "task_reconciliation.pending=true 表示 checkpoint 恢复、上下文压缩或旧状态升级后必须重建全账本可见性：完整读取 closed-inclusive summary 索引，"
-            "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。全部 active 任务完成 upsert 后立即解除对账；"
+            "在后一模型批次用 review_token 逐条 upsert 所有 active 任务；保留 completed，重复 active 标为 abandoned 并注明重复关系。"
+            "保留 active 或改为 dormant 必须提交 reconciliation_review（stage_assessment、execution_basis、resume_condition、evidence_refs）并重新提交当前 description 和 rationale。"
+            "stage_assessment 核对目标是否已完成、被后续阶段覆盖以及描述是否符合最新进展；阶段变化须改写旧目标或有证据地结束。"
+            "active 的 execution_basis 必须说明当前可验证执行路径，不能用愿望、未知路线或旧理由代替；无路径转 dormant 并写明 resume_condition。"
+            "evidence_refs 必须引用实际证据，审查判断不是引擎事实；不得仅刷新审查时间，不得按回合数自动删除。全部 active 任务完成审查后立即解除对账；"
             "完成前不可 navigate、use_item 或创建任务，对话可继续。"
             "task_review.required=true 表示新剧情证据晚于相关 active task 的上次审计。对话仍可继续 advance_dialog；对话结束后若要 navigate 或 use_item，"
             "必须先调用 get_tasks，再只对 task_review.tasks 中真正受影响的 id 调用 upsert_task，选择确认继续、改写、dormant、completed 或 abandoned。无字段变化的 upsert_task 只刷新 review snapshot，不得改写 rationale。"
@@ -15153,6 +15311,7 @@ class DebugState:
         self.finish_agent_status()
         return decision
 
+    @memory_access
     def write_action(
         self,
         buttons: list[str],
@@ -15185,6 +15344,7 @@ class DebugState:
             self.append_navigation_diagnostic("action_written", {"action": entry})
             return entry
 
+    @memory_access
     def write_use_item_action(self, item_id: int, role_id: int | None = None, target: str | None = None) -> dict:
         item_id = int(item_id)
         if item_id <= 0:
@@ -15266,6 +15426,7 @@ class DebugState:
     def current_action_result(self) -> dict:
         return read_optional_json(self.action_result_path)
 
+    @memory_access
     def write_equip_item_action(
         self,
         item_id: int,
@@ -15372,6 +15533,7 @@ class DebugState:
             time.sleep(0.02)
         raise TimeoutError(f"choice_select generation {generation} did not complete")
 
+    @memory_access
     def write_choice_action(self, generation: int, option_index: int) -> dict:
         try:
             generation = int(generation)
@@ -15417,6 +15579,7 @@ class DebugState:
             raise RuntimeError(str(result.get("error") or result.get("status") or "choice_select_failed"))
         return {**entry, "result": result}
 
+    @memory_access
     def write_shop_action(self, action: str, item_id: int | None = None) -> dict:
         if action not in {"shop_buy", "shop_sell", "shop_leave"}:
             raise ValueError("action must be shop_buy, shop_sell, or shop_leave")
@@ -15536,6 +15699,7 @@ class DebugState:
             time.sleep(0.02)
         raise TimeoutError("battle action did not complete")
 
+    @memory_access
     def write_battle_action(self, args: dict) -> dict:
         start_time = time.time()
         with self.action_lock:

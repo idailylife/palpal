@@ -2197,17 +2197,31 @@ class AgentRuntime:
             return
 
     async def _replace_sdk_session_items(self, session_id: str, items: list[dict]) -> None:
+        await asyncio.to_thread(self._replace_sdk_session_items_sync, session_id, items)
+
+    def _replace_sdk_session_items_sync(self, session_id: str, items: list[dict]) -> None:
         try:
             from agents import SQLiteSession
         except ImportError:
             if items:
                 raise RuntimeError("openai-agents is required to restore checkpoint transcript")
             return
+        # Serialize before opening the transaction: invalid items cannot erase history.
+        encoded = [json.dumps(item, ensure_ascii=False) for item in items]
         session = SQLiteSession(session_id, self.sqlite_path)
-        await session.clear_session()
-        if items:
-            await session.add_items(items)
-        self._clear_history_migration_marker(session_id)
+        try:
+            with sqlite3.connect(self.sqlite_path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("INSERT OR IGNORE INTO agent_sessions(session_id) VALUES (?)", (session_id,))
+                connection.execute("DELETE FROM agent_messages WHERE session_id = ?", (session_id,))
+                connection.executemany("INSERT INTO agent_messages(session_id, message_data) VALUES (?, ?)",
+                                       [(session_id, value) for value in encoded])
+                connection.execute("UPDATE agent_sessions SET updated_at=CURRENT_TIMESTAMP WHERE session_id=?", (session_id,))
+                # Remove migration metadata within the same transaction when present.
+                if connection.execute("SELECT 1 FROM sqlite_master WHERE name='palpal_session_migrations'").fetchone():
+                    connection.execute("DELETE FROM palpal_session_migrations WHERE session_id=?", (session_id,))
+        finally:
+            session.close()
 
     async def _clear_sdk_session(self, session_id: str) -> bool:
         try:
@@ -2370,47 +2384,61 @@ class AgentRuntime:
             kept.sort(key=lambda item: int(item.get("seq") or 0))
             self._rewrite_events_file(kept)
 
-    def restore_checkpoint(self, checkpoint_dir: Path, checkpoint_id: str, game_instance_id: str | None) -> dict:
+    def validate_checkpoint(self, checkpoint_dir: Path) -> dict:
         path = checkpoint_dir / "agent" / "session.json"
-        try:
-            bundle = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(bundle, dict) or int(bundle.get("version") or 0) != CHECKPOINT_BUNDLE_VERSION:
-                raise ValueError("unsupported agent checkpoint bundle")
-            control = bundle.get("control")
-            transcript = bundle.get("transcript")
-            events = bundle.get("events")
-            tool_outputs = bundle.get("tool_outputs", [])
-            if (
-                not isinstance(control, dict)
-                or not isinstance(transcript, list)
-                or not isinstance(events, list)
-                or not isinstance(tool_outputs, list)
-            ):
-                raise ValueError("invalid agent checkpoint bundle")
-            checkpoint_outputs_dir = checkpoint_dir / "agent" / "tool_outputs"
-            for entry in tool_outputs:
-                output_ref = entry.get("output_ref") if isinstance(entry, dict) else None
-                source = checkpoint_outputs_dir / output_ref if self._valid_output_ref(output_ref) else None
-                if source is None or source.is_symlink() or not source.is_file():
-                    raise ValueError("invalid agent checkpoint tool output")
-        except FileNotFoundError:
-            return self.reset(
-                "checkpoint_loaded_without_agent_bundle",
-                game_instance_id=game_instance_id,
-                checkpoint_id=checkpoint_id,
-            )
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return self.reset(
-                "checkpoint_agent_bundle_incompatible",
-                game_instance_id=game_instance_id,
-                checkpoint_id=checkpoint_id,
-            )
+        bundle = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(bundle, dict) or int(bundle.get("version") or 0) != CHECKPOINT_BUNDLE_VERSION:
+            raise ValueError("unsupported agent checkpoint bundle")
+        control = bundle.get("control")
+        transcript = bundle.get("transcript")
+        events = bundle.get("events")
+        tool_outputs = bundle.get("tool_outputs", [])
+        if (
+            not isinstance(control, dict)
+            or not isinstance(transcript, list)
+            or not isinstance(events, list)
+            or not isinstance(tool_outputs, list)
+        ):
+            raise ValueError("invalid agent checkpoint bundle")
+        checkpoint_outputs_dir = checkpoint_dir / "agent" / "tool_outputs"
+        for entry in tool_outputs:
+            output_ref = entry.get("output_ref") if isinstance(entry, dict) else None
+            source = checkpoint_outputs_dir / output_ref if self._valid_output_ref(output_ref) else None
+            if source is None or source.is_symlink() or not source.is_file():
+                raise ValueError("invalid agent checkpoint tool output")
+        source_id = bundle.get("source_session_id")
+        if not isinstance(source_id, str) or not re.fullmatch(r"[0-9a-f]{32}", source_id) or control.get("session_id") != source_id:
+            raise ValueError("checkpoint_session_identity_mismatch")
+        if not all(isinstance(item, dict) for item in transcript + events):
+            raise ValueError("invalid checkpoint transcript or events")
+        for key in ("turn", "max_turns", "compactions"):
+            value = control.get(key, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"invalid checkpoint control: {key}")
+        for event in events:
+            if any(isinstance(event.get(key, 0), bool) or not isinstance(event.get(key, 0), int)
+                   or event.get(key, 0) < 0 for key in ("seq", "turn")):
+                raise ValueError("invalid checkpoint event sequence")
+        for key in ("usage", "provider_usage", "equipment_review", "room_inspection"):
+            if key in control and not isinstance(control[key], dict):
+                raise ValueError(f"invalid checkpoint control: {key}")
+        refs = set(re.findall(r"tool-[0-9a-f]{32}\.txt", json.dumps(transcript)))
+        if not refs.issubset({entry["output_ref"] for entry in tool_outputs}):
+            raise ValueError("checkpoint_tool_output_reference_missing")
+        # Check recorded lengths even for older bundles without content hashes.
+        for entry in tool_outputs:
+            if (checkpoint_outputs_dir / entry["output_ref"]).stat().st_size != entry.get("bytes"):
+                raise ValueError("checkpoint_tool_output_size_mismatch")
+        return bundle
 
+    def restore_checkpoint(self, checkpoint_dir: Path, checkpoint_id: str, game_instance_id: str | None) -> dict:
+        bundle = self.validate_checkpoint(checkpoint_dir)
+        control, transcript, events = bundle["control"], bundle["transcript"], bundle["events"]
+        tool_outputs = bundle.get("tool_outputs", [])
         source_session_id = str(bundle.get("source_session_id") or control.get("session_id") or "") or None
         with self.lock:
             if self.is_running():
                 raise RuntimeError("agent_session_running")
-            previous_session_id = self.state.get("session_id")
             # Rollback semantics: resume the checkpoint's own session instead of forking.
             target_session_id = source_session_id or previous_session_id
             self.generation += 1
@@ -2443,20 +2471,14 @@ class AgentRuntime:
             restored.update(status="paused", phase="paused", run_turn=0, stop_reason="checkpoint_restored", generation=self.generation)
             restored["task_reconciliation_pending"] = True
             restored["task_reconciliation_reason"] = "checkpoint_restored"
+        self._restore_checkpoint_tool_outputs(checkpoint_dir, tool_outputs, restored["session_id"])
+        # Keep the SQLite commit inside the checkpoint operation. A timed-out
+        # background future must never write into a later recovery attempt.
+        self._replace_sdk_session_items_sync(restored["session_id"], transcript)
+        with self.lock:
             self.state = restored
             self._persist()
             self._notify_session_changed()
-        try:
-            self._restore_checkpoint_tool_outputs(checkpoint_dir, tool_outputs, restored["session_id"])
-            self._submit(self._replace_sdk_session_items(restored["session_id"], transcript)).result(timeout=30)
-        except Exception:
-            return self.reset(
-                "checkpoint_agent_transcript_restore_failed",
-                game_instance_id=game_instance_id,
-                checkpoint_id=checkpoint_id,
-                parent_session_id=previous_session_id,
-                restored_from_session_id=source_session_id,
-            )
         self._replace_session_events(restored["session_id"], events)
         self.emit(
             "session",
@@ -2647,30 +2669,31 @@ class AgentRuntime:
         self.reset("game_instance_changed", game_instance_id=instance_id)
 
     def start(self, model: str | None, max_turns: int, *, decide_only: bool = False) -> dict:
-        max_turns = max(1, min(int(max_turns), 100))
-        if decide_only and self.debug.snapshot().get("in_battle"):
-            raise RuntimeError("decide_once_unavailable_in_battle")
-        with self.lock:
-            if self.is_running():
-                raise RuntimeError("agent_session_running")
-            self.cancel_event.clear()
-            self.generation += 1
-            generation = self.generation
-            self.state.update(
-                model=self.debug.deepseek_model(model),
-                status="running",
-                phase="deciding",
-                run_turn=0,
-                max_turns=1 if decide_only else max_turns,
-                stop_reason=None,
-                started_at=_stamp(),
-                ended_at=None,
-                generation=generation,
-            )
-            self._persist()
-            self.emit("run", "deciding", "Agent run started.", {"max_turns": self.state["max_turns"], "decide_only": decide_only})
-            self.run_future = self._submit(self._run(generation, decide_only=decide_only))
-            return self.snapshot()
+        with self.debug.checkpoint_access():
+            max_turns = max(1, min(int(max_turns), 100))
+            if decide_only and self.debug.snapshot().get("in_battle"):
+                raise RuntimeError("decide_once_unavailable_in_battle")
+            with self.lock:
+                if self.is_running():
+                    raise RuntimeError("agent_session_running")
+                self.cancel_event.clear()
+                self.generation += 1
+                generation = self.generation
+                self.state.update(
+                    model=self.debug.deepseek_model(model),
+                    status="running",
+                    phase="deciding",
+                    run_turn=0,
+                    max_turns=1 if decide_only else max_turns,
+                    stop_reason=None,
+                    started_at=_stamp(),
+                    ended_at=None,
+                    generation=generation,
+                )
+                self._persist()
+                self.emit("run", "deciding", "Agent run started.", {"max_turns": self.state["max_turns"], "decide_only": decide_only})
+                self.run_future = self._submit(self._run(generation, decide_only=decide_only))
+                return self.snapshot()
 
     def interrupt(self) -> dict:
         with self.debug.navigation_action_lock:
@@ -2716,7 +2739,7 @@ class AgentRuntime:
         task.get_loop().call_soon_threadsafe(task.cancel)
 
     async def execute_pending(self) -> dict:
-        with self.lock:
+        with self.debug.checkpoint_access(), self.lock:
             if self.is_running():
                 raise RuntimeError("agent_session_running")
             decision = self.state.get("pending_decision")
@@ -3518,6 +3541,8 @@ exploration value, and maintained local tasks to choose the next action.
             prompt = current_prompt()
         streams = []
         for attempt in range(2):
+            if self.cancel_event.is_set():
+                raise asyncio.CancelledError
             stream = Runner.run_streamed(
                 agent, prompt, session=session, max_turns=16,
             )
@@ -3540,6 +3565,8 @@ exploration value, and maintained local tasks to choose the next action.
                         model=self.state.get("model"),
                         update_last_prompt=True,
                     )
+            if self.cancel_event.is_set():
+                raise asyncio.CancelledError
             if submitted_decision is not None:
                 break
             if attempt == 0:
@@ -4504,6 +4531,17 @@ exploration value, and maintained local tasks to choose the next action.
                 raise RuntimeError("interrupted")
             self.emit("navigation", "progress", "Coordinate movement step completed.",
                       {"step": step + 1, "result": result, "actual_position": after.get("party_position")})
+            if result.get("recovery"):
+                interrupted = (
+                    (self.debug.room_identity(after) or {}).get("id") != identity.get("id")
+                    or self.debug.native_trigger_generation(after) != trigger
+                    or not self.debug.control_state(after)["navigation_ready"]
+                )
+                arrived = after.get("party_position") == result.get("expected_position")
+                return {"ok": arrived and not interrupted,
+                        "status": "recovery_interrupted" if interrupted else "recovered" if arrived else "no_progress",
+                        "actual_position": after.get("party_position"), "execution_steps": 1,
+                        "refresh_navigation": True}
             before_pos = (state.get("party_position"), state.get("party_direction"))
             after_pos = (after.get("party_position"), after.get("party_direction"))
             stalled = stalled + 1 if before_pos == after_pos else 0

@@ -22,6 +22,14 @@
 static int g_agent_initialized = 0;
 static int g_agent_enabled = 0;
 static int g_agent_headless = 0;
+static BOOL g_agent_checkpoint_paused = FALSE;
+static BOOL g_agent_checkpoint_loading = FALSE;
+static BOOL g_agent_checkpoint_failed = FALSE;
+static char g_agent_slot_request_id[33] = "";
+static char g_agent_loading_request_id[33] = "";
+static char g_agent_loading_action[16] = "";
+static int g_agent_loading_slot = 0;
+
 static BOOL g_agent_startup_waiting = FALSE;
 static BOOL g_agent_startup_ready = FALSE;
 static int g_agent_startup_slot = 0;
@@ -1815,12 +1823,13 @@ PALPAL_AgentWriteSlotResult(
       "\"status\":\"%s\","
       "\"action\":\"%s\","
       "\"slot\":%d,"
+      "\"request_id\":\"%s\","
       "\"error\":",
       (unsigned int)SDL_GetTicks(),
       ok ? "true" : "false",
       status ? status : "unknown",
       action ? action : "unknown",
-      slot);
+      slot, g_agent_slot_request_id);
    if (error && error[0])
    {
       fprintf(fp, "\"%s\"", error);
@@ -1919,7 +1928,7 @@ PALPAL_AgentSlotCommandAllowed(
    int slot
 )
 {
-   if (slot < 0)
+   if (slot < 1 || slot > 255)
    {
       PALPAL_AgentWriteSlotResult(FALSE, "invalid_slot", action, slot, "invalid_slot");
       return FALSE;
@@ -1934,7 +1943,8 @@ PALPAL_AgentSlotCommandAllowed(
       PALPAL_AgentWriteSlotResult(FALSE, "in_battle", action, slot, "in_battle");
       return FALSE;
    }
-   if (gpGlobals->fEnteringScene)
+   if (gpGlobals->fEnteringScene &&
+       !(g_agent_checkpoint_failed && strcmp(action, "load_slot") == 0))
    {
       PALPAL_AgentWriteSlotResult(FALSE, "entering_scene", action, slot, "entering_scene");
       return FALSE;
@@ -1953,6 +1963,129 @@ PALPAL_AgentSlotCommandAllowed(
 }
 
 static VOID
+PALPAL_AgentCheckpointControl(VOID)
+{
+   char path[PAL_MAX_PATH], result[PAL_MAX_PATH], temporary[PAL_MAX_PATH];
+   char command[16], request[33], argument[PAL_MAX_PATH];
+   FILE *fp;
+   const char *status = "failed";
+   PALPAL_AgentPath(path, sizeof(path), "checkpoint_control.txt");
+   fp = fopen(path, "r");
+   if (!fp) return;
+   argument[0] = '\0';
+   if (fscanf(fp, "%15s %32s", command, request) != 2)
+   { fclose(fp); remove(path); return; }
+   if (fgets(argument, sizeof(argument), fp))
+   {
+      size_t n = strlen(argument);
+      while (n && (argument[n-1] == '\n' || argument[n-1] == '\r')) argument[--n] = '\0';
+   }
+   fclose(fp);
+   remove(path);
+   if (strcmp(command, "validate") == 0)
+      status = PAL_ValidateSaveFile(argument[0] == ' ' ? argument + 1 : argument) ? "validated" : "invalid_save";
+   else if (strcmp(command, "pause") == 0)
+   {
+      if (g_agent_checkpoint_paused || g_agent_startup_waiting || (gpGlobals && !gpGlobals->fInBattle &&
+          !gpGlobals->fEnteringScene && !PAL_IsInDialog() && !g_agent_action_pending))
+      { g_agent_checkpoint_paused = TRUE; status = "paused"; }
+      else status = "unsafe_pause";
+   }
+   else if (strcmp(command, "resume") == 0 && !g_agent_checkpoint_failed)
+   { g_agent_checkpoint_paused = FALSE; status = "resumed"; }
+   PALPAL_AgentPath(result, sizeof(result), "checkpoint_control_result.json");
+   snprintf(temporary, sizeof(temporary), "%s.tmp", result);
+   fp = fopen(temporary, "w");
+   if (!fp) return;
+   fprintf(fp, "{\"request_id\":\"%s\",\"status\":\"%s\",\"frame\":%u}\n", request, status, gpGlobals ? (unsigned int)gpGlobals->dwFrameNum : 0);
+   fclose(fp);
+   rename(temporary, result);
+}
+
+VOID
+PALPAL_AgentCheckpointWait(VOID)
+{
+   if (!PALPAL_AgentEnabled()) return;
+   PALPAL_AgentCheckpointControl();
+   while (g_agent_checkpoint_paused && !g_agent_checkpoint_loading)
+   {
+      PALPAL_AgentWriteState();
+      PALPAL_AgentPollAction();
+      PALPAL_AgentCheckpointControl();
+      SDL_Delay(10);
+   }
+}
+
+VOID
+PALPAL_AgentCheckpointLoadFailed(VOID)
+{
+   g_agent_checkpoint_failed = TRUE;
+   g_agent_checkpoint_paused = TRUE;
+   g_agent_checkpoint_loading = FALSE;
+   strcpy(g_agent_slot_request_id, g_agent_loading_request_id);
+   PALPAL_AgentWriteSlotResult(FALSE, "load_failed", g_agent_loading_action,
+      g_agent_loading_slot, "invalid_save");
+}
+
+BOOL
+PALPAL_AgentCheckpointLoading(VOID)
+{ return g_agent_checkpoint_loading; }
+
+VOID
+PALPAL_AgentCheckpointLoaded(VOID)
+{
+   if (!g_agent_checkpoint_loading || g_agent_checkpoint_failed) return;
+   g_agent_checkpoint_loading = FALSE;
+   strcpy(g_agent_slot_request_id, g_agent_loading_request_id);
+   PALPAL_AgentWriteSlotResult(TRUE,
+      strcmp(g_agent_loading_action, "start_slot") == 0 ? "started" : "loaded",
+      g_agent_loading_action, g_agent_loading_slot, NULL);
+}
+
+/* Events from the abandoned live branch must not be replayed after restore.
+ * Keep sequence counters monotonic so future native evidence cannot collide. */
+static VOID
+PALPAL_AgentClearCheckpointObservations(VOID)
+{
+   g_agent_trigger_observation.valid = FALSE;
+   g_agent_trigger_observation.completed = FALSE;
+   g_agent_latest_dialog_event.valid = FALSE;
+   g_agent_dialog_event_count = 0;
+   g_agent_dialog_event_next = 0;
+   g_agent_last_dialog_ticks = 0;
+   g_agent_dialog_speaker_bound = FALSE;
+   g_agent_dialog_speaker[0] = L'\0';
+   g_agent_last_battle.valid = FALSE;
+   g_agent_visible_outcome_count = 0;
+   g_agent_visible_active.valid = FALSE;
+   g_agent_choice.active = FALSE;
+   g_agent_shop.active = FALSE;
+}
+
+static BOOL
+PALPAL_AgentBeginSlotLoad(const char *action, int slot)
+{
+   char path[PAL_MAX_PATH];
+   if (slot < 0 || slot > 255 || (strcmp(action, "load_slot") == 0 && slot == 0) ||
+       (strcmp(action, "start_slot") == 0 && slot != 0))
+   { PALPAL_AgentWriteSlotResult(FALSE, "invalid_slot", action, slot, "invalid_slot"); return FALSE; }
+   if (slot)
+   {
+      UTIL_CombinePath(path, sizeof(path), 2, gConfig.pszSavePath, PAL_va(1, "%d.rpg", slot));
+      if (!PAL_ValidateSaveFile(path))
+      { PALPAL_AgentWriteSlotResult(FALSE, "invalid_save", action, slot, "invalid_save"); return FALSE; }
+   }
+   PALPAL_AgentClearCheckpointObservations();
+   strcpy(g_agent_loading_request_id, g_agent_slot_request_id);
+   strncpy(g_agent_loading_action, action, sizeof(g_agent_loading_action) - 1);
+   g_agent_loading_slot = slot;
+   g_agent_checkpoint_loading = TRUE;
+   g_agent_checkpoint_paused = TRUE;
+   g_agent_checkpoint_failed = FALSE;
+   return TRUE;
+}
+
+static VOID
 PALPAL_AgentDoStartupSlotAction(
    const char *action,
    int slot
@@ -1966,6 +2099,7 @@ PALPAL_AgentDoStartupSlotAction(
       return;
    }
 
+   if (!PALPAL_AgentBeginSlotLoad(action, slot)) return;
    g_agent_startup_slot = slot;
    g_agent_startup_ready = TRUE;
    g_agent_startup_waiting = FALSE;
@@ -2045,6 +2179,12 @@ PALPAL_AgentLoadStartupActionFile(
       {
          continue;
       }
+      if (strcmp(key, "request_id") == 0)
+      {
+         strncpy(g_agent_slot_request_id, value, sizeof(g_agent_slot_request_id) - 1);
+         g_agent_slot_request_id[32] = '\0';
+         continue;
+      }
       if (strcmp(key, "start_slot") == 0 || strcmp(key, "load_slot") == 0)
       {
          strncpy(pending_action, key, sizeof(pending_action) - 1);
@@ -2076,8 +2216,10 @@ PALPAL_AgentDoSaveSlot(
       return;
    }
 
-   PAL_SaveGame(slot, PALPAL_AgentNextSavedTimes());
-   PALPAL_AgentWriteSlotResult(TRUE, "saved", "save_slot", slot, NULL);
+   if (PAL_SaveGame(slot, PALPAL_AgentNextSavedTimes()))
+      PALPAL_AgentWriteSlotResult(TRUE, "saved", "save_slot", slot, NULL);
+   else
+      PALPAL_AgentWriteSlotResult(FALSE, "save_failed", "save_slot", slot, "save_io_error");
 }
 
 static VOID
@@ -2090,6 +2232,7 @@ PALPAL_AgentDoLoadSlot(
       return;
    }
 
+   if (!PALPAL_AgentBeginSlotLoad("load_slot", slot)) return;
    PAL_ReloadInNextTick(slot);
    PALPAL_AgentWriteSlotResult(TRUE, "load_scheduled", "load_slot", slot, NULL);
 }
@@ -2131,6 +2274,7 @@ PALPAL_AgentDoStartSlot(
    {
       PAL_EndDialog();
    }
+   if (!PALPAL_AgentBeginSlotLoad("start_slot", slot)) return;
    PAL_ReloadInNextTick(slot);
    PALPAL_AgentWriteSlotResult(TRUE, "start_scheduled", "start_slot", slot, NULL);
 }
@@ -2722,6 +2866,12 @@ PALPAL_AgentLoadActionFile(
       char target[64];
       if (sscanf(line, "%31s %63s", key, value) != 2)
       {
+         continue;
+      }
+      if (strcmp(key, "request_id") == 0)
+      {
+         strncpy(g_agent_slot_request_id, value, sizeof(g_agent_slot_request_id) - 1);
+         g_agent_slot_request_id[32] = '\0';
          continue;
       }
       if (strcmp(key, "frames") == 0)
@@ -3809,6 +3959,14 @@ PALPAL_AgentFindRoomStart(
             int x = *start_x + dx;
             int y = *start_y + dy;
             if (abs(dx) != radius && abs(dy) != radius)
+            {
+               continue;
+            }
+            /* Native steps change both grid axes by one. Never seed the
+             * opposite parity lattice, which the player cannot step onto.
+             * Radius one therefore checks only actual adjacent destinations.
+             */
+            if ((dx + dy) % 2 != 0)
             {
                continue;
             }
@@ -6245,6 +6403,8 @@ PALPAL_AgentWriteState(
       (g_agent_action_pending || g_agent_action_count > 0 || g_agent_waiting_for_move) ? "true" : "false",
       PALPAL_AgentRemainingActionSteps(),
       g_agent_waiting_for_move ? "true" : "false");
+   fprintf(fp, "\"checkpoint\":{\"paused\":%s,\"load_failed\":%s},",
+      g_agent_checkpoint_paused ? "true" : "false", g_agent_checkpoint_failed ? "true" : "false");
    fprintf(fp, "\"frame\":%u,", (unsigned int)gpGlobals->dwFrameNum);
    fprintf(fp, "\"in_main_game\":%s,", gpGlobals->fInMainGame ? "true" : "false");
    fprintf(fp, "\"in_battle\":%s,", gpGlobals->fInBattle ? "true" : "false");

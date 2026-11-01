@@ -116,7 +116,14 @@ def make_debug_state(tmp):
     root = Path(tmp)
     asset_dir = root / "assets"
     asset_dir.mkdir(exist_ok=True)
-    return DebugState(root / "runtime", asset_dir, root / "sdlpal")
+    debug = DebugState(root / "runtime", asset_dir, root / "sdlpal")
+    # Unit fixtures have no native process; integration tests exercise the real
+    # file transport separately. Keep checkpoint pause/backup explicitly local.
+    debug.checkpoint_native_control = lambda command, **kwargs: {
+        "status": {"pause": "paused", "resume": "resumed", "validate": "validated"}[command],
+    }
+    debug.checkpoint_backup_native = lambda target: (target / "game.rpg").write_bytes(b"live-game-backup")
+    return debug
 
 
 def seed_exploration_room(debug, state, visited):
@@ -143,7 +150,7 @@ def fake_load_command(command, slot):
     assert command == "load_slot"
     return {
         "action": {"command": command, "slot": slot},
-        "result": {"ok": True, "action": command, "slot": slot, "status": "load_scheduled"},
+        "result": {"ok": True, "action": command, "slot": slot, "status": "loaded"},
     }
 
 

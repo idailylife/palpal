@@ -607,6 +607,30 @@ headless Chrome through the Chrome DevTools Protocol, verifies that both
 WebSocket streams are live, and checks that the frame canvas has non-black
 pixels. It stops the game and server before exiting.
 
+## Checkpoint recovery
+
+Checkpoint saves pause the native game while capturing the game file, companion
+memory and Agent session. New checkpoints include SHA-256 hashes. Loading checks
+the complete bundle and native save format before changing the live game; complete
+version 2 bundles remain supported, while incomplete or incompatible bundles are
+rejected instead of starting an empty Agent session.
+
+If an operation fails after pausing, the game controls remain blocked. The current
+phase and error appear in the checkpoint panel; recovery files remain under
+`runtime/checkpoint_operations/`, and `runtime/checkpoint_operation.json` preserves
+the block across debug-server restarts. A deliberate load retry can clear the block
+after a successful restore. A normal `./run` refuses to clear runtime history while
+recovery is pending; use `./run debug` to inspect or retry with the existing game.
+Checkpoint slots must be in the range 1–255; slot 0 is reserved for a new game.
+
+After building, the optional native smoke check copies resources and a source save
+into a temporary directory, verifies memo restoration and native I/O errors, and
+stops its test game:
+
+```sh
+.venv/bin/python -m scripts.checkpoint_smoke --game-save /path/to/checkpoint/game.rpg
+```
+
 ## Licensing Notes
 
 SDLPAL is GPL-3.0. This project vendors and modifies SDLPAL, so changes to the

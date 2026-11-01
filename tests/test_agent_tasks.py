@@ -1,5 +1,7 @@
 from unittest import mock
 
+import pytest
+
 from tests.support import create_agent_task, make_checkpoint_state, make_debug_state, make_object, make_state, write_state
 
 
@@ -23,6 +25,19 @@ def change_task_status(debug, task_id, status, state=None, *, reason="Test evide
         "status_reason": reason,
         "status_evidence": [f"event:{len(debug.event_log) - 1}"],
     }, state)
+
+
+def reconciliation_fields(ref, *, dormant=False):
+    return {
+        "description": "Investigate the current lead",
+        "rationale": "The latest evidence supports the current stage.",
+        "reconciliation_review": {
+            "stage_assessment": "The lead is unresolved; the earlier stage has ended.",
+            "execution_basis": "" if dormant else "The observed doorway provides a route to investigate the lead.",
+            "resume_condition": "Resume when a route to the lead is observed." if dormant else "",
+            "evidence_refs": [ref],
+        },
+    }
 
 
 def test_task_ledger_create_update_close_and_filtering(tmp_path):
@@ -103,6 +118,8 @@ def test_six_task_reconciliation_and_forty_inbox_recovery(tmp_path):
         args = {"id": f"task-{index}", "review_token": audit["review_token"]}
         if index == 0:
             args.update(status="completed", status_reason="Rescue succeeded.", status_evidence=[pending[0]])
+        else:
+            args.update(reconciliation_fields(pending[index]))
         assert debug.run_agent_tool("upsert_task", args, state, tool_cycle=cycle)["ok"]
     assert not debug.agent_runtime.task_reconciliation_pending()
     blocked = debug.run_agent_tool("submit_decision", {
@@ -466,6 +483,7 @@ def test_reconciliation_clears_after_audit_and_allows_inbox_derived_task(tmp_pat
     assert debug.agent_runtime.task_reconciliation_pending() is True
     confirmed = debug.run_agent_tool("upsert_task", {
         "id": "existing-task", "review_token": audit["review_token"],
+        **reconciliation_fields(inbox_id),
     }, state, tool_cycle=cycle)
     assert confirmed["ok"] is True
     assert debug.agent_runtime.task_reconciliation_pending() is False
@@ -515,11 +533,116 @@ def test_active_task_context_is_sorted_bounded_and_compact(tmp_path):
     assert len(context["active_tasks"][0]["description"]) == 160
     assert context["active_tasks"][0]["description"].endswith("…")
     assert set(context["active_tasks"][0]) == {
-        "id", "description", "priority", "object_id", "transition_key", "room_id",
+        "id", "description", "rationale", "priority", "object_id", "transition_key", "room_id",
     }
-    assert "rationale" not in context["active_tasks"][0]
+    assert context["active_tasks"][0]["rationale"] == "Reason 9"
     assert "history" not in context["active_tasks"][0]
     assert "updated_at" not in context["active_tasks"][0]
+
+
+def test_legacy_task_context_includes_latest_rationale_without_rewriting_ledger(tmp_path):
+    debug = make_debug_state(tmp_path)
+    create_agent_task(debug, {
+        "id": "thief", "description": "Old phase; no executable clues.",
+        "rationale": "Find the stolen goods.",
+    })
+    latest = "Moon pointed out suspicious activity at the well. " + "Investigate safely. " * 20
+    debug.run_agent_tool("upsert_task", {"id": "thief", "rationale": latest})
+    before = debug.exploration_path.read_bytes()
+
+    context = debug.active_task_context()["active_tasks"][0]
+
+    assert context["description"] == "Old phase; no executable clues."
+    assert context["rationale"] == latest[:159] + "…"
+    assert "progress" not in context  # Never promote legacy reasoning into evidence.
+    assert debug.exploration_path.read_bytes() == before
+
+
+def test_task_progress_keeps_observation_hypothesis_and_next_step_separate(tmp_path):
+    debug = make_debug_state(tmp_path)
+    debug.dialog_history.append({"source_key": "well-clue", "text": "井裡頭一定有古怪！", "time": 100})
+    created = create_agent_task(debug, {
+        "id": "thief", "description": "Investigate the well to find the thief.",
+        "rationale": "A new clue needs verification.",
+        "progress": {
+            "evidence_refs": ["well-clue"],
+            "hypotheses": ["The old passage might lead to the well; unverified."],
+            "next_step": "Inspect the well objects before choosing an entrance.",
+        },
+    })
+    assert created["ok"]
+    progress = created["task"]["progress"]
+    assert progress["evidence"] == [{
+        "ref": "well-clue", "kind": "dialog", "observed_at": 100,
+        "summary": "井裡頭一定有古怪！",
+    }]
+    assert "passage" not in str(progress["evidence"])
+    assert created["task"]["origin_evidence"] == progress["evidence"]
+    assert debug.active_task_context()["active_tasks"][0]["progress"] == progress
+    assert "rationale" not in debug.active_task_context()["active_tasks"][0]
+    assert debug.run_agent_tool("get_tasks", {"detail": "summary"})["tasks"][0]["progress"] == progress
+    checkpoint = tmp_path / "progress-checkpoint"
+    debug.copy_companion_to_checkpoint(checkpoint)
+
+    # Evidence excerpts survive restart/pruning and an ordinary no-op review.
+    reloaded = make_debug_state(tmp_path)
+    before = reloaded.read_exploration()
+    reviewed = reloaded.run_agent_tool("upsert_task", {"id": "thief"})
+    assert reviewed["task"]["progress"] == progress
+    assert reloaded.read_exploration()["tasks_revision"] == before["tasks_revision"]
+    assert reviewed["task"]["history"] == before["tasks"]["thief"]["history"]
+    updated = reloaded.run_agent_tool("upsert_task", {
+        "id": "thief", "description": "Investigate the well to find the thief.",
+        "progress": {
+            "evidence_refs": ["well-clue"], "hypotheses": [],
+            "next_step": "Verify another route; the old passage is not confirmed as the entrance.",
+        },
+    })
+    assert updated["ok"]
+    assert updated["task"]["progress"]["evidence"] == progress["evidence"]
+    assert updated["task"]["progress"]["hypotheses"] == []
+    assert reloaded.read_exploration()["tasks_revision"] == before["tasks_revision"] + 1
+    reloaded.restore_companion_from_checkpoint(checkpoint)
+    assert reloaded.active_task_context()["active_tasks"][0]["progress"] == progress
+    assert reloaded.read_exploration()["tasks_revision"] == before["tasks_revision"]
+
+
+@pytest.mark.parametrize("progress", [
+    {"evidence_refs": ["imaginary-transition"], "hypotheses": [], "next_step": "Check."},
+    {"evidence_refs": [], "hypotheses": [], "next_step": "x" * 161},
+    {"evidence_refs": [], "hypotheses": ["x" * 161], "next_step": "Check."},
+    {"evidence_refs": [], "hypotheses": ["A", "B", "C", "D"], "next_step": "Check."},
+    {"evidence_refs": "invented", "hypotheses": [], "next_step": "Check."},
+    {"evidence_refs": [], "hypotheses": [], "next_step": "Check.", "facts": ["This is the well."]},
+])
+def test_invalid_task_progress_is_rejected_before_task_or_revision_changes(tmp_path, progress):
+    debug = make_debug_state(tmp_path)
+    create_agent_task(debug, {"id": "thief", "description": "Find thief.", "rationale": "Clue."})
+    before = debug.exploration_path.read_bytes()
+    result = debug.run_agent_tool("upsert_task", {
+        "id": "thief", "description": "Changed goal.", "progress": progress,
+    })
+    assert result["ok"] is False
+    assert debug.exploration_path.read_bytes() == before
+
+
+def test_task_progress_requires_current_goal_and_is_invalidated_by_legacy_narrative_update(tmp_path):
+    debug = make_debug_state(tmp_path)
+    create_agent_task(debug, {"id": "thief", "description": "Find thief.", "rationale": "Clue."})
+    progress = {"evidence_refs": [], "hypotheses": ["Possible entrance."], "next_step": "Verify entrance."}
+    before = debug.exploration_path.read_bytes()
+    assert not debug.run_agent_tool("upsert_task", {"id": "thief", "progress": progress})["ok"]
+    assert debug.exploration_path.read_bytes() == before
+    assert debug.run_agent_tool("upsert_task", {
+        "id": "thief", "description": "Verify suspected entrance.", "progress": progress,
+    })["ok"]
+    updated = debug.run_agent_tool("upsert_task", {"id": "thief", "rationale": "Entrance disproven; search elsewhere."})
+    assert updated["ok"]
+    assert updated["task"]["progress"] is None
+    context = debug.active_task_context()["active_tasks"][0]
+    assert "progress" not in context
+    assert context["rationale"] == "Entrance disproven; search elsewhere."
+    assert updated["task"]["history"][-1]["changes"]["progress"]["to"] is None
 
 
 def test_task_review_matches_object_dialog_and_events_but_not_unrelated_objects(tmp_path):
@@ -1228,7 +1351,11 @@ def test_task_ledger_is_additive_and_survives_checkpoint_round_trip(tmp_path):
         "rationale": "It is the next stated destination.",
         "room_id": "S3/M99:000000000001",
     })
-    with mock.patch.object(debug, "run_slot_command", return_value={"result": {}}):
+    def slot_command(command, slot):
+        if command == "save_slot":
+            debug.save_slot_path(slot).write_bytes(b"new-task-checkpoint")
+        return {"result": {"ok": True, "status": "saved" if command == "save_slot" else "loaded"}}
+    with mock.patch.object(debug, "run_slot_command", side_effect=slot_command):
         debug.save_checkpoint("tasks", "Tasks")
         debug.write_exploration(debug.empty_exploration())
         write_state(debug, state)
@@ -1334,3 +1461,98 @@ def test_delivery_phase_regression_reviews_old_object_task_without_inventory_ite
     })
     assert successor["task"]["status"] == "active"
     assert [task["id"] for task in debug.task_ledger()] == ["deliver-upstairs"]
+
+
+@pytest.mark.parametrize('reason', ['checkpoint_restored', 'context_compacted'])
+def test_reconciliation_rejects_empty_confirmation_without_mutation(tmp_path, reason):
+    debug = make_debug_state(tmp_path)
+    state = review_state()
+    write_state(debug, state)
+    create_agent_task(debug, {'id': 'old', 'description': 'Buy shrimp',
+                              'rationale': 'No known route, keep active.'})
+    debug.agent_runtime.mark_task_reconciliation_pending(reason)
+    cycle = debug.new_agent_tool_cycle(state)
+    audit = debug.run_agent_tool('get_tasks', {'include_closed': True, 'detail': 'summary'},
+                                 state, tool_cycle=cycle)
+    base = {'id': 'old', 'review_token': audit['review_token']}
+    debug.event_log.append({'source_key': 'route-evidence', 'type': 'transition', 'time': 100})
+    before = debug.read_exploration()
+    invalid = [base, {**base, **reconciliation_fields('invented-reference')}]
+    for field in ['execution_basis', 'stage_assessment']:
+        args = {**base, **reconciliation_fields('route-evidence')}
+        args['reconciliation_review'][field] = ' '
+        invalid.append(args)
+    for field in ['description', 'rationale']:
+        args = {**base, **reconciliation_fields('route-evidence')}
+        del args[field]
+        invalid.append(args)
+    for args in invalid:
+        assert not debug.run_agent_tool('upsert_task', args, state, tool_cycle=cycle)['ok']
+        assert debug.read_exploration() == before
+        assert debug.agent_runtime.task_reconciliation_pending()
+        assert not cycle.get('reconciled_task_ids')
+    blocked = debug.run_agent_tool('submit_decision', {
+        'action': 'navigate', 'target_id': 63, 'reason': 'Continue.'}, state, tool_cycle=cycle)
+    assert blocked['error']['code'] == 'task_reconciliation_required'
+    good = debug.run_agent_tool('upsert_task', {
+        **base, **reconciliation_fields('route-evidence')}, state, tool_cycle=cycle)
+    assert good['ok']
+    assert not debug.agent_runtime.task_reconciliation_pending()
+    assert good['task']['description'] == 'Investigate the current lead'
+    assert good['task']['reconciliation_review']['evidence'][0]['ref'] == 'route-evidence'
+    # Ordinary reviews stay cheap and preserve the semantic audit without new history.
+    confirmed = debug.run_agent_tool('upsert_task', {'id': 'old'}, state)
+    assert confirmed['task']['history'] == good['task']['history']
+    assert confirmed['task']['reconciliation_review'] == good['task']['reconciliation_review']
+    changed = debug.run_agent_tool('upsert_task', {'id': 'old', 'description': 'A later stage'}, state)
+    assert changed['task']['reconciliation_review'] is None
+
+
+def test_reconciliation_shelves_unreachable_task_with_resume_condition(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = review_state()
+    write_state(debug, state)
+    create_agent_task(debug, {'id': 'promise', 'description': 'Visit the fair',
+                              'rationale': 'No verified route.'})
+    debug.event_log.append({'source_key': 'departure', 'type': 'transition', 'time': 100})
+    debug.agent_runtime.mark_task_reconciliation_pending('checkpoint_restored')
+    cycle = debug.new_agent_tool_cycle(state)
+    audit = debug.run_agent_tool('get_tasks', {'include_closed': True, 'detail': 'summary'},
+                                 state, tool_cycle=cycle)
+    args = {'id': 'promise', 'status': 'dormant', 'review_token': audit['review_token'],
+            'status_reason': 'No verified path remains.', 'status_evidence': ['departure'],
+            **reconciliation_fields('departure', dormant=True)}
+    before = debug.read_exploration()
+    args['reconciliation_review']['resume_condition'] = ''
+    assert not debug.run_agent_tool('upsert_task', args, state, tool_cycle=cycle)['ok']
+    assert debug.read_exploration() == before
+    args['reconciliation_review']['resume_condition'] = 'Return with a verified route to the fair.'
+    result = debug.run_agent_tool('upsert_task', args, state, tool_cycle=cycle)
+    assert result['ok']
+    assert result['task']['status'] == 'dormant'
+    assert not debug.agent_runtime.task_reconciliation_pending()
+    assert debug.task_ledger() == []
+    assert debug.task_ledger(include_closed=True)[0]['history']
+    summary = debug.task_summary_view(result['task'])
+    assert summary['reconciliation_review']['resume_condition'] == 'Return with a verified route to the fair.'
+
+
+def test_reconciliation_does_not_keep_an_old_structured_next_step(tmp_path):
+    debug = make_debug_state(tmp_path)
+    state = review_state()
+    write_state(debug, state)
+    debug.event_log.append({'source_key': 'entered-city', 'type': 'transition', 'time': 100})
+    fields = reconciliation_fields('entered-city')
+    create_agent_task(debug, {'id': 'city', 'description': fields['description'],
+                              'rationale': fields['rationale'],
+                              'progress': {'evidence_refs': ['entered-city'], 'hypotheses': [],
+                                           'next_step': 'Enter the city.'}})
+    debug.agent_runtime.mark_task_reconciliation_pending('context_compacted')
+    cycle = debug.new_agent_tool_cycle(state)
+    audit = debug.run_agent_tool('get_tasks', {'include_closed': True, 'detail': 'summary'},
+                                 state, tool_cycle=cycle)
+    result = debug.run_agent_tool('upsert_task', {
+        'id': 'city', 'review_token': audit['review_token'], **fields}, state, tool_cycle=cycle)
+    assert result['ok']
+    assert result['task']['progress'] is None
+    assert 'progress' not in debug.task_summary_view(result['task'])

@@ -1188,17 +1188,19 @@ function renderCheckpoints(state) {
   const labelHadFocus = document.activeElement === existingInput;
   const labelSelectionStart = existingInput?.selectionStart ?? existingLabel.length;
   const labelSelectionEnd = existingInput?.selectionEnd ?? labelSelectionStart;
-  const stateBusy = Boolean(checkpointBusy) || sessionRunning();
+  const operation = state?.checkpoint_operation;
+  const recoveryRequired = operation?.recovery_required === true;
+  const stateBusy = Boolean(checkpointBusy) || sessionRunning() || Boolean(operation && !recoveryRequired);
   const startupWaiting = state?.status === "startup_waiting";
   const stableMainGame = state?.control?.phase === "ready"
     && state?.in_main_game !== false
     && !state?._debug?.runtime_stale;
-  const canSave = !stateBusy && stableMainGame;
-  const canLoad = !stateBusy && !state?._debug?.action_pending && (startupWaiting || stableMainGame);
+  const canSave = !stateBusy && !operation && stableMainGame;
+  const canLoad = !stateBusy && !state?._debug?.action_pending && (recoveryRequired || startupWaiting || stableMainGame);
   // Starting over is a reset, not a checkpoint operation: the opening scene
   // immediately shows dialog, so requiring a stable save point here makes the
   // control appear permanently unavailable after the first start.
-  const canStartNew = !stateBusy
+  const canStartNew = !stateBusy && !operation
     && !state?._debug?.action_pending
     && !state?.in_battle
     && !state?.entering_scene
@@ -1210,6 +1212,7 @@ function renderCheckpoints(state) {
     busy: checkpointBusy,
     status: checkpointStatus,
     error: checkpointError,
+    operation,
     canSave,
     canLoad,
     canStartNew,
@@ -1233,7 +1236,12 @@ function renderCheckpoints(state) {
   const defaultStatus = startupWaiting
     ? "Game is waiting for a checkpoint or new game."
     : (checkpointsLoaded ? `${checkpoints.length} saved` : "Loading...");
-  const statusText = checkpointError || checkpointStatus || defaultStatus;
+  const operationStatus = operation
+    ? recoveryRequired
+      ? `恢复未完成（${operation.phase}），现场与恢复材料已保留，游戏控制已暂停。${operation.error || ""}`
+      : `Checkpoint: ${operation.phase}…`
+    : null;
+  const statusText = operationStatus || checkpointError || checkpointStatus || defaultStatus;
   const buttonText = checkpointBusy
     ? checkpointStatus || "Checkpoint busy..."
     : checkpointsLoaded

@@ -105,6 +105,14 @@ def test_main_accepts_dotenv_key_and_starts_components_in_order(tmp_path, monkey
 def test_inspect_screen_tool_is_always_registered_with_strict_schema(tmp_path):
     debug = make_debug_state(tmp_path)
     specs = {item["function"]["name"]: item["function"] for item in debug.agent_tool_specs()}
+    description = specs["inspect_screen"]["description"]
+    assert "主动检查当前游戏 PNG" in description
+    assert "无需等结构化查询失败" in description
+    assert "同房间移动后可再次观察" in description
+    assert "应先观察" in description
+    assert "允许看不见或无法判断" in description
+    assert "每个工具周期最多一次未缓存请求" in description
+    assert "确认 transition" in description
     schema = specs["inspect_screen"]["parameters"]
     assert schema["properties"]["focus"]["enum"] == ["room_layout", "passage", "ui_text", "object"]
     assert schema["properties"]["target_id"]["minimum"] == 1

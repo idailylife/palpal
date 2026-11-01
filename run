@@ -52,6 +52,10 @@ ensure_runtime() {
 
 prepare_live_runtime() {
     ensure_runtime
+    # Never erase recovery material on a routine restart after a partial load.
+    if [ -f "$RUNTIME_DIR/checkpoint_operation.json" ]; then
+        "$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("phase")=="completed" else "Checkpoint recovery is required; runtime data was preserved. Start ./run debug to inspect or retry.")' "$RUNTIME_DIR/checkpoint_operation.json"
+    fi
     rm -f \
         "$SOCKET_PATH" \
         "$RUNTIME_DIR/action.txt" \

@@ -219,7 +219,7 @@ PAL_LoadResources(
    //
    if (gpResources->bLoadFlags & kLoadGlobalData)
    {
-      PAL_InitGameData(gpGlobals->bCurrentSaveSlot);
+      if (!PAL_InitGameData(gpGlobals->bCurrentSaveSlot)) return;
       AUDIO_PlayMusic(gpGlobals->wNumMusic, TRUE, 1);
    }
 

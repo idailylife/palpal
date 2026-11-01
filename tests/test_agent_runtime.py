@@ -3262,7 +3262,8 @@ def test_sdk_plain_text_end_retries_once_in_same_session_and_requires_submit(tmp
     assert retry["details"] == {"api": "responses", "reasoning_effort": "high"}
 
 
-def test_sdk_two_non_submit_ends_raise_protocol_error_without_parsing_text(tmp_path, monkeypatch):
+@pytest.mark.parametrize('interrupt_at', [None, 'before_run', 'first_stream', 'retry_stream'])
+def test_sdk_non_submit_end_distinguishes_protocol_failure_from_interrupt(tmp_path, monkeypatch, interrupt_at):
     runtime = make_debug_state(tmp_path).agent_runtime
     captured = {"prompts": []}
 
@@ -3275,6 +3276,8 @@ def test_sdk_two_non_submit_ends_raise_protocol_error_without_parsing_text(tmp_p
         context_wrapper = None
         final_output = json.dumps(submission())
         async def stream_events(self):
+            if interrupt_at == 'first_stream' or (interrupt_at == 'retry_stream' and len(captured['prompts']) == 2):
+                runtime.cancel_event.set()
             if False: yield None
 
     class Runner:
@@ -3298,10 +3301,18 @@ def test_sdk_two_non_submit_ends_raise_protocol_error_without_parsing_text(tmp_p
     monkeypatch.setitem(sys.modules, "agents.agent", fake_agent_module)
     monkeypatch.setattr(runtime, "_maybe_compact_sdk", lambda *args: asyncio.sleep(0))
 
-    with pytest.raises(RuntimeError, match="submit_decision_protocol_error"):
-        asyncio.run(runtime._sdk_decide(make_state(), "feedback"))
+    if interrupt_at == 'before_run':
+        runtime.cancel_event.set()
+    if interrupt_at is None:
+        with pytest.raises(RuntimeError, match="submit_decision_protocol_error"):
+            asyncio.run(runtime._sdk_decide(make_state(), "feedback"))
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(runtime._sdk_decide(make_state(), "feedback"))
 
-    assert len(captured["prompts"]) == 2
+    assert len(captured["prompts"]) == {None: 2, 'before_run': 0, 'first_stream': 1, 'retry_stream': 2}[interrupt_at]
+    retries = [event for event in runtime.events() if event['phase'] == 'protocol_retry']
+    assert len(retries) == (1 if interrupt_at in (None, 'retry_stream') else 0)
 
 
 def test_responses_adapter_accepts_legacy_chat_items_from_sqlite_session(tmp_path):

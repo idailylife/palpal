@@ -820,7 +820,23 @@ def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
     assert 'transition_candidate=true 的 touch 应作为有意选择的离房路线' in policy
     assert '不要为了遍历 touch 而提前进入' in policy
     assert '运行时会在首次进入本会话尚未成功查看的新逻辑房间时自动提供一次 room_layout 视觉注释' in policy
-    assert '仍不足以解释布局、出口、UI 文本或疑似通道，可以按需再次调用 inspect_screen' in policy
+    assert '主动使用 inspect_screen 了解当前环境' in policy
+    assert '无需等结构化查询失败' in policy
+    assert '房间看过不代表当前位置看过' in policy
+    assert '同一房间内移动到新观察位置后' in policy
+    assert '剧情或对话引入新设施、地点线索且空间关系不明时' in policy
+    assert '待画面无遮挡后先观察再选择相关路线' in policy
+    assert '准备把出口解释为井口、密道等具体用途' in policy
+    assert '现有地点理解与对话、导航、画面矛盾时' in policy
+    assert '允许不可见或无法判断' in policy
+    assert '不预设人物已在井边或出口就是井口' in policy
+    assert '对话记录的 room_id 只标识对话发生地' in policy
+    assert '隔墙看见设施不证明人物就在设施旁或能直接走到' in policy
+    assert '不能据此断言目标不存在或无路可达' in policy
+    assert '同一视野、同一疑点已有有效观察时复用结果' in policy
+    assert '不为凑次数逐回合截图' in policy
+    assert '即使 confidence=high 也不得直接写 Room Memo、创建或确认 transition' in policy
+    assert '疑似密道必须通过真实 native action、房间变化和现有 transition observation/native trigger 才能确认' in policy
     assert '显式 task 绑定、未知目的地、当前 active task 结构下尚未穿越、非近期回退、目的地 frontier>0' in policy
     assert 'frontier=0 仅表示当前没有未走邻格' in policy
     assert '不能据此声称目的地是死路、噪音或剧情已经耗尽' in policy
@@ -890,6 +906,7 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     by_name = {tool['function']['name']: tool for tool in tools}
     assert set(names) == {
         'upsert_task', 'upsert_room_memo', 'get_tasks', 'get_navigation', 'inspect_target',
+        'get_exploration_options',
         'get_observations', 'get_inventory', 'get_shop', 'get_equipment',
         'get_room_memory', 'inspect_screen', 'get_tool_output', 'review_task_inbox',
         'submit_decision', 'preview_item_placement', 'observe_target',

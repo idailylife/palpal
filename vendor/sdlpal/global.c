@@ -21,6 +21,7 @@
 
 #include "main.h"
 #include "resampler.h"
+#include "agent.h"
 #include "palcfg.h"
 
 static GLOBALVARS _gGlobals;
@@ -558,6 +559,40 @@ typedef struct tagSAVEDGAME_WIN
 	EVENTOBJECT      rgEventObject[MAX_EVENT_OBJECTS];
 } SAVEDGAME_WIN, *LPSAVEDGAME_WIN;
 
+/* Validate before copying any saved fields into live globals. */
+static BOOL
+PAL_ValidateSaveData(LPSAVEDGAME_COMMON s, size_t size, size_t bytes)
+{
+   size_t expected = size - sizeof(EVENTOBJECT) * MAX_EVENT_OBJECTS +
+      PAL_MKFGetChunkSize(0, gpGlobals->f.fpSSS);
+   int i;
+   if (bytes != expected || bytes > size) return FALSE;
+   DO_BYTESWAP(s, size);
+   if (s->nPartyMember >= MAX_PLAYERS_IN_PARTY || s->wNumScene == 0 ||
+       s->wNumScene >= MAX_SCENES || s->wPartyDirection > 3 ||
+       s->nPartyMember + s->nFollower >= MAX_PLAYABLE_PLAYER_ROLES) return FALSE;
+   for (i = 0; i <= s->nPartyMember; i++)
+      if (s->rgParty[i].wPlayerRole >= MAX_PLAYER_ROLES) return FALSE;
+   i = s->wNumScene - 1;
+   if (s->rgScene[i].wEventObjectIndex > s->rgScene[i + 1].wEventObjectIndex ||
+       s->rgScene[i + 1].wEventObjectIndex >
+          PAL_MKFGetChunkSize(0, gpGlobals->f.fpSSS) / sizeof(EVENTOBJECT)) return FALSE;
+   return TRUE;
+}
+
+BOOL
+PAL_ValidateSaveFile(const char *path)
+{
+   size_t size = gConfig.fIsWIN95 ? sizeof(SAVEDGAME_WIN) : sizeof(SAVEDGAME_DOS);
+   LPSAVEDGAME_COMMON saved = (LPSAVEDGAME_COMMON)calloc(1, size);
+   FILE *fp = fopen(path, "rb");
+   size_t bytes = fp && saved ? fread(saved, 1, size, fp) : 0;
+   BOOL ok = fp && saved && !ferror(fp) && fgetc(fp) == EOF && PAL_ValidateSaveData(saved, size, bytes);
+   if (fp) fclose(fp);
+   free(saved);
+   return ok;
+}
+
 static BOOL
 PAL_LoadGame_Common(
 	int                 iSaveSlot,
@@ -579,7 +614,7 @@ PAL_LoadGame_Common(
 		fclose(fp);
 	}
 
-	if (n < size - sizeof(EVENTOBJECT) * MAX_EVENT_OBJECTS)
+	if (!PAL_ValidateSaveData(s, size, n))
 	{
 		return FALSE;
 	}
@@ -587,7 +622,7 @@ PAL_LoadGame_Common(
 	//
 	// Adjust endianness
 	//
-	DO_BYTESWAP(s, size);
+	/* Validated and swapped above. */
 
 	//
 	// Cash amount is in DWORD, so do a wordswap in Big-Endian.
@@ -657,14 +692,14 @@ PAL_LoadGame_DOS(
 
 --*/
 {
-   SAVEDGAME_DOS   *s = (SAVEDGAME_DOS*)malloc(sizeof(SAVEDGAME_DOS));
+   SAVEDGAME_DOS   *s = (SAVEDGAME_DOS*)calloc(1, sizeof(SAVEDGAME_DOS));
    int                       i;
 
    //
    // Get all the data from the saved game struct.
    //
-   if (!PAL_LoadGame_Common(iSaveSlot, (LPSAVEDGAME_COMMON)s, sizeof(SAVEDGAME_DOS)))
-	   return -1;
+   if (!s || !PAL_LoadGame_Common(iSaveSlot, (LPSAVEDGAME_COMMON)s, sizeof(SAVEDGAME_DOS)))
+   { free(s); return -1; }
 
    //
    // Convert the DOS-style data structure to WIN-style data structure
@@ -704,13 +739,13 @@ PAL_LoadGame_WIN(
 
 --*/
 {
-   SAVEDGAME_WIN   *s = (SAVEDGAME_WIN*)malloc(sizeof(SAVEDGAME_WIN));
+   SAVEDGAME_WIN   *s = (SAVEDGAME_WIN*)calloc(1, sizeof(SAVEDGAME_WIN));
 
    //
    // Get all the data from the saved game struct.
    //
-   if (!PAL_LoadGame_Common(iSaveSlot, (LPSAVEDGAME_COMMON)s, sizeof(SAVEDGAME_WIN)))
-	   return -1;
+   if (!s || !PAL_LoadGame_Common(iSaveSlot, (LPSAVEDGAME_COMMON)s, sizeof(SAVEDGAME_WIN)))
+   { free(s); return -1; }
 
    memcpy(gpGlobals->g.rgObject, s->rgObject, sizeof(gpGlobals->g.rgObject));
    memcpy(gpGlobals->g.lprgEventObject, s->rgEventObject, sizeof(EVENTOBJECT) * gpGlobals->g.nEventObject);
@@ -731,7 +766,7 @@ PAL_LoadGame(
 	return gConfig.fIsWIN95 ? PAL_LoadGame_WIN(iSaveSlot) : PAL_LoadGame_DOS(iSaveSlot);
 }
 
-static VOID
+static BOOL
 PAL_SaveGame_Common(
 	int                iSaveSlot,
 	WORD               wSavedTimes,
@@ -741,6 +776,8 @@ PAL_SaveGame_Common(
 {
 	FILE *fp;
 	size_t i;
+   char path[PAL_MAX_PATH], temporary[PAL_MAX_PATH];
+   BOOL ok;
 
 	s->wSavedTimes = wSavedTimes;
 	s->wViewportX = PAL_X(gpGlobals->viewport);
@@ -788,19 +825,20 @@ PAL_SaveGame_Common(
 	//
 	// Try writing to file
 	//
-	if ((fp = UTIL_OpenFileAtPathForMode(gConfig.pszSavePath, PAL_va(1, "%d.rpg", iSaveSlot), "wb")) == NULL)
-	{
-		return;
-	}
-
-	i = PAL_MKFGetChunkSize(0, gpGlobals->f.fpSSS);
-	i += size - sizeof(EVENTOBJECT) * MAX_EVENT_OBJECTS;
-
-	fwrite(s, i, 1, fp);
-	fclose(fp);
+   UTIL_CombinePath(path, sizeof(path), 2, gConfig.pszSavePath, PAL_va(1, "%d.rpg", iSaveSlot));
+   snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+   if ((fp = fopen(temporary, "wb")) == NULL) return FALSE;
+   i = PAL_MKFGetChunkSize(0, gpGlobals->f.fpSSS);
+   i += size - sizeof(EVENTOBJECT) * MAX_EVENT_OBJECTS;
+   ok = fwrite(s, 1, i, fp) == i;
+   if (fflush(fp) != 0) ok = FALSE;
+   if (fclose(fp) != 0) ok = FALSE;
+   if (ok && rename(temporary, path) != 0) ok = FALSE;
+   if (!ok) remove(temporary);
+   return ok;
 }
 
-static VOID
+static BOOL
 PAL_SaveGame_DOS(
    int            iSaveSlot,
    WORD           wSavedTimes
@@ -820,12 +858,14 @@ PAL_SaveGame_DOS(
 
 --*/
 {
-   SAVEDGAME_DOS   *s = (SAVEDGAME_DOS*)malloc(sizeof(SAVEDGAME_DOS));
+   BOOL ok;
+   SAVEDGAME_DOS   *s = (SAVEDGAME_DOS*)calloc(1, sizeof(SAVEDGAME_DOS));
    UINT32                    i;
 
    //
    // Convert the WIN-style data structure to DOS-style data structure
    //
+   if (!s) return FALSE;
    for (i = 0; i < MAX_OBJECTS; i++)
    {
       memcpy(&s->rgObject[i], &gpGlobals->g.rgObject[i], sizeof(OBJECT_DOS));
@@ -836,11 +876,12 @@ PAL_SaveGame_DOS(
    //
    // Put all the data to the saved game struct.
    //
-   PAL_SaveGame_Common(iSaveSlot, wSavedTimes, (LPSAVEDGAME_COMMON)s, sizeof(SAVEDGAME_DOS));
+   ok = PAL_SaveGame_Common(iSaveSlot, wSavedTimes, (LPSAVEDGAME_COMMON)s, sizeof(SAVEDGAME_DOS));
    free(s);
+   return ok;
 }
 
-static VOID
+static BOOL
 PAL_SaveGame_WIN(
    int            iSaveSlot,
    WORD           wSavedTimes
@@ -860,7 +901,10 @@ PAL_SaveGame_WIN(
 
 --*/
 {
-   SAVEDGAME_WIN   *s = (SAVEDGAME_WIN*)malloc(sizeof(SAVEDGAME_WIN));
+   BOOL ok;
+   SAVEDGAME_WIN   *s = (SAVEDGAME_WIN*)calloc(1, sizeof(SAVEDGAME_WIN));
+
+   if (!s) return FALSE;
 
    //
    // Put all the data to the saved game struct.
@@ -868,21 +912,22 @@ PAL_SaveGame_WIN(
    memcpy(&s->rgObject, gpGlobals->g.rgObject, sizeof(gpGlobals->g.rgObject));
    memcpy(&s->rgEventObject, gpGlobals->g.lprgEventObject, sizeof(EVENTOBJECT) * gpGlobals->g.nEventObject);
 
-   PAL_SaveGame_Common(iSaveSlot, wSavedTimes, (LPSAVEDGAME_COMMON)s, sizeof(SAVEDGAME_WIN));
+   ok = PAL_SaveGame_Common(iSaveSlot, wSavedTimes, (LPSAVEDGAME_COMMON)s, sizeof(SAVEDGAME_WIN));
 
    free(s);
+   return ok;
 }
 
-VOID
+BOOL
 PAL_SaveGame(
    int            iSaveSlot,
    WORD           wSavedTimes
 )
 {
 	if (gConfig.fIsWIN95)
-		PAL_SaveGame_WIN(iSaveSlot, wSavedTimes);
+		return PAL_SaveGame_WIN(iSaveSlot, wSavedTimes);
 	else
-		PAL_SaveGame_DOS(iSaveSlot, wSavedTimes);
+		return PAL_SaveGame_DOS(iSaveSlot, wSavedTimes);
 }
 
 VOID
@@ -911,7 +956,7 @@ PAL_ReloadInNextTick(
     gpGlobals->dwFrameNum = 0;
 }
 
-VOID
+BOOL
 PAL_InitGameData(
    INT         iSaveSlot
 )
@@ -942,6 +987,11 @@ PAL_InitGameData(
       //
       // Cannot load the saved game file. Load the defaults.
       //
+      if (iSaveSlot != 0 && PALPAL_AgentEnabled())
+      {
+         PALPAL_AgentCheckpointLoadFailed();
+         return FALSE;
+      }
       PAL_LoadDefaultGame();
    }
 
@@ -951,6 +1001,7 @@ PAL_InitGameData(
    memset(gpGlobals->rgPlayerStatus, 0, sizeof(gpGlobals->rgPlayerStatus));
 
    PAL_UpdateEquipments();
+   return TRUE;
 }
 
 INT

@@ -7,6 +7,21 @@ from tests.support import fake_load_command, fake_save_command, make_checkpoint_
 
 
 
+def complete_legacy_checkpoint(debug, directory):
+    """Build a complete v2 bundle to exercise supported pre-hash checkpoints."""
+    path = directory / 'manifest.json'
+    manifest = json.loads(path.read_text())
+    manifest.update(version=2, companion_version=11)
+    manifest.pop('integrity', None)
+    path.write_text(json.dumps(manifest))
+    exploration = directory / 'companion/exploration.json'
+    exploration.parent.mkdir(parents=True, exist_ok=True)
+    if not exploration.exists():
+        exploration.write_text(json.dumps(debug.empty_exploration()))
+    if not (directory / 'agent/session.json').exists():
+        debug.agent_runtime.export_checkpoint(directory)
+
+
 def test_startup_waiting_rejects_save_checkpoint(tmp_path):
     debug = make_debug_state(tmp_path)
     write_state(debug, make_startup_state())
@@ -22,6 +37,7 @@ def test_startup_waiting_allows_load_checkpoint(tmp_path):
     (checkpoint_dir / 'game.rpg').write_bytes(b'checkpoint-rpg')
     (checkpoint_dir / 'manifest.json').write_text(json.dumps({'version': 1, 'label': 'CP1', 'created_at': '2026-01-01T00:00:00Z'}), encoding='utf-8')
     write_state(debug, make_startup_state())
+    complete_legacy_checkpoint(debug, checkpoint_dir)
     with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
         result = debug.load_checkpoint('cp1')
     assert result['ok']
@@ -126,7 +142,7 @@ def test_room_memo_follows_checkpoint_branch_survives_session_reset_and_clears_o
 def test_wait_for_slot_result_accepts_slot_zero(tmp_path):
     debug = make_debug_state(tmp_path)
     start_time = 0.0
-    debug.action_result_path.write_text(json.dumps({'ok': True, 'action': 'start_slot', 'slot': 0}), encoding='utf-8')
+    debug.action_result_path.write_text(json.dumps({'ok': True, 'action': 'start_slot', 'slot': 0, 'status': 'started'}), encoding='utf-8')
     result = debug.wait_for_slot_result('start_slot', 0, start_time, timeout=0.1)
     assert result['ok']
     assert result['slot'] == 0
@@ -145,7 +161,7 @@ def test_save_checkpoint_writes_manifest_game_and_existing_companion_files(tmp_p
     checkpoint = result['checkpoint']
     checkpoint_dir = debug.checkpoint_dir('before-door')
     assert result['ok']
-    assert checkpoint['version'] == 2
+    assert checkpoint['version'] == 3
     assert checkpoint['companion_version'] == 11
     assert checkpoint['label'] == 'Before Door'
     assert checkpoint['state']['scene_id'] == 3
@@ -189,6 +205,7 @@ def test_load_checkpoint_restores_companion_files_and_refreshes_caches(tmp_path)
     checkpoint_dir = debug.checkpoint_dir('cp1')
     (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[{"source_key":"new","text":"new"}]', encoding='utf-8')
     (checkpoint_dir / 'companion' / 'events.json').write_text('[{"type":"new"}]', encoding='utf-8')
+    complete_legacy_checkpoint(debug, checkpoint_dir)
     with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
         result = debug.load_checkpoint('cp1')
     assert result['ok']
@@ -215,6 +232,7 @@ def test_checkpoint_load_keeps_history_and_continues_logical_frame_after_raw_rol
     (checkpoint_dir / 'companion' / 'events.json').write_text('[{"type":"checkpoint_event"}]', encoding='utf-8')
     (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
     (checkpoint_dir / 'companion' / 'agent_log.jsonl').write_text('{"turn":7}\n', encoding='utf-8')
+    complete_legacy_checkpoint(debug, checkpoint_dir)
     with patch.object(debug, 'run_slot_command', side_effect=fake_load_command), patch.object(debug, 'clear_runtime_history', wraps=debug.clear_runtime_history) as clear_history:
         result = debug.load_checkpoint('cp1')
         rolled_back = make_state(frame=1)
@@ -277,6 +295,7 @@ def test_v11_checkpoint_lazily_adds_interaction_context_without_rewriting_checkp
     (checkpoint_dir / 'companion' / 'dialog_history.json').write_text('[]', encoding='utf-8')
     (checkpoint_dir / 'companion' / 'events.json').write_text('[]', encoding='utf-8')
 
+    complete_legacy_checkpoint(debug, checkpoint_dir)
     with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
         result = debug.load_checkpoint('legacy-v11')
     assert result['ok']
@@ -306,6 +325,7 @@ def test_checkpoint_load_from_startup_uses_companion_history_for_logical_frame_b
     (checkpoint_dir / 'companion' / 'exploration.json').write_text('{"version":11,"rooms":{},"transitions":{}}', encoding='utf-8')
     (checkpoint_dir / 'companion' / 'agent_log.jsonl').write_text(json.dumps({'turn': 6, 'frame': 4729, 'logical_frame': 4729, 'episode': '1/12/test-room/test-room', 'nav_room_id': '1/12/test-room'}) + '\n', encoding='utf-8')
     write_state(debug, make_startup_state())
+    complete_legacy_checkpoint(debug, checkpoint_dir)
     with patch.object(debug, 'run_slot_command', side_effect=fake_load_command), patch.object(debug, 'clear_runtime_history', wraps=debug.clear_runtime_history) as clear_history:
         result = debug.load_checkpoint('cp1')
         resumed = make_state(frame=1)
@@ -320,7 +340,7 @@ def test_checkpoint_load_from_startup_uses_companion_history_for_logical_frame_b
 
 
 
-def test_load_checkpoint_discards_incompatible_companion_files(tmp_path):
+def test_load_checkpoint_rejects_incompatible_companion_before_native_load(tmp_path):
     debug = make_debug_state(tmp_path)
     write_state(debug)
     checkpoint_dir = debug.checkpoint_dir('old-cp')
@@ -336,16 +356,13 @@ def test_load_checkpoint_discards_incompatible_companion_files(tmp_path):
         '{"version":11,"rooms":{"live":{}},"room_memos":{"S1/M1:0123456789AB":{"room_id":"S1/M1:0123456789AB","text":"live memo","source":"agent_annotation"}},"transitions":{}}',
         encoding='utf-8',
     )
-    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-        result = debug.load_checkpoint('old-cp')
-    assert result['ok']
-    assert result['restored']['exploration.json']['discarded']
-    assert debug.dialog_history == []
-    assert debug.event_log == []
-    assert not debug.dialogs_path.exists()
-    assert not debug.events_path.exists()
-    assert not debug.agent_log_path.exists()
-    assert not debug.exploration_path.exists()
+    complete_legacy_checkpoint(debug, checkpoint_dir)
+    before = {path: path.read_bytes() for path in (debug.dialogs_path, debug.events_path, debug.exploration_path)}
+    with patch.object(debug, 'run_slot_command') as native:
+        with pytest.raises(ValueError, match='exploration_incompatible'):
+            debug.load_checkpoint('old-cp')
+    native.assert_not_called()
+    assert all(path.read_bytes() == content for path, content in before.items())
 
 
 def test_checkpoint_restores_agent_with_rollback_semantics(tmp_path):
@@ -512,7 +529,7 @@ def test_checkpoint_restores_agent_with_rollback_semantics(tmp_path):
 
 
 @pytest.mark.parametrize("bundle_kind", ["version-one", "corrupt"])
-def test_incompatible_agent_bundle_starts_an_empty_session(tmp_path, bundle_kind):
+def test_incompatible_agent_bundle_refuses_load_without_reset(tmp_path, bundle_kind):
     debug = make_debug_state(tmp_path)
     state = {**make_state(), 'game_instance_id': 'game-a'}
     write_state(debug, state)
@@ -542,19 +559,16 @@ def test_incompatible_agent_bundle_starts_an_empty_session(tmp_path, bundle_kind
     )
     (checkpoint_dir / 'agent' / 'session.json').write_text(agent_bundle, encoding='utf-8')
 
-    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-        debug.load_checkpoint(checkpoint_id)
-
-    restored = runtime.snapshot()
-    assert restored['session_id'] != previous_session_id
-    assert restored['stop_reason'] == 'checkpoint_agent_bundle_incompatible'
-    assert restored['turn'] == 0
-    assert restored['checkpoint_id'] == checkpoint_id
-    assert restored['task_reconciliation_pending'] is True
-    assert 'goal' not in restored
+    complete_legacy_checkpoint(debug, checkpoint_dir)
+    with patch.object(debug, 'run_slot_command') as native:
+        with pytest.raises(ValueError):
+            debug.load_checkpoint(checkpoint_id)
+    native.assert_not_called()
+    assert runtime.snapshot()['session_id'] == previous_session_id
+    assert debug.checkpoint_status() is None
 
 
-def test_old_checkpoint_loads_with_a_new_empty_agent_session(tmp_path):
+def test_incomplete_legacy_checkpoint_refuses_load_without_reset(tmp_path):
     debug = make_debug_state(tmp_path)
     state = {**make_state(), 'game_instance_id': 'game-a'}
     write_state(debug, state)
@@ -571,15 +585,14 @@ def test_old_checkpoint_loads_with_a_new_empty_agent_session(tmp_path):
         'created_at': '2026-01-01T00:00:00Z',
     }), encoding='utf-8')
 
-    with patch.object(debug, 'run_slot_command', side_effect=fake_load_command):
-        debug.load_checkpoint('legacy')
-
+    with patch.object(debug, 'run_slot_command') as native:
+        with pytest.raises(ValueError, match='manifest_incompatible'):
+            debug.load_checkpoint('legacy')
+    native.assert_not_called()
     restored = debug.agent_runtime.snapshot()
-    assert restored['session_id'] != previous_session_id
-    assert restored['turn'] == 0
-    assert restored['checkpoint_id'] == 'legacy'
-    assert restored['stop_reason'] == 'checkpoint_loaded_without_agent_bundle'
-    assert restored['task_reconciliation_pending'] is True
+    assert restored['session_id'] == previous_session_id
+    assert restored['turn'] == 3
+    assert restored['checkpoint_id'] is None
 
 
 def test_delete_checkpoint_only_removes_target_directory(tmp_path):

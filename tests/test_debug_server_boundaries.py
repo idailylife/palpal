@@ -527,7 +527,7 @@ def test_action_file_writers_validate_and_replace_results(tmp_path):
     slot_action = debug.write_slot_action("save_slot", "12")
     assert slot_action["command"] == "save_slot"
     assert slot_action["slot"] == 12
-    assert debug.action_path.read_text(encoding="ascii") == "save_slot 12\n"
+    assert debug.action_path.read_text(encoding="ascii") == f"request_id {slot_action['request_id']}\nsave_slot 12\n"
     assert not debug.action_result_path.exists()
 
     with pytest.raises(ValueError, match="unsupported slot command"):
