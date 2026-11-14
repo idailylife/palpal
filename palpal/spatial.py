@@ -288,7 +288,9 @@ def route_to_position(debug, state, x, y, face=None):
             parent[nxt] = (current, move)
             queue.append(nxt)
     if end is None:
-        return {'ok': False, 'status': 'unreachable_position_or_facing'}
+        if face is not None and any(node == goal for node, _ in parent):
+            return {'ok': False, 'status': 'facing_unreachable', 'position_reachable': True}
+        return {'ok': False, 'status': 'unreachable_position'}
     steps = []
     while parent[end] is not None:
         previous, move = parent[end]

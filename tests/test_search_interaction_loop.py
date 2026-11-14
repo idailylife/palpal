@@ -51,7 +51,7 @@ def test_progressed_entry_allows_return_despite_fresh_alternative(tmp_path):
     state = entry_room_state()
     context = install_entry_context(debug, state)
     install_entry_candidate(debug, state, context)
-    assert debug.room_entry_navigation_rejection(state, 758)['reason'] == 'immediate_entry_return'
+    assert debug.room_entry_navigation_rejection(state, 758) is None
     context['status'] = 'progressed'
     assert debug.room_entry_navigation_rejection(state, 758) is None
 

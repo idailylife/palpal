@@ -230,6 +230,9 @@ def test_new_logical_room_is_automatically_inspected_before_decision(tmp_path, m
     assert calls[0][0] == "inspect_screen"
     assert calls[0][1]["focus"] == "room_layout"
     assert "object IDs, scripts, or confirmed transitions" in calls[0][1]["question"]
+    assert "visible differences in clothing or poses" in calls[0][1]["question"]
+    assert "Do not infer identities, life/death, plot" in calls[0][1]["question"]
+    assert len(calls[0][1]["question"]) <= 200
     assert "visual_annotation" in feedback
     assert runtime.snapshot()["room_inspection"] == {
         "baseline_required": False,
@@ -514,7 +517,7 @@ def test_selected_only_entry_return_is_allowed_and_records_normal_entry(tmp_path
     assert entry_return_checks == [(70, 758)]
 
 
-def test_site_history_entry_return_with_alternative_is_soft_avoid_only(tmp_path):
+def test_changed_binding_does_not_inherit_confirmed_entry_return(tmp_path):
     debug = make_debug_state(tmp_path)
     runtime = debug.agent_runtime
     source = make_state(objects=[transition_object(706, 32, 0, 13729)], frame=10)
@@ -545,8 +548,12 @@ def test_site_history_entry_return_with_alternative_is_soft_avoid_only(tmp_path)
 
     navigation = debug.run_agent_tool("get_navigation", {}, destination)["navigation"]
     target = next(item for item in navigation["targets"] if item["id"] == 758)
-    assert target["entry_relation"] == "confirmed_entry_return"
-    assert target["known_destination_basis"] == "confirmed_site_history"
+    assert target.get("entry_relation") != "confirmed_entry_return"
+    assert target["known_destination"] is False
+    assert target.get("known_destination_room_id") is None
+    assert target["traversal_context"]["total_count"] == 0
+    assert target.get("possible_entry_return") is not True
+    assert not target.get("returns_to_recent_room")
 
     submitted = debug.run_agent_tool("submit_decision", {
         "action": "navigate",
@@ -3747,7 +3754,7 @@ def test_sdk_prompt_omits_redundant_goal_tools_and_constraints(tmp_path, monkeyp
     assert set(captured["prompt"]) == {"feedback", "context"}
     assert set(captured["prompt"]["context"]) == {
         "state_summary", "room_memo", "active_tasks", "active_tasks_total", "task_review", "task_inbox",
-        "task_reconciliation", "room_entry_context", "recent_transition_chain",
+        "task_reconciliation", "room_entry_context", "recent_transition_chain", "room_history", "room_memo_review",
     }
 
 

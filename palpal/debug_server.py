@@ -7207,50 +7207,6 @@ class DebugState(CheckpointSupport):
             transition_key,
             recent_semantic_room_keys,
         )
-        if not payload.get("known_destination") and isinstance(obj, dict) and identity is not None:
-            fields = self.transition_key_fields(identity, obj, object_id)
-            by_room = (data.get("transitions") or {}).get(identity["id"], {})
-            site_records = []
-            for record in by_room.values() if isinstance(by_room, dict) else []:
-                versions = [record]
-                versions.extend(
-                    item for item in record.get("observations") or []
-                    if isinstance(item, dict)
-                )
-                for version in versions:
-                    record_fields = version.get("transition_key_fields")
-                    if not isinstance(record_fields, dict):
-                        continue
-                    if version.get("confirmation") not in {"native_trigger", "human_confirmed"}:
-                        continue
-                    if int(version.get("object_id") or 0) != int(object_id):
-                        continue
-                    if all(
-                        record_fields.get(key) == fields.get(key)
-                        for key in ("scene_id", "map_id", "x", "y", "trigger_mode")
-                    ):
-                        site_records.append(version)
-            destinations = {
-                str(record.get("to_room_id"))
-                for record in site_records
-                if record.get("to_room_id")
-            }
-            if len(destinations) == 1:
-                record = site_records[0]
-                fallback = self.transition_destination_payload(
-                    data,
-                    identity["id"],
-                    object_id,
-                    recent_room_ids,
-                    None,
-                    str(record.get("transition_key")),
-                    recent_semantic_room_keys,
-                )
-                if fallback.get("known_destination"):
-                    fallback["known_destination_basis"] = "confirmed_site_history"
-                    fallback["transition_key"] = transition_key
-                    fallback["transition_key_fields"] = fields
-                    return fallback
         return payload
 
     def infer_destination_entry_candidate(
@@ -8858,25 +8814,14 @@ class DebugState(CheckpointSupport):
                     except (TypeError, ValueError):
                         record_object_id = 0
                     current_object = self.target_object(state, record_object_id) if record_object_id > 0 else None
-                    if current_object is not None:
-                        current_key = self.transition_key_from_fields(
-                            self.transition_key_fields(current_identity, current_object, record_object_id)
-                        )
-                        recorded_key = record.get("transition_key") or str(object_key)
-                        if current_key != recorded_key:
-                            matching_records = [
-                                candidate
-                                for candidate in by_transition.values()
-                                if isinstance(candidate, dict)
-                                and int(candidate.get("object_id") or 0) == record_object_id
-                            ]
-                            stable_search_record = (
-                                trigger_kind(int(current_object.get("trigger_mode") or 0)) == "search"
-                                and record.get("confirmation") in {"native_trigger", "human_confirmed"}
-                                and len(matching_records) == 1
-                            )
-                            if not stable_search_record:
-                                continue
+                    if current_object is None:
+                        continue
+                    current_key = self.transition_key_from_fields(
+                        self.transition_key_fields(current_identity, current_object, record_object_id)
+                    )
+                    recorded_key = record.get("transition_key") or str(object_key)
+                    if current_key != recorded_key:
+                        continue
                 payload = {
                     "transition_key": record.get("transition_key") or str(object_key),
                     "transition_key_fields": record.get("transition_key_fields"),
@@ -9012,6 +8957,7 @@ class DebugState(CheckpointSupport):
             "to_semantic_room": transition.get("to_semantic_room"),
             "confidence": transition.get("confidence"),
             "confirmation": transition.get("confirmation"),
+            "last_traversed_at": transition.get("last_traversed_at") or transition.get("observed_at"),
             "exploration": self.agent_room_exploration_counts(
                 self.room_exploration_summary_from_data(data, str(other_room_id) if other_room_id else None)
             ),
@@ -9126,11 +9072,21 @@ class DebugState(CheckpointSupport):
         )
         with self.exploration_lock:
             data = self.read_exploration()
-        outgoing = [
-            self.compact_agent_room_transition(transition, direction="outgoing", data=data)
-            for transition in transitions.get("transitions") or []
-            if isinstance(transition, dict)
-        ]
+        # Navigation filters old script bindings; memory must retain those facts.
+        current_keys = {row.get("transition_key") for row in transitions.get("transitions") or []}
+        outgoing = [self.compact_agent_room_transition(row, direction="outgoing", data=data)
+                    for row in transitions.get("transitions") or []]
+        historical_outgoing = []
+        for key, record in data.get("transitions", {}).get(resolved_room_id, {}).items():
+            if not isinstance(record, dict):
+                continue
+            edge = self.compact_agent_room_transition(
+                {**record, "transition_key": key}, direction="outgoing", data=data)
+            identity = self.room_identity(state)
+            if identity and identity.get("id") == resolved_room_id:
+                edge["matches_current_binding"] = key in current_keys
+            if key not in current_keys:
+                historical_outgoing.append(edge)
         incoming = []
         entry_candidates = []
         stored_transitions = data.get("transitions") if isinstance(data.get("transitions"), dict) else {}
@@ -9189,9 +9145,46 @@ class DebugState(CheckpointSupport):
                 "incoming": incoming,
             },
         }
+        if historical_outgoing:
+            result["transitions"]["historical_outgoing"] = historical_outgoing
         if entry_candidates:
             result["transitions"]["entry_candidates"] = entry_candidates
         return result
+
+    def agent_room_history_context(self, room_id: str | None, state: dict) -> dict:
+        memory = self.agent_room_memory(room_id, state)
+        history = {"room_id": memory["room_id"], "exploration": memory["exploration"]}
+        for direction in ("incoming", "outgoing"):
+            source = list(memory["transitions"][direction])
+            if direction == "outgoing":
+                source.extend(memory["transitions"].get("historical_outgoing", []))
+            records = [item for item in source
+                       if item.get("confirmation") in {"native_trigger", "human_confirmed"}]
+            records.sort(key=lambda item: (
+                -(item.get("last_traversed_at") or 0), str(item.get("transition_key") or "")))
+            history[direction] = {"total": len(records), "truncated": len(records) > 8,
+                                  "records": records[:8]}
+        candidates = memory["transitions"].get("entry_candidates", [])
+        history["entry_candidates"] = {"total": len(candidates), "truncated": len(candidates) > 8,
+                                       "records": candidates[:8]}
+        history["details_tool"] = "get_room_memory"
+
+        memo = self.room_memo(memory["room_id"])
+        samples = memory["semantic_evidence"]["samples"]["latest"]
+        evidence = []
+        for sample in samples:
+            # Repeated dialogue is not new evidence merely because it was heard again.
+            times = [entry.get("time") for entry in self.dialog_history
+                     if (entry.get("logical_room_id") or entry.get("room_id")) == memory["room_id"]
+                     and entry.get("event_object_id") == sample.get("event_object_id")
+                     and " ".join(str(entry.get("text") or "").split())[:180] == sample["text"]
+                     and isinstance(entry.get("time"), (int, float))]
+            if memo is None or (times and min(times) > (memo.get("updated_at") or 0)):
+                evidence.append(sample)
+        review = {"suggested": bool(evidence), "blocking": False,
+                  "reason": ("missing_memo" if memo is None else "new_semantic_evidence") if evidence else None,
+                  "evidence": evidence[:3]}
+        return {"room_history": history, "room_memo_review": review}
 
     def current_room_memo_view(self) -> dict:
         state = self.read_live_state()
@@ -13249,6 +13242,7 @@ class DebugState(CheckpointSupport):
         context = {
             "state_summary": self.agent_state_summary(state),
             "room_memo": self.room_memo(room_id),
+            **self.agent_room_history_context(room_id, state),
             **self.active_task_context(state),
             "task_reconciliation": self.task_reconciliation_context(),
             "room_entry_context": self.agent_runtime.room_entry_context_for_state(state),
@@ -14124,11 +14118,12 @@ class DebugState(CheckpointSupport):
             "同一上下文连续失败或多个不同上下文均失败时，应比单次久远失败更谨慎。"
             "将 agent_priority、interaction_state、recent_dialog_feedback、对象历史、目的地探索状态、路线成本和最近决策作为决策信号；不要把任何单一信号变成无条件优先规则。"
             "距离是成本信号，不是优先级规则；当近处目标重复陈旧或无效果行为时，它仍可能比更远目标或传送更差。"
-            "在没有明确剧情时限、直接关键目标、战斗或资源风险，且不会明显绕路时，对 fresh、reachable 的非传送 search 目标给予温和正向偏好。"
+            "非战斗且没有明确剧情时限、直接可执行的关键目标、具体风险或明显绕路时，默认优先逐个调查 fresh、reachable 的非传送 search 目标，再考虑离开当前房间。"
             "同样可以探索尚未尝试、fresh、reachable 且 transition_candidate=false 的 touch 目标，但优先处理仍有价值的 search，再一次只尝试一个 touch。"
-            "准备离开当前房间或进入传送前，要认真比较这类目标；路线成本较低的目标可以先检查，每次交互后都根据新状态重新评估。"
-            "这不要求扫空房间，也不设置固定步数或搜刮数量；只有后续目标仍然顺路且有探索价值时才继续。"
-            "active 任务本身不等于紧急；明确的剧情时限、直接可执行的关键目标、明显绕路或风险可以压过顺路搜索。"
+            "准备离开当前房间或进入传送前，必须先调用 get_navigation 获取本次进入房间后的当前候选，再比较未交互目标与出口；房间来过、历史出口已知或旧结论都不能代替当前检查。每次交互后都根据新状态重新评估。"
+            "这不要求扫空房间，也不设置固定步数或搜刮数量；每个尚未交互的可达目标都保留独立调查价值；非战斗状态不等于区域安全。"
+            "active 任务本身不等于紧急；明确的剧情时限、直接可执行的关键目标、明显绕路或具体风险可以压过逐目标探索。"
+            "单个对象的已死、无效果或重复台词只约束该对象；不得推广为其他未交互对象无价值，也不得未经逐一核查声称全部对象相同。外观相似不证明行为相同。"
             "search 和 touch 只是引擎交互方式，不证明目标是物资、宝箱或 NPC；不要据此编造标签或预期掉落，尝试 touch 属于探索而不是已确认的搜刮。"
             "touch 可能触发战斗、控制接管或此前未知的房间切换；发生任一情况时停止当前房间的连续探索并重新决策。"
             "reappeared_battle_trigger 表示同一逻辑房间、对象 ID 和 trigger_script 已确认在战斗胜利后消失并再次可交互。"
@@ -14149,6 +14144,10 @@ class DebugState(CheckpointSupport):
             "主动使用 inspect_screen 了解当前环境、布局、出口、UI 文本和目标外观，并结合 get_navigation、get_room_memory、inspect_target 核对可达性与历史；无需等结构化查询失败。"
             "同一房间内移动到新观察位置后，若旧画面不足以支持当前空间判断，应再次观察；剧情或对话引入新设施、地点线索且空间关系不明时，待画面无遮挡后先观察再选择相关路线。"
             "准备把出口解释为井口、密道等具体用途，或现有地点理解与对话、导航、画面矛盾时，先调用 inspect_screen 核对当前视野，再决定验证动作。"
+            "犹豫下一步、候选目标难以区分、连续调查没有进展，或准备折返、认定区域无价值时，应考虑调用 inspect_screen 查看当前画面，而不是只重复查询导航和历史。"
+            "重复进入房间的不同位置或地图内移动后，旧观察可能未覆盖当前视野；根据当前疑问主动补看人物、外观差异、布局和可能遗漏的线索。"
+            "准备以这些对象都一样、没有价值或区域已探索完为由跳过未交互目标时，必须说明覆盖这些目标的实际证据；单个对象反馈或房间访问历史不足以支持该判断。证据不足就调用 inspect_screen 核实外观，或实际调查未交互对象，即使自己并不犹豫也不能直接沿用旧结论。无法区分则保留未知，不能将看不出区别当作无需调查。"
+            "视觉未能回答问题时，考虑实际交互或移动验证，避免反复询问同一疑点；不要求每回合截图。"
             "question 应提出具体待验证问题，并允许不可见或无法判断；例如询问人物与井之间是否隔着墙、有无可见连接通路，不预设人物已在井边或出口就是井口。"
             "区分对话发生地、对话提及的地点、画面可见位置和实际可达位置；对话记录的 room_id 只标识对话发生地，隔墙看见设施不证明人物就在设施旁或能直接走到。"
             "logical_room 是通行区域，不是独立地理空间；不同 map_id 也可能采用相同局部布局。"
@@ -14184,6 +14183,15 @@ class DebugState(CheckpointSupport):
             "旧任务没有 progress 时参考最新 rationale 并重新验证，不要根据旧 description 自动认定无线索；普通确认继续仍只提交 id。"
             "任何尚未解决、将影响未来行动的委托、线索或自发调查目标都必须成为独立 task，不要求 NPC 明说请去做；普通且不会影响后续行动的探索不必为每个对象创建 task。"
             "room_memo 只是可能过期的地点语义注释和普通 companion 数据，不是引擎事实，也不得覆盖 native transition、房间范围对话或 human-confirmed semantic annotation。"
+            "room_history 自动提供当前稳定房间的持久历史；incoming/outgoing 是明确有向的已确认通路，不能反转为可走路线。"
+            "历史 outgoing 的 matches_current_binding=false 表示当前导航未匹配该历史脚本绑定，历史仍真实但不能直接作为当前可执行路线。"
+            "列表 truncated=true 时调用 get_room_memory 获取完整历史；entry_candidates 仅为反向入口推测。"
+            "known_destination=false 仅表示该有向出口目的地未确认，不能据此断言通往新区域。"
+            "untraversed_current_context 仅表示当前任务上下文未走过，须同时检查 total_count；frontier 和 visited 都不能单独证明是新房间。"
+            "回到旧区域时结合任务、历史来路和剩余目标解释选路理由，不要仅因未知出口而宣称主线进展。"
+            "recent_transition_chain 仅覆盖最近入口及即时折返，不是完整旅行历史。"
+            "room_memo_review 是非阻断维护提示；对话结束后评估是否创建、更新或清除 memo，证据不足允许不写。"
+            "memo 聚焦有证据支持的地点身份、用途及限制；路线方向和探索计数以结构化历史为准，不得仅凭官兵、商人或画面猜正式地名。"
             "第一次获得稳定、高置信的地点身份或用途时立即用 upsert_room_memo 写入短 memo；新证据细化或否定地点身份时整体更新或清除。"
             "memo 只记录地点语义、稳定功能和重要人物关系；不要重复坐标、传送列表、拾取记录或结构化探索，行动相关线索必须保留为独立 task。"
             "根据地点语义比较候选入口，或准备给 task 新增、改变非空 room_id 时，必须先查询每个候选房间的 get_room_memory；证据不足则保持 task 未绑定房间。"
@@ -14241,7 +14249,7 @@ class DebugState(CheckpointSupport):
             "不要因 target_object_id 被拒绝就推断剧情物品只能靠重复 NPC 交互自动使用。进程重启或载入存档不会恢复最近事件对象，"
             "因此应先重新与目标 NPC 交互，再使用这种物品。普通全局效果脚本可能忽略事件上下文，不要把所有 apply_to_all 物品都视为剧情物品。"
             "对于任何明确的 search/touch 或 transition 目标，提交 navigate 和 target_id；"
-            "空间任务可提交 move_to(x,y,face)：精确站位且不自动调查，到达须同时满足位置和朝向。"
+            "空间任务可提交 move_to(x,y,face)：精确站位且不自动调查，face 为可选约束；普通探索移动应省略 face，只有任务明确要求朝向才填写。指定时到达须同时满足位置和朝向。"
             "放置物品前调用 preview_item_placement 检查实际落点与站位；合法只代表可放置，不代表任务有效。"
             "inspect_target.motion 是已观察移动轨迹，默认最近一段，可用 motion_offset 从 0 分页读取；不代表未来路线。"
             "motion.moved 仅指历史移动；current_status 和 observed_stationary_seconds 描述当前观测，unknown 不代表停住。"
@@ -14707,25 +14715,8 @@ class DebugState(CheckpointSupport):
             return None
         task_override = self.active_task_binds_navigation_target(state, target_id)
         executable = {"reachable", "transition", "blocked_by_interactable"}
-        if (context.get("status") == "entered"
-                and selected.get("entry_relation") == "inferred_entry_return" and not task_override):
-            alternatives = [
-                target for target in targets
-                if int(target.get("id") or 0) != target_id
-                and target.get("status") in executable
-                and target.get("possible_entry_return") is not True
-                and target.get("agent_priority") not in {
-                    "avoid_repeat", "soft_avoid", "avoid_backtrack", "avoid_immediate_backtrack",
-                }
-            ]
-            if alternatives:
-                return {
-                    "reason": "immediate_entry_return",
-                    "entry_relation": selected.get("entry_relation"),
-                    "source_room_id": context.get("source_room_id"),
-                    "destination_room_id": context.get("destination_room_id"),
-                    "alternative_target_ids": [int(target.get("id") or 0) for target in alternatives[:10]],
-                }
+        # Proximity only suggests an entrance; keep it advisory even when
+        # another target is executable. That target may be the actual return.
         if context.get("status") == "recovery_pending" and selected.get("recovery_route") is not True:
             recovery = next((
                 target for target in targets
@@ -14865,7 +14856,11 @@ class DebugState(CheckpointSupport):
             args = action.get("args") or {}
             route = self.route_to_position(latest_state, **args)
             if not route["ok"]:
-                self.reject_agent_decision(decision, "position_invalid", error=route["status"])
+                self.reject_agent_decision(
+                    decision, "position_invalid", error=route["status"],
+                    **({"position_reachable": True, "suggestion": "omit_optional_face_or_choose_reachable_facing"}
+                       if route["status"] == "facing_unreachable" else {}),
+                )
             return decision
         if action.get("tool") != "navigation_step":
             return decision

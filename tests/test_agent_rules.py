@@ -796,7 +796,7 @@ def test_agent_messages_put_stable_policy_before_dynamic_context(tmp_path):
     assert 'rules' not in dynamic
 
 
-def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
+def test_agent_policy_prefers_individual_exploration_and_active_visual_checks(tmp_path):
     policy = make_debug_state(tmp_path).agent_policy_prompt()
 
     assert 'status=reachable、transition 或 blocked_by_interactable' in policy
@@ -804,15 +804,23 @@ def test_agent_policy_mildly_prefers_low_detour_fresh_search(tmp_path):
     assert 'targets_returned < targets_total' in policy
     assert '沿 next_offset 连续读取到 complete=true' in policy
     assert '不能根据部分分页输出声称没有其他候选或证据' in policy
-    assert 'fresh、reachable 的非传送 search 目标给予温和正向偏好' in policy
+    assert '默认优先逐个调查 fresh、reachable 的非传送 search 目标' in policy
     assert '尚未尝试、fresh、reachable 且 transition_candidate=false 的 touch 目标' in policy
     assert '优先处理仍有价值的 search，再一次只尝试一个 touch' in policy
     assert '准备离开当前房间或进入传送前' in policy
     assert '每次交互后都根据新状态重新评估' in policy
+    assert '必须先调用 get_navigation 获取本次进入房间后的当前候选' in policy
+    assert '必须说明覆盖这些目标的实际证据' in policy
+    assert '即使自己并不犹豫也不能直接沿用旧结论' in policy
+    assert '外观相似不证明行为相同' in policy
+    assert '单个对象的已死、无效果或重复台词只约束该对象' in policy
+    assert '犹豫下一步、候选目标难以区分' in policy
+    assert '重复进入房间的不同位置或地图内移动后' in policy
+    assert '不要求每回合截图' in policy
     assert '不要求扫空房间' in policy
     assert '不设置固定步数或搜刮数量' in policy
     assert 'active 任务本身不等于紧急' in policy
-    assert '明确的剧情时限、直接可执行的关键目标、明显绕路或风险可以压过顺路搜索' in policy
+    assert '明确的剧情时限、直接可执行的关键目标、明显绕路或具体风险可以压过逐目标探索' in policy
     assert 'search 和 touch 只是引擎交互方式，不证明目标是物资、宝箱或 NPC' in policy
     assert '尝试 touch 属于探索而不是已确认的搜刮' in policy
     assert 'touch 可能触发战斗、控制接管或此前未知的房间切换' in policy
@@ -955,7 +963,7 @@ def test_agent_tool_specs_include_queries_and_submit(tmp_path):
     assert context['active_tasks_total'] == 0
     assert set(context) == {
         'state_summary', 'room_memo', 'active_tasks', 'active_tasks_total', 'task_review', 'task_inbox',
-        'task_reconciliation', 'room_entry_context', 'recent_transition_chain',
+        'task_reconciliation', 'room_entry_context', 'recent_transition_chain', 'room_history', 'room_memo_review',
     }
     assert context['room_entry_context'] is None
     assert context['recent_transition_chain'] == []
@@ -1039,7 +1047,7 @@ def install_entry_candidate(debug, state, context):
     debug.write_exploration(data)
 
 
-def test_entry_adjacent_unknown_transition_is_marked_and_rejected_before_movement(tmp_path):
+def test_entry_adjacent_unknown_transition_is_advisory_before_movement(tmp_path):
     debug = make_debug_state(tmp_path)
     state = entry_room_state()
     context = install_entry_context(debug, state)
@@ -1058,9 +1066,9 @@ def test_entry_adjacent_unknown_transition_is_marked_and_rejected_before_movemen
         'action': 'navigate', 'target_id': 758, 'reason': 'Take the nearest unknown transition.',
     }, state)
     decision = result['decision']
-    assert decision['validation']['reason'] == 'immediate_entry_return'
-    assert decision['validation']['alternative_target_ids'] == [767]
-    assert decision['recommended_action']['tool'] == 'no_op'
+    assert decision.get('validation', {}).get('status') != 'rejected'
+    assert decision['recommended_action']['tool'] == 'navigation_step'
+    assert decision['recommended_action']['args']['id'] == 758
     assert not debug.action_path.exists()
 
 

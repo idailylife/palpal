@@ -3064,7 +3064,7 @@ class AgentRuntime:
         started = _now()
         arguments = {
             "focus": "room_layout",
-            "question": "Describe the current room layout, visible exits, and obvious risks. Do not infer object IDs, scripts, or confirmed transitions.",
+            "question": "Describe layout, exits, risks and visible differences in clothing or poses. Do not infer identities, life/death, plot, object IDs, scripts, or confirmed transitions.",
         }
         result = await asyncio.to_thread(
             self.debug.run_agent_tool,

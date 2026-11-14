@@ -2,6 +2,8 @@ import json
 import threading
 import time
 
+import pytest
+
 from tests.support import create_agent_task, make_debug_state, make_state, make_touch_object, write_state
 from palpal.debug_server import decode_nav_grid, nav_bit, pal_distance, trigger_radius, world_pos
 
@@ -1886,13 +1888,27 @@ def test_dialog_entry_confirmation_records_context_and_unique_return_candidate(t
         'action': 'navigate', 'target_id': 703,
         'reason': 'Immediately return through the inferred entrance.',
     }, destination)['decision']
-    assert rejected['validation']['reason'] == 'immediate_entry_return'
+    assert rejected.get('validation', {}).get('status') != 'rejected'
+    assert rejected['recommended_action']['args']['id'] == 703
     selected = debug.run_agent_tool('submit_decision', {
         'action': 'navigate', 'target_id': 707,
         'reason': 'Continue deeper instead of immediately returning.',
     }, destination)['decision']
     assert selected['recommended_action']['args']['id'] == 707
     assert selected.get('validation', {}).get('status') != 'rejected'
+
+    # The inferred reverse entrance belongs to its original script binding too.
+    changed = {**destination, 'objects': [{**return_side, 'trigger_script': 13602}, deeper]}
+    changed_navigation = debug.run_agent_tool('get_navigation', {}, changed)['navigation']
+    changed_target = next(item for item in changed_navigation['targets'] if item['id'] == 703)
+    assert changed_target['known_destination'] is False
+    assert changed_target.get('possible_entry_return') is not True
+    assert changed_target.get('entry_relation') not in {'confirmed_entry_return', 'inferred_entry_return'}
+    changed_route = debug.run_agent_tool('inspect_target', {'id': 703}, changed)['route']
+    assert changed_route['known_destination'] is False
+    assert changed_route['status'] == 'transition'
+    historical_candidate = debug.run_agent_tool('get_room_memory', {}, changed)['transitions']['entry_candidates'][0]
+    assert historical_candidate['transition_key'] == candidate['transition_key']
 
 
 def test_manual_movement_ignores_native_trigger_with_mismatched_source_scene(tmp_path):
@@ -2400,7 +2416,7 @@ def test_navigation_and_route_include_known_transition_destination(tmp_path):
     assert known_by_key[transition_key]['traversal']['total_count'] == 1
 
 
-def test_confirmed_search_transition_stays_search_across_agent_tools(tmp_path):
+def test_changed_search_binding_stays_search_with_unknown_destination_across_agent_tools(tmp_path):
     target = {
         'id': 75, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
         'trigger_mode': 1, 'trigger_script': 8149, 'auto_script': 0,
@@ -2427,19 +2443,21 @@ def test_confirmed_search_transition_stays_search_across_agent_tools(tmp_path):
     )['transitions']
 
     assert target_view['kind'] == 'search'
-    assert target_view['status'] == 'transition'
-    assert target_view['transition_candidate'] is True
-    assert target_view['known_destination_room_id'] == debug.room_identity(destination)['id']
+    assert target_view['status'] == 'reachable'
+    assert not target_view.get('known_destination')
+    assert target_view.get('known_destination_room_id') is None
     assert route['kind'] == 'search'
-    assert route['status'] == 'transition'
-    assert route['transition_key'] != record['transition_key']
-    assert route['known_destination_basis'] == 'confirmed_site_history'
+    assert route['status'] == 'reachable'
+    assert not route.get('known_destination')
+    assert debug.transition_observation_from_state(advanced, 75)['transition_key'] != record['transition_key']
     assert executable_route['action'] == 'search'
-    assert executable_route['status'] == 'transition'
-    assert memory['outgoing'][0]['transition_key'] == record['transition_key']
+    assert executable_route['status'] == 'reachable'
+    assert memory['outgoing'] == []
+    assert memory['historical_outgoing'][0]['transition_key'] == record['transition_key']
+    assert memory['historical_outgoing'][0]['matches_current_binding'] is False
 
 
-def test_site_history_requires_same_position_mode_and_one_destination(tmp_path):
+def test_site_history_never_substitutes_for_current_script_binding(tmp_path):
     debug = make_debug_state(tmp_path)
     base = {
         'id': 692, 'x': 16, 'y': 8, 'sprite_id': 1, 'state': 1,
@@ -2458,10 +2476,10 @@ def test_site_history_requires_same_position_mode_and_one_destination(tmp_path):
     )
 
     advanced = {**source, 'objects': [{**base, 'trigger_script': 13583}]}
-    inherited = debug.transition_destination_for_state(advanced, 692)
-    assert inherited['known_destination'] is True
-    assert inherited['known_destination_basis'] == 'confirmed_site_history'
-    assert inherited['known_destination_room_id'] == debug.room_identity(destination_a)['id']
+    unknown = debug.transition_destination_for_state(advanced, 692)
+    assert unknown['known_destination'] is False
+    assert unknown['known_destination_room_id'] is None
+    assert unknown['traversal_context']['total_count'] == 0
 
     moved = {**advanced, 'objects': [{**advanced['objects'][0], 'x': 32}]}
     assert debug.transition_destination_for_state(moved, 692)['known_destination'] is False
@@ -2473,6 +2491,97 @@ def test_site_history_requires_same_position_mode_and_one_destination(tmp_path):
         to_state=destination_b, confirmation='native_trigger',
     )
     assert debug.transition_destination_for_state(advanced, 692)['known_destination'] is False
+
+
+@pytest.mark.parametrize('mode', [1, 4], ids=['search', 'touch'])
+@pytest.mark.parametrize('change', [
+    {'trigger_script': 25577}, {'x': 64}, {'y': 16}, {'trigger_mode': 2},
+    {'trigger_mode': 5},
+], ids=['script', 'x', 'y', 'search-mode', 'touch-mode'])
+def test_changed_transition_binding_is_history_only(tmp_path, mode, change):
+    debug = make_debug_state(tmp_path)
+    obj = {'id': 2003, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1,
+           'trigger_mode': mode, 'trigger_script': 25573, 'auto_script': 0,
+           'blocking': False, 'interactable': True}
+    source = make_state(width=5, height=5, objects=[obj])
+    destination = {**make_state(), 'scene_id': 106, 'map_id': 106}
+    old = debug.record_transition_destination(
+        debug.room_identity(source), 2003, debug.room_identity(destination),
+        from_object=obj, from_state=source, to_state=destination,
+        confirmation='native_trigger')
+    current = {**source, 'objects': [{**obj, **change}]}
+    write_state(debug, current)
+
+    payload = debug.transition_destination_for_state(current, 2003)
+    assert payload['known_destination'] is False
+    assert payload['known_destination_room_id'] is None
+    assert payload['known_destination_transition_key'] is None
+    assert payload['traversal_context']['total_count'] == 0
+    assert not payload['returns_to_recent_room']
+    navigation = debug.run_agent_tool('get_navigation', {}, current)['navigation']
+    target = next(item for item in navigation['targets'] if item['id'] == 2003)
+    route = debug.run_agent_tool('inspect_target', {'id': 2003}, current)['route']
+    for view in (target, route):
+        assert not view.get('known_destination')
+        assert view.get('known_destination_room_id') is None
+        assert view.get('traversal_context', {}).get('total_count', 0) == 0
+        assert view['status'] in {'reachable', 'transition'}
+    assert debug.route_to_object(current, 2003)['action'] in {'search', 'touch'}
+    assert debug.known_transitions_summary(debug.room_identity(current)['id'], current)['transitions'] == []
+    memory = debug.run_agent_tool('get_room_memory', {}, current)['transitions']
+    assert memory['outgoing'] == []
+    historical = memory['historical_outgoing']
+    assert len(historical) == 1
+    assert historical[0]['transition_key'] == old['transition_key']
+    assert historical[0]['matches_current_binding'] is False
+    assert historical[0]['traversal']['total_count'] == 1
+    history = debug.agent_tool_initial_context(current)['room_history']['outgoing']
+    assert history['total'] == 1
+    assert history['records'] == historical
+    missing = {**current, 'objects': []}
+    assert debug.known_transitions_summary(debug.room_identity(missing)['id'], missing)['transitions'] == []
+    assert debug.transition_destination_for_state(missing, 2003)['known_destination'] is False
+
+
+@pytest.mark.parametrize('mode', [1, 4], ids=['search', 'touch'])
+def test_new_script_confirmation_keeps_both_historical_destinations(tmp_path, mode):
+    debug = make_debug_state(tmp_path)
+    obj = {'id': 2003, 'x': 32, 'y': 0, 'sprite_id': 0, 'state': 1,
+           'trigger_mode': mode, 'trigger_script': 25573, 'auto_script': 0,
+           'blocking': False, 'interactable': True}
+    source = make_state(objects=[obj])
+    old_destination = {**make_state(), 'scene_id': 106, 'map_id': 106}
+    new_destination = {**make_state(), 'scene_id': 109, 'map_id': 109}
+    old = debug.record_transition_destination(
+        debug.room_identity(source), 2003, debug.room_identity(old_destination),
+        from_object=obj, from_state=source, to_state=old_destination,
+        confirmation='native_trigger')
+    current_obj = {**obj, 'trigger_script': 25577}
+    current = {**source, 'objects': [current_obj]}
+    new = debug.record_transition_destination(
+        debug.room_identity(current), 2003, debug.room_identity(new_destination),
+        from_object=current_obj, from_state=current, to_state=new_destination,
+        confirmation='human_confirmed')
+    write_state(debug, current)
+    navigation = debug.run_agent_tool('get_navigation', {}, current)['navigation']
+    target = next(item for item in navigation['targets'] if item['id'] == 2003)
+    route = debug.run_agent_tool('inspect_target', {'id': 2003}, current)['route']
+    for view in (target, route):
+        assert view['known_destination'] is True
+        assert view['known_destination_room_id'] == debug.room_identity(new_destination)['id']
+        assert view['transition_key'] == new['transition_key']
+        assert view['traversal_context']['total_count'] == 1
+    memory = debug.run_agent_tool('get_room_memory', {}, current)['transitions']
+    assert [edge['transition_key'] for edge in memory['outgoing']] == [new['transition_key']]
+    assert [edge['transition_key'] for edge in memory['historical_outgoing']] == [old['transition_key']]
+    assert memory['historical_outgoing'][0]['matches_current_binding'] is False
+    history = debug.agent_tool_initial_context(current)['room_history']['outgoing']
+    assert history['total'] == 2
+    assert {edge['to_room_id'] for edge in history['records']} == {
+        debug.room_identity(old_destination)['id'], debug.room_identity(new_destination)['id']}
+    # Another script cannot inherit either of the two confirmed destinations.
+    unknown = {**source, 'objects': [{**obj, 'trigger_script': 25578}]}
+    assert debug.transition_destination_for_state(unknown, 2003)['known_destination'] is False
 
 
 def test_multiple_nearby_transitions_do_not_infer_entry_return(tmp_path):

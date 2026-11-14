@@ -490,3 +490,24 @@ def test_passive_window_cannot_bridge_stream_gap(tmp_path, monkeypatch):
     result = debug.observe_target(7, 2)
     assert not result['ok']
     assert result['observation']['status'] == 'observation_interrupted'
+
+
+def test_reachable_cell_reports_unsatisfied_optional_facing(tmp_path):
+    debug = make_debug_state(tmp_path)
+    cells = {(4, 4), (3, 5), (2, 4)}
+    state = make_state(width=7, height=7, start=(4, 4),
+                       blocked=[(x, y) for x in range(7) for y in range(7)
+                                if (x, y) not in cells])
+    assert debug.route_to_position(state, 48, 40)['steps'] == 1
+    assert debug.route_to_position(state, 48, 40, 'down')['ok']
+    route = debug.route_to_position(state, 48, 40, 'left')
+    assert route['status'] == 'facing_unreachable'
+    assert route['position_reachable'] is True
+    write_state(debug, state)
+    decision = debug.run_agent_tool('submit_decision', {
+        'action': 'move_to', 'x': 48, 'y': 40, 'face': 'left',
+        'reason': 'Explore the adjacent cell.',
+    }, state)['decision']
+    assert decision['validation']['error'] == 'facing_unreachable'
+    assert decision['validation']['position_reachable'] is True
+    assert not debug.action_path.exists()
